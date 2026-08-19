@@ -1,0 +1,77 @@
+// Prisma schema for the dsh-storage database backend.
+//
+// Table layout adapted from the ai_messages / ai_chat_histories models of the
+// source project (packages/core/prisma/schema.prisma), generalized for dsh:
+//   - `type` values come from the dsh session event map
+//     ('user' | 'model' | 'tool' | ...) instead of gemini-cli message roles.
+//   - `agent_id` distinguishes the main agent from subagent writers.
+//
+// Switch `provider` to "postgresql" if needed. Run `npx prisma generate`
+// (and `npx prisma db push` / migrations) before enabling the database backend.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+/// One row per projected session event (user message, assistant message,
+/// tool call/result, compression snapshot, ...).
+model DshMessage {
+  id            String    @id @default(cuid()) @db.Char(36)
+  sessionId     String    @map("session_id") @db.VarChar(100)
+  userId        String    @map("user_id") @db.Char(36)
+  historyId     String?   @map("history_id") @db.Char(36)
+  type          String    @db.VarChar(50)
+  content       String    @db.LongText
+  thoughts      Json?
+  model         String?   @db.VarChar(100)
+  tokens        Json?
+  toolCalls     Json?     @map("tool_calls")
+  agentId       String?   @map("agent_id") @db.VarChar(100)
+  metadata      Json?
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamp(0)
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamp(0)
+  deletedAt     DateTime? @map("deleted_at") @db.Timestamp(0)
+
+  // Relations
+  history       DshChatHistory? @relation(fields: [historyId], references: [id], onDelete: NoAction)
+
+  @@index([sessionId], map: "idx_session")
+  @@index([userId], map: "idx_user")
+  @@index([historyId], map: "idx_history")
+  @@index([createdAt], map: "idx_created")
+  @@index([deletedAt], map: "idx_deleted")
+  @@index([agentId], map: "idx_agent")
+  @@index([sessionId, agentId, type, createdAt], map: "idx_session_agent_type_created")
+  @@map("dsh_messages")
+}
+
+/// Per-session rollup, maintained incrementally by the projector and
+/// finalized on session disposal / archive.
+model DshChatHistory {
+  id             String    @id @default(cuid()) @db.Char(36)
+  sessionId      String    @map("session_id") @db.VarChar(100)
+  userId         String    @map("user_id") @db.Char(36)
+  title          String?   @db.VarChar(255)
+  summary        String?   @db.Text
+  messageCount   Int       @default(0) @map("message_count")
+  totalTokens    BigInt    @default(0) @map("total_tokens")
+  firstMessageAt DateTime? @map("first_message_at") @db.DateTime(6)
+  lastMessageAt  DateTime? @map("last_message_at") @db.DateTime(6)
+  archivedAt     DateTime  @default(now()) @map("archived_at") @db.DateTime(6)
+  metadata       Json?
+  deletedAt      DateTime? @map("deleted_at") @db.DateTime(6)
+
+  // Relations
+  messages       DshMessage[]
+
+  @@index([sessionId], map: "idx_chat_history_session")
+  @@index([userId], map: "idx_chat_history_user")
+  @@index([archivedAt], map: "idx_chat_history_archived")
+  @@index([deletedAt], map: "idx_chat_history_deleted")
+  @@map("dsh_chat_histories")
+}

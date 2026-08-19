@@ -1,0 +1,4 @@
+# 插入 dsh-langfuse 插件行；插件配置见下文 Config schema(也可在 profile 的 cordis.patch.yml 里覆盖)
+- insert:
+    - id: langfuse
+      name: dsh-langfuse
