@@ -52,6 +52,9 @@ interface SessionAccum {
 }
 
 export function apply(ctx: Context, config: StoragePluginConfig): void {
+  // dsh event names come from declaration merging in @deepseek-ai/* packages that are
+  // not all published yet; cast once here. TODO(verify): drop when installable.
+  const on = ctx.on.bind(ctx) as (name: string, handler: (...args: any[]) => unknown) => void
   if (!config.enabled || !config.database.enabled || !config.database.url) return
 
   const backends: StorageBackend[] = [new DatabaseBackend({ url: config.database.url })]
@@ -67,12 +70,12 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     )
   }
 
-  ctx.on('ready', async () => {
+  on('ready', async () => {
     await fanout(async (backend) => backend.init?.())
   })
 
   /* eslint-disable @typescript-eslint/no-explicit-any */
-  ctx.on('session/event', (session: any, event: any) => {
+  on('session/event', (session: any, event: any) => {
     const sessionId: string = session?.id ?? 'unknown'
     const accum = sessions.get(sessionId) ?? { messageCount: 0, totalTokens: 0 }
     sessions.set(sessionId, accum)
@@ -101,11 +104,11 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     }
   })
 
-  ctx.on('session/disposed' as never, (session: any) => {
+  on('session/disposed', (session: any) => {
     sessions.delete(session?.id ?? 'unknown')
   })
 
-  ctx.on('dispose', async () => {
+  on('dispose', async () => {
     sessions.clear()
     await fanout(async (backend) => backend.close?.())
   })

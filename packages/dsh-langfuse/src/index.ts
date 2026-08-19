@@ -53,6 +53,9 @@ function traceKey(sessionId: string, turnId: string | undefined): string {
 }
 
 export function apply(ctx: Context, config: LangfusePluginConfig): void {
+  // dsh event names come from declaration merging in @deepseek-ai/* packages that are
+  // not all published yet; cast once here. TODO(verify): drop when installable.
+  const on = ctx.on.bind(ctx) as (name: string, handler: (...args: any[]) => unknown) => void
   if (!config.enabled || !config.publicKey || !config.secretKey) return
 
   const reporter = new LangfuseReporter(config)
@@ -63,7 +66,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): void {
   // names (`turn.id`, `turn.kind`, `reason.kind`) against the dsh version you
   // pin — the session event map is pre-release and may shift.
   // ------------------------------------------------------------------
-  ctx.on('session/event', (session: any, event: any) => {
+  on('session/event', (session: any, event: any) => {
     const sessionId: string = session?.id ?? event?.session ?? 'unknown'
     if (event?.type === 'turn/start') {
       const key = traceKey(sessionId, event.turn?.id)
@@ -94,7 +97,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): void {
   // TODO(verify): how to reach session/turn identity from `options` /
   // `this` (agent-loop requests carry `markAgentLoopRequest` identity).
   // ------------------------------------------------------------------
-  ctx.on('llm/stream', async function (this: unknown, options: any, next: any) {
+  on('llm/stream', async function (this: unknown, options: any, next: any) {
     const model: string | undefined = options?.model
     const generation = await reporter.generation(undefined /* trace-less until turn wiring is verified */, {
       name: 'llm-call',
@@ -145,7 +148,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): void {
   // Waterfall per docs/tool-execution-pipeline.md:
   //   (exec: { name, arguments, agent, signal }, next)
   // ------------------------------------------------------------------
-  ctx.on('tools/execute', async (exec: any, next: any) => {
+  on('tools/execute', async (exec: any, next: any) => {
     const span = await reporter.span(undefined /* trace-less; see TODO above */, {
       name: `tool:${exec?.name ?? 'unknown'}`,
       input: config.captureContent ? exec?.arguments : undefined,
@@ -163,7 +166,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): void {
     }
   })
 
-  ctx.on('dispose', () => {
+  on('dispose', () => {
     traces.clear()
     return reporter.shutdown()
   })

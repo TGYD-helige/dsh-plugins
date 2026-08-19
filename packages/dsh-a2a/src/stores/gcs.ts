@@ -15,7 +15,8 @@
 
 import { createReadStream } from 'node:fs'
 import { pipeline } from 'node:stream/promises'
-import type { Task, TaskStore } from '@a2a-js/sdk/server'
+import type { Task } from '@a2a-js/sdk'
+import type { TaskStore } from '@a2a-js/sdk/server'
 
 export interface GcsTaskStoreConfig {
   bucket: string

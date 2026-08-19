@@ -11,7 +11,8 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import type { Task, TaskStore } from '@a2a-js/sdk/server'
+import type { Task } from '@a2a-js/sdk'
+import type { TaskStore } from '@a2a-js/sdk/server'
 
 export interface RedisTaskStoreConfig {
   url: string

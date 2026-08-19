@@ -76,6 +76,9 @@ export interface A2aPluginConfig {
 }
 
 export function apply(ctx: Context, config: A2aPluginConfig): void {
+  // dsh event names come from declaration merging in @deepseek-ai/* packages that are
+  // not all published yet; cast once here. TODO(verify): drop when installable.
+  const on = ctx.on.bind(ctx) as (name: string, handler: (...args: any[]) => unknown) => void
   if (!config.enabled) return
 
   const bridge = new A2aBridge(ctx, {
@@ -98,7 +101,7 @@ export function apply(ctx: Context, config: A2aPluginConfig): void {
 
   let server: { close(): Promise<void> } | null = null
 
-  ctx.on('ready', async () => {
+  on('ready', async () => {
     await taskStore?.init()
     server = await startA2aServer(bridge, {
       host: config.host,
@@ -114,7 +117,7 @@ export function apply(ctx: Context, config: A2aPluginConfig): void {
     console.log(`[dsh-a2a] A2A endpoint: http://${config.host}:${config.port}${config.basePath}/`)
   })
 
-  ctx.on('dispose', async () => {
+  on('dispose', async () => {
     await server?.close()
     await bridge.dispose()
     await taskStore?.close?.()

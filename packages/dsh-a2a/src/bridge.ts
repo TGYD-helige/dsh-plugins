@@ -46,7 +46,10 @@ export class A2aBridge {
   ) {
     // Fan the durable session event stream out to per-task listeners.
     // TODO(verify): event names/payloads against your pinned dsh version.
-    ctx.on('session/event', (session: any, event: any) => {
+    // Cast: dsh event names come from declaration merging in @deepseek-ai/*
+    // packages that are not all published yet.
+    const on = ctx.on.bind(ctx) as (name: string, handler: (...args: any[]) => unknown) => void
+    on('session/event', (session: any, event: any) => {
       const entry = this.findBySessionId(session?.id)
       if (!entry) return
       const a2aEvent = translateSessionEvent(event)
@@ -74,7 +77,7 @@ export class A2aBridge {
     const entry = existingId ? this.tasks.get(existingId) : undefined
 
     if (entry) {
-      await entry.agent.followup(createUserMessage({ content: input.text, source: { kind: 'user' } }))
+      await entry.agent.followup(createUserMessage({ content: [{ type: 'text', text: input.text }], source: { kind: 'user' } }))
       return { taskId: existingId!, contextId: entry.sessionId }
     }
 
@@ -91,7 +94,7 @@ export class A2aBridge {
     this.tasks.set(taskId, newEntry)
     this.byContext.set(sessionId, taskId)
 
-    await handle.agent.followup(createUserMessage({ content: input.text, source: { kind: 'user' } }))
+    await handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: input.text }], source: { kind: 'user' } }))
     return { taskId, contextId: sessionId }
   }
 
