@@ -9,25 +9,25 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import type { MessageRow, SessionRow, StorageBackend } from '../types.js'
+import type { MessageRow, SessionRow, StorageBackend } from '../types.js';
 
 export interface DatabaseBackendConfig {
   /** Full connection URL, e.g. mysql://user:pass@host:3306/dbname */
-  url: string
+  url: string;
 }
 
 export class DatabaseBackend implements StorageBackend {
-  readonly name = 'database'
-  private prisma: any = null
+  readonly name = 'database';
+  private prisma: any = null;
 
   constructor(private config: DatabaseBackendConfig) {}
 
   async init(): Promise<void> {
-    const mod = await import('@prisma/client')
+    const mod = await import('@prisma/client');
     this.prisma = new (mod as any).PrismaClient({
       datasources: { db: { url: this.config.url } },
-    })
-    await this.prisma.$connect()
+    });
+    await this.prisma.$connect();
   }
 
   private toDbData(row: MessageRow): Record<string, unknown> {
@@ -41,20 +41,20 @@ export class DatabaseBackend implements StorageBackend {
       agentId: row.agentId ?? undefined,
       metadata: { id: row.id, ...(row.metadata ?? {}) },
       createdAt: row.createdAt,
-    }
+    };
   }
 
   async upsertMessage(row: MessageRow): Promise<void> {
-    if (!this.prisma) return
-    const data = this.toDbData(row)
+    if (!this.prisma) return;
+    const data = this.toDbData(row);
     // Match the source project's convention: the logical message id rides in
     // metadata.id; the DB primary key is a cuid assigned on first insert.
     const existing = await this.prisma.aiMessage.findFirst({
       where: { sessionId: row.sessionId, metadata: { path: ['id'], equals: row.id } },
       select: { id: true },
-    })
+    });
     if (existing) {
-      await this.prisma.aiMessage.update({ where: { id: existing.id }, data })
+      await this.prisma.aiMessage.update({ where: { id: existing.id }, data });
     } else {
       await this.prisma.aiMessage.create({
         data: {
@@ -62,16 +62,16 @@ export class DatabaseBackend implements StorageBackend {
           historyId: row.historyId,
           ...data,
         },
-      })
+      });
     }
   }
 
   async upsertSession(row: SessionRow): Promise<void> {
-    if (!this.prisma) return
+    if (!this.prisma) return;
     const existing = await this.prisma.aiChatHistory.findFirst({
       where: { sessionId: row.sessionId, deletedAt: null },
       select: { id: true },
-    })
+    });
     const data = {
       sessionId: row.sessionId,
       title: row.title ?? undefined,
@@ -81,15 +81,15 @@ export class DatabaseBackend implements StorageBackend {
       firstMessageAt: row.firstMessageAt ?? undefined,
       lastMessageAt: row.lastMessageAt ?? undefined,
       metadata: row.metadata ?? undefined,
-    }
+    };
     if (existing) {
-      await this.prisma.aiChatHistory.update({ where: { id: existing.id }, data })
+      await this.prisma.aiChatHistory.update({ where: { id: existing.id }, data });
     } else {
-      await this.prisma.aiChatHistory.create({ data })
+      await this.prisma.aiChatHistory.create({ data });
     }
   }
 
   async close(): Promise<void> {
-    await this.prisma?.$disconnect?.()
+    await this.prisma?.$disconnect?.();
   }
 }

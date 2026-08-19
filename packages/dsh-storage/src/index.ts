@@ -18,17 +18,17 @@
  * @module dsh-storage
  */
 
-import type { Context } from '@deepseek-ai/cordis'
-import Schema from '@deepseek-ai/schemastery'
-import { projectEvent, usageOf } from './projector.js'
-import type { MessageRow, SessionRow, StorageBackend } from './types.js'
-import { DatabaseBackend } from './backends/database.js'
+import type { Context } from '@deepseek-ai/cordis';
+import Schema from '@deepseek-ai/schemastery';
+import { DatabaseBackend } from './backends/database.js';
+import { projectEvent, usageOf } from './projector.js';
+import type { MessageRow, SessionRow, StorageBackend } from './types.js';
 
-export const name = 'dsh-storage'
+export const name = 'dsh-storage';
 
 // Event-tap only: no hard service dependency. Add 'sessionPersistence' to
 // `inject` if you want fail-fast when persistence is not composed.
-export const inject = [] as string[]
+export const inject = [] as string[];
 
 export const Config = Schema.object({
   enabled: Schema.boolean().default(false),
@@ -36,60 +36,62 @@ export const Config = Schema.object({
     enabled: Schema.boolean().default(false),
     url: Schema.string().role('secret').default(''),
   }),
-})
+});
 
 export interface StoragePluginConfig {
-  enabled: boolean
-  database: { enabled: boolean; url: string }
+  enabled: boolean;
+  database: { enabled: boolean; url: string };
 }
 
 /** Per-session live rollup used to maintain the session row. */
 interface SessionAccum {
-  messageCount: number
-  totalTokens: number
-  firstMessageAt?: Date
-  lastMessageAt?: Date
+  messageCount: number;
+  totalTokens: number;
+  firstMessageAt?: Date;
+  lastMessageAt?: Date;
 }
 
 export function apply(ctx: Context, config: StoragePluginConfig): void {
   // dsh event names come from declaration merging in @deepseek-ai/* packages that are
   // not all published yet; cast once here. TODO(verify): drop when installable.
-  const on = ctx.on.bind(ctx) as (name: string, handler: (...args: any[]) => unknown) => void
-  if (!config.enabled || !config.database.enabled || !config.database.url) return
+  const on = ctx.on.bind(ctx) as (name: string, handler: (...args: any[]) => unknown) => void;
+  if (!config.enabled || !config.database.enabled || !config.database.url) return;
 
-  const backends: StorageBackend[] = [new DatabaseBackend({ url: config.database.url })]
+  const backends: StorageBackend[] = [new DatabaseBackend({ url: config.database.url })];
 
-  const sessions = new Map<string, SessionAccum>()
+  const sessions = new Map<string, SessionAccum>();
 
   async function fanout(call: (backend: StorageBackend) => Promise<void>): Promise<void> {
     // Mirroring must never break the agent loop: log and swallow.
     await Promise.all(
       backends.map((backend) =>
-        call(backend).catch((error) => console.error(`[dsh-storage] ${backend.name} error:`, error)),
+        call(backend).catch((error) =>
+          console.error(`[dsh-storage] ${backend.name} error:`, error),
+        ),
       ),
-    )
+    );
   }
 
   on('ready', async () => {
-    await fanout(async (backend) => backend.init?.())
-  })
+    await fanout(async (backend) => backend.init?.());
+  });
 
   /* eslint-disable @typescript-eslint/no-explicit-any */
   on('session/event', (session: any, event: any) => {
-    const sessionId: string = session?.id ?? 'unknown'
-    const accum = sessions.get(sessionId) ?? { messageCount: 0, totalTokens: 0 }
-    sessions.set(sessionId, accum)
+    const sessionId: string = session?.id ?? 'unknown';
+    const accum = sessions.get(sessionId) ?? { messageCount: 0, totalTokens: 0 };
+    sessions.set(sessionId, accum);
 
-    const row: MessageRow | null = projectEvent(session, event, { sessionId })
+    const row: MessageRow | null = projectEvent(session, event, { sessionId });
     if (row) {
-      accum.messageCount += 1
-      accum.firstMessageAt ??= row.createdAt
-      accum.lastMessageAt = row.createdAt
-      void fanout((backend) => backend.upsertMessage(row))
+      accum.messageCount += 1;
+      accum.firstMessageAt ??= row.createdAt;
+      accum.lastMessageAt = row.createdAt;
+      void fanout((backend) => backend.upsertMessage(row));
     }
 
-    const usage = usageOf(event)
-    accum.totalTokens += usage.input + usage.output
+    const usage = usageOf(event);
+    accum.totalTokens += usage.input + usage.output;
 
     if (row || usage.input + usage.output > 0 || event?.type === 'turn/end') {
       const sessionRow: SessionRow = {
@@ -99,17 +101,17 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
         totalTokens: accum.totalTokens,
         firstMessageAt: accum.firstMessageAt ?? null,
         lastMessageAt: accum.lastMessageAt ?? null,
-      }
-      void fanout((backend) => backend.upsertSession(sessionRow))
+      };
+      void fanout((backend) => backend.upsertSession(sessionRow));
     }
-  })
+  });
 
   on('session/disposed', (session: any) => {
-    sessions.delete(session?.id ?? 'unknown')
-  })
+    sessions.delete(session?.id ?? 'unknown');
+  });
 
   on('dispose', async () => {
-    sessions.clear()
-    await fanout(async (backend) => backend.close?.())
-  })
+    sessions.clear();
+    await fanout(async (backend) => backend.close?.());
+  });
 }

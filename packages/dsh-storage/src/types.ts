@@ -7,33 +7,33 @@
 
 /** One row in `ai_messages`. */
 export interface MessageRow {
-  id: string
-  sessionId: string
-  historyId: string | null
+  id: string;
+  sessionId: string;
+  historyId: string | null;
   /** 'user' | 'model' | 'tool' | 'utility_compressor' | plugin-defined */
-  type: string
-  content: string
-  thoughts?: unknown
-  model?: string | null
-  tokens?: unknown
-  toolCalls?: unknown
-  agentId?: string | null
-  metadata?: Record<string, unknown>
-  createdAt: Date
+  type: string;
+  content: string;
+  thoughts?: unknown;
+  model?: string | null;
+  tokens?: unknown;
+  toolCalls?: unknown;
+  agentId?: string | null;
+  metadata?: Record<string, unknown>;
+  createdAt: Date;
 }
 
 /** One row in `ai_chat_histories` — a per-session rollup. */
 export interface SessionRow {
-  id: string
-  sessionId: string
-  title?: string | null
-  summary?: string | null
-  messageCount: number
-  totalTokens: number
-  firstMessageAt?: Date | null
-  lastMessageAt?: Date | null
-  archivedAt?: Date
-  metadata?: Record<string, unknown>
+  id: string;
+  sessionId: string;
+  title?: string | null;
+  summary?: string | null;
+  messageCount: number;
+  totalTokens: number;
+  firstMessageAt?: Date | null;
+  lastMessageAt?: Date | null;
+  archivedAt?: Date;
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -43,9 +43,9 @@ export interface SessionRow {
  * loop.
  */
 export interface StorageBackend {
-  readonly name: string
-  init?(): Promise<void>
-  upsertMessage(row: MessageRow): Promise<void>
-  upsertSession(row: SessionRow): Promise<void>
-  close?(): Promise<void>
+  readonly name: string;
+  init?(): Promise<void>;
+  upsertMessage(row: MessageRow): Promise<void>;
+  upsertSession(row: SessionRow): Promise<void>;
+  close?(): Promise<void>;
 }

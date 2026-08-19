@@ -14,6 +14,15 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: biomejs/setup-biome@v2
+      - run: biome check .
+
   build:
     name: Typecheck & Build
     runs-on: ubuntu-latest

@@ -13,51 +13,51 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import { createReadStream } from 'node:fs'
-import { pipeline } from 'node:stream/promises'
-import type { Task } from '@a2a-js/sdk'
-import type { TaskStore } from '@a2a-js/sdk/server'
+import { createReadStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import type { Task } from '@a2a-js/sdk';
+import type { TaskStore } from '@a2a-js/sdk/server';
 
 export interface GcsTaskStoreConfig {
-  bucket: string
+  bucket: string;
   /** Object key prefix, default 'tasks' (matches the source layout). */
-  prefix?: string
+  prefix?: string;
   /** Path to a service-account key file; omit to use ADC. */
-  keyFilename?: string
+  keyFilename?: string;
 }
 
 export class GcsTaskStore implements TaskStore {
-  private bucket: any = null
-  private prefix: string
+  private bucket: any = null;
+  private prefix: string;
 
   constructor(private config: GcsTaskStoreConfig) {
-    this.prefix = config.prefix ?? 'tasks'
+    this.prefix = config.prefix ?? 'tasks';
   }
 
   async init(): Promise<void> {
-    const mod = await import('@google-cloud/storage')
+    const mod = await import('@google-cloud/storage');
     const storage = new (mod as any).Storage(
       this.config.keyFilename ? { keyFilename: this.config.keyFilename } : undefined,
-    )
-    this.bucket = storage.bucket(this.config.bucket)
+    );
+    this.bucket = storage.bucket(this.config.bucket);
   }
 
   async save(task: Task): Promise<void> {
-    if (!this.bucket) return
-    const { gzipSync } = await import('node:zlib')
+    if (!this.bucket) return;
+    const { gzipSync } = await import('node:zlib');
     await this.bucket
       .file(`${this.prefix}/${task.id}/metadata.json.gz`)
-      .save(gzipSync(JSON.stringify(task)), { contentType: 'application/gzip', resumable: false })
+      .save(gzipSync(JSON.stringify(task)), { contentType: 'application/gzip', resumable: false });
   }
 
   async load(taskId: string): Promise<Task | undefined> {
-    if (!this.bucket) return undefined
-    const file = this.bucket.file(`${this.prefix}/${taskId}/metadata.json.gz`)
-    const [exists] = await file.exists()
-    if (!exists) return undefined
-    const [buf] = await file.download()
-    const { gunzipSync } = await import('node:zlib')
-    return JSON.parse(gunzipSync(buf).toString('utf8')) as Task
+    if (!this.bucket) return undefined;
+    const file = this.bucket.file(`${this.prefix}/${taskId}/metadata.json.gz`);
+    const [exists] = await file.exists();
+    if (!exists) return undefined;
+    const [buf] = await file.download();
+    const { gunzipSync } = await import('node:zlib');
+    return JSON.parse(gunzipSync(buf).toString('utf8')) as Task;
   }
 
   /**
@@ -66,21 +66,21 @@ export class GcsTaskStore implements TaskStore {
    * to control inclusion and avoid shelling out.
    */
   async archiveWorkspace(taskId: string, cwd: string): Promise<void> {
-    if (!this.bucket) return
-    const { execFile } = await import('node:child_process')
-    const { promisify } = await import('node:util')
-    const { mkdtemp, rm } = await import('node:fs/promises')
-    const { tmpdir } = await import('node:os')
-    const { join } = await import('node:path')
+    if (!this.bucket) return;
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const { mkdtemp, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
 
-    const dir = await mkdtemp(join(tmpdir(), 'dsh-a2a-archive-'))
-    const tarball = join(dir, 'workspace.tar.gz')
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-a2a-archive-'));
+    const tarball = join(dir, 'workspace.tar.gz');
     try {
-      await promisify(execFile)('tar', ['-czf', tarball, '-C', cwd, '.'])
-      const dest = this.bucket.file(`${this.prefix}/${taskId}/workspace.tar.gz`)
-      await pipeline(createReadStream(tarball), dest.createWriteStream())
+      await promisify(execFile)('tar', ['-czf', tarball, '-C', cwd, '.']);
+      const dest = this.bucket.file(`${this.prefix}/${taskId}/workspace.tar.gz`);
+      await pipeline(createReadStream(tarball), dest.createWriteStream());
     } finally {
-      await rm(dir, { recursive: true, force: true })
+      await rm(dir, { recursive: true, force: true });
     }
   }
 }
