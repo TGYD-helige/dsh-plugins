@@ -20,8 +20,20 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - uses: biomejs/setup-biome@v2
-      - run: biome check .
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # Run the workspace-pinned biome via the lint script, not a
+      # setup-biome latest install — keeps CLI and schema versions aligned.
+      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm lint
 
   build:
     name: Typecheck & Build
