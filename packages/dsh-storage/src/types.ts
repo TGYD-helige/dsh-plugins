@@ -1,16 +1,14 @@
 /**
  * Shared row types and the backend contract.
  *
- * Row shapes mirror the `dsh_messages` / `dsh_chat_histories` Prisma models
- * (see prisma/schema.prisma), which are adapted from the source project's
- * ai_messages / ai_chat_histories tables.
+ * Row shapes mirror the `ai_messages` / `ai_chat_histories` Prisma models
+ * (see prisma/schema.prisma), matching the source project's tables.
  */
 
-/** One row in `dsh_messages`. */
+/** One row in `ai_messages`. */
 export interface MessageRow {
   id: string
   sessionId: string
-  userId: string
   historyId: string | null
   /** 'user' | 'model' | 'tool' | 'utility_compressor' | plugin-defined */
   type: string
@@ -24,11 +22,10 @@ export interface MessageRow {
   createdAt: Date
 }
 
-/** One row in `dsh_chat_histories` — a per-session rollup. */
+/** One row in `ai_chat_histories` — a per-session rollup. */
 export interface SessionRow {
   id: string
   sessionId: string
-  userId: string
   title?: string | null
   summary?: string | null
   messageCount: number
@@ -50,11 +47,5 @@ export interface StorageBackend {
   init?(): Promise<void>
   upsertMessage(row: MessageRow): Promise<void>
   upsertSession(row: SessionRow): Promise<void>
-  /**
-   * Archive the session workspace (e.g. tar to GCS). Called on
-   * `session/disposed` when `archiveWorkspace` is enabled in config and the
-   * backend implements it.
-   */
-  archiveWorkspace?(sessionId: string, cwd: string): Promise<void>
   close?(): Promise<void>
 }

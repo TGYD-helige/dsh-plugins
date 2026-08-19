@@ -1,7 +1,7 @@
 {
   "name": "dsh-storage",
   "version": "0.1.0",
-  "description": "Session storage mirror for DeepSeek Harness: projects the session event stream into MySQL/PostgreSQL, Redis, and/or GCS without replacing dsh's local persistence.",
+  "description": "Session storage mirror for DeepSeek Harness: projects the session event stream into MySQL/PostgreSQL (ai_messages / ai_chat_histories) without replacing dsh's local persistence.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -36,12 +36,6 @@
   },
   "peerDependenciesMeta": {
     "@prisma/client": {
-      "optional": true
-    },
-    "ioredis": {
-      "optional": true
-    },
-    "@google-cloud/storage": {
       "optional": true
     }
   },

@@ -16,6 +16,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { A2aBridge } from './bridge.js'
 import { startA2aServer } from './server.js'
+import { RedisTaskStore } from './stores/redis.js'
+import { GcsTaskStore } from './stores/gcs.js'
 
 export const name = 'dsh-a2a'
 
@@ -39,6 +41,25 @@ export const Config = Schema.object({
     version: Schema.string().default('0.1.0'),
     publicUrl: Schema.string().default(''),
   }),
+  /**
+   * A2A task state store (task metadata only — conversation history is
+   * dsh-storage's ai_messages, not this). 'memory' loses tasks on restart.
+   */
+  taskStore: Schema.union([
+    Schema.const('memory'),
+    Schema.const('redis'),
+    Schema.const('gcs'),
+  ]).default('memory'),
+  redis: Schema.object({
+    url: Schema.string().default('redis://127.0.0.1:6379'),
+    keyPrefix: Schema.string().default('a2a'),
+    ttlSeconds: Schema.natural().default(86400),
+  }),
+  gcs: Schema.object({
+    bucket: Schema.string().default(''),
+    prefix: Schema.string().default('tasks'),
+    keyFilename: Schema.string().default(''),
+  }),
 })
 
 export interface A2aPluginConfig {
@@ -49,6 +70,9 @@ export interface A2aPluginConfig {
   cwd: string
   agent: { provider: string; model: string }
   card: { name: string; description: string; version: string; publicUrl: string }
+  taskStore: 'memory' | 'redis' | 'gcs'
+  redis: { url: string; keyPrefix: string; ttlSeconds: number }
+  gcs: { bucket: string; prefix: string; keyFilename: string }
 }
 
 export function apply(ctx: Context, config: A2aPluginConfig): void {
@@ -62,9 +86,20 @@ export function apply(ctx: Context, config: A2aPluginConfig): void {
     },
   })
 
+  // Task state store (metadata only). Wired into the @a2a-js/sdk
+  // RequestHandler when the SDK transport lands (see server.ts TODO); the
+  // bridge keeps an in-memory task map until then.
+  let taskStore: { init(): Promise<void>; close?(): Promise<void> } | null = null
+  if (config.taskStore === 'redis') {
+    taskStore = new RedisTaskStore(config.redis)
+  } else if (config.taskStore === 'gcs' && config.gcs.bucket) {
+    taskStore = new GcsTaskStore(config.gcs)
+  }
+
   let server: { close(): Promise<void> } | null = null
 
   ctx.on('ready', async () => {
+    await taskStore?.init()
     server = await startA2aServer(bridge, {
       host: config.host,
       port: config.port,
@@ -82,5 +117,6 @@ export function apply(ctx: Context, config: A2aPluginConfig): void {
   ctx.on('dispose', async () => {
     await server?.close()
     await bridge.dispose()
+    await taskStore?.close?.()
   })
 }

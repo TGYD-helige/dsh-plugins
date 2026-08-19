@@ -4,8 +4,8 @@ Generic, config-driven plugins for [DeepSeek Harness (dsh)](https://github.com/d
 
 | Package | What it does | Seams used |
 | --- | --- | --- |
-| [`dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) (JSON-RPC + SSE): task create/cancel, streaming, agent card | `ctx.agents`, `session/event`, own HTTP server |
-| [`dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL (`dsh_messages` / `dsh_chat_histories`), Redis, and/or GCS (incl. workspace tar archives) | `session/event` tap (local persistence stays authoritative) |
+| [`dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) (JSON-RPC + SSE): task create/cancel, streaming, agent card; pluggable task-state stores (memory/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, own HTTP server |
+| [`dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
 | [`dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call, one span per tool call, one trace per turn | `llm/stream` + `tools/execute` waterfalls, `session/event` |
 
 ## Status
@@ -62,13 +62,6 @@ All three plugins are **disabled by default** and configured through the standar
         database:
           enabled: true
           url: mysql://user:pass@host:3306/agent
-        redis:
-          enabled: true
-          url: redis://127.0.0.1:6379
-        gcs:
-          enabled: false
-          bucket: my-agent-archives
-        archiveWorkspace: true
     - id: a2a
       name: dsh-a2a
       config:
@@ -76,16 +69,23 @@ All three plugins are **disabled by default** and configured through the standar
         host: 127.0.0.1   # no auth built in — keep loopback or front with a proxy
         port: 41241
         cwd: /srv/agent-workspaces
+        taskStore: redis  # memory | redis | gcs — A2A task state only
+        redis:
+          url: redis://127.0.0.1:6379
+        gcs:
+          bucket: my-agent-archives
 ```
 
 ## Data model
 
-`dsh-storage`'s relational shape (`packages/dsh-storage/prisma/schema.prisma`) is adapted from the source project's `ai_messages` / `ai_chat_histories` tables:
+`dsh-storage`'s relational shape (`packages/dsh-storage/prisma/schema.prisma`) matches the source project's `ai_messages` / `ai_chat_histories` tables, so existing data stays compatible (one deviation: no `user_id` column — tenancy rides on `session_id`):
 
-- **`dsh_messages`** — one row per projected session event (user / model / tool), with `thoughts`, `tokens`, `tool_calls`, `agent_id`, `metadata` JSON columns and soft-delete.
-- **`dsh_chat_histories`** — per-session rollup (message count, total tokens, first/last message timestamps, archive marker).
+- **`ai_messages`** — one row per projected session event (user / model / tool), with `thoughts`, `tokens`, `tool_calls`, `agent_id`, `metadata` JSON columns and soft-delete.
+- **`ai_chat_histories`** — per-session rollup (message count, total tokens, first/last message timestamps, archive marker).
 
 The logical message id rides in `metadata.id`; the DB primary key is a cuid, so re-projected events update rather than duplicate.
+
+A2A **task state** is a separate concern from conversation history: `dsh-a2a` ships pluggable `TaskStore` backends — in-memory (default), Redis (task metadata JSON + TTL, `contextId → taskId` index), and GCS (gzipped task metadata + optional workspace tar archive, same layout as the source project's `GCSTaskStore`).
 
 ## Security
 
@@ -110,9 +110,9 @@ pnpm typecheck
 
 Known scaffold gaps (help welcome):
 
-- `dsh-a2a`: the session-event → A2A event translation table is a stub (`translateSessionEvent` in `bridge.ts`); the `@a2a-js/sdk` transport (RequestHandler, ExecutionEventBus, TaskStore, resubscribe-with-replay) is not wired yet.
+- `dsh-a2a`: the session-event → A2A event translation table is a stub (`translateSessionEvent` in `bridge.ts`); the `@a2a-js/sdk` transport (RequestHandler, ExecutionEventBus, resubscribe-with-replay) is not wired yet — the Redis/GCS `TaskStore`s are created from config but not yet fed by the SDK handler.
 - `dsh-langfuse`: turn-trace ↔ generation/span parenting needs the verified session identity path from `llm/stream` options.
-- `dsh-storage`: GCS workspace archiving shells out to `tar`; Redis mirror is list-based, no query API.
+- `dsh-a2a` GCS store: workspace archiving shells out to `tar`.
 
 ## License
 

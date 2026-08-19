@@ -17,7 +17,6 @@ import type { MessageRow } from './types.js'
 
 export interface ProjectContext {
   sessionId: string
-  userId: string
   agentId?: string | null
 }
 
@@ -45,7 +44,6 @@ function toolPartsOf(message: any): unknown[] | undefined {
 export function projectEvent(session: any, event: any, ctx: ProjectContext): MessageRow | null {
   const base = {
     sessionId: ctx.sessionId,
-    userId: ctx.userId,
     historyId: null,
     agentId: ctx.agentId ?? 'main',
     createdAt: new Date(event?.timestamp ?? Date.now()),

@@ -5,7 +5,7 @@
 Monorepo of generic [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) plugins (`packages/dsh-*`). Each package is a dsh **bundle**: a Cordis plugin (`export name/inject/Config/apply`) plus a `cordis.patch.yml`, installable via `dsh plugin add`. No dsh core patches — everything rides documented seams (services, typed events, waterfalls).
 
 - `dsh-a2a` — A2A protocol (JSON-RPC + SSE) server driving `ctx.agents`
-- `dsh-storage` — mirrors `session/event` into MySQL/PostgreSQL (`prisma/schema.prisma`: `dsh_messages` / `dsh_chat_histories`), Redis, GCS
+- `dsh-storage` — mirrors `session/event` into MySQL/PostgreSQL (`prisma/schema.prisma`: `ai_messages` / `ai_chat_histories`, same tables as the source project). A2A task state (Redis/GCS TaskStores) lives in `dsh-a2a`, NOT here — task metadata ≠ conversation history.
 - `dsh-langfuse` — Langfuse via `llm/stream` + `tools/execute` waterfalls
 
 dsh is developer preview: **pin versions, keep README's compat matrix current**, and verify every `TODO(verify)` marker against the pinned dsh source before removing it.
