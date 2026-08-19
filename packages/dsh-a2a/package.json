@@ -28,7 +28,7 @@
   },
   "dependencies": {
     "@a2a-js/sdk": "^0.3.11",
-    "@deepseek-ai/schemastery": "^4.0.0",
+    "@deepseek-ai/schemastery": "^3.18.1",
     "express": "^4.21.0"
   },
   "peerDependencies": {
@@ -38,8 +38,21 @@
     "@deepseek-ai/dsh-session": ">=0.0.1-rc.1",
     "@deepseek-ai/dsh-user-approval": ">=0.0.1-rc.1"
   },
+  "peerDependenciesMeta": {
+    "ioredis": {
+      "optional": true
+    },
+    "@google-cloud/storage": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@types/express": "^4.17.21",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-llm": "0.0.1-rc.1",
+    "@types/node": "^22.0.0",
+    "ioredis": "^5.0.0",
+    "@google-cloud/storage": "^7.0.0"
   }
 }

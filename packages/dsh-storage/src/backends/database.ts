@@ -1,32 +1,33 @@
 /**
  * MySQL/PostgreSQL backend via Prisma, using prisma/schema.prisma in this
- * package (dsh_messages / dsh_chat_histories). `@prisma/client` is an
- * optional peer dependency — generate it against the bundled schema first:
+ * package (ai_messages / ai_chat_histories — same tables as the source
+ * project, so existing data is read/written compatibly). `@prisma/client` is
+ * an optional peer dependency — generate it against the bundled schema first:
  *
  *   npx prisma generate --schema node_modules/dsh-storage/prisma/schema.prisma
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import type { MessageRow, SessionRow, StorageBackend } from '../types.js'
+import type { MessageRow, SessionRow, StorageBackend } from '../types.js';
 
 export interface DatabaseBackendConfig {
   /** Full connection URL, e.g. mysql://user:pass@host:3306/dbname */
-  url: string
+  url: string;
 }
 
 export class DatabaseBackend implements StorageBackend {
-  readonly name = 'database'
-  private prisma: any = null
+  readonly name = 'database';
+  private prisma: any = null;
 
   constructor(private config: DatabaseBackendConfig) {}
 
   async init(): Promise<void> {
-    const mod = await import('@prisma/client')
+    const mod = await import('@prisma/client');
     this.prisma = new (mod as any).PrismaClient({
       datasources: { db: { url: this.config.url } },
-    })
-    await this.prisma.$connect()
+    });
+    await this.prisma.$connect();
   }
 
   private toDbData(row: MessageRow): Record<string, unknown> {
@@ -40,41 +41,39 @@ export class DatabaseBackend implements StorageBackend {
       agentId: row.agentId ?? undefined,
       metadata: { id: row.id, ...(row.metadata ?? {}) },
       createdAt: row.createdAt,
-    }
+    };
   }
 
   async upsertMessage(row: MessageRow): Promise<void> {
-    if (!this.prisma) return
-    const data = this.toDbData(row)
+    if (!this.prisma) return;
+    const data = this.toDbData(row);
     // Match the source project's convention: the logical message id rides in
     // metadata.id; the DB primary key is a cuid assigned on first insert.
-    const existing = await this.prisma.dshMessage.findFirst({
+    const existing = await this.prisma.aiMessage.findFirst({
       where: { sessionId: row.sessionId, metadata: { path: ['id'], equals: row.id } },
       select: { id: true },
-    })
+    });
     if (existing) {
-      await this.prisma.dshMessage.update({ where: { id: existing.id }, data })
+      await this.prisma.aiMessage.update({ where: { id: existing.id }, data });
     } else {
-      await this.prisma.dshMessage.create({
+      await this.prisma.aiMessage.create({
         data: {
           sessionId: row.sessionId,
-          userId: row.userId,
           historyId: row.historyId,
           ...data,
         },
-      })
+      });
     }
   }
 
   async upsertSession(row: SessionRow): Promise<void> {
-    if (!this.prisma) return
-    const existing = await this.prisma.dshChatHistory.findFirst({
+    if (!this.prisma) return;
+    const existing = await this.prisma.aiChatHistory.findFirst({
       where: { sessionId: row.sessionId, deletedAt: null },
       select: { id: true },
-    })
+    });
     const data = {
       sessionId: row.sessionId,
-      userId: row.userId,
       title: row.title ?? undefined,
       summary: row.summary ?? undefined,
       messageCount: row.messageCount,
@@ -82,15 +81,15 @@ export class DatabaseBackend implements StorageBackend {
       firstMessageAt: row.firstMessageAt ?? undefined,
       lastMessageAt: row.lastMessageAt ?? undefined,
       metadata: row.metadata ?? undefined,
-    }
+    };
     if (existing) {
-      await this.prisma.dshChatHistory.update({ where: { id: existing.id }, data })
+      await this.prisma.aiChatHistory.update({ where: { id: existing.id }, data });
     } else {
-      await this.prisma.dshChatHistory.create({ data })
+      await this.prisma.aiChatHistory.create({ data });
     }
   }
 
   async close(): Promise<void> {
-    await this.prisma?.$disconnect?.()
+    await this.prisma?.$disconnect?.();
   }
 }
