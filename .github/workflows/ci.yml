@@ -16,35 +16,43 @@ permissions:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    if: >
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on:
+      - instance-hnpsq9go
+      - linux
+      - x64
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
+      # pnpm version comes from the packageManager field in package.json —
+      # do not set it here too (pnpm/action-setup errors on duplicates).
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
 
-      # Run the workspace-pinned biome via the lint script, not a
-      # setup-biome latest install — keeps CLI and schema versions aligned.
       - run: pnpm install --frozen-lockfile=false
       - run: pnpm lint
 
   build:
     name: Typecheck & Build
-    runs-on: ubuntu-latest
+    if: >
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on:
+      - instance-hnpsq9go
+      - linux
+      - x64
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - uses: actions/setup-node@v4
         with:
