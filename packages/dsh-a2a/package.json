@@ -28,7 +28,7 @@
   },
   "dependencies": {
     "@a2a-js/sdk": "^0.3.11",
-    "@deepseek-ai/schemastery": "^4.0.0",
+    "@deepseek-ai/schemastery": "^3.18.1",
     "express": "^4.21.0"
   },
   "peerDependencies": {
