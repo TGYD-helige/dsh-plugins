@@ -35,6 +35,16 @@ jobs:
       - run: pnpm install --frozen-lockfile=false
       - run: pnpm lint
 
+      # Workflow files are parsed by GitHub only at run time — a schema or
+      # context error kills the workflow with zero job logs (we shipped
+      # `${{ runner.temp }}` in a job-level `env:` once and the E2E never
+      # triggered). Lint them like code.
+      - name: Lint workflow files (actionlint, pinned)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz | tar xz actionlint
+          ./actionlint .github/workflows/*.yml
+
   build:
     name: Typecheck, Build & Test
     runs-on: ubuntu-latest

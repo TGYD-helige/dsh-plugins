@@ -52,7 +52,6 @@ jobs:
     env:
       DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
       DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
-      DSH_HOME: ${{ runner.temp }}/dsh-home
       DSH_TELEMETRY_DISABLED: '1'
       DSH_PROVIDER: ${{ matrix.provider }}
 
