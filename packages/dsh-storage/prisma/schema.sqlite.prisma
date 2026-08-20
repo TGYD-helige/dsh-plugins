@@ -1,0 +1,67 @@
+// Prisma schema for the dsh-storage database backend — SQLite variant (Prisma 7).
+//
+// Same models as schema.mysql.prisma, without native type attributes
+// (SQLite has no `@db.*` vocabulary here). Client pre-generation and table
+// creation work as described in schema.mysql.prisma's header. Connection URL
+// shape: file:/absolute/path/to/db.sqlite.
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/sqlite"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+/// One row per projected session event (user message, assistant message,
+/// tool call/result, compression snapshot, ...).
+model AiMessage {
+  id            String    @id @default(cuid())
+  sessionId     String    @map("session_id")
+  historyId     String?   @map("history_id")
+  type          String
+  content       String
+  thoughts      Json?
+  model         String?
+  tokens        Json?
+  toolCalls     Json?     @map("tool_calls")
+  agentId       String?   @map("agent_id")
+  metadata      Json?
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at")
+  deletedAt     DateTime? @map("deleted_at")
+
+  // Relations
+  history       AiChatHistory? @relation(fields: [historyId], references: [id], onDelete: NoAction)
+
+  @@index([sessionId], map: "idx_session")
+  @@index([historyId], map: "idx_history")
+  @@index([createdAt], map: "idx_created")
+  @@index([deletedAt], map: "idx_deleted")
+  @@index([agentId], map: "idx_agent")
+  @@index([sessionId, agentId, type, createdAt], map: "idx_session_agent_type_created")
+  @@map("ai_messages")
+}
+
+/// Per-session rollup, maintained incrementally by the projector.
+model AiChatHistory {
+  id             String    @id @default(cuid())
+  sessionId      String    @map("session_id")
+  title          String?
+  summary        String?
+  messageCount   Int       @default(0) @map("message_count")
+  totalTokens    BigInt    @default(0) @map("total_tokens")
+  firstMessageAt DateTime? @map("first_message_at")
+  lastMessageAt  DateTime? @map("last_message_at")
+  metadata       Json?
+  deletedAt      DateTime? @map("deleted_at")
+
+  // Relations
+  messages       AiMessage[]
+
+  @@index([sessionId], map: "idx_chat_history_session")
+  @@index([deletedAt], map: "idx_chat_history_deleted")
+  @@map("ai_chat_histories")
+}

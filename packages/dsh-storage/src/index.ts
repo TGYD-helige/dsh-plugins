@@ -1,6 +1,6 @@
 /**
  * dsh-storage — mirrors the dsh session event stream into the ai_messages /
- * ai_chat_histories tables (MySQL/PostgreSQL).
+ * ai_chat_histories tables (MySQL/PostgreSQL/SQLite/SQL Server).
  *
  * Design: dsh's own session persistence (JSONL/SQLite) stays authoritative.
  * This plugin taps `session/event` (the same seam the built-in persistence
@@ -20,7 +20,7 @@
 
 import type { Context } from '@deepseek-ai/cordis';
 import Schema from '@deepseek-ai/schemastery';
-import { DatabaseBackend } from './backends/database.js';
+import { DatabaseBackend, type DatabaseProvider } from './backends/database.js';
 import { projectEvent, usageOf } from './projector.js';
 import type { MessageRow, SessionRow, StorageBackend } from './types.js';
 
@@ -34,46 +34,84 @@ export const Config = Schema.object({
   enabled: Schema.boolean().default(false),
   database: Schema.object({
     enabled: Schema.boolean().default(false),
+    provider: Schema.union(['mysql', 'postgresql', 'sqlite', 'sqlserver'] as const).default(
+      'sqlite',
+    ),
     url: Schema.string().role('secret').default(''),
   }),
 });
 
 export interface StoragePluginConfig {
   enabled: boolean;
-  database: { enabled: boolean; url: string };
+  database: { enabled: boolean; provider: DatabaseProvider; url: string };
 }
 
 /** Per-session live rollup used to maintain the session row. */
 interface SessionAccum {
   messageCount: number;
   totalTokens: number;
+  title?: string;
   firstMessageAt?: Date;
   lastMessageAt?: Date;
 }
 
 export function apply(ctx: Context, config: StoragePluginConfig): void {
-  // dsh event names come from declaration merging in @deepseek-ai/* packages that are
-  // not all published yet; cast once here. TODO(verify): drop when installable.
+  // Lifecycle: this cordis fork has no 'ready'/'dispose' events — startup
+  // work goes in ctx.effect() (runs immediately at plugin load; the returned
+  // disposer runs on fiber unload at shutdown). Event taps verified against
+  // @deepseek-ai/dsh-session@0.1.0-rc.7: session/event(session, event),
+  // session/disposed(session), and the awaited session/flush(session)
+  // durability checkpoint. The cast stays because the dsh-session types that
+  // declare these event names are not installed.
   const on = ctx.on.bind(ctx) as (name: string, handler: (...args: any[]) => unknown) => void;
   if (!config.enabled || !config.database.enabled || !config.database.url) return;
 
-  const backends: StorageBackend[] = [new DatabaseBackend({ url: config.database.url })];
+  const backends: StorageBackend[] = [
+    new DatabaseBackend({
+      provider: config.database.provider,
+      url: config.database.url,
+    }),
+  ];
 
   const sessions = new Map<string, SessionAccum>();
 
-  async function fanout(call: (backend: StorageBackend) => Promise<void>): Promise<void> {
+  // Row writes are fire-and-forget during the run, but tracked so the
+  // session/flush checkpoint and shutdown can drain them — a one-shot
+  // (headless) run would otherwise lose the tail events to process exit.
+  const pending = new Set<Promise<void>>();
+
+  function track(task: Promise<void>): Promise<void> {
+    pending.add(task);
+    void task.finally(() => pending.delete(task));
+    return task;
+  }
+
+  function guard(call: (backend: StorageBackend) => Promise<void>): Promise<void> {
     // Mirroring must never break the agent loop: log and swallow.
-    await Promise.all(
+    return Promise.all(
       backends.map((backend) =>
         call(backend).catch((error) =>
           console.error(`[dsh-storage] ${backend.name} error:`, error),
         ),
       ),
-    );
+    ).then(() => {});
   }
 
-  on('ready', async () => {
-    await fanout(async (backend) => backend.init?.());
+  // Backend init starts at plugin load; every write chains behind it so no
+  // row is lost to a still-connecting backend.
+  let started: Promise<void>;
+
+  function fanout(call: (backend: StorageBackend) => Promise<void>): Promise<void> {
+    return track(started.then(() => guard(call)));
+  }
+
+  ctx.effect(() => {
+    started = track(guard(async (backend) => backend.init?.()));
+    return async () => {
+      sessions.clear();
+      await Promise.all([...pending]);
+      await guard(async (backend) => backend.close?.());
+    };
   });
 
   /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -82,7 +120,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     const accum = sessions.get(sessionId) ?? { messageCount: 0, totalTokens: 0 };
     sessions.set(sessionId, accum);
 
-    const row: MessageRow | null = projectEvent(session, event, { sessionId });
+    const row: MessageRow | null = projectEvent(session, event, sessionId);
     if (row) {
       accum.messageCount += 1;
       accum.firstMessageAt ??= row.createdAt;
@@ -93,10 +131,21 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     const usage = usageOf(event);
     accum.totalTokens += usage.input + usage.output;
 
-    if (row || usage.input + usage.output > 0 || event?.type === 'turn/end') {
+    // Latest-wins title snapshot (log-only `session/title` event; payload
+    // { title, messageSeqs, source } verified against dsh-session-title@0.1.0-rc.7).
+    if (event?.type === 'session/title' && typeof event.data?.title === 'string') {
+      accum.title = event.data.title;
+    }
+
+    if (
+      row ||
+      usage.input + usage.output > 0 ||
+      event?.type === 'turn/end' ||
+      event?.type === 'session/title'
+    ) {
       const sessionRow: SessionRow = {
-        id: sessionId,
         sessionId,
+        title: accum.title ?? null,
         messageCount: accum.messageCount,
         totalTokens: accum.totalTokens,
         firstMessageAt: accum.firstMessageAt ?? null,
@@ -110,8 +159,8 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     sessions.delete(session?.id ?? 'unknown');
   });
 
-  on('dispose', async () => {
-    sessions.clear();
-    await fanout(async (backend) => backend.close?.());
+  // Durability checkpoint: the store awaits every session/flush listener.
+  on('session/flush', async () => {
+    await Promise.all([...pending]);
   });
 }
