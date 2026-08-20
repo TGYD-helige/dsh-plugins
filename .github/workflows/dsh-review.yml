@@ -39,10 +39,12 @@ jobs:
       - name: Prepare isolated DSH directories
         run: |
           set -euo pipefail
-          echo "DSH_HOME=$RUNNER_TEMP/dsh-review-home" >> "$GITHUB_ENV"
-          echo "DSH_REVIEW_CONTEXT=$RUNNER_TEMP/dsh-review-context.md" >> "$GITHUB_ENV"
-          echo "DSH_REVIEW_OUTPUT=$RUNNER_TEMP/dsh-review-output.json" >> "$GITHUB_ENV"
-          echo "DSH_REVIEW_STDERR=$RUNNER_TEMP/dsh-review-stderr.log" >> "$GITHUB_ENV"
+          {
+            echo "DSH_HOME=$RUNNER_TEMP/dsh-review-home"
+            echo "DSH_REVIEW_CONTEXT=$RUNNER_TEMP/dsh-review-context.md"
+            echo "DSH_REVIEW_OUTPUT=$RUNNER_TEMP/dsh-review-output.json"
+            echo "DSH_REVIEW_STDERR=$RUNNER_TEMP/dsh-review-stderr.log"
+          } >> "$GITHUB_ENV"
 
       - name: Verify review credentials
         env:
