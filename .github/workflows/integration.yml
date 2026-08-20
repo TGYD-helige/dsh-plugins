@@ -131,6 +131,24 @@ jobs:
           dsh --version
           pnpm --version
 
+      # dsh-llm-deepseek (rc.7/rc.8) loses tool-call id/name when the gateway
+      # sends explicit empty strings in later tool-call deltas: the `!== void 0`
+      # guards let "" overwrite the accumulated values, so the assembled block
+      # ends up as unknown tool "". Patch the installed adapter to truthy
+      # guards until dsh ships the upstream fix (grep fails loudly on drift).
+      - name: Patch dsh-llm-deepseek tool-call assembly (upstream bug workaround)
+        if: ${{ !matrix.provider }}
+        run: |
+          set -euo pipefail
+          adapter="$(find "$(npm prefix -g)/lib/node_modules" -path '*dsh-llm-deepseek/lib/index.js' | head -1)"
+          echo "patching $adapter"
+          sed -i \
+            -e 's/if (call\.id !== void 0) block\.callId = call\.id;/if (call.id) block.callId = call.id;/' \
+            -e 's/if (call\.function?\.name !== void 0) block\.name = call\.function\.name;/if (call.function?.name) block.name = call.function.name;/' \
+            "$adapter"
+          grep -n 'if (call.id) block.callId' "$adapter"
+          grep -n 'if (call.function?.name) block.name' "$adapter"
+
       # Stage A: the bundle installs and composes into the headless profile.
       # No LLM call and no secrets needed.
       - name: Stage A — bundle composes into the headless profile
