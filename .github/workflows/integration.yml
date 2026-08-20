@@ -50,10 +50,12 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
     env:
-      DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
-      DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
       DSH_TELEMETRY_DISABLED: '1'
       DSH_PROVIDER: ${{ matrix.provider }}
+      # Only the availability flag at job level — the secrets themselves enter
+      # no step except Stage B, so PR-modified install/build scripts never see
+      # them. Fork PRs evaluate to 'false' (no secrets are exposed to forks).
+      DSH_SECRETS_AVAILABLE: ${{ secrets.DSH_INTEGRATION_BASE_URL != '' && secrets.DSH_INTEGRATION_API_KEY != '' }}
 
     steps:
       - uses: actions/checkout@v7
@@ -162,9 +164,12 @@ jobs:
       # Stage B: the package's scenario script. The base leg (no provider)
       # does the real LLM round-trip and needs the secrets (fork PRs receive
       # none and land in the skip step); provider legs are backend-only and
-      # always run.
+      # always run. Secrets are scoped to this step only.
       - name: Stage B — run scenario
-        if: matrix.provider || (env.DSH_INTEGRATION_BASE_URL != '' && env.DSH_INTEGRATION_API_KEY != '')
+        if: matrix.provider || env.DSH_SECRETS_AVAILABLE == 'true'
+        env:
+          DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
+          DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
         run: node ".github/scripts/integration/${{ matrix.package }}.mjs"
 
       # Runtime visibility: the full session event log (including
@@ -195,6 +200,6 @@ jobs:
             ${{ runner.temp }}/dsh-home/sessions
 
       - name: Skipped — Stage B (secrets unavailable)
-        if: ${{ !matrix.provider && (env.DSH_INTEGRATION_BASE_URL == '' || env.DSH_INTEGRATION_API_KEY == '') }}
+        if: ${{ !matrix.provider && env.DSH_SECRETS_AVAILABLE != 'true' }}
         run: |
           echo "::warning::DSH_INTEGRATION_BASE_URL or DSH_INTEGRATION_API_KEY secret not set — skipping Stage B."

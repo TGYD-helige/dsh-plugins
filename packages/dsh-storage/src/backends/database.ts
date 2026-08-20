@@ -162,6 +162,22 @@ export class DatabaseBackend implements StorageBackend {
     });
   }
 
+  async readSession(sessionId: string): Promise<SessionRow | null> {
+    if (!this.prisma) return null;
+    const row = await this.prisma.aiChatHistory.findUnique({
+      where: { id: pk(`session ${sessionId}`) },
+    });
+    if (!row) return null;
+    return {
+      sessionId: row.sessionId,
+      title: row.title,
+      messageCount: row.messageCount,
+      totalTokens: Number(row.totalTokens),
+      firstMessageAt: row.firstMessageAt,
+      lastMessageAt: row.lastMessageAt,
+    };
+  }
+
   async upsertSession(row: SessionRow): Promise<void> {
     if (!this.prisma) return;
     // PK upsert like upsertMessage: the find-then-write pattern raced under

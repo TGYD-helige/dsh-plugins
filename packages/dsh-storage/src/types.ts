@@ -42,6 +42,8 @@ export interface SessionRow {
 export interface StorageBackend {
   readonly name: string;
   init?(): Promise<void>;
+  /** Read the stored session row, for seeding the live rollup on resume. */
+  readSession?(sessionId: string): Promise<SessionRow | null>;
   upsertMessage(row: MessageRow): Promise<void>;
   upsertSession(row: SessionRow): Promise<void>;
   close?(): Promise<void>;

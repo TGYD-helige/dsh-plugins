@@ -121,7 +121,13 @@ export function projectEvent(_session: any, event: any, sessionId: string): Mess
   }
 }
 
-/** Extract token usage — only `assistant/message` carries it (`data.usage`). */
+/**
+ * Extract token usage — only `assistant/message` carries it (`data.usage`).
+ * The catalog states there is no separate usage record: the usage chunks in
+ * the raw stream are the same accounting in flight, so counting them too
+ * would double-count. Accepted edge: a request that fails before producing
+ * an assistant/message contributes nothing to the rollup.
+ */
 export function usageOf(event: any): { input: number; output: number } {
   if (event?.type !== 'assistant/message') return { input: 0, output: 0 };
   const u = event.data?.usage;

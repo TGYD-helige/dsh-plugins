@@ -8,6 +8,7 @@ vi.mock('./backends/database.js', () => ({
   DatabaseBackend: class {
     readonly name = 'database';
     init = vi.fn(async () => {});
+    readSession = vi.fn(async () => null);
     upsertMessage = vi.fn(async () => {});
     upsertSession = vi.fn(async () => {});
     close = vi.fn(async () => {});
@@ -264,5 +265,56 @@ describe('dsh-storage plugin', () => {
     release();
     await checkpoint;
     expect(flushed).toBe(true);
+  });
+
+  it('seeds the rollup from the stored session row on resume', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    backend.readSession.mockResolvedValue({
+      sessionId: 's1',
+      title: 'old title',
+      messageCount: 50,
+      totalTokens: 1000,
+      firstMessageAt: new Date(1600000000000),
+      lastMessageAt: new Date(1600000100000),
+    });
+
+    ctx.events.emit('session/event', { id: 's1' }, userEvent('x', 'm1', 1700000000000));
+    await flush();
+
+    expect(backend.readSession).toHaveBeenCalledWith('s1');
+    const lastSession = backend.upsertSession.mock.calls.at(-1)?.[0];
+    expect(lastSession).toMatchObject({
+      sessionId: 's1',
+      title: 'old title',
+      messageCount: 51,
+      totalTokens: 1000,
+      firstMessageAt: new Date(1600000000000),
+      lastMessageAt: new Date(1700000000000),
+    });
+  });
+
+  it('serializes rollup writes per session: latest-wins under bursts', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    let release!: () => void;
+    backend.upsertSession.mockImplementationOnce(
+      () => new Promise<void>((resolve) => (release = resolve)),
+    );
+
+    ctx.events.emit('session/event', { id: 's1' }, userEvent('a'));
+    ctx.events.emit('session/event', { id: 's1' }, userEvent('b'));
+    await flush();
+    // First write still in flight; the second event's write must be queued
+    // behind it, not racing it.
+    expect(backend.upsertSession).toHaveBeenCalledTimes(1);
+
+    release();
+    await flush();
+    expect(backend.upsertSession).toHaveBeenCalledTimes(2);
+    expect(backend.upsertSession.mock.calls[0][0].messageCount).toBe(1);
+    expect(backend.upsertSession.mock.calls[1][0].messageCount).toBe(2);
+    // Final state is the newest snapshot, never an older one landing last.
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(2);
   });
 });

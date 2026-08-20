@@ -105,6 +105,42 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     return track(started.then(() => guard(call)));
   }
 
+  // Per-session serialization: all event processing for one session runs
+  // through a promise chain, so rollup writes complete in event order
+  // (latest-wins — concurrent absolute snapshots must not land out of order)
+  // and the first event of an unknown session seeds its accumulator from the
+  // stored row before any write (resume: constructor seeds are not re-emitted,
+  // so history must come from the database, not from zero).
+  const chains = new Map<string, Promise<void>>();
+
+  function enqueue(sessionId: string, task: () => Promise<void>): void {
+    const next = (chains.get(sessionId) ?? Promise.resolve())
+      .then(task)
+      .catch((error) => console.error('[dsh-storage] mirror task error:', error));
+    chains.set(sessionId, next);
+    track(next);
+  }
+
+  async function seedAccum(sessionId: string): Promise<SessionAccum> {
+    for (const backend of backends) {
+      try {
+        const row = await backend.readSession?.(sessionId);
+        if (row) {
+          return {
+            messageCount: row.messageCount,
+            totalTokens: row.totalTokens,
+            title: row.title ?? undefined,
+            firstMessageAt: row.firstMessageAt ?? undefined,
+            lastMessageAt: row.lastMessageAt ?? undefined,
+          };
+        }
+      } catch (error) {
+        console.error(`[dsh-storage] ${backend.name} error:`, error);
+      }
+    }
+    return { messageCount: 0, totalTokens: 0 };
+  }
+
   ctx.effect(() => {
     started = track(guard(async (backend) => backend.init?.()));
     return async () => {
@@ -117,42 +153,47 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   /* eslint-disable @typescript-eslint/no-explicit-any */
   on('session/event', (session: any, event: any) => {
     const sessionId: string = session?.id ?? 'unknown';
-    const accum = sessions.get(sessionId) ?? { messageCount: 0, totalTokens: 0 };
-    sessions.set(sessionId, accum);
+    enqueue(sessionId, async () => {
+      let accum = sessions.get(sessionId);
+      if (!accum) {
+        accum = await seedAccum(sessionId);
+        sessions.set(sessionId, accum);
+      }
 
-    const row: MessageRow | null = projectEvent(session, event, sessionId);
-    if (row) {
-      accum.messageCount += 1;
-      accum.firstMessageAt ??= row.createdAt;
-      accum.lastMessageAt = row.createdAt;
-      void fanout((backend) => backend.upsertMessage(row));
-    }
+      const row: MessageRow | null = projectEvent(session, event, sessionId);
+      if (row) {
+        accum.messageCount += 1;
+        accum.firstMessageAt ??= row.createdAt;
+        accum.lastMessageAt = row.createdAt;
+        await fanout((backend) => backend.upsertMessage(row));
+      }
 
-    const usage = usageOf(event);
-    accum.totalTokens += usage.input + usage.output;
+      const usage = usageOf(event);
+      accum.totalTokens += usage.input + usage.output;
 
-    // Latest-wins title snapshot (log-only `session/title` event; payload
-    // { title, messageSeqs, source } verified against dsh-session-title@0.1.0-rc.7).
-    if (event?.type === 'session/title' && typeof event.data?.title === 'string') {
-      accum.title = event.data.title;
-    }
+      // Latest-wins title snapshot (log-only `session/title` event; payload
+      // { title, messageSeqs, source } verified against dsh-session-title@0.1.0-rc.7).
+      if (event?.type === 'session/title' && typeof event.data?.title === 'string') {
+        accum.title = event.data.title;
+      }
 
-    if (
-      row ||
-      usage.input + usage.output > 0 ||
-      event?.type === 'turn/end' ||
-      event?.type === 'session/title'
-    ) {
-      const sessionRow: SessionRow = {
-        sessionId,
-        title: accum.title ?? null,
-        messageCount: accum.messageCount,
-        totalTokens: accum.totalTokens,
-        firstMessageAt: accum.firstMessageAt ?? null,
-        lastMessageAt: accum.lastMessageAt ?? null,
-      };
-      void fanout((backend) => backend.upsertSession(sessionRow));
-    }
+      if (
+        row ||
+        usage.input + usage.output > 0 ||
+        event?.type === 'turn/end' ||
+        event?.type === 'session/title'
+      ) {
+        const sessionRow: SessionRow = {
+          sessionId,
+          title: accum.title ?? null,
+          messageCount: accum.messageCount,
+          totalTokens: accum.totalTokens,
+          firstMessageAt: accum.firstMessageAt ?? null,
+          lastMessageAt: accum.lastMessageAt ?? null,
+        };
+        await fanout((backend) => backend.upsertSession(sessionRow));
+      }
+    });
   });
 
   on('session/disposed', (session: any) => {

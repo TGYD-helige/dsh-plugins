@@ -91,7 +91,7 @@ SQL Server note: Prisma's sqlserver connector has no `Json` type, so its variant
 - **`ai_messages`** — one row per projected session event (user / model / tool), with `thoughts`, `tokens`, `tool_calls`, `agent_id`, `metadata` JSON columns and soft-delete.
 - **`ai_chat_histories`** — per-session rollup (message count, total tokens, first/last message timestamps).
 
-The logical message id rides in `metadata.id`; the DB primary key is a deterministic hash of `(session_id, message id)`, so re-projected events upsert in place rather than duplicate — on every connector (the source project's `metadata.id` JSON-path lookup only works on PostgreSQL/MySQL).
+The logical message id rides in `metadata.id`; the DB primary key is a deterministic hash of `(session_id, message id)`, so re-projected events upsert in place rather than duplicate — on every connector (the source project's `metadata.id` JSON-path lookup only works on PostgreSQL/MySQL). Upgrade note: the early scaffold wrote cuid primary keys — if you ran it, dedupe old rows by `metadata.id` before enabling this version.
 
 A2A **task state** is a separate concern from conversation history: `dsh-a2a` ships pluggable `TaskStore` backends — in-memory (default), Redis (task metadata JSON + TTL, `contextId → taskId` index), and GCS (gzipped task metadata + optional workspace tar archive, same layout as the source project's `GCSTaskStore`).
 
@@ -122,6 +122,7 @@ Known scaffold gaps (help welcome):
 - `dsh-a2a`: the session-event → A2A event translation table is a stub (`translateSessionEvent` in `bridge.ts`); the `@a2a-js/sdk` transport (RequestHandler, ExecutionEventBus, resubscribe-with-replay) is not wired yet — the Redis/GCS `TaskStore`s are created from config but not yet fed by the SDK handler.
 - `dsh-langfuse`: turn-trace ↔ generation/span parenting needs the verified session identity path from `llm/stream` options.
 - `dsh-a2a` GCS store: workspace archiving shells out to `tar`.
+- No package ships its `preview.png` yet — the shared preview system (see AGENTS.md) is unbuilt; generate all three together when it lands.
 
 ## License
 

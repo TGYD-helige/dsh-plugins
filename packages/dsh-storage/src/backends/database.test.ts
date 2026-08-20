@@ -232,6 +232,40 @@ describe('DatabaseBackend', () => {
     expect(call.create.content).toBe('hello');
   });
 
+  it('reads a stored session row for resume seeding', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    prisma.aiChatHistory.findUnique = vi.fn().mockResolvedValue({
+      sessionId: 's1',
+      title: 'old',
+      messageCount: 50,
+      totalTokens: 1000n,
+      firstMessageAt: new Date(1600000000000),
+      lastMessageAt: new Date(1600000100000),
+    });
+
+    const row = await backend.readSession('s1');
+
+    expect(prisma.aiChatHistory.findUnique).toHaveBeenCalledWith({
+      where: { id: expect.stringMatching(/^[0-9a-f]{36}$/) },
+    });
+    expect(row).toEqual({
+      sessionId: 's1',
+      title: 'old',
+      messageCount: 50,
+      totalTokens: 1000,
+      firstMessageAt: new Date(1600000000000),
+      lastMessageAt: new Date(1600000100000),
+    });
+  });
+
+  it('returns null from readSession when no row exists', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    prisma.aiChatHistory.findUnique = vi.fn().mockResolvedValue(null);
+    await expect(backend.readSession('s1')).resolves.toBeNull();
+  });
+
   it('disconnects on close', async () => {
     await backend.init();
     const prisma = prismaMock.instances[0];
