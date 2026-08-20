@@ -103,9 +103,11 @@ jobs:
         if: ${{ !matrix.provider }}
         run: |
           set -euo pipefail
+          # pnpm pack may print a bare filename or an absolute path depending
+          # on version — always reduce to the basename.
           name="$(cd "packages/${{ matrix.package }}" && pnpm pack --pack-destination "$RUNNER_TEMP" | tail -n1)"
           echo "tarball: $name"
-          echo "DSH_PKG_TARBALL=$RUNNER_TEMP/$name" >> "$GITHUB_ENV"
+          echo "DSH_PKG_TARBALL=$RUNNER_TEMP/$(basename "$name")" >> "$GITHUB_ENV"
 
       - name: Install the dsh CLI (pinned)
         if: ${{ !matrix.provider }}
@@ -113,9 +115,12 @@ jobs:
           set -euo pipefail
           # `dsh plugin` forwards to pnpm; the profile template's pnpm-workspace
           # settings (nodeLinker: hoisted, autoInstallPeers: false) need pnpm 10.
-          # pnpm/action-setup's 9.x shadows npm-global on PATH — pin npm-global first.
-          npm i -g "@deepseek-ai/dsh@${{ env.DSH_CLI_VERSION }}" pnpm@10
-          echo "$(npm prefix -g)/bin" >> "$GITHUB_PATH"
+          # pnpm/action-setup's 9.x lives in PNPM_HOME and shadows npm-global —
+          # override PATH wholesale so npm-global wins (GITHUB_PATH only prepends).
+          # npm's allow-scripts gate: dsh's subprocess helper needs its postinstall.
+          npm i -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs \
+            "@deepseek-ai/dsh@${{ env.DSH_CLI_VERSION }}" pnpm@10
+          echo "PATH=$(npm prefix -g)/bin:$PATH" >> "$GITHUB_ENV"
           dsh --version
           pnpm --version
 
