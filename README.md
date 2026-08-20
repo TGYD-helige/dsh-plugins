@@ -5,7 +5,7 @@ Generic, config-driven plugins for [DeepSeek Harness (dsh)](https://github.com/d
 | Package | What it does | Seams used |
 | --- | --- | --- |
 | [`dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) (JSON-RPC + SSE): task create/cancel, streaming, agent card; pluggable task-state stores (memory/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, own HTTP server |
-| [`dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
+| [`dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
 | [`dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call, one span per tool call, one trace per turn | `llm/stream` + `tools/execute` waterfalls, `session/event` |
 
 ## Status
@@ -61,6 +61,7 @@ All three plugins are **disabled by default** and configured through the standar
         enabled: true
         database:
           enabled: true
+          provider: mysql   # mysql | postgresql | sqlite | sqlserver
           url: mysql://user:pass@host:3306/agent
     - id: a2a
       name: dsh-a2a
@@ -78,12 +79,19 @@ All three plugins are **disabled by default** and configured through the standar
 
 ## Data model
 
-`dsh-storage`'s relational shape (`packages/dsh-storage/prisma/schema.prisma`) matches the source project's `ai_messages` / `ai_chat_histories` tables, so existing data stays compatible (one deviation: no `user_id` column — tenancy rides on `session_id`):
+`dsh-storage`'s relational shape matches the source project's `ai_messages` / `ai_chat_histories` tables, so existing data stays compatible (one deviation: no `user_id` column — tenancy rides on `session_id`). It requires **Prisma 7** peer packages at runtime: `@prisma/client` plus the driver adapter for your database (`@prisma/adapter-mariadb` for MySQL, `@prisma/adapter-pg` for PostgreSQL, `@prisma/adapter-libsql` for SQLite, `@prisma/adapter-mssql` for SQL Server). The PrismaClient is pre-generated per provider and shipped in the package — **no `prisma generate` step**. Create or upgrade the tables with the shipped schema variant:
+
+```sh
+npx prisma db push --schema node_modules/dsh-storage/prisma/schema.mysql.prisma --url "mysql://user:pass@host:3306/agent"
+# schema.postgresql.prisma / schema.sqlite.prisma / schema.sqlserver.prisma work the same way
+```
+
+SQL Server note: Prisma's sqlserver connector has no `Json` type, so its variant maps the JSON columns to text — the backend serializes them on write automatically (derived from `provider: sqlserver`; SQL Server's `ISJSON` / `JSON_VALUE` still query the text as JSON).
 
 - **`ai_messages`** — one row per projected session event (user / model / tool), with `thoughts`, `tokens`, `tool_calls`, `agent_id`, `metadata` JSON columns and soft-delete.
-- **`ai_chat_histories`** — per-session rollup (message count, total tokens, first/last message timestamps, archive marker).
+- **`ai_chat_histories`** — per-session rollup (message count, total tokens, first/last message timestamps).
 
-The logical message id rides in `metadata.id`; the DB primary key is a cuid, so re-projected events update rather than duplicate.
+The logical message id rides in `metadata.id`; the DB primary key is a deterministic hash of `(session_id, message id)`, so re-projected events upsert in place rather than duplicate — on every connector (the source project's `metadata.id` JSON-path lookup only works on PostgreSQL/MySQL).
 
 A2A **task state** is a separate concern from conversation history: `dsh-a2a` ships pluggable `TaskStore` backends — in-memory (default), Redis (task metadata JSON + TTL, `contextId → taskId` index), and GCS (gzipped task metadata + optional workspace tar archive, same layout as the source project's `GCSTaskStore`).
 
@@ -106,6 +114,7 @@ packages/
 pnpm install
 pnpm build        # tsc per package
 pnpm typecheck
+pnpm test         # vitest (packages with a test script)
 ```
 
 Known scaffold gaps (help welcome):
