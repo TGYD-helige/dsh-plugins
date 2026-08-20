@@ -17,7 +17,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -118,14 +118,32 @@ const markerContent = 'ci-dsh-storage-marker-7788';
 writeFileSync(join(workDir, markerFile), `${markerContent}\n`);
 const prompt = `请用工具读取当前目录下的 ${markerFile}，并把它的内容原样复述给我`;
 
-// The model sometimes finishes a tool round-trip with an empty final text
-// (no wrap-up prose) — that is a writing-style variance, not a failure. The
-// acceptance standard is the database content, so retry once on an empty
-// answer and then let the DB assertions below be the judge.
-let query;
-for (let attempt = 1; attempt <= 2; attempt++) {
+function dbHasMarkerToolRow() {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    return (
+      db
+        .prepare("SELECT COUNT(*) c FROM ai_messages WHERE type = 'tool' AND content LIKE '%' || ? || '%'")
+        .get(markerContent).c > 0
+    );
+  } finally {
+    db.close();
+  }
+}
+
+// deepseek-v4-flash through the gateway stochastically emits malformed tool
+// calls (empty tool name — observed in CI), and may also finish a tool
+// round-trip with empty wrap-up prose. Both are model variance, so retry
+// with a fresh database until the marker-bearing tool result lands (the real
+// acceptance gate) or the attempts run out.
+for (let attempt = 1; attempt <= 3; attempt++) {
+  if (attempt > 1) {
+    // A retried run is a new session in the same file — start clean.
+    rmSync(dbPath, { force: true });
+    run('pnpm', ['dlx', 'prisma@7.9.1', 'db', 'push', '--schema', schemaPath, '--url', `file:${dbPath}`]);
+  }
   console.log(`\n$ dsh --profile headless "${prompt}" (attempt ${attempt})`);
-  query = spawnSync(dsh, ['--profile', 'headless', prompt], {
+  const query = spawnSync(dsh, ['--profile', 'headless', prompt], {
     cwd: workDir,
     encoding: 'utf8',
     timeout: 8 * 60_000,
@@ -143,9 +161,11 @@ for (let attempt = 1; attempt <= 2; attempt++) {
   process.stderr.write(query.stderr ?? '');
   if (query.error) throw query.error;
   if (query.status !== 0) throw new Error(`dsh headless exited ${query.status}`);
-  if (query.stdout?.trim()) break;
-  console.log('::warning::empty answer from dsh headless');
+  if (!query.stdout?.trim()) console.log('::warning::empty answer from dsh headless');
+  if (dbHasMarkerToolRow()) break;
+  console.log('::warning::attempt produced no marker-bearing tool result');
 }
+
 
 // 6. Assert the mirror in SQLite.
 console.log('\n--- ai_messages ---');
