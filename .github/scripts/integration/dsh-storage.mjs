@@ -70,7 +70,10 @@ run(dsh, ['plugin', '--profile', 'headless', 'add', '@prisma/client@7.9.1', '@pr
 //    id-targeted row replaces the bundle row's whole config). The template
 //    file is one top-level YAML array (`[]`), so rewrite it wholesale. The
 //    agent-default-model row restates the dsh-base default explicitly so the
-//    scenario is pinned to deepseek-v4-flash rather than inheriting it.
+//    scenario is pinned to deepseek-v4-flash rather than inheriting it. The
+//    llm-deepseek row disables thinking: with reasoning enabled, this
+//    gateway stochastically garbles tool calls (empty tool name — observed
+//    in CI), and the scenario does not need thinking.
 const patchPath = join(dshHome, 'profiles', 'headless', 'cordis.patch.yml');
 writeFileSync(
   patchPath,
@@ -87,6 +90,10 @@ writeFileSync(
   config:
     provider: deepseek-official
     model: deepseek-v4-flash
+
+- id: llm-deepseek
+  config:
+    thinking: disabled
 `,
 );
 console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);
