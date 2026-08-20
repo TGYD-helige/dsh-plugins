@@ -72,6 +72,13 @@ jobs:
       - run: pnpm install --frozen-lockfile=false
       - run: pnpm build
 
+      # Pin DSH_HOME inside the workspace temp so the profile, sessions, and
+      # db land in one artifact-able place (job-level env can't see
+      # runner.temp — that broke this workflow once; steps see it fine).
+      - name: Prepare DSH_HOME
+        if: ${{ !matrix.provider }}
+        run: echo "DSH_HOME=$RUNNER_TEMP/dsh-home" >> "$GITHUB_ENV"
+
       # Backend-only provider legs: no dsh boot, no LLM, no secrets — just a
       # real service database, db push, and backend writes/reads. They also
       # run on fork PRs (forks receive no secrets and nothing is needed).
@@ -141,6 +148,33 @@ jobs:
       - name: Stage B — run scenario
         if: matrix.provider || (env.DSH_INTEGRATION_BASE_URL != '' && env.DSH_INTEGRATION_API_KEY != '')
         run: node ".github/scripts/integration/${{ matrix.package }}.mjs"
+
+      # Runtime visibility: the full session event log (including
+      # request/header — what the model actually saw) lives in the profile's
+      # sessions dir as zstd-compressed jsonl. Dump it on every outcome.
+      - name: Dump dsh session event log
+        if: ${{ always() && !matrix.provider }}
+        run: |
+          set -euo pipefail
+          if ! command -v zstd >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq zstd
+          fi
+          shopt -s globstar nullglob
+          for f in "$DSH_HOME"/sessions/**/session.jsonl.zstd; do
+            echo "== $f =="
+            zstd -dc "$f"
+          done
+
+      - name: Upload E2E artifacts (db + sessions)
+        if: ${{ always() && !matrix.provider }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-${{ matrix.package }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/dsh-storage-e2e/dsh.db
+            ${{ runner.temp }}/dsh-home/sessions
 
       - name: Skipped — Stage B (secrets unavailable)
         if: ${{ !matrix.provider && (env.DSH_INTEGRATION_BASE_URL == '' || env.DSH_INTEGRATION_API_KEY == '') }}
