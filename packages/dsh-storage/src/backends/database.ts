@@ -167,18 +167,11 @@ export class DatabaseBackend implements StorageBackend {
 
   async readSession(sessionId: string): Promise<SessionRow | null> {
     if (!this.prisma) return null;
-    let row = await this.prisma.aiChatHistory.findUnique({
-      where: { id: pk(`session ${sessionId}`) },
-    });
-    // Pre-hash rows (cuid primary keys, early scaffold) don't match the PK —
-    // fall back to the session id. The row's actual PK rides back in `pk`,
-    // so later writes absorb it in place instead of creating a second row.
-    row ??= await this.prisma.aiChatHistory.findFirst({
+    const row = await this.prisma.aiChatHistory.findFirst({
       where: { sessionId, deletedAt: null },
     });
     if (!row) return null;
     return {
-      pk: row.id,
       sessionId: row.sessionId,
       title: row.title,
       messageCount: row.messageCount,
@@ -197,11 +190,16 @@ export class DatabaseBackend implements StorageBackend {
 
   async upsertSession(row: SessionRow): Promise<void> {
     if (!this.prisma) return;
-    // PK upsert like upsertMessage: the find-then-write pattern raced under
-    // event bursts and produced duplicate rows for one session. A seeded
-    // legacy row keeps its own PK so it is absorbed, never duplicated.
-    const id = row.pk ?? pk(`session ${row.sessionId}`);
+    // Find-then-write is race-free because the plugin serializes event
+    // processing per session (see the per-session chain in index.ts). The
+    // cuid primary key matches the source project and early-scaffold rows,
+    // so existing data is continued, never duplicated.
+    const existing = await this.prisma.aiChatHistory.findFirst({
+      where: { sessionId: row.sessionId, deletedAt: null },
+      select: { id: true },
+    });
     const data = {
+      sessionId: row.sessionId,
       title: row.title ?? undefined,
       messageCount: row.messageCount,
       totalTokens: BigInt(row.totalTokens),
@@ -209,11 +207,11 @@ export class DatabaseBackend implements StorageBackend {
       lastMessageAt: row.lastMessageAt ?? undefined,
       metadata: this.jsonField(row.metadata),
     };
-    await this.prisma.aiChatHistory.upsert({
-      where: { id },
-      create: { id, sessionId: row.sessionId, ...data },
-      update: data,
-    });
+    if (existing) {
+      await this.prisma.aiChatHistory.update({ where: { id: existing.id }, data });
+    } else {
+      await this.prisma.aiChatHistory.create({ data });
+    }
   }
 
   async close(): Promise<void> {

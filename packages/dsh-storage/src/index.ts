@@ -53,9 +53,6 @@ interface SessionAccum {
   title?: string;
   firstMessageAt?: Date;
   lastMessageAt?: Date;
-  /** PK of the history row this rollup writes to (set when seeded from an
-   *  existing row — legacy cuid rows are absorbed in place, never duplicated). */
-  historyPk?: string;
   /** Existing history-row metadata, preserved verbatim across our writes. */
   metadata: Record<string, unknown>;
   /**
@@ -167,7 +164,6 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
             title: row.title ?? undefined,
             firstMessageAt: row.firstMessageAt ?? undefined,
             lastMessageAt: row.lastMessageAt ?? undefined,
-            historyPk: row.pk,
             // Preserve every existing metadata field; we only own our key.
             metadata: { ...(row.metadata ?? {}) },
             usageSample: usageSampleOfMetadata(row.metadata?.[LAST_USAGE_KEY]),
@@ -247,7 +243,6 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
           ...(accum.usageSample ? { [LAST_USAGE_KEY]: accum.usageSample } : {}),
         };
         const sessionRow: SessionRow = {
-          pk: accum.historyPk,
           sessionId,
           title: accum.title ?? null,
           messageCount: accum.messageCount,

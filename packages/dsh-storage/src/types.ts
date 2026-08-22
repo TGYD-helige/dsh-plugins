@@ -25,8 +25,6 @@ export interface MessageRow {
 
 /** One row in `ai_chat_histories` — a per-session rollup. */
 export interface SessionRow {
-  /** DB primary key override: set when writing back to a seeded legacy row. */
-  pk?: string;
   sessionId: string;
   title?: string | null;
   messageCount: number;
