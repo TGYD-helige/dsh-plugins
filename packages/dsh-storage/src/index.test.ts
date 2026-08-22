@@ -2,12 +2,15 @@ import { Context } from '@deepseek-ai/cordis';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { apply, inject, name } from './index.js';
 
-const backends = vi.hoisted(() => ({ instances: [] as any[] }));
+const backends = vi.hoisted(() => ({
+  instances: [] as any[],
+  initImpl: undefined as (() => Promise<void>) | undefined,
+}));
 
 vi.mock('./backends/database.js', () => ({
   DatabaseBackend: class {
     readonly name = 'database';
-    init = vi.fn(async () => {});
+    init = vi.fn(() => backends.initImpl?.() ?? Promise.resolve());
     readSession = vi.fn(async () => null);
     upsertMessage = vi.fn(async () => {});
     upsertSession = vi.fn(async () => {});
@@ -64,6 +67,7 @@ describe('dsh-storage plugin', () => {
 
   beforeEach(() => {
     backends.instances.length = 0;
+    backends.initImpl = undefined;
     seq = 0;
     ctx = new Context();
   });
@@ -291,6 +295,225 @@ describe('dsh-storage plugin', () => {
       totalTokens: 1000,
       firstMessageAt: new Date(1600000000000),
       lastMessageAt: new Date(1700000000000),
+    });
+  });
+
+  it('waits for backend init before seeding the rollup', async () => {
+    let releaseInit!: () => void;
+    backends.initImpl = () => new Promise<void>((resolve) => (releaseInit = resolve));
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    backend.readSession.mockResolvedValue({
+      sessionId: 's1',
+      title: 'old title',
+      messageCount: 50,
+      totalTokens: 1000,
+      firstMessageAt: new Date(1600000000000),
+      lastMessageAt: new Date(1600000100000),
+    });
+
+    ctx.events.emit('session/event', { id: 's1' }, userEvent('x', 'm1', 1700000000000));
+    await flush();
+    // Init still pending: no read, no write — nothing may zero-seed over the
+    // stored rollup while the backend is still connecting.
+    expect(backend.readSession).not.toHaveBeenCalled();
+    expect(backend.upsertSession).not.toHaveBeenCalled();
+
+    releaseInit();
+    await flush();
+    expect(backend.readSession).toHaveBeenCalledWith('s1');
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0]).toMatchObject({
+      messageCount: 51,
+      totalTokens: 1000,
+    });
+  });
+
+  it('treats a seed read failure as failure (no zero-seed overwrite) and retries', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    backend.readSession.mockRejectedValueOnce(new Error('db down'));
+
+    ctx.events.emit('session/event', { id: 's1' }, userEvent('x', 'm1', 1700000000000));
+    await flush();
+
+    // The failed read must not produce a zero-seeded session row.
+    expect(backend.upsertSession).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledWith('[dsh-storage] database error:', expect.any(Error));
+
+    // Next event re-seeds from the (now readable) stored row.
+    backend.readSession.mockResolvedValue({
+      sessionId: 's1',
+      title: null,
+      messageCount: 50,
+      totalTokens: 1000,
+      firstMessageAt: new Date(1600000000000),
+      lastMessageAt: new Date(1600000100000),
+    });
+    ctx.events.emit('session/event', { id: 's1' }, userEvent('y', 'm2', 1700000001000));
+    await flush();
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0]).toMatchObject({
+      messageCount: 51,
+      totalTokens: 1000,
+    });
+    errorSpy.mockRestore();
+  });
+
+  it('accounts usage per step with replacement across chunks and messages', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const session = { id: 's1' };
+
+    // Failed step: usage arrives only as a chunk, no assistant/message.
+    ctx.events.emit(
+      'session/event',
+      session,
+      ev('assistant/chunk', {
+        turn: 0,
+        step: 0,
+        chunk: { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
+      }),
+    );
+    // Retry at the next step: a progressive chunk sample, then the final
+    // message of the SAME step — the message replaces the chunk's sample.
+    ctx.events.emit(
+      'session/event',
+      session,
+      ev('assistant/chunk', {
+        turn: 0,
+        step: 1,
+        chunk: { type: 'usage', usage: { inputTokens: 20, outputTokens: 0 } },
+      }),
+    );
+    ctx.events.emit(
+      'session/event',
+      session,
+      ev(
+        'assistant/message',
+        {
+          turn: 0,
+          step: 1,
+          message: {
+            id: 'a1',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'hello' }],
+            source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' },
+          },
+          usage: { inputTokens: 20, outputTokens: 7 },
+        },
+        1700000001000,
+      ),
+    );
+    await flush();
+
+    const lastSession = backend.upsertSession.mock.calls.at(-1)?.[0];
+    expect(lastSession).toMatchObject({
+      messageCount: 1,
+      // step 0: 10+5 (failed, chunk only); step 1: chunk 20+0 replaced by
+      // message 20+7 → 27. Total = 15 + 27 = 42.
+      totalTokens: 42,
+    });
+  });
+
+  it('replaces progressive usage samples of one step instead of adding them', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const session = { id: 's1' };
+
+    ctx.events.emit(
+      'session/event',
+      session,
+      ev('assistant/chunk', {
+        turn: 0,
+        step: 0,
+        chunk: { type: 'usage', usage: { inputTokens: 10, outputTokens: 0 } },
+      }),
+    );
+    ctx.events.emit(
+      'session/event',
+      session,
+      ev('assistant/chunk', {
+        turn: 0,
+        step: 0,
+        chunk: { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
+      }),
+    );
+    await flush();
+
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0].totalTokens).toBe(15);
+  });
+
+  it('folds cache buckets into the token total', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+
+    ctx.events.emit(
+      'session/event',
+      { id: 's1' },
+      assistantEvent('hi', {
+        inputTokens: 100,
+        outputTokens: 7,
+        cacheReadTokens: 900,
+        cacheWriteTokens: 30,
+      }),
+    );
+    await flush();
+
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0].totalTokens).toBe(1037);
+  });
+
+  it('keeps write order across dispose and a new event on the same id', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    let release!: () => void;
+    backend.upsertSession.mockImplementationOnce(
+      () => new Promise<void>((resolve) => (release = resolve)),
+    );
+
+    const session = { id: 's1' };
+    ctx.events.emit('session/event', session, userEvent('a'));
+    ctx.events.emit('session/event', session, userEvent('b'));
+    ctx.events.emit('session/disposed', session);
+    ctx.events.emit('session/event', session, userEvent('c'));
+    await flush();
+    // taskA is now blocked on its first write; taskB/C are chained behind it.
+    release();
+    await flush();
+
+    // taskA (count=1) and taskB (count=2) land before taskC (re-seeded
+    // count=1) — the settle-guarded chain delete cannot let C jump the queue.
+    expect(backend.upsertSession.mock.calls.map((c: any) => c[0].messageCount)).toEqual([1, 2, 1]);
+  });
+
+  it('restores the last usage sample on resume and folds only the delta', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    backend.readSession.mockResolvedValue({
+      sessionId: 's1',
+      title: null,
+      messageCount: 5,
+      totalTokens: 120,
+      metadata: {
+        custom: 'keep-me',
+        'dsh-storage:lastUsage': { key: '0:0', input: 100, output: 20 },
+      },
+    });
+
+    // The in-flight step's final message arrives after the reload — only the
+    // delta over the stored sample counts: 120 + (150-100) + (30-20) = 180.
+    ctx.events.emit(
+      'session/event',
+      { id: 's1' },
+      assistantEvent('hello', { inputTokens: 150, outputTokens: 30 }),
+    );
+    await flush();
+
+    const lastSession = backend.upsertSession.mock.calls.at(-1)?.[0];
+    expect(lastSession.totalTokens).toBe(180);
+    // Existing metadata fields survive our bookkeeping write.
+    expect(lastSession.metadata).toMatchObject({
+      custom: 'keep-me',
+      'dsh-storage:lastUsage': { key: '0:0', input: 150, output: 30 },
     });
   });
 

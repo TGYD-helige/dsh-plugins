@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { projectEvent, usageOf } from './projector.js';
+import { projectEvent, usageSampleOf } from './projector.js';
 
 // Event envelopes follow the dsh persistence catalog: { type, seq, time, data }.
 const sessionId = 's1';
@@ -212,25 +212,61 @@ describe('projectEvent', () => {
   });
 });
 
-describe('usageOf', () => {
-  it('reads data.usage of an assistant/message', () => {
+describe('usageSampleOf', () => {
+  it('samples an assistant/chunk usage record with its step key', () => {
     expect(
-      usageOf({ type: 'assistant/message', data: { usage: { inputTokens: 3, outputTokens: 4 } } }),
-    ).toEqual({ input: 3, output: 4 });
+      usageSampleOf({
+        type: 'assistant/chunk',
+        data: {
+          turn: 1,
+          step: 2,
+          chunk: { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
+        },
+      }),
+    ).toEqual({ key: '1:2', sample: { input: 10, output: 5 } });
   });
 
-  it('ignores usage-shaped fields on other event types', () => {
+  it('samples an assistant/message usage with its step key', () => {
     expect(
-      usageOf({ type: 'turn/end', data: { usage: { inputTokens: 9, outputTokens: 9 } } }),
-    ).toEqual({ input: 0, output: 0 });
+      usageSampleOf({
+        type: 'assistant/message',
+        data: { turn: 0, step: 1, usage: { inputTokens: 8, outputTokens: 2 } },
+      }),
+    ).toEqual({ key: '0:1', sample: { input: 8, output: 2 } });
   });
 
-  it('returns zeros when usage is missing or partial', () => {
-    expect(usageOf({})).toEqual({ input: 0, output: 0 });
-    expect(usageOf({ type: 'assistant/message', data: {} })).toEqual({ input: 0, output: 0 });
-    expect(usageOf({ type: 'assistant/message', data: { usage: { inputTokens: 7 } } })).toEqual({
-      input: 7,
-      output: 0,
-    });
+  it('folds cache buckets into input (they are billed separately, not subsets)', () => {
+    expect(
+      usageSampleOf({
+        type: 'assistant/message',
+        data: {
+          turn: 0,
+          step: 0,
+          usage: { inputTokens: 100, outputTokens: 7, cacheReadTokens: 900, cacheWriteTokens: 30 },
+        },
+      }),
+    ).toEqual({ key: '0:0', sample: { input: 1030, output: 7 } });
+  });
+
+  it('returns null for non-usage chunks and other events', () => {
+    expect(
+      usageSampleOf({
+        type: 'assistant/chunk',
+        data: { turn: 0, step: 0, chunk: { type: 'text', text: 'x' } },
+      }),
+    ).toBeNull();
+    expect(usageSampleOf({ type: 'turn/end', data: { turn: 0 } })).toBeNull();
+    expect(usageSampleOf({ type: 'user/message', data: {} })).toBeNull();
+  });
+
+  it('returns null when usage or the step identity is missing', () => {
+    expect(usageSampleOf({ type: 'assistant/message', data: { turn: 0, step: 1 } })).toBeNull();
+    expect(
+      usageSampleOf({
+        type: 'assistant/message',
+        data: { usage: { inputTokens: 1 } },
+      }),
+    ).toBeNull();
+    expect(usageSampleOf({})).toBeNull();
   });
 });

@@ -127,25 +127,28 @@ export class DatabaseBackend implements StorageBackend {
     await this.prisma.$connect();
   }
 
+  /** JSON column value, text-serialized on SQL Server (no Prisma Json type). */
+  private jsonField(value: unknown): unknown {
+    return value == null
+      ? undefined
+      : this.config.provider === 'sqlserver'
+        ? JSON.stringify(value)
+        : value;
+  }
+
   private toDbData(row: MessageRow): Record<string, unknown> {
     // SQL Server has no Prisma Json type: its variant uses text columns, so
     // JSON fields are serialized on write (derived from the provider — the
     // only valid combination, not a user knob).
-    const json = (value: unknown) =>
-      value == null
-        ? undefined
-        : this.config.provider === 'sqlserver'
-          ? JSON.stringify(value)
-          : value;
     return {
       type: row.type,
       content: row.content,
-      thoughts: json(row.thoughts),
+      thoughts: this.jsonField(row.thoughts),
       model: row.model ?? undefined,
-      tokens: json(row.tokens),
-      toolCalls: json(row.toolCalls),
+      tokens: this.jsonField(row.tokens),
+      toolCalls: this.jsonField(row.toolCalls),
       agentId: row.agentId ?? undefined,
-      metadata: json({ id: row.id, ...(row.metadata ?? {}) }),
+      metadata: this.jsonField({ id: row.id, ...(row.metadata ?? {}) }),
       createdAt: row.createdAt,
     };
   }
@@ -164,31 +167,47 @@ export class DatabaseBackend implements StorageBackend {
 
   async readSession(sessionId: string): Promise<SessionRow | null> {
     if (!this.prisma) return null;
-    const row = await this.prisma.aiChatHistory.findUnique({
+    let row = await this.prisma.aiChatHistory.findUnique({
       where: { id: pk(`session ${sessionId}`) },
+    });
+    // Pre-hash rows (cuid primary keys, early scaffold) don't match the PK —
+    // fall back to the session id. The row's actual PK rides back in `pk`,
+    // so later writes absorb it in place instead of creating a second row.
+    row ??= await this.prisma.aiChatHistory.findFirst({
+      where: { sessionId, deletedAt: null },
     });
     if (!row) return null;
     return {
+      pk: row.id,
       sessionId: row.sessionId,
       title: row.title,
       messageCount: row.messageCount,
       totalTokens: Number(row.totalTokens),
       firstMessageAt: row.firstMessageAt,
       lastMessageAt: row.lastMessageAt,
+      // SQL Server stores JSON columns as text — parse them back on read.
+      metadata:
+        row.metadata == null
+          ? undefined
+          : typeof row.metadata === 'string'
+            ? JSON.parse(row.metadata)
+            : row.metadata,
     };
   }
 
   async upsertSession(row: SessionRow): Promise<void> {
     if (!this.prisma) return;
     // PK upsert like upsertMessage: the find-then-write pattern raced under
-    // event bursts and produced duplicate rows for one session.
-    const id = pk(`session ${row.sessionId}`);
+    // event bursts and produced duplicate rows for one session. A seeded
+    // legacy row keeps its own PK so it is absorbed, never duplicated.
+    const id = row.pk ?? pk(`session ${row.sessionId}`);
     const data = {
       title: row.title ?? undefined,
       messageCount: row.messageCount,
       totalTokens: BigInt(row.totalTokens),
       firstMessageAt: row.firstMessageAt ?? undefined,
       lastMessageAt: row.lastMessageAt ?? undefined,
+      metadata: this.jsonField(row.metadata),
     };
     await this.prisma.aiChatHistory.upsert({
       where: { id },

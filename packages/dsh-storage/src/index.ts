@@ -21,7 +21,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import Schema from '@deepseek-ai/schemastery';
 import { DatabaseBackend, type DatabaseProvider } from './backends/database.js';
-import { projectEvent, usageOf } from './projector.js';
+import { projectEvent, usageSampleOf } from './projector.js';
 import type { MessageRow, SessionRow, StorageBackend } from './types.js';
 
 export const name = 'dsh-storage';
@@ -53,6 +53,34 @@ interface SessionAccum {
   title?: string;
   firstMessageAt?: Date;
   lastMessageAt?: Date;
+  /** PK of the history row this rollup writes to (set when seeded from an
+   *  existing row — legacy cuid rows are absorbed in place, never duplicated). */
+  historyPk?: string;
+  /** Existing history-row metadata, preserved verbatim across our writes. */
+  metadata: Record<string, unknown>;
+  /**
+   * The latest usage sample with its step key — replacement accounting. dsh
+   * emits a step's usage samples adjacently (chunks, then the message), so
+   * only the most recent sample needs keeping to dedup the chunk↔message
+   * pair and progressive samples; it is also all a resume needs to avoid
+   * double-counting the in-flight step. Persisted in the row's metadata as
+   * `dsh-storage:lastUsage` (namespaced — other writers' fields survive).
+   */
+  usageSample?: { key: string; input: number; output: number };
+}
+
+/** Metadata key for our usage bookkeeping — namespaced so other writers' fields never collide with it. */
+const LAST_USAGE_KEY = 'dsh-storage:lastUsage';
+
+/** Shape-guarded restore of our usage sample from arbitrary metadata. */
+function usageSampleOfMetadata(value: unknown): SessionAccum['usageSample'] {
+  const v = value as { key?: unknown; input?: unknown; output?: unknown } | null;
+  return v &&
+    typeof v.key === 'string' &&
+    typeof v.input === 'number' &&
+    typeof v.output === 'number'
+    ? { key: v.key, input: v.input, output: v.output }
+    : undefined;
 }
 
 export function apply(ctx: Context, config: StoragePluginConfig): void {
@@ -114,7 +142,10 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   const chains = new Map<string, Promise<void>>();
 
   function enqueue(sessionId: string, task: () => Promise<void>): void {
-    const next = (chains.get(sessionId) ?? Promise.resolve())
+    // First task of a session also chains behind backend init, so seedAccum
+    // never reads from a still-connecting backend (prisma === null would
+    // masquerade as "row not found" and zero-seed over the stored rollup).
+    const next = (chains.get(sessionId) ?? started)
       .then(task)
       .catch((error) => console.error('[dsh-storage] mirror task error:', error));
     chains.set(sessionId, next);
@@ -122,6 +153,10 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   }
 
   async function seedAccum(sessionId: string): Promise<SessionAccum> {
+    // "Row not found" (a new session) is the only zero-seed case. A read
+    // failure is NOT "not found": fail the task so the next event re-seeds,
+    // instead of accumulating from zero and overwriting the stored rollup.
+    let readFailure: unknown;
     for (const backend of backends) {
       try {
         const row = await backend.readSession?.(sessionId);
@@ -132,13 +167,19 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
             title: row.title ?? undefined,
             firstMessageAt: row.firstMessageAt ?? undefined,
             lastMessageAt: row.lastMessageAt ?? undefined,
+            historyPk: row.pk,
+            // Preserve every existing metadata field; we only own our key.
+            metadata: { ...(row.metadata ?? {}) },
+            usageSample: usageSampleOfMetadata(row.metadata?.[LAST_USAGE_KEY]),
           };
         }
       } catch (error) {
+        readFailure ??= error;
         console.error(`[dsh-storage] ${backend.name} error:`, error);
       }
     }
-    return { messageCount: 0, totalTokens: 0 };
+    if (readFailure) throw readFailure;
+    return { messageCount: 0, totalTokens: 0, metadata: {} };
   }
 
   ctx.effect(() => {
@@ -168,8 +209,24 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
         await fanout((backend) => backend.upsertMessage(row));
       }
 
-      const usage = usageOf(event);
-      accum.totalTokens += usage.input + usage.output;
+      // Replacement usage accounting: the latest sample for a (turn, step)
+      // supersedes the previous one — fold only the delta, so the
+      // chunk↔message pair and progressive samples never double-count, and a
+      // failed step (usage chunk, no message) still counts. Samples of one
+      // step arrive adjacently, so a single latest sample is all we track.
+      const sampled = usageSampleOf(event);
+      let usageDelta = 0;
+      if (sampled) {
+        const prev = accum.usageSample;
+        usageDelta =
+          sampled.sample.input +
+          sampled.sample.output -
+          (prev && prev.key === sampled.key ? prev.input + prev.output : 0);
+        if (!prev || prev.key !== sampled.key || usageDelta !== 0) {
+          accum.usageSample = { key: sampled.key, ...sampled.sample };
+          accum.totalTokens += usageDelta;
+        }
+      }
 
       // Latest-wins title snapshot (log-only `session/title` event; payload
       // { title, messageSeqs, source } verified against dsh-session-title@0.1.0-rc.7).
@@ -179,17 +236,25 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
 
       if (
         row ||
-        usage.input + usage.output > 0 ||
+        usageDelta !== 0 ||
         event?.type === 'turn/end' ||
         event?.type === 'session/title'
       ) {
+        // Merge our bookkeeping into the existing metadata instead of
+        // replacing the column — other fields (present or future) survive.
+        const metadata = {
+          ...accum.metadata,
+          ...(accum.usageSample ? { [LAST_USAGE_KEY]: accum.usageSample } : {}),
+        };
         const sessionRow: SessionRow = {
+          pk: accum.historyPk,
           sessionId,
           title: accum.title ?? null,
           messageCount: accum.messageCount,
           totalTokens: accum.totalTokens,
           firstMessageAt: accum.firstMessageAt ?? null,
           lastMessageAt: accum.lastMessageAt ?? null,
+          ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
         };
         await fanout((backend) => backend.upsertSession(sessionRow));
       }
@@ -197,7 +262,22 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   });
 
   on('session/disposed', (session: any) => {
-    sessions.delete(session?.id ?? 'unknown');
+    const sessionId: string = session?.id ?? 'unknown';
+    // The delete must run inside the session's chain — a synchronous delete
+    // here races the queued event tasks (the map may not even have the entry
+    // yet at emit time, and queued tasks would keep growing the accumulator
+    // the dispose was meant to drop).
+    enqueue(sessionId, async () => {
+      sessions.delete(sessionId);
+    });
+    // Delete the chain entry only once it has settled AND is still the same
+    // entry — deleting earlier would let a recreated session race the
+    // orphaned writes; skipping the delete when a new task has since chained
+    // on preserves order.
+    const chain = chains.get(sessionId);
+    chain?.finally(() => {
+      if (chains.get(sessionId) === chain) chains.delete(sessionId);
+    });
   });
 
   // Durability checkpoint: the store awaits every session/flush listener.

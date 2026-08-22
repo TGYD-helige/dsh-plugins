@@ -16,7 +16,7 @@ Early scaffold. The plugin shapes, config schemas, and seam choices are in place
 
 | dsh-plugins | dsh | cordis |
 | --- | --- | --- |
-| 0.1.x | `0.1.0-rc.7` (source) / `>=0.0.1-rc.1` (npm) | `^4.0.1` |
+| 0.1.x | `0.1.0-rc.7` (source) / `0.1.0-rc.7` (npm) | `^4.0.1` |
 
 dsh is in developer preview and **will** break compatibility between releases. Every release of these plugins pins a tested dsh version in this matrix; upgrade deliberately.
 

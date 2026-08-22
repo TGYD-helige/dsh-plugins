@@ -263,7 +263,85 @@ describe('DatabaseBackend', () => {
     await backend.init();
     const prisma = prismaMock.instances[0];
     prisma.aiChatHistory.findUnique = vi.fn().mockResolvedValue(null);
+    prisma.aiChatHistory.findFirst = vi.fn().mockResolvedValue(null);
     await expect(backend.readSession('s1')).resolves.toBeNull();
+  });
+
+  it('serializes session metadata as text on sqlserver', async () => {
+    backend = new DatabaseBackend({
+      provider: 'sqlserver',
+      url: 'sqlserver://host:1433;database=dsh;user=sa;password=p',
+    });
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+
+    await backend.upsertSession({
+      ...sessionRow,
+      metadata: { usageByStep: { '0:0': { input: 100, output: 20 } } },
+    });
+
+    const call = prisma.aiChatHistory.upsert.mock.calls[0][0];
+    expect(call.create.metadata).toBe(
+      JSON.stringify({ usageByStep: { '0:0': { input: 100, output: 20 } } }),
+    );
+  });
+
+  it('parses string-stored metadata back on readSession (sqlserver)', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    prisma.aiChatHistory.findUnique = vi.fn().mockResolvedValue({
+      sessionId: 's1',
+      title: null,
+      messageCount: 5,
+      totalTokens: 120n,
+      firstMessageAt: null,
+      lastMessageAt: null,
+      metadata: JSON.stringify({ usageByStep: { '0:0': { input: 100, output: 20 } } }),
+    });
+
+    const row = await backend.readSession('s1');
+    expect(row?.metadata).toEqual({ usageByStep: { '0:0': { input: 100, output: 20 } } });
+  });
+
+  it('falls back to a sessionId lookup for pre-hash (cuid) history rows', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    prisma.aiChatHistory.findUnique = vi.fn().mockResolvedValue(null);
+    prisma.aiChatHistory.findFirst = vi.fn().mockResolvedValue({
+      id: 'legacy-cuid',
+      sessionId: 's1',
+      title: 'legacy',
+      messageCount: 9,
+      totalTokens: 90n,
+      firstMessageAt: new Date(1600000000000),
+      lastMessageAt: null,
+      metadata: null,
+    });
+
+    const row = await backend.readSession('s1');
+
+    expect(prisma.aiChatHistory.findFirst).toHaveBeenCalledWith({
+      where: { sessionId: 's1', deletedAt: null },
+    });
+    expect(row).toMatchObject({
+      pk: 'legacy-cuid',
+      sessionId: 's1',
+      title: 'legacy',
+      messageCount: 9,
+      totalTokens: 90,
+      firstMessageAt: new Date(1600000000000),
+    });
+  });
+
+  it('writes back to a legacy row PK instead of creating a second row', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+
+    await backend.upsertSession({ ...sessionRow, pk: 'legacy-cuid' });
+
+    const call = prisma.aiChatHistory.upsert.mock.calls[0][0];
+    expect(call.where.id).toBe('legacy-cuid');
+    expect(call.create.id).toBe('legacy-cuid');
   });
 
   it('disconnects on close', async () => {

@@ -7,8 +7,10 @@
  * - envelope: `{ type, seq, time, data }` — payload lives under `data`.
  * - surface events (the only ones producing LLM messages, and the only ones
  *   projected to rows): `user/message`, `assistant/message`, `tool/result`.
- * - token usage rides on `assistant/message`'s `data.usage`; `turn/end`
- *   carries none — it only serves as a rollup checkpoint.
+ * - token usage: `assistant/chunk` `{ type: 'usage' }` is authoritative per
+ *   step; `assistant/message`'s `data.usage` only counts when no usage chunk
+ *   was seen for the step (dedup in usageOf). `turn/end` carries none — it
+ *   only serves as a rollup checkpoint.
  * - compaction summaries enter the surface as a `user/message` with
  *   `surfaceOp: replace`, so they flow through the user path unchanged.
  */
@@ -115,24 +117,51 @@ export function projectEvent(_session: any, event: any, sessionId: string): Mess
 
     default:
       // Log-only events (assistant/chunk, turn/step lifecycle, approvals,
-      // compaction markers, ...) are not standalone rows; assistant/message
-      // usage rolls up into SessionRow.
+      // compaction markers, ...) are not standalone rows; usage rolls up into
+      // SessionRow via usageOf (usage chunks and assistant/message).
       return null;
   }
 }
 
+export interface UsageSample {
+  input: number;
+  output: number;
+}
+
 /**
- * Extract token usage — only `assistant/message` carries it (`data.usage`).
- * The catalog states there is no separate usage record: the usage chunks in
- * the raw stream are the same accounting in flight, so counting them too
- * would double-count. Accepted edge: a request that fails before producing
- * an assistant/message contributes nothing to the rollup.
+ * Extract the usage sample carried by one event, keyed by its step, or null
+ * when the event carries none.
+ *
+ * dsh-llm emits usage as:
+ * - `assistant/chunk` with `chunk.type === 'usage'` — the step's accounting,
+ *   emitted even when the request later fails (a failed step produces no
+ *   assistant/message, so message-only accounting would miss it entirely);
+ * - `assistant/message.data.usage` — the same step's final accounting.
+ *
+ * Samples for one `(turn, step)` are REPLACEMENTS, not additive: later
+ * samples supersede earlier ones (progressive chunks, then the message).
+ * The caller keeps the latest sample per step and folds only the delta into
+ * its rollup. Totals include the cache buckets: cacheRead/cacheWrite are
+ * billed in their own buckets (observed cacheReadTokens ≫ inputTokens in
+ * dsh session logs — they are not subsets of inputTokens).
  */
-export function usageOf(event: any): { input: number; output: number } {
-  if (event?.type !== 'assistant/message') return { input: 0, output: 0 };
-  const u = event.data?.usage;
-  return {
-    input: u?.inputTokens ?? 0,
+export function usageSampleOf(event: any): { key: string; sample: UsageSample } | null {
+  const total = (u: any): UsageSample => ({
+    input: (u?.inputTokens ?? 0) + (u?.cacheReadTokens ?? 0) + (u?.cacheWriteTokens ?? 0),
     output: u?.outputTokens ?? 0,
-  };
+  });
+
+  let data: any;
+  let usage: any;
+  if (event?.type === 'assistant/chunk' && event.data?.chunk?.type === 'usage') {
+    data = event.data;
+    usage = data.chunk.usage;
+  } else if (event?.type === 'assistant/message') {
+    data = event.data;
+    usage = data?.usage;
+  } else {
+    return null;
+  }
+  if (!usage || data?.turn == null || data?.step == null) return null;
+  return { key: `${data.turn}:${data.step}`, sample: total(usage) };
 }
