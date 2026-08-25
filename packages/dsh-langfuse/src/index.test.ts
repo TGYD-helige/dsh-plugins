@@ -310,6 +310,8 @@ describe('dsh-langfuse plugin', () => {
         input: { messages: [], system: undefined, tools: undefined },
       });
       expect(trace.generations[0].ends[0]).toMatchObject({
+        // The generation name gains the reply's first line at close.
+        name: 'llm-call [hello]',
         output: 'hello',
         usage: { input: 10, output: 5, total: 15 },
         level: 'DEFAULT',
@@ -363,9 +365,8 @@ describe('dsh-langfuse plugin', () => {
 
     it('records the loop-built request as a nested llm-request span', async () => {
       await setup();
-      await drain(
-        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(textDelta('hi'), finishStop())),
-      );
+      const sent = [textDelta('hi'), finishStop()];
+      await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...sent)));
       const generation = fakeObs(mocks.instances[0].traces[0].generations[0]);
       expect(generation.spans).toHaveLength(1);
       const requestSpan = generation.spans[0];
@@ -376,7 +377,12 @@ describe('dsh-langfuse plugin', () => {
       });
       // The AbortSignal is not JSON-safe and must not cross to Langfuse.
       expect((requestSpan.body as { input: Record<string, unknown> }).input.signal).toBeUndefined();
-      expect(requestSpan.ends[0]).toMatchObject({ level: 'DEFAULT' });
+      // The span's output is the collected chunk stream (the raw response).
+      expect(requestSpan.ends[0]).toMatchObject({
+        output: sent,
+        level: 'DEFAULT',
+        metadata: { chunkCount: 2 },
+      });
     });
 
     it('sets completionStartTime at the first token delta, not at block boundaries', async () => {
@@ -455,17 +461,25 @@ describe('dsh-langfuse plugin', () => {
 
     it('reports and rethrows mid-stream iteration failures, keeping partial progress', async () => {
       await setup();
+      const partial = [textDelta('partial'), usageChunk({ inputTokens: 10, outputTokens: 5 })];
       const stream = ctx.waterfall('llm/stream', optionsOf(), async function* () {
-        yield textDelta('partial');
-        yield usageChunk({ inputTokens: 10, outputTokens: 5 });
+        yield* partial;
         throw new Error('adapter boom');
       });
       await expect(drain(stream)).rejects.toThrow('adapter boom');
-      expect(fakeObs(mocks.instances[0].traces[0].generations[0]).ends[0]).toMatchObject({
+      const generation = fakeObs(mocks.instances[0].traces[0].generations[0]);
+      expect(generation.ends[0]).toMatchObject({
+        name: 'llm-call [partial]',
         output: 'partial',
         usage: { input: 10, output: 5, total: 15 },
         level: 'ERROR',
         statusMessage: 'adapter boom',
+      });
+      // The request span keeps the chunks streamed before the throw too.
+      expect(generation.spans[0].ends[0]).toMatchObject({
+        output: partial,
+        level: 'ERROR',
+        metadata: { chunkCount: 2 },
       });
     });
 
@@ -558,6 +572,11 @@ describe('dsh-langfuse plugin', () => {
         input: { messageCount: 0, hasSystem: false },
         metadata: { provider: 'test' },
       });
+      // Chunks are content too: only the structural count crosses.
+      expect(requestSpan.ends[0]).toMatchObject({
+        output: undefined,
+        metadata: { chunkCount: 1 },
+      });
     });
 
     it('withholds finish failure text, keeping level and error code', async () => {
@@ -592,7 +611,10 @@ describe('dsh-langfuse plugin', () => {
       await ctx.waterfall('tools/execute', execOf(), async () =>
         errResult('cat: /etc/shadow: permission denied', 'E_PERM'),
       );
-      expect(fakeObs(mocks.instances[0].traces[0].spans[0]).ends[0]).toMatchObject({
+      const span = fakeObs(mocks.instances[0].traces[0].spans[0]);
+      // Argument summaries are content too: no [path] suffix when redacted.
+      expect(span.body).toMatchObject({ name: 'tool:write_file' });
+      expect(span.ends[0]).toMatchObject({
         level: 'ERROR',
         statusMessage: undefined,
         metadata: { errorCode: 'E_PERM' },
@@ -624,7 +646,7 @@ describe('dsh-langfuse plugin', () => {
       const trace = fakeTrace(mocks.instances[0].traces[0]);
       expect(trace.spans).toHaveLength(1);
       expect(trace.spans[0].body).toMatchObject({
-        name: 'tool:write_file',
+        name: 'tool:write_file [a.ts]',
         input: { path: 'a.ts' },
         metadata: { callId: 'c1', toolName: 'write_file' },
       });
@@ -697,7 +719,7 @@ describe('dsh-langfuse plugin', () => {
       expect(trace.generations).toHaveLength(0);
 
       const delegationSpan = fakeObs(trace.spans[0]);
-      expect(delegationSpan.body).toMatchObject({ name: 'tool:subagent' });
+      expect(delegationSpan.body).toMatchObject({ name: 'tool:subagent [read marker]' });
       expect(delegationSpan.spans).toHaveLength(1);
 
       const subSpan = fakeObs(delegationSpan.spans[0]);
@@ -823,7 +845,7 @@ describe('dsh-langfuse plugin', () => {
       const subSpan = fakeObs(trace.spans[0]);
       expect(subSpan.spans).toHaveLength(1);
       expect(subSpan.spans[0].body).toMatchObject({
-        name: 'tool:read_file',
+        name: 'tool:read_file [ci-marker.txt]',
         input: { path: 'ci-marker.txt' },
       });
       expect(trace.spans).toHaveLength(1);

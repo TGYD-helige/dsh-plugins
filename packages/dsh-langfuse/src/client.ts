@@ -34,7 +34,7 @@ export interface LangfuseConnectionConfig {
 export type ObservationLevel = 'DEFAULT' | 'WARNING' | 'ERROR';
 
 /** Any observation client that can parent a span (trace, span, or generation). */
-export type SpanParent = LangfuseTraceClient | LangfuseSpanClient | LangfuseGenerationClient;
+type SpanParent = LangfuseTraceClient | LangfuseSpanClient | LangfuseGenerationClient;
 
 /**
  * Map dsh token accounting onto Langfuse's usage fields, keeping every
@@ -88,7 +88,6 @@ export class LangfuseReporter {
       });
     } catch (error) {
       console.error('[dsh-langfuse] client init failed:', error);
-      this.client = null;
     }
   }
 
@@ -121,7 +120,7 @@ export class LangfuseReporter {
   ): void {
     if (!trace) return;
     try {
-      trace.update({ input: update.input, metadata: update.metadata });
+      trace.update(update);
     } catch (error) {
       console.error('[dsh-langfuse] trace update failed:', error);
     }
@@ -140,13 +139,7 @@ export class LangfuseReporter {
   ): LangfuseGenerationClient | null {
     if (!parent) return null;
     try {
-      return parent.generation({
-        name: input.name,
-        model: input.model,
-        input: input.input,
-        modelParameters: input.modelParameters,
-        metadata: input.metadata,
-      });
+      return parent.generation(input);
     } catch (error) {
       console.error('[dsh-langfuse] generation creation failed:', error);
       return null;
@@ -156,6 +149,7 @@ export class LangfuseReporter {
   endGeneration(
     generation: LangfuseGenerationClient | null,
     update: {
+      name?: string;
       output?: unknown;
       usage?: TokenUsage;
       completionStartTime?: Date;
@@ -167,6 +161,7 @@ export class LangfuseReporter {
     if (!generation) return;
     try {
       generation.end({
+        name: update.name,
         output: update.output,
         ...(update.usage ? usageOf(update.usage) : {}),
         completionStartTime: update.completionStartTime,
@@ -186,7 +181,7 @@ export class LangfuseReporter {
   ): LangfuseSpanClient | null {
     if (!parent) return null;
     try {
-      return parent.span({ name: input.name, input: input.input, metadata: input.metadata });
+      return parent.span(input);
     } catch (error) {
       console.error('[dsh-langfuse] span creation failed:', error);
       return null;
@@ -200,7 +195,7 @@ export class LangfuseReporter {
   ): void {
     if (!span) return;
     try {
-      span.update({ name: update.name, input: update.input, metadata: update.metadata });
+      span.update(update);
     } catch (error) {
       console.error('[dsh-langfuse] span update failed:', error);
     }
@@ -217,12 +212,7 @@ export class LangfuseReporter {
   ): void {
     if (!span) return;
     try {
-      span.end({
-        output: update.output,
-        level: update.level,
-        statusMessage: update.statusMessage,
-        metadata: update.metadata,
-      });
+      span.end(update);
     } catch (error) {
       console.error('[dsh-langfuse] span end failed:', error);
     }

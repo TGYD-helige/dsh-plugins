@@ -55,8 +55,7 @@ const EXPECTED_MODEL = 'deepseek-v4-flash';
 // Non-empty trimmed value or fallback — GitHub injects unset secrets as '',
 // which `??` would happily keep.
 function envOr(value, fallback) {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed : fallback;
+  return value?.trim() || fallback;
 }
 
 // Returns a list of problems; empty list means the trace fully matches.
@@ -68,8 +67,13 @@ function evaluateTrace(observations, codeword) {
     if (!condition) problems.push(message);
   };
 
-  const generation = generations.find((o) => o.name === 'llm-call');
-  need(generation, 'missing generation "llm-call"');
+  const generation = generations.find(
+    // The plugin renames generations to `llm-call [<first line>]` at close,
+    // so match by prefix — and skip purpose calls (`metadata.purpose`), which
+    // share the prefix form (`llm-call [session-title]`).
+    (o) => o.name?.startsWith('llm-call') && o.metadata?.purpose == null,
+  );
+  need(generation, 'missing main "llm-call*" generation');
   if (generation) {
     need(
       generation.model === EXPECTED_MODEL,
@@ -104,6 +108,10 @@ function evaluateTrace(observations, codeword) {
       '"llm-request" span is not parented under the generation',
     );
     need(requestSpan.endTime != null, '"llm-request" span has no endTime (never completed)');
+    need(
+      Array.isArray(requestSpan.output) && requestSpan.output.length > 0,
+      '"llm-request" span has no response chunks',
+    );
   }
   return problems;
 }
@@ -183,9 +191,9 @@ async function runVerification({
   secretKey,
   fromStartTime,
   codeword,
-  evaluate = evaluateTrace,
+  evaluate,
 }) {
-  const origin = envOr(baseUrl, DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const origin = baseUrl.replace(/\/+$/, '');
   const deadline = Date.now() + DEFAULT_DEADLINE_MS;
   const auth = `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString('base64')}`;
 
@@ -219,7 +227,7 @@ async function runVerification({
       if (response.status === 429) {
         // Rate limits are shared per organization — honor Retry-After
         // instead of burning the deadline on failures.
-        const retryAfterSeconds = Number(response.headers?.get?.('retry-after'));
+        const retryAfterSeconds = Number(response.headers.get('retry-after'));
         const retryAfterMs =
           Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
             ? Math.min(retryAfterSeconds * 1000, 120_000)
@@ -251,11 +259,18 @@ async function runVerification({
     let waitMs = POLL_INTERVAL_MS;
     try {
       // Discovery: the turn's generation carries the codeword in its IO (the
-      // prompt mentions the marker file; tool-call arguments repeat it).
-      const candidates = await fetchObservations({ type: 'GENERATION', name: 'llm-call' });
+      // prompt mentions the marker file; tool-call arguments repeat it). No
+      // server-side name filter — generations are renamed `llm-call [<first
+      // line>]` at close, so exact-name queries would miss them; the prefix
+      // and the run-unique codeword do the filtering client-side.
+      const candidates = await fetchObservations({ type: 'GENERATION' });
       const traceIds = [
         ...new Set(
-          candidates.filter((o) => JSON.stringify(o).includes(codeword)).map((o) => o.traceId),
+          candidates
+            .filter(
+              (o) => o.name?.startsWith('llm-call') && JSON.stringify(o).includes(codeword),
+            )
+            .map((o) => o.traceId),
         ),
       ];
 
@@ -343,7 +358,6 @@ async function main() {
 
   // Fake mode only: the capture sink the assertions read from.
   const captured = [];
-  let fakeServer;
   let pluginConnection;
   if (realMode) {
     // YAML-double-quoted scalars are JSON-compatible — keys can't break the
@@ -354,7 +368,7 @@ async function main() {
       baseUrl: JSON.stringify(baseUrl),
     };
   } else {
-    fakeServer = await startFakeIngestion(captured);
+    const fakeServer = await startFakeIngestion(captured);
     const fakeUrl = `http://127.0.0.1:${fakeServer.address().port}`;
     console.log(`fake langfuse ingestion at ${fakeUrl}`);
     pluginConnection = { publicKey: 'pk-lf-ci', secretKey: 'sk-lf-ci', baseUrl: fakeUrl };
@@ -501,11 +515,9 @@ async function main() {
 
   // --- Phase 1: direct marker read → trace / generation / tool span --------
   const phase1 = await runPhase('phase 1', prompt1, codeword, evaluateTrace);
+  assert(phase1.ok, `phase 1 failed: ${phase1.state}`);
 
-  // Phase-1 assertions.
-  if (realMode) {
-    assert(phase1.ok, `phase 1 Langfuse verification failed: ${phase1.state}`);
-  } else {
+  if (!realMode) {
     // Fake mode: the loop already proved the shape; trace-level extras get
     // their own checks.
     console.log(`\n--- captured ${captured.length} ingestion events ---`);
@@ -515,7 +527,6 @@ async function main() {
       (e) => e.type === 'trace-create' && e.body?.name === 'dsh-turn' && e.body?.sessionId,
     )?.body;
     assert(trace, 'no dsh-turn trace with a sessionId was ingested');
-    assert(phase1.ok, `phase 1 shape incomplete: ${phase1.state}`);
 
     // Turn-boundary metadata rides session events near process teardown —
     // useful signal, but the exact flush timing is dsh's business: warn only.
@@ -531,18 +542,8 @@ async function main() {
   // --- Phase 2: subagent delegation → delegation span / subagent span /
   //    child generation + child tool span, all in the one parent trace ------
   const phase2 = await runPhase('phase 2', prompt2, codeword2, evaluateSubagentTrace);
-
-  // Phase-2 assertions.
-  if (realMode) {
-    assert(phase2.ok, `phase 2 Langfuse verification failed: ${phase2.state}`);
-    console.log(`\nSCENARIO_OK (phase 1: ${phase1.state}; phase 2: ${phase2.state})`);
-    return;
-  }
-  assert(phase2.ok, `phase 2 subagent tree incomplete: ${phase2.state}`);
-  console.log(
-    `\nSCENARIO_OK (phase 1 captured, phase 2 subagent tree verified; events=${captured.length})`,
-  );
-  fakeServer?.close();
+  assert(phase2.ok, `phase 2 failed: ${phase2.state}`);
+  console.log(`\nSCENARIO_OK (phase 1: ${phase1.state}; phase 2: ${phase2.state})`);
 }
 
 main().catch((error) => {

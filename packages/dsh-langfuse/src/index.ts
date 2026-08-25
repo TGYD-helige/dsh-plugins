@@ -6,8 +6,9 @@
  * - `llm/stream` waterfall  → one Langfuse **generation** per LLM call
  *   (input = full request; output, token usage and finish reason collected
  *   from the chunk stream), plus a nested `llm-request` **span** holding the
- *   verbatim loop-built request (the rawest request a plugin can observe —
- *   the provider HTTP body is assembled inside the adapter).
+ *   verbatim loop-built request and the collected chunk stream (the rawest
+ *   request/response a plugin can observe — the provider HTTP body is
+ *   assembled inside the adapter).
  * - `tools/execute` waterfall → one Langfuse **span** per tool dispatch
  *   (routed to the session's trace via `exec.agent.id` — the agent/session
  *   shared identity).
@@ -142,9 +143,43 @@ function requestBodyOf(options: GenerateOptions, captureContent: boolean): Recor
       toolCount: options.tools?.length,
     };
   }
-  const body: Partial<GenerateOptions> = { ...options };
-  delete body.signal;
+  const { signal: _, ...body } = options;
   return body;
+}
+
+/** Generation names carry the reply's first non-empty line (capped) for list readability. */
+function enhanceWithFirstLine(base: string, text: string): string | undefined {
+  const firstLine = text
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  if (!firstLine) return undefined;
+  return `${base} [${firstLine.length > 80 ? `${firstLine.slice(0, 79)}…` : firstLine}]`;
+}
+
+/** Tool argument keys worth surfacing in a span name, in priority order. */
+const ARG_SUMMARY_KEYS = [
+  'path',
+  'file_path',
+  'filePath',
+  'command',
+  'description',
+  'query',
+  'name',
+  'url',
+  'instruction',
+];
+
+/** A short argument summary for span names: the first matching key's first line, trimmed and capped. */
+function toolCallSummary(args: unknown): string | undefined {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return undefined;
+  for (const key of ARG_SUMMARY_KEYS) {
+    const value = (args as Record<string, unknown>)[key];
+    if (typeof value !== 'string') continue;
+    const first = value.split('\n', 1)[0].trim();
+    if (first.length > 0) return first.slice(0, 80);
+  }
+  return undefined;
 }
 
 export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void> | void {
@@ -158,19 +193,17 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
 
   /**
    * The trace an observation for `sessionId` belongs to: the session's open
-   * turn trace, else a per-session one-off trace shared by everything outside
-   * a turn (between-turn maintenance calls like compaction, sessions that
-   * started before the plugin loaded, session-less hand-built calls) so those
-   * observations stay in one trace instead of fragmenting per call. The next
-   * `turn/start` replaces it. Subagent child sessions resolve through their
-   * parent chain to the root trace (the depth bound is a cycle guard —
-   * delegation depth is config-capped, 8 is purely defensive).
+   * turn trace, else a per-session one-off trace shared by that session's
+   * out-of-turn calls (between-turn maintenance like compaction, sessions
+   * that started before the plugin loaded) so those observations stay in one
+   * trace instead of fragmenting per call. The next `turn/start` replaces it.
+   * Session-less hand-built calls get one trace each — there is no key to
+   * cache under. Subagent child sessions resolve through their parent chain
+   * (a tree by construction) to the root trace.
    */
   function traceFor(sessionId: string | undefined): TraceHandle {
     let id = sessionId;
-    for (let depth = 0; id && children.has(id) && depth < 8; depth++) {
-      id = children.get(id)?.parentSessionId;
-    }
+    while (id && children.has(id)) id = children.get(id)?.parentSessionId;
     const existing = id ? sessions.get(id) : undefined;
     if (existing) return existing.trace;
     const trace = reporter.openTrace({ name: config.traceName, sessionId: id });
@@ -315,8 +348,9 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   // must not be async — it returns an async-generator tee instead.
   // ------------------------------------------------------------------
   ctx.on('llm/stream', (options, next) => {
+    const generationName = options.purpose ? `llm-call [${options.purpose}]` : 'llm-call';
     const generation = reporter.startGeneration(parentFor(options.sessionId), {
-      name: options.purpose ? `llm-call [${options.purpose}]` : 'llm-call',
+      name: generationName,
       model: options.model,
       input: config.captureContent
         ? { messages: options.messages, system: options.system, tools: options.tools }
@@ -328,18 +362,21 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     // The rawest request a plugin can observe: the loop-built GenerateOptions
     // verbatim, pre-adapter (the provider HTTP body is assembled inside the
     // adapter — dsh exposes no seam for it). Nested under the generation,
-    // closed alongside it with the same outcome.
+    // closed alongside it with the same outcome; its output is the collected
+    // chunk stream (the raw response at this seam).
     const requestSpan = reporter.startSpan(generation, {
       name: 'llm-request',
       input: requestBodyOf(options, config.captureContent),
-      metadata: {
-        provider: options.provider,
-        reasoningEffort: options.reasoningEffort,
-        purpose: options.purpose,
-      },
+      metadata: { provider: options.provider },
     });
+    const rawChunks: StreamChunk[] = [];
     const closeRequest = (level: ObservationLevel, statusMessage?: string) => {
-      reporter.endSpan(requestSpan, { level, statusMessage });
+      reporter.endSpan(requestSpan, {
+        output: config.captureContent ? rawChunks : undefined,
+        level,
+        statusMessage,
+        metadata: { chunkCount: rawChunks.length },
+      });
     };
 
     let stream: AsyncIterable<StreamChunk>;
@@ -355,15 +392,15 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     // Tee the chunk stream: replay every chunk unchanged, then close the
     // generation from the terminal `finish` chunk and accumulated content.
     // Stream failures surface as a `finish` chunk with an error/aborted
-    // reason rather than throwing; the `finally` also closes the generation
-    // when the consumer abandons the stream early.
+    // reason rather than throwing; the single close in `finally` also covers
+    // consumer abandonment and mid-stream throws.
     return (async function* () {
       let text = '';
       const toolCalls: Array<{ name: string; arguments: string }> = [];
       let usage: TokenUsage | undefined;
       let finish: FinishReason | undefined;
       let completionStartTime: Date | undefined;
-      let failed = false;
+      let thrownMessage: string | undefined;
       const outputBody = () =>
         config.captureContent
           ? toolCalls.length > 0
@@ -372,6 +409,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
           : undefined;
       try {
         for await (const chunk of stream) {
+          rawChunks.push(chunk);
           // TTFT is the first real token — block boundaries, usage frames and
           // empty heartbeat deltas are not completions (dsh's shared predicate).
           if (completionStartTime === undefined && isTokenDelta(chunk)) {
@@ -396,49 +434,48 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
           yield chunk;
         }
       } catch (error) {
-        failed = true;
-        const statusMessage = contentMessage(config, messageOf(error));
-        closeRequest('ERROR', statusMessage);
-        // Partial progress still counts: keep whatever streamed before the throw.
+        // The raw message stays local — redaction gates what crosses to
+        // Langfuse, and `undefined` (not an empty string) is the no-throw
+        // discriminator.
+        thrownMessage = messageOf(error);
+        throw error;
+      } finally {
+        const failure =
+          finish && (finish.kind === 'error' || finish.kind === 'aborted') ? finish : undefined;
+        // No terminal finish chunk (the consumer abandoned the stream or
+        // the adapter cut it short): the call's outcome is unknown — mark
+        // it instead of posing as a normal completion.
+        let level: ObservationLevel = 'DEFAULT';
+        let statusMessage: string | undefined;
+        if (thrownMessage !== undefined) {
+          level = 'ERROR';
+          statusMessage = contentMessage(config, thrownMessage);
+        } else if (failure) {
+          level = failure.kind === 'aborted' ? 'WARNING' : 'ERROR';
+          // `failure` is contractually required on error/aborted finishes,
+          // but a non-conformant adapter must never turn observability into
+          // a generator-level TypeError escaping into the agent loop.
+          statusMessage = contentMessage(config, failure.failure?.message ?? 'unknown failure');
+        } else if (!finish) {
+          level = 'WARNING';
+          statusMessage = 'stream closed before the terminal finish chunk';
+        }
+        closeRequest(level, statusMessage);
+        // Partial progress counts on every path: whatever streamed is kept.
         reporter.endGeneration(generation, {
+          name: enhanceWithFirstLine(generationName, text),
           output: outputBody(),
           usage,
           completionStartTime,
-          level: 'ERROR',
+          level,
           statusMessage,
+          metadata: {
+            finishReason: finish?.kind,
+            errorCode: failure?.failure?.code,
+            incomplete: finish ? undefined : true,
+            toolCallCount: toolCalls.length > 0 ? toolCalls.length : undefined,
+          },
         });
-        throw error;
-      } finally {
-        if (!failed) {
-          const failure =
-            finish && (finish.kind === 'error' || finish.kind === 'aborted') ? finish : undefined;
-          // No terminal finish chunk (the consumer abandoned the stream or
-          // the adapter cut it short): the call's outcome is unknown — mark
-          // it instead of posing as a normal completion.
-          let level: ObservationLevel = 'DEFAULT';
-          let statusMessage: string | undefined;
-          if (failure) {
-            level = failure.kind === 'aborted' ? 'WARNING' : 'ERROR';
-            statusMessage = contentMessage(config, failure.failure.message);
-          } else if (!finish) {
-            level = 'WARNING';
-            statusMessage = 'stream closed before the terminal finish chunk';
-          }
-          closeRequest(level, statusMessage);
-          reporter.endGeneration(generation, {
-            output: outputBody(),
-            usage,
-            completionStartTime,
-            level,
-            statusMessage,
-            metadata: {
-              finishReason: finish?.kind,
-              errorCode: failure?.failure.code,
-              incomplete: finish ? undefined : true,
-              toolCallCount: toolCalls.length > 0 ? toolCalls.length : undefined,
-            },
-          });
-        }
       }
     })();
   });
@@ -451,15 +488,15 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   // ------------------------------------------------------------------
   ctx.on('tools/execute', async (exec, next) => {
     const sessionId = exec.agent?.id;
+    // Argument summaries are argument content — they ride captureContent.
+    const argSummary = config.captureContent ? toolCallSummary(exec.arguments) : undefined;
     const span = reporter.startSpan(parentFor(sessionId), {
-      name: `tool:${exec.name}`,
+      name: `tool:${exec.name}${argSummary ? ` [${argSummary}]` : ''}`,
       input: config.captureContent ? exec.arguments : undefined,
       metadata: { callId: exec.callId, toolName: exec.name },
     });
     if (sessionId && span) {
-      const stack = openToolSpans.get(sessionId) ?? [];
-      stack.push(span);
-      openToolSpans.set(sessionId, stack);
+      openToolSpans.set(sessionId, [...(openToolSpans.get(sessionId) ?? []), span]);
     }
     try {
       const result = await next();
