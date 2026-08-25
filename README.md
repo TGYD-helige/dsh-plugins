@@ -6,7 +6,7 @@ Generic, config-driven plugins for [DeepSeek Harness (dsh)](https://github.com/d
 | --- | --- | --- |
 | [`dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) (JSON-RPC + SSE): task create/cancel, streaming, agent card; pluggable task-state stores (memory/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, own HTTP server |
 | [`dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
-| [`dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call, one span per tool call, one trace per turn | `llm/stream` + `tools/execute` waterfalls, `session/event` |
+| [`dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call (plus a nested `llm-request` span with the verbatim loop-built request), one span per tool call, one trace per turn; subagent child sessions nested under the parent's tree | `llm/stream` + `tools/execute` waterfalls, `session/event`, `session/created` + `subagent/start`/`subagent/end` |
 
 ## Status
 
