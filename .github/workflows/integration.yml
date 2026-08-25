@@ -144,11 +144,12 @@ jobs:
         env:
           DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
           DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
-          # dsh-langfuse only: absent keys (fork PRs) flip the scenario to its
-          # fake-ingestion fallback — see the scenario script.
-          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
-          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
-          LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
+          # dsh-langfuse only: blanked on other packages' legs (fork PRs get
+          # no secrets at all and the scenario self-skips Stage B). Absent
+          # keys flip the scenario to its fake-ingestion fallback.
+          LANGFUSE_PUBLIC_KEY: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_PUBLIC_KEY || '' }}
+          LANGFUSE_SECRET_KEY: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_SECRET_KEY || '' }}
+          LANGFUSE_BASE_URL: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_BASE_URL || '' }}
         run: node ".github/scripts/integration/${{ matrix.package }}.mjs"
 
       # Runtime visibility: the full session event log (including
@@ -177,6 +178,7 @@ jobs:
           path: |
             ${{ runner.temp }}/dsh-storage-e2e/dsh.db
             ${{ runner.temp }}/dsh-langfuse-e2e
+            !${{ runner.temp }}/dsh-langfuse-e2e/dsh-home/**
             ${{ runner.temp }}/dsh-home/sessions
 
       - name: Skipped — Stage B (secrets unavailable)

@@ -9,9 +9,12 @@
  *   project, run one seeded LLM query (deepseek-v4-flash, marker file forces
  *   a tool round-trip), then poll the v1 Observations API until the ingested
  *   trace shows the expected shape — the data is really in Langfuse.
- * - fake mode (secrets absent, e.g. fork PRs): same boot against an
- *   in-process fake ingestion endpoint with in-memory assertions, so the leg
- *   still proves the plugin wiring without any secrets.
+ * - fake mode (LANGFUSE_* absent): same boot against an in-process fake
+ *   ingestion endpoint with in-memory assertions, so the leg still proves
+ *   the plugin wiring without a Langfuse instance. Note fork PRs never
+ *   reach this script at all — Stage B is gated on the DSH_INTEGRATION_*
+ *   secrets, which forks don't receive; fake mode covers LANGFUSE-keyless
+ *   same-repo runs and local development.
  *
  * The query runs via async spawn: in fake mode the endpoint lives in THIS
  * process, so the event loop must stay responsive while dsh runs.
@@ -26,11 +29,10 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
 
 // ---------------------------------------------------------------------------
 // Real-Langfuse verification (v1 Observations API — v2 observations is
@@ -38,7 +40,8 @@ import { pathToFileURL } from 'node:url';
 // is never used; works on self-hosted v3 and cloud alike). Ingestion lands
 // piecemeal, so a poll that finds the trace but not the full shape is
 // retried, never failed immediately; 429s honor Retry-After (org-shared rate
-// limits); a 404 (missing route) fails fast. Ported from pi's
+// limits); other 4xx are unhealable client errors and fail fast with a
+// bounded slice of the validation body. Ported from pi's
 // telemetry-langfuse-verify.mjs.
 // ---------------------------------------------------------------------------
 
@@ -51,18 +54,13 @@ const EXPECTED_MODEL = 'deepseek-v4-flash';
 
 // Non-empty trimmed value or fallback — GitHub injects unset secrets as '',
 // which `??` would happily keep.
-export function envOr(value, fallback) {
+function envOr(value, fallback) {
   const trimmed = value?.trim();
   return trimmed ? trimmed : fallback;
 }
 
-export function resolveDeadlineMs(value) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_DEADLINE_MS;
-}
-
 // Returns a list of problems; empty list means the trace fully matches.
-export function evaluateTrace(observations, codeword) {
+function evaluateTrace(observations, codeword) {
   const spans = observations.filter((o) => o.type === 'SPAN');
   const generations = observations.filter((o) => o.type === 'GENERATION');
   const problems = [];
@@ -114,7 +112,7 @@ export function evaluateTrace(observations, codeword) {
 // it, and the child's own generation + tool span nested one level deeper —
 // all inside the ONE parent trace (a child leaking its own trace fails the
 // delegation-span check).
-export function evaluateSubagentTrace(observations, codeword) {
+function evaluateSubagentTrace(observations, codeword) {
   const spans = observations.filter((o) => o.type === 'SPAN');
   const generations = observations.filter((o) => o.type === 'GENERATION');
   const problems = [];
@@ -164,60 +162,57 @@ export function evaluateSubagentTrace(observations, codeword) {
 }
 
 // Fake-mode captures are upsert envelopes ({type, body} sharing observation
-// ids); fold them into the observation shape the evaluators consume.
-export function capturedToObservations(captured) {
+// ids); fold them into the observation shape the evaluators consume. Span and
+// generation bodies never carry a `type` of their own, so it doubles as the
+// observation kind.
+function capturedToObservations(captured) {
   const byId = new Map();
   for (const e of captured) {
     if (!e.body?.id || !/^(span|generation)-/.test(e.type)) continue;
     const kind = e.type.startsWith('generation-') ? 'GENERATION' : 'SPAN';
-    byId.set(e.body.id, { ...byId.get(e.body.id), ...e.body, __kind: kind });
+    byId.set(e.body.id, { ...byId.get(e.body.id), ...e.body, type: kind });
   }
-  return [...byId.values()].map(({ __kind, ...body }) => ({ ...body, type: __kind }));
+  return [...byId.values()];
 }
 
 // Polls the v1 Observations API until a codeworded generation's trace matches
-// the expected shape or the deadline passes. Returns { ok, state } — the
-// caller owns logging and process exit so tests can drive this with a fake
-// fetch.
-export async function runVerification({
+// the expected shape or the deadline passes. Returns { ok, state }.
+async function runVerification({
   baseUrl,
   publicKey,
   secretKey,
   fromStartTime,
   codeword,
   evaluate = evaluateTrace,
-  deadlineMs = DEFAULT_DEADLINE_MS,
-  fetchImpl = fetch,
-  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-  log = () => {},
 }) {
   const origin = envOr(baseUrl, DEFAULT_BASE_URL).replace(/\/+$/, '');
-  const limit = resolveDeadlineMs(deadlineMs);
-  const deadline = Date.now() + limit;
+  const deadline = Date.now() + DEFAULT_DEADLINE_MS;
   const auth = `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString('base64')}`;
 
   async function fetchObservations(params) {
     const rows = [];
     for (let page = 1; page <= MAX_PAGES; page += 1) {
+      // Small pages on purpose: the API docs warn that large page sizes
+      // trigger request errors on some deployments.
       const query = new URLSearchParams({
         fromStartTime,
-        limit: '1000',
+        limit: '100',
         page: String(page),
         ...params,
       });
       // A hung fetch must not outlive the polling deadline.
       const remaining = deadline - Date.now();
-      const response = await fetchImpl(`${origin}/api/public/observations?${query}`, {
+      const response = await fetch(`${origin}/api/public/observations?${query}`, {
         headers: { authorization: auth, accept: 'application/json' },
         signal: AbortSignal.timeout(Math.min(REQUEST_TIMEOUT_MS, Math.max(1000, remaining))),
       });
-      if (response.status === 404) {
-        // A missing route never heals — retrying burns the whole deadline.
-        // Self-hosted v3 exposes only the v1 API (v2 is cloud/v4-only).
+      // 4xx is a client error that never heals by retrying — fail fast, and
+      // include a bounded slice of the validation body (it quotes the query,
+      // never the auth header) so the CI log shows the actual complaint.
+      if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+        const detail = (await response.text()).slice(0, 300);
         throw Object.assign(
-          new Error(
-            `observations API not found at ${origin} (HTTP 404) — wrong baseUrl, or a v2-only path on self-hosted v3`,
-          ),
+          new Error(`Langfuse observations query rejected (HTTP ${response.status}): ${detail}`),
           { fatal: true },
         );
       }
@@ -234,7 +229,7 @@ export async function runVerification({
         });
       }
       if (!response.ok) {
-        // Status only — a response body can carry request details or internals.
+        // Status only — a 5xx body can carry request details or internals.
         throw new Error(`Langfuse observations query failed with HTTP ${response.status}`);
       }
       // Parse manually: response.json() error messages embed a snippet of the
@@ -252,9 +247,8 @@ export async function runVerification({
   }
 
   let lastState = 'no candidate trace seen yet';
-  let waitMs = POLL_INTERVAL_MS;
   while (true) {
-    waitMs = POLL_INTERVAL_MS;
+    let waitMs = POLL_INTERVAL_MS;
     try {
       // Discovery: the turn's generation carries the codeword in its IO (the
       // prompt mentions the marker file; tool-call arguments repeat it).
@@ -267,22 +261,22 @@ export async function runVerification({
 
       for (const traceId of traceIds) {
         const observations = await fetchObservations({ traceId });
-        log(`--- candidate trace ${traceId}: ${observations.length} observation(s) ---`);
+        console.log(`--- candidate trace ${traceId}: ${observations.length} observation(s) ---`);
         for (const o of observations) {
-          log(`  ${o.type}:${o.name} parent=${o.parentObservationId ?? 'null'} end=${o.endTime ?? 'null'}`);
+          console.log(`  ${o.type}:${o.name} parent=${o.parentObservationId ?? 'null'} end=${o.endTime ?? 'null'}`);
         }
         const problems = evaluate(observations, codeword);
         if (problems.length === 0) {
           return { ok: true, state: `trace ${traceId} matches the expected dsh-langfuse shape` };
         }
         lastState = `trace ${traceId} incomplete: ${problems.join('; ')}`;
-        log(`  not complete yet: ${problems.join('; ')}`);
+        console.log(`  not complete yet: ${problems.join('; ')}`);
       }
       if (traceIds.length === 0) {
         lastState = 'no trace with the codeword seen yet';
       }
     } catch (error) {
-      log(`Langfuse poll failed: ${error.message}`);
+      console.log(`Langfuse poll failed: ${error.message}`);
       lastState = `poll error: ${error.message}`;
       // Fatal errors (e.g. a route that does not exist) abort the whole
       // verification now instead of timing out the deadline.
@@ -293,7 +287,9 @@ export async function runVerification({
     if (Date.now() > deadline) {
       return { ok: false, state: lastState };
     }
-    await sleep(Math.min(waitMs, Math.max(0, deadline - Date.now())));
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(waitMs, Math.max(0, deadline - Date.now()))),
+    );
   }
 }
 
@@ -417,6 +413,10 @@ async function main() {
 `,
   );
   if (!realMode) console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);
+  // The patch carries the real keys in real mode — it must not outlive the
+  // scenario (CI uploads artifacts from the runner; process 'exit' also
+  // covers the throw paths).
+  process.once('exit', () => rmSync(patchPath, { force: true }));
 
   // 3. Two seeded queries, each forcing a tool round-trip. The marker FILE
   //    NAME is the codeword: it flows into the tool span's input and the
@@ -467,76 +467,59 @@ async function main() {
     });
   }
 
-  const spans = () => captured.filter((e) => e.type === 'span-create').map((e) => e.body);
-  const markerSpan = (file) =>
-    spans().find(
-      (b) => String(b.name).startsWith('tool:') && JSON.stringify(b.input ?? '').includes(file),
-    );
-  const log = (message) => console.log(message);
-
   // deepseek-v4-flash through the gateway stochastically garbles tool calls
-  // (observed in CI), so attempts retry. Fake mode gates cheaply on the
-  // captured shapes; real mode gates on the Langfuse read-back itself.
+  // (observed in CI), so attempts retry. Fake mode gates on the captured
+  // shapes via the same evaluator; real mode gates on the Langfuse read-back.
   const maxAttempts = realMode ? 2 : 3;
+  async function runPhase(phase, prompt, codeword, evaluate) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      console.log(`\n(${phase} attempt ${attempt}/${maxAttempts})`);
+      captured.length = 0;
+      await runQuery(prompt);
+      let result;
+      if (realMode) {
+        result = await runVerification({
+          baseUrl,
+          publicKey,
+          secretKey,
+          fromStartTime: runStartedAt,
+          codeword,
+          evaluate,
+        });
+      } else {
+        const problems = evaluate(capturedToObservations(captured), codeword);
+        result =
+          problems.length === 0
+            ? { ok: true, state: 'captured shape matches' }
+            : { ok: false, state: problems.join('; ') };
+      }
+      if (result.ok) return result;
+      console.log(`::warning::${phase} attempt ${attempt} did not verify: ${result.state}`);
+    }
+    return { ok: false, state: `${phase}: attempts exhausted` };
+  }
 
   // --- Phase 1: direct marker read → trace / generation / tool span --------
-  let verified1 = null;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    console.log(`\n(phase 1 attempt ${attempt}/${maxAttempts})`);
-    captured.length = 0;
-    await runQuery(prompt1);
-    if (realMode) {
-      verified1 = await runVerification({
-        baseUrl,
-        publicKey,
-        secretKey,
-        fromStartTime: runStartedAt,
-        codeword,
-        log,
-      });
-      if (verified1.ok) break;
-      console.log(`::warning::phase 1 attempt ${attempt} did not verify: ${verified1.state}`);
-    } else if (markerSpan(markerFile)) {
-      break;
-    } else {
-      console.log('::warning::phase 1 attempt produced no marker-bearing tool span');
-    }
-  }
+  const phase1 = await runPhase('phase 1', prompt1, codeword, evaluateTrace);
 
   // Phase-1 assertions.
   if (realMode) {
-    assert(verified1?.ok, `phase 1 Langfuse verification failed: ${verified1?.state ?? 'never ran'}`);
+    assert(phase1.ok, `phase 1 Langfuse verification failed: ${phase1.state}`);
   } else {
-    // Fake mode: assert the captured tree. The SDK envelope is upsert-based:
-    // creates and later updates share the observation id, so match follow-ups
-    // loosely by id instead of betting on exact event-type spellings.
+    // Fake mode: the loop already proved the shape; trace-level extras get
+    // their own checks.
     console.log(`\n--- captured ${captured.length} ingestion events ---`);
     for (const e of captured) console.log(` ${e.type} ${JSON.stringify(e.body).slice(0, 160)}`);
 
-    const traces = captured.filter((e) => e.type === 'trace-create').map((e) => e.body);
-    const generations = captured.filter((e) => e.type === 'generation-create').map((e) => e.body);
-
-    const trace = traces.find((b) => b.name === 'dsh-turn' && b.sessionId);
+    const trace = captured.find(
+      (e) => e.type === 'trace-create' && e.body?.name === 'dsh-turn' && e.body?.sessionId,
+    )?.body;
     assert(trace, 'no dsh-turn trace with a sessionId was ingested');
-    const traceEvents = captured.filter((e) => e.body?.id === trace.id);
-
-    const generation = generations.find(
-      (b) => b.traceId === trace.id && b.model === EXPECTED_MODEL,
-    );
-    assert(generation, `no ${EXPECTED_MODEL} generation under the turn trace`);
-    const ended = captured.find(
-      (e) => e.body?.id === generation.id && (e.body.usage || e.body.usageDetails),
-    );
-    assert(ended, 'generation never closed with token usage');
-    const totalTokens = ended.body.usage?.total ?? ended.body.usageDetails?.total ?? 0;
-    assert(totalTokens > 0, `generation total token usage is ${totalTokens}`);
-
-    const toolSpan = markerSpan(markerFile);
-    assert(toolSpan, 'no marker-bearing tool span — the model did not read the marker file');
-    assert(toolSpan.traceId === trace.id, 'tool span is not parented under the turn trace');
+    assert(phase1.ok, `phase 1 shape incomplete: ${phase1.state}`);
 
     // Turn-boundary metadata rides session events near process teardown —
     // useful signal, but the exact flush timing is dsh's business: warn only.
+    const traceEvents = captured.filter((e) => e.body?.id === trace.id);
     if (!traceEvents.some((e) => e.body?.metadata?.endReason)) {
       console.log('::warning::turn trace has no endReason metadata');
     }
@@ -547,50 +530,22 @@ async function main() {
 
   // --- Phase 2: subagent delegation → delegation span / subagent span /
   //    child generation + child tool span, all in the one parent trace ------
-  let verified2 = null;
-  let fakeSubagentTree = false;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    console.log(`\n(phase 2 attempt ${attempt}/${maxAttempts})`);
-    captured.length = 0;
-    await runQuery(prompt2);
-    if (realMode) {
-      verified2 = await runVerification({
-        baseUrl,
-        publicKey,
-        secretKey,
-        fromStartTime: runStartedAt,
-        codeword: codeword2,
-        evaluate: evaluateSubagentTrace,
-        log,
-      });
-      if (verified2.ok) break;
-      console.log(`::warning::phase 2 attempt ${attempt} did not verify: ${verified2.state}`);
-    } else {
-      const problems = evaluateSubagentTrace(capturedToObservations(captured), codeword2);
-      if (problems.length === 0) {
-        fakeSubagentTree = true;
-        break;
-      }
-      console.log(`::warning::phase 2 attempt shape incomplete: ${problems.join('; ')}`);
-    }
-  }
+  const phase2 = await runPhase('phase 2', prompt2, codeword2, evaluateSubagentTrace);
 
   // Phase-2 assertions.
   if (realMode) {
-    assert(verified2?.ok, `phase 2 Langfuse verification failed: ${verified2?.state ?? 'never ran'}`);
-    console.log(`\nSCENARIO_OK (phase 1: ${verified1.state}; phase 2: ${verified2.state})`);
+    assert(phase2.ok, `phase 2 Langfuse verification failed: ${phase2.state}`);
+    console.log(`\nSCENARIO_OK (phase 1: ${phase1.state}; phase 2: ${phase2.state})`);
     return;
   }
-  assert(fakeSubagentTree, 'phase 2 subagent tree incomplete after all attempts');
+  assert(phase2.ok, `phase 2 subagent tree incomplete: ${phase2.state}`);
   console.log(
     `\nSCENARIO_OK (phase 1 captured, phase 2 subagent tree verified; events=${captured.length})`,
   );
   fakeServer?.close();
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch((error) => {
-    console.error(`::error::${error.message}`);
-    process.exit(1);
-  });
-}
+main().catch((error) => {
+  console.error(`::error::${error.message}`);
+  process.exit(1);
+});
