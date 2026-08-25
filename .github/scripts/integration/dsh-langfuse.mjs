@@ -7,7 +7,7 @@
  * - real mode (LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY present): boot the
  *   dsh headless profile with the packed plugin pointed at the REAL Langfuse
  *   project, run one seeded LLM query (deepseek-v4-flash, marker file forces
- *   a tool round-trip), then poll the Observations API v2 until the ingested
+ *   a tool round-trip), then poll the v1 Observations API until the ingested
  *   trace shows the expected shape — the data is really in Langfuse.
  * - fake mode (secrets absent, e.g. fork PRs): same boot against an
  *   in-process fake ingestion endpoint with in-memory assertions, so the leg
@@ -33,11 +33,13 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 // ---------------------------------------------------------------------------
-// Real-Langfuse verification (Observations API v2 — the deprecated
-// /api/public/traces read path is never used). Ingestion lands piecemeal, so
-// a poll that finds the trace but not the full shape is retried, never failed
-// immediately; 429s honor Retry-After (org-shared rate limits). Ported from
-// pi's telemetry-langfuse-verify.mjs.
+// Real-Langfuse verification (v1 Observations API — v2 observations is
+// cloud/self-hosted-v4 only, and the deprecated /api/public/traces read path
+// is never used; works on self-hosted v3 and cloud alike). Ingestion lands
+// piecemeal, so a poll that finds the trace but not the full shape is
+// retried, never failed immediately; 429s honor Retry-After (org-shared rate
+// limits); a 404 (missing route) fails fast. Ported from pi's
+// telemetry-langfuse-verify.mjs.
 // ---------------------------------------------------------------------------
 
 const DEFAULT_BASE_URL = 'https://cloud.langfuse.com';
@@ -98,7 +100,7 @@ export function evaluateTrace(observations, codeword) {
   return problems;
 }
 
-// Polls the Observations API v2 until a codeworded generation's trace matches
+// Polls the v1 Observations API until a codeworded generation's trace matches
 // the expected shape or the deadline passes. Returns { ok, state } — the
 // caller owns logging and process exit so tests can drive this with a fake
 // fetch.
@@ -120,22 +122,29 @@ export async function runVerification({
 
   async function fetchObservations(params) {
     const rows = [];
-    let cursor;
-    for (let page = 0; page < MAX_PAGES; page += 1) {
+    for (let page = 1; page <= MAX_PAGES; page += 1) {
       const query = new URLSearchParams({
-        fields: 'core,basic,io',
         fromStartTime,
-        toStartTime: new Date().toISOString(),
         limit: '1000',
+        page: String(page),
         ...params,
       });
-      if (cursor) query.set('cursor', cursor);
       // A hung fetch must not outlive the polling deadline.
       const remaining = deadline - Date.now();
-      const response = await fetchImpl(`${origin}/api/public/v2/observations?${query}`, {
+      const response = await fetchImpl(`${origin}/api/public/observations?${query}`, {
         headers: { authorization: auth, accept: 'application/json' },
         signal: AbortSignal.timeout(Math.min(REQUEST_TIMEOUT_MS, Math.max(1000, remaining))),
       });
+      if (response.status === 404) {
+        // A missing route never heals — retrying burns the whole deadline.
+        // Self-hosted v3 exposes only the v1 API (v2 is cloud/v4-only).
+        throw Object.assign(
+          new Error(
+            `observations API not found at ${origin} (HTTP 404) — wrong baseUrl, or a v2-only path on self-hosted v3`,
+          ),
+          { fatal: true },
+        );
+      }
       if (response.status === 429) {
         // Rate limits are shared per organization — honor Retry-After
         // instead of burning the deadline on failures.
@@ -161,8 +170,7 @@ export async function runVerification({
         throw new Error('Langfuse observations query returned invalid JSON');
       }
       rows.push(...(body.data ?? []));
-      cursor = body.meta?.cursor;
-      if (!cursor) return rows;
+      if (page >= (body.meta?.totalPages ?? 1)) return rows;
     }
     throw new Error(`Langfuse observations query exceeded ${MAX_PAGES} pages`);
   }
@@ -200,6 +208,9 @@ export async function runVerification({
     } catch (error) {
       log(`Langfuse poll failed: ${error.message}`);
       lastState = `poll error: ${error.message}`;
+      // Fatal errors (e.g. a route that does not exist) abort the whole
+      // verification now instead of timing out the deadline.
+      if (error.fatal) return { ok: false, state: lastState };
       if (error.retryAfterMs) waitMs = error.retryAfterMs;
     }
 
