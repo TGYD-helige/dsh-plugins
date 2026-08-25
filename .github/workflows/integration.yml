@@ -1,0 +1,235 @@
+name: Integration
+
+# Per-package E2E: boot the real dsh headless profile with the packed plugin,
+# run one LLM query, and verify the plugin's observable effect. A package
+# joins the matrix by shipping `.github/scripts/integration/<package>.mjs` —
+# see .github/scripts/integration-matrix.mjs.
+#
+# Two leg shapes, split because `environment` is job-level:
+# - scenario: the base LLM leg. It receives DSH_INTEGRATION_* secrets and
+#   executes PR-modifiable scenario scripts, so it is gated behind the
+#   `integration` environment (required reviewers configured in repo settings;
+#   until then GitHub auto-creates it unprotected and the leg just runs).
+#   Fork PRs get no secrets and Stage B self-skips.
+# - scenario-backends: backend-only provider legs (db push + real backend
+#   writes/reads against a service database). No secrets anywhere — they run
+#   ungated, including on fork PRs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # dsh is developer preview — pin the CLI under test (AGENTS.md compat stance).
+  DSH_CLI_VERSION: 0.1.0-rc.7
+
+jobs:
+  detect:
+    name: Detect integration scenarios
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      backend_matrix: ${{ steps.select.outputs.backend_matrix }}
+      has_scenarios: ${{ steps.select.outputs.has_scenarios }}
+      has_backends: ${{ steps.select.outputs.has_backends }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select packages with an integration scenario
+        id: select
+        run: node .github/scripts/integration-matrix.mjs
+
+  scenario:
+    name: E2E (${{ matrix.package }})
+    needs: detect
+    if: needs.detect.outputs.has_scenarios == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: integration
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+      # Only the availability flag at job level — the secrets themselves enter
+      # no step except Stage B, so PR-modified install/build scripts never see
+      # them. Fork PRs evaluate to 'false' (no secrets are exposed to forks).
+      DSH_SECRETS_AVAILABLE: ${{ secrets.DSH_INTEGRATION_BASE_URL != '' && secrets.DSH_INTEGRATION_API_KEY != '' }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm version comes from the packageManager field in package.json —
+      # do not set it here too (pnpm/action-setup errors on duplicates).
+      - uses: pnpm/action-setup@v4
+
+      # Node 24 (not ci.yml's 22): scenario scripts read SQLite through
+      # node:sqlite, which is unflagged since 23.4.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm build
+
+      # Pin DSH_HOME inside the workspace temp so the profile, sessions, and
+      # db land in one artifact-able place (job-level env can't see
+      # runner.temp — that broke this workflow once; steps see it fine).
+      - name: Prepare DSH_HOME
+        run: echo "DSH_HOME=$RUNNER_TEMP/dsh-home" >> "$GITHUB_ENV"
+
+      - name: Pack the plugin tarball
+        run: |
+          set -euo pipefail
+          # pnpm pack may print a bare filename or an absolute path depending
+          # on version — always reduce to the basename.
+          name="$(cd "packages/${{ matrix.package }}" && pnpm pack --pack-destination "$RUNNER_TEMP" | tail -n1)"
+          echo "tarball: $name"
+          echo "DSH_PKG_TARBALL=$RUNNER_TEMP/$(basename "$name")" >> "$GITHUB_ENV"
+
+      - name: Install the dsh CLI (pinned)
+        run: |
+          set -euo pipefail
+          # `dsh plugin` forwards to pnpm; the profile template's pnpm-workspace
+          # settings (nodeLinker: hoisted, autoInstallPeers: false) need pnpm 10.
+          # pnpm/action-setup's 9.x lives in PNPM_HOME and shadows npm-global —
+          # override PATH wholesale so npm-global wins (GITHUB_PATH only prepends).
+          # npm's allow-scripts gate: dsh's subprocess helper needs its postinstall.
+          npm i -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs \
+            "@deepseek-ai/dsh@${{ env.DSH_CLI_VERSION }}" pnpm@10
+          echo "PATH=$(npm prefix -g)/bin:$PATH" >> "$GITHUB_ENV"
+          dsh --version
+          pnpm --version
+
+      # dsh-llm-deepseek (rc.7/rc.8) loses tool-call id/name when the gateway
+      # sends explicit empty strings in later tool-call deltas: the `!== void 0`
+      # guards let "" overwrite the accumulated values, so the assembled block
+      # ends up as unknown tool "". Patch the installed adapter to truthy
+      # guards until dsh ships the upstream fix (grep fails loudly on drift).
+      - name: Patch dsh-llm-deepseek tool-call assembly (upstream bug workaround)
+        run: |
+          set -euo pipefail
+          adapter="$(find "$(npm prefix -g)/lib/node_modules" -path '*dsh-llm-deepseek/lib/index.js' | head -1)"
+          echo "patching $adapter"
+          sed -i \
+            -e 's/if (call\.id !== void 0) block\.callId = call\.id;/if (call.id) block.callId = call.id;/' \
+            -e 's/if (call\.function?\.name !== void 0) block\.name = call\.function\.name;/if (call.function?.name) block.name = call.function.name;/' \
+            "$adapter"
+          grep -n 'if (call.id) block.callId' "$adapter"
+          grep -n 'if (call.function?.name) block.name' "$adapter"
+
+      # Stage A: the bundle installs and composes into the headless profile.
+      # No LLM call and no secrets needed.
+      - name: Stage A — bundle composes into the headless profile
+        run: |
+          set -euo pipefail
+          dsh plugin --profile headless add "$DSH_PKG_TARBALL"
+          dsh --profile headless --dump-config | tee /tmp/dsh-config.yml
+          grep -F "name: ${{ matrix.package }}" /tmp/dsh-config.yml
+
+      # Stage B: the package's scenario script — the real LLM round-trip.
+      # Secrets are scoped to this step only.
+      - name: Stage B — run scenario
+        if: env.DSH_SECRETS_AVAILABLE == 'true'
+        env:
+          DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
+          DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
+        run: node ".github/scripts/integration/${{ matrix.package }}.mjs"
+
+      # Runtime visibility: the full session event log (including
+      # request/header — what the model actually saw) lives in the profile's
+      # sessions dir as zstd-compressed jsonl. Dump it on every outcome.
+      - name: Dump dsh session event log
+        if: always()
+        run: |
+          set -euo pipefail
+          if ! command -v zstd >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq zstd
+          fi
+          shopt -s globstar nullglob
+          for f in "$DSH_HOME"/sessions/**/session.jsonl.zstd; do
+            echo "== $f =="
+            zstd -dc "$f"
+          done
+
+      - name: Upload E2E artifacts (db + sessions)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-${{ matrix.package }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/dsh-storage-e2e/dsh.db
+            ${{ runner.temp }}/dsh-home/sessions
+
+      - name: Skipped — Stage B (secrets unavailable)
+        if: env.DSH_SECRETS_AVAILABLE != 'true'
+        run: |
+          echo "::warning::DSH_INTEGRATION_BASE_URL or DSH_INTEGRATION_API_KEY secret not set — skipping Stage B."
+
+  scenario-backends:
+    name: E2E (${{ matrix.package }}-${{ matrix.provider }})
+    needs: detect
+    if: needs.detect.outputs.has_backends == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect.outputs.backend_matrix) }}
+    env:
+      DSH_PROVIDER: ${{ matrix.provider }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm build
+
+      # Backend-only provider legs: no dsh boot, no LLM, no secrets — just a
+      # real service database, db push, and backend writes/reads. They also
+      # run on fork PRs (forks receive no secrets and nothing is needed).
+      - name: Start service database (${{ matrix.provider }})
+        run: |
+          set -euo pipefail
+          case "${{ matrix.provider }}" in
+            mysql)
+              docker run -d --name ci-db -p 3306:3306 -e MYSQL_ROOT_PASSWORD='Dsh_ci_Passw0rd' -e MYSQL_DATABASE=dsh mysql:8.4
+              echo 'DSH_DB_URL=mysql://root:Dsh_ci_Passw0rd@127.0.0.1:3306/dsh' >> "$GITHUB_ENV"
+              until docker exec ci-db mysql -uroot -pDsh_ci_Passw0rd -e 'SELECT 1' >/dev/null 2>&1; do sleep 2; done
+              ;;
+            postgresql)
+              docker run -d --name ci-db -p 5432:5432 -e POSTGRES_PASSWORD='Dsh_ci_Passw0rd' -e POSTGRES_DB=dsh postgres:16-alpine
+              echo 'DSH_DB_URL=postgresql://postgres:Dsh_ci_Passw0rd@127.0.0.1:5432/dsh' >> "$GITHUB_ENV"
+              until docker exec ci-db pg_isready -U postgres >/dev/null 2>&1; do sleep 2; done
+              ;;
+            sqlserver)
+              docker run -d --name ci-db -p 1433:1433 -e ACCEPT_EULA=Y -e 'SA_PASSWORD=Dsh_ci_Passw0rd!' mcr.microsoft.com/mssql/server:2022-latest
+              echo 'DSH_DB_URL=sqlserver://127.0.0.1:1433;database=dsh;user=sa;password=Dsh_ci_Passw0rd!;encrypt=true;trustServerCertificate=true' >> "$GITHUB_ENV"
+              until docker exec ci-db /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Dsh_ci_Passw0rd!' -C -Q 'SELECT 1' >/dev/null 2>&1; do sleep 2; done
+              docker exec ci-db /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Dsh_ci_Passw0rd!' -C -Q 'CREATE DATABASE dsh'
+              ;;
+            *) echo "::error::unknown provider ${{ matrix.provider }}" && exit 1 ;;
+          esac
+
+      # Stage B: the package's scenario script in backend-only mode. No
+      # secrets are passed on these legs, ever.
+      - name: Stage B — run scenario
+        run: node ".github/scripts/integration/${{ matrix.package }}.mjs"

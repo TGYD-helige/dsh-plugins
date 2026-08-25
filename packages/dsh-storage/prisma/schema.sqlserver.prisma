@@ -1,0 +1,73 @@
+// Prisma schema for the dsh-storage database backend — SQL Server variant (Prisma 7).
+//
+// Same models as schema.mysql.prisma, with SQL Server native types. Prisma's
+// sqlserver connector has NO Json type, so every JSON column is a plain text
+// column here — the backend serializes them on write automatically (derived
+// from `provider: sqlserver`; SQL Server's own ISJSON/JSON_VALUE still query
+// the text as JSON).
+//
+// Connection URL shape (parsed by the backend into a node-mssql config):
+//   sqlserver://host:1433;database=dbname;user=sa;password=p;encrypt=true;trustServerCertificate=true
+// Client pre-generation and table creation work as described in
+// schema.mysql.prisma's header.
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/sqlserver"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "sqlserver"
+}
+
+/// One row per projected session event (user message, assistant message,
+/// tool call/result, compression snapshot, ...).
+model AiMessage {
+  id            String    @id @default(cuid()) @db.Char(36)
+  sessionId     String    @map("session_id") @db.VarChar(100)
+  historyId     String?   @map("history_id") @db.Char(36)
+  type          String    @db.VarChar(50)
+  content       String    @db.NVarChar(Max)
+  thoughts      String?   @db.NVarChar(Max)
+  model         String?   @db.VarChar(100)
+  tokens        String?   @db.NVarChar(Max)
+  toolCalls     String?   @map("tool_calls") @db.NVarChar(Max)
+  agentId       String?   @map("agent_id") @db.VarChar(100)
+  metadata      String?   @db.NVarChar(Max)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.DateTime2
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at") @db.DateTime2
+  deletedAt     DateTime? @map("deleted_at") @db.DateTime2
+
+  // Relations
+  history       AiChatHistory? @relation(fields: [historyId], references: [id], onDelete: NoAction)
+
+  @@index([sessionId], map: "idx_session")
+  @@index([historyId], map: "idx_history")
+  @@index([createdAt], map: "idx_created")
+  @@index([deletedAt], map: "idx_deleted")
+  @@index([agentId], map: "idx_agent")
+  @@index([sessionId, agentId, type, createdAt], map: "idx_session_agent_type_created")
+  @@map("ai_messages")
+}
+
+/// Per-session rollup, maintained incrementally by the projector.
+model AiChatHistory {
+  id             String    @id @default(cuid()) @db.Char(36)
+  sessionId      String    @map("session_id") @db.VarChar(100)
+  title          String?   @db.VarChar(255)
+  summary        String?   @db.NVarChar(Max)
+  messageCount   Int       @default(0) @map("message_count")
+  totalTokens    BigInt    @default(0) @map("total_tokens")
+  firstMessageAt DateTime? @map("first_message_at") @db.DateTime2
+  lastMessageAt  DateTime? @map("last_message_at") @db.DateTime2
+  metadata       String?   @db.NVarChar(Max)
+  deletedAt      DateTime? @map("deleted_at") @db.DateTime2
+
+  // Relations
+  messages       AiMessage[]
+
+  @@index([sessionId], map: "idx_chat_history_session")
+  @@index([deletedAt], map: "idx_chat_history_deleted")
+  @@map("ai_chat_histories")
+}

@@ -34,6 +34,12 @@
     }
   },
   "files": {
-    "includes": ["packages/**/*.ts", "*.json", "*.yaml", ".github/**/*.yml"]
+    "includes": [
+      "packages/**/*.ts",
+      "!packages/dsh-storage/src/generated",
+      "*.json",
+      "*.yaml",
+      ".github/**/*.yml"
+    ]
   }
 }

@@ -1,0 +1,114 @@
+name: DSH Code Review
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+
+concurrency:
+  group: dsh-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: DSH code review
+    if: github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # pull_request_target provides secrets, so only trusted base code is
+      # checked out. PR files are passed to DSH as untrusted review data.
+      - name: Check out trusted base revision
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Prepare isolated DSH directories
+        run: |
+          set -euo pipefail
+          {
+            echo "DSH_HOME=$RUNNER_TEMP/dsh-review-home"
+            echo "DSH_REVIEW_CONTEXT=$RUNNER_TEMP/dsh-review-context.md"
+            echo "DSH_REVIEW_OUTPUT=$RUNNER_TEMP/dsh-review-output.json"
+            echo "DSH_REVIEW_STDERR=$RUNNER_TEMP/dsh-review-stderr.log"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify review credentials
+        env:
+          DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
+          DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$DSH_INTEGRATION_BASE_URL" || { echo '::error::DSH_INTEGRATION_BASE_URL is not configured'; exit 1; }
+          test -n "$DSH_INTEGRATION_API_KEY" || { echo '::error::DSH_INTEGRATION_API_KEY is not configured'; exit 1; }
+
+      - name: Install DSH (pinned)
+        run: |
+          npm install --global @deepseek-ai/dsh@0.1.0-rc.7
+          dsh --version
+
+      - name: Prepare untrusted PR data for review
+        uses: actions/github-script@v9
+        env:
+          CONTEXT_PATH: ${{ runner.temp }}/dsh-review-context.md
+        with:
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const scriptUrl = pathToFileURL(`${process.env.GITHUB_WORKSPACE}/.github/scripts/publish-dsh-review.mjs`);
+            const { prepareDshReview } = await import(scriptUrl.href);
+            await prepareDshReview({ github, context, core, contextPath: process.env.CONTEXT_PATH });
+
+      - name: Run DSH code review
+        env:
+          DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
+          DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
+          DSH_PERMISSION_MODE: read-only
+          DSH_TELEMETRY_DISABLED: '1'
+        run: |
+          set -euo pipefail
+          if ! dsh \
+            --profile headless \
+            --patch .github/dsh-review/model.patch.yml \
+            'Run the trusted code review task.' \
+            > "$DSH_REVIEW_OUTPUT" \
+            2> "$DSH_REVIEW_STDERR"; then
+            echo '::error::DSH code review failed'
+            tail -n 200 "$DSH_REVIEW_STDERR"
+            exit 1
+          fi
+          test -s "$DSH_REVIEW_OUTPUT" || { echo '::error::DSH review returned no output'; exit 1; }
+
+      - name: Publish review comment
+        uses: actions/github-script@v9
+        env:
+          REVIEW_PATH: ${{ runner.temp }}/dsh-review-output.json
+        with:
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const scriptUrl = pathToFileURL(`${process.env.GITHUB_WORKSPACE}/.github/scripts/publish-dsh-review.mjs`);
+            const { publishDshReview } = await import(scriptUrl.href);
+            await publishDshReview({ github, context, core, reviewPath: process.env.REVIEW_PATH });
+
+      - name: Upload DSH review artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dsh-review-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/dsh-review-output.json
+            ${{ runner.temp }}/dsh-review-stderr.log

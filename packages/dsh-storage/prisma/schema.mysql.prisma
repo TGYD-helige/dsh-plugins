@@ -1,4 +1,4 @@
-// Prisma schema for the dsh-storage database backend.
+// Prisma schema for the dsh-storage database backend — MySQL variant (Prisma 7).
 //
 // Table layout matches the source project's ai_messages / ai_chat_histories
 // (packages/core/prisma/schema.prisma) so existing data stays compatible:
@@ -7,16 +7,20 @@
 //   - `agent_id` distinguishes the main agent from subagent writers.
 //   - no user_id: tenancy is carried by session_id, not a column.
 //
-// Switch `provider` to "postgresql" if needed. Run `npx prisma generate`
-// (and `npx prisma db push` / migrations) before enabling the database backend.
+// The client is pre-generated at package build time (`pnpm generate`, output
+// src/generated/mysql, compiled into lib/generated) — consumers do NOT run
+// `prisma generate`. To create/upgrade tables, run `prisma db push` /
+// migrations against this file; the connection URL lives in prisma.config.ts
+// (Prisma 7 dropped datasource.url from the schema).
 
 generator client {
-  provider = "prisma-client-js"
+  provider            = "prisma-client"
+  output              = "../src/generated/mysql"
+  importFileExtension = "js"
 }
 
 datasource db {
   provider = "mysql"
-  url      = env("DATABASE_URL")
 }
 
 /// One row per projected session event (user message, assistant message,
@@ -49,8 +53,7 @@ model AiMessage {
   @@map("ai_messages")
 }
 
-/// Per-session rollup, maintained incrementally by the projector and
-/// finalized on session disposal / archive.
+/// Per-session rollup, maintained incrementally by the projector.
 model AiChatHistory {
   id             String    @id @default(cuid()) @db.Char(36)
   sessionId      String    @map("session_id") @db.VarChar(100)
@@ -60,7 +63,6 @@ model AiChatHistory {
   totalTokens    BigInt    @default(0) @map("total_tokens")
   firstMessageAt DateTime? @map("first_message_at") @db.DateTime(6)
   lastMessageAt  DateTime? @map("last_message_at") @db.DateTime(6)
-  archivedAt     DateTime  @default(now()) @map("archived_at") @db.DateTime(6)
   metadata       Json?
   deletedAt      DateTime? @map("deleted_at") @db.DateTime(6)
 
@@ -68,7 +70,6 @@ model AiChatHistory {
   messages       AiMessage[]
 
   @@index([sessionId], map: "idx_chat_history_session")
-  @@index([archivedAt], map: "idx_chat_history_archived")
   @@index([deletedAt], map: "idx_chat_history_deleted")
   @@map("ai_chat_histories")
 }

@@ -3,3 +3,7 @@ lib/
 *.tgz
 *.log
 .DS_Store
+.idea/
+
+# Prisma pre-generated clients (rebuilt by `pnpm generate`)
+packages/dsh-storage/src/generated/

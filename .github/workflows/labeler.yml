@@ -1,0 +1,47 @@
+name: PR Labeler
+
+# Rule-based labels are available to every PR. DeepSeek proposes a priority
+# only for same-repository PRs with no existing P0-P3 label; maintainers retain
+# control by setting any priority label themselves.
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'PR number to (re)label, or "all" for every open PR'
+        required: true
+        default: 'all'
+
+concurrency:
+  group: labeler-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  label:
+    name: Sync PR labels
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
+      DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
+
+    steps:
+      # pull_request_target checks out the trusted default branch (the labeler
+      # script is trusted code; PR content flows in as data only).
+      - uses: actions/checkout@v7
+
+      - name: Sync labels
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const scriptUrl = pathToFileURL(`${process.env.GITHUB_WORKSPACE}/.github/scripts/labeler.mjs`);
+            const { syncPrLabels } = await import(scriptUrl.href);
+            await syncPrLabels({ github, context, core });
