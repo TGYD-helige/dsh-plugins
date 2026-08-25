@@ -144,6 +144,11 @@ jobs:
         env:
           DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
           DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
+          # dsh-langfuse only: absent keys (fork PRs) flip the scenario to its
+          # fake-ingestion fallback — see the scenario script.
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
         run: node ".github/scripts/integration/${{ matrix.package }}.mjs"
 
       # Runtime visibility: the full session event log (including

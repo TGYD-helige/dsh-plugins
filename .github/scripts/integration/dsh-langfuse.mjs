@@ -1,21 +1,27 @@
+#!/usr/bin/env node
+
 /**
- * dsh-langfuse integration scenario (base leg only — no provider variants):
- * boot the dsh headless profile with the packed plugin pointed at an
- * in-process fake Langfuse ingestion endpoint, run one real LLM query
- * (deepseek-v4-flash through the integration gateway, seeded to force a tool
- * round-trip), then assert the trace/generation/span tree the plugin
- * ingested. No real Langfuse instance and no extra secrets: the fake
- * endpoint captures POST /api/public/ingestion batches in memory, and the
- * plugin's publicKey/secretKey are placeholders it never checks.
+ * dsh-langfuse integration scenario (base leg only — no provider variants),
+ * in two modes keyed on the LANGFUSE_* secrets:
  *
- * The query runs via async spawn on purpose: the fake endpoint lives in THIS
- * process, so the event loop must stay responsive while dsh runs (a
- * spawnSync there would deadlock the SDK's shutdown flush).
+ * - real mode (LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY present): boot the
+ *   dsh headless profile with the packed plugin pointed at the REAL Langfuse
+ *   project, run one seeded LLM query (deepseek-v4-flash, marker file forces
+ *   a tool round-trip), then poll the Observations API v2 until the ingested
+ *   trace shows the expected shape — the data is really in Langfuse.
+ * - fake mode (secrets absent, e.g. fork PRs): same boot against an
+ *   in-process fake ingestion endpoint with in-memory assertions, so the leg
+ *   still proves the plugin wiring without any secrets.
+ *
+ * The query runs via async spawn: in fake mode the endpoint lives in THIS
+ * process, so the event loop must stay responsive while dsh runs.
  *
  * Contract with .github/workflows/integration.yml:
  *   env in : DSH_INTEGRATION_BASE_URL, DSH_INTEGRATION_API_KEY, DSH_PKG_TARBALL
- *   env opt: DSH_HOME (default <workdir>/dsh-home), DSH_CLI (default 'dsh'),
- *            RUNNER_TEMP (default os.tmpdir())
+ *   env opt: LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL,
+ *            DSH_HOME (default <workdir>/dsh-home), DSH_CLI (default 'dsh'),
+ *            RUNNER_TEMP (default os.tmpdir()),
+ *            GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT (codeword uniqueness)
  *   exit   : non-zero on any failure
  */
 
@@ -24,84 +30,294 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
-const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), 'dsh-langfuse-e2e');
-mkdirSync(workDir, { recursive: true });
-const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
-const dsh = process.env.DSH_CLI ?? 'dsh';
+// ---------------------------------------------------------------------------
+// Real-Langfuse verification (Observations API v2 — the deprecated
+// /api/public/traces read path is never used). Ingestion lands piecemeal, so
+// a poll that finds the trace but not the full shape is retried, never failed
+// immediately; 429s honor Retry-After (org-shared rate limits). Ported from
+// pi's telemetry-langfuse-verify.mjs.
+// ---------------------------------------------------------------------------
 
-const { DSH_INTEGRATION_BASE_URL, DSH_INTEGRATION_API_KEY, DSH_PKG_TARBALL } = process.env;
-for (const name of ['DSH_INTEGRATION_BASE_URL', 'DSH_INTEGRATION_API_KEY', 'DSH_PKG_TARBALL']) {
-  if (!process.env[name]) throw new Error(`${name} is required`);
+const DEFAULT_BASE_URL = 'https://cloud.langfuse.com';
+const DEFAULT_DEADLINE_MS = 5 * 60 * 1000;
+const POLL_INTERVAL_MS = 15_000;
+const REQUEST_TIMEOUT_MS = 15_000;
+const MAX_PAGES = 20;
+const EXPECTED_MODEL = 'deepseek-v4-flash';
+
+// Non-empty trimmed value or fallback — GitHub injects unset secrets as '',
+// which `??` would happily keep.
+export function envOr(value, fallback) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : fallback;
 }
+
+export function resolveDeadlineMs(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_DEADLINE_MS;
+}
+
+// Returns a list of problems; empty list means the trace fully matches.
+export function evaluateTrace(observations, codeword) {
+  const spans = observations.filter((o) => o.type === 'SPAN');
+  const generations = observations.filter((o) => o.type === 'GENERATION');
+  const problems = [];
+  const need = (condition, message) => {
+    if (!condition) problems.push(message);
+  };
+
+  const generation = generations.find((o) => o.name === 'llm-call');
+  need(generation, 'missing generation "llm-call"');
+  if (generation) {
+    need(
+      generation.model === EXPECTED_MODEL,
+      `generation model is ${generation.model ?? 'null'}, expected ${EXPECTED_MODEL}`,
+    );
+    need(generation.endTime != null, 'generation "llm-call" has no endTime (never completed)');
+    need(
+      generation.parentObservationId == null,
+      'generation "llm-call" is not parented at the trace root',
+    );
+    const total = generation.usage?.total ?? generation.usageDetails?.total ?? 0;
+    need(total > 0, `generation "llm-call" total token usage is ${total}`);
+  }
+
+  const toolSpan = spans.find(
+    (o) => o.name?.startsWith('tool:') && JSON.stringify(o.input ?? '').includes(codeword),
+  );
+  need(toolSpan, 'missing codeword-bearing "tool:*" span');
+  if (toolSpan) {
+    need(toolSpan.endTime != null, `"${toolSpan.name}" span has no endTime (never completed)`);
+    need(
+      toolSpan.parentObservationId == null,
+      `"${toolSpan.name}" span is not parented at the trace root`,
+    );
+  }
+  return problems;
+}
+
+// Polls the Observations API v2 until a codeworded generation's trace matches
+// the expected shape or the deadline passes. Returns { ok, state } — the
+// caller owns logging and process exit so tests can drive this with a fake
+// fetch.
+export async function runVerification({
+  baseUrl,
+  publicKey,
+  secretKey,
+  fromStartTime,
+  codeword,
+  deadlineMs = DEFAULT_DEADLINE_MS,
+  fetchImpl = fetch,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  log = () => {},
+}) {
+  const origin = envOr(baseUrl, DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const limit = resolveDeadlineMs(deadlineMs);
+  const deadline = Date.now() + limit;
+  const auth = `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString('base64')}`;
+
+  async function fetchObservations(params) {
+    const rows = [];
+    let cursor;
+    for (let page = 0; page < MAX_PAGES; page += 1) {
+      const query = new URLSearchParams({
+        fields: 'core,basic,io',
+        fromStartTime,
+        toStartTime: new Date().toISOString(),
+        limit: '1000',
+        ...params,
+      });
+      if (cursor) query.set('cursor', cursor);
+      // A hung fetch must not outlive the polling deadline.
+      const remaining = deadline - Date.now();
+      const response = await fetchImpl(`${origin}/api/public/v2/observations?${query}`, {
+        headers: { authorization: auth, accept: 'application/json' },
+        signal: AbortSignal.timeout(Math.min(REQUEST_TIMEOUT_MS, Math.max(1000, remaining))),
+      });
+      if (response.status === 429) {
+        // Rate limits are shared per organization — honor Retry-After
+        // instead of burning the deadline on failures.
+        const retryAfterSeconds = Number(response.headers?.get?.('retry-after'));
+        const retryAfterMs =
+          Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+            ? Math.min(retryAfterSeconds * 1000, 120_000)
+            : POLL_INTERVAL_MS;
+        throw Object.assign(new Error('Langfuse rate limited the observations query (HTTP 429)'), {
+          retryAfterMs,
+        });
+      }
+      if (!response.ok) {
+        // Status only — a response body can carry request details or internals.
+        throw new Error(`Langfuse observations query failed with HTTP ${response.status}`);
+      }
+      // Parse manually: response.json() error messages embed a snippet of the
+      // response body, which must never reach the CI log.
+      let body;
+      try {
+        body = JSON.parse(await response.text());
+      } catch {
+        throw new Error('Langfuse observations query returned invalid JSON');
+      }
+      rows.push(...(body.data ?? []));
+      cursor = body.meta?.cursor;
+      if (!cursor) return rows;
+    }
+    throw new Error(`Langfuse observations query exceeded ${MAX_PAGES} pages`);
+  }
+
+  let lastState = 'no candidate trace seen yet';
+  let waitMs = POLL_INTERVAL_MS;
+  while (true) {
+    waitMs = POLL_INTERVAL_MS;
+    try {
+      // Discovery: the turn's generation carries the codeword in its IO (the
+      // prompt mentions the marker file; tool-call arguments repeat it).
+      const candidates = await fetchObservations({ type: 'GENERATION', name: 'llm-call' });
+      const traceIds = [
+        ...new Set(
+          candidates.filter((o) => JSON.stringify(o).includes(codeword)).map((o) => o.traceId),
+        ),
+      ];
+
+      for (const traceId of traceIds) {
+        const observations = await fetchObservations({ traceId });
+        log(`--- candidate trace ${traceId}: ${observations.length} observation(s) ---`);
+        for (const o of observations) {
+          log(`  ${o.type}:${o.name} parent=${o.parentObservationId ?? 'null'} end=${o.endTime ?? 'null'}`);
+        }
+        const problems = evaluateTrace(observations, codeword);
+        if (problems.length === 0) {
+          return { ok: true, state: `trace ${traceId} matches the expected dsh-langfuse shape` };
+        }
+        lastState = `trace ${traceId} incomplete: ${problems.join('; ')}`;
+        log(`  not complete yet: ${problems.join('; ')}`);
+      }
+      if (traceIds.length === 0) {
+        lastState = 'no trace with the codeword seen yet';
+      }
+    } catch (error) {
+      log(`Langfuse poll failed: ${error.message}`);
+      lastState = `poll error: ${error.message}`;
+      if (error.retryAfterMs) waitMs = error.retryAfterMs;
+    }
+
+    if (Date.now() > deadline) {
+      return { ok: false, state: lastState };
+    }
+    await sleep(Math.min(waitMs, Math.max(0, deadline - Date.now())));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario
+// ---------------------------------------------------------------------------
 
 function assert(cond, msg) {
   if (!cond) throw new Error(`assertion failed: ${msg}`);
 }
 
-// --- fake Langfuse ingestion endpoint --------------------------------------
-// The v3 SDK posts { batch: [{ id, type, timestamp, body }] } to
-// /api/public/ingestion; keep every (type, body) pair in memory. Any other
-// call 404s loudly — a surprise endpoint means the SDK drifted from the
-// envelope this scenario asserts on. unref'd so the process can always exit.
-const captured = [];
-const server = createServer((req, res) => {
-  if (req.method !== 'POST' || !req.url?.startsWith('/api/public/ingestion')) {
-    console.log(`::warning::unexpected ${req.method} ${req.url}`);
-    res.writeHead(404).end();
-    return;
-  }
-  const chunks = [];
-  req.on('data', (chunk) => chunks.push(chunk));
-  req.on('end', () => {
-    const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    for (const item of payload.batch ?? []) captured.push({ type: item.type, body: item.body });
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end('{"successes":[],"errors":[]}');
+// In-process fake Langfuse endpoint for the secrets-free mode: captures
+// POST /api/public/ingestion batches in memory; anything else 404s loudly.
+async function startFakeIngestion(captured) {
+  const server = createServer((req, res) => {
+    if (req.method !== 'POST' || !req.url?.startsWith('/api/public/ingestion')) {
+      console.log(`::warning::unexpected ${req.method} ${req.url}`);
+      res.writeHead(404).end();
+      return;
+    }
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      for (const item of payload.batch ?? []) captured.push({ type: item.type, body: item.body });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"successes":[],"errors":[]}');
+    });
   });
-});
-server.unref();
-await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
-const baseUrl = `http://127.0.0.1:${server.address().port}`;
-console.log(`fake langfuse ingestion at ${baseUrl}`);
-
-// If the runner routes egress through a host-level proxy, fetch to the
-// gateway can break — drop proxy vars from the LLM-carrying process.
-const netEnv = Object.fromEntries(
-  Object.entries(process.env).filter(([k]) => !/^(https?_proxy|all_proxy|no_proxy)$/i.test(k)),
-);
-
-function run(cmd, args, env = {}) {
-  console.log(`\n$ ${cmd} ${args.join(' ')}`);
-  const r = spawnSync(cmd, args, { stdio: 'inherit', cwd: workDir, env: { ...process.env, ...env } });
-  if (r.error) throw r.error;
-  if (r.status !== 0) throw new Error(`${cmd} ${args.slice(0, 3).join(' ')} exited ${r.status}`);
+  server.unref();
+  await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+  return server;
 }
 
-const dshHomeEnv = { DSH_HOME: dshHome };
+async function main() {
+  const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), 'dsh-langfuse-e2e');
+  mkdirSync(workDir, { recursive: true });
+  const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
+  const dsh = process.env.DSH_CLI ?? 'dsh';
 
-// 1. Install the packed bundle (idempotent — the workflow's Stage A already
-//    did it once), then the langfuse peer: the profile template sets
-//    autoInstallPeers: false, so runtime peers are added explicitly. The
-//    dsh-* peers ship with the profile itself.
-run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], dshHomeEnv);
-run(dsh, ['plugin', '--profile', 'headless', 'add', 'langfuse@3.38.20'], dshHomeEnv);
+  const { DSH_INTEGRATION_BASE_URL, DSH_INTEGRATION_API_KEY, DSH_PKG_TARBALL } = process.env;
+  for (const name of ['DSH_INTEGRATION_BASE_URL', 'DSH_INTEGRATION_API_KEY', 'DSH_PKG_TARBALL']) {
+    if (!process.env[name]) throw new Error(`${name} is required`);
+  }
 
-// 2. Enable the plugin through the profile's user patch layer (an
-//    id-targeted row replaces the bundle row's whole config), pointed at the
-//    fake endpoint. The agent-default-model row pins deepseek-v4-flash; the
-//    llm-deepseek row disables thinking — with reasoning enabled, this
-//    gateway stochastically garbles tool calls (observed in CI).
-const patchPath = join(dshHome, 'profiles', 'headless', 'cordis.patch.yml');
-writeFileSync(
-  patchPath,
-  `# dsh-langfuse integration scenario: enable the plugin against the fake ingestion endpoint.
+  const publicKey = envOr(process.env.LANGFUSE_PUBLIC_KEY, '');
+  const secretKey = envOr(process.env.LANGFUSE_SECRET_KEY, '');
+  const realMode = Boolean(publicKey && secretKey);
+  const baseUrl = envOr(process.env.LANGFUSE_BASE_URL, DEFAULT_BASE_URL);
+  console.log(`mode: ${realMode ? `real Langfuse (${baseUrl})` : 'fake ingestion endpoint'}`);
+
+  // Fake mode only: the capture sink the assertions read from.
+  const captured = [];
+  let fakeServer;
+  let pluginConnection;
+  if (realMode) {
+    // YAML-double-quoted scalars are JSON-compatible — keys can't break the
+    // patch. NEVER log the patch in this mode: it carries the real keys.
+    pluginConnection = {
+      publicKey: JSON.stringify(publicKey),
+      secretKey: JSON.stringify(secretKey),
+      baseUrl: JSON.stringify(baseUrl),
+    };
+  } else {
+    fakeServer = await startFakeIngestion(captured);
+    const fakeUrl = `http://127.0.0.1:${fakeServer.address().port}`;
+    console.log(`fake langfuse ingestion at ${fakeUrl}`);
+    pluginConnection = { publicKey: 'pk-lf-ci', secretKey: 'sk-lf-ci', baseUrl: fakeUrl };
+  }
+
+  // If the runner routes egress through a host-level proxy, fetch to the
+  // gateway can break — drop proxy vars from the LLM-carrying process.
+  const netEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !/^(https?_proxy|all_proxy|no_proxy)$/i.test(k)),
+  );
+
+  function run(cmd, args, env = {}) {
+    console.log(`\n$ ${cmd} ${args.join(' ')}`);
+    const r = spawnSync(cmd, args, {
+      stdio: 'inherit',
+      cwd: workDir,
+      env: { ...process.env, ...env },
+    });
+    if (r.error) throw r.error;
+    if (r.status !== 0) throw new Error(`${cmd} ${args.slice(0, 3).join(' ')} exited ${r.status}`);
+  }
+
+  const dshHomeEnv = { DSH_HOME: dshHome };
+
+  // 1. Install the packed bundle (idempotent — the workflow's Stage A already
+  //    did it once), then the langfuse peer: the profile template sets
+  //    autoInstallPeers: false, so runtime peers are added explicitly. The
+  //    dsh-* peers ship with the profile itself.
+  run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], dshHomeEnv);
+  run(dsh, ['plugin', '--profile', 'headless', 'add', 'langfuse@3.38.20'], dshHomeEnv);
+
+  // 2. Enable the plugin through the profile's user patch layer (an
+  //    id-targeted row replaces the bundle row's whole config). The
+  //    agent-default-model row pins deepseek-v4-flash; the llm-deepseek row
+  //    disables thinking — with reasoning enabled, this gateway
+  //    stochastically garbles tool calls (observed in CI).
+  const patchPath = join(dshHome, 'profiles', 'headless', 'cordis.patch.yml');
+  writeFileSync(
+    patchPath,
+    `# dsh-langfuse integration scenario: enable the plugin against ${realMode ? 'the real Langfuse' : 'the fake endpoint'}.
 - id: langfuse
   config:
     enabled: true
-    publicKey: pk-lf-ci
-    secretKey: sk-lf-ci
-    baseUrl: ${baseUrl}
+    publicKey: ${pluginConnection.publicKey}
+    secretKey: ${pluginConnection.secretKey}
+    baseUrl: ${pluginConnection.baseUrl}
 
 - id: agent-default-model
   config:
@@ -112,98 +328,139 @@ writeFileSync(
   config:
     thinking: disabled
 `,
-);
-console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);
+  );
+  if (!realMode) console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);
 
-// 3. One real query, seeded to force a tool round-trip: the marker file's
-//    unique content can only reach a tool span through a real dispatch (see
-//    dsh-storage's scenario for the retry rationale — same model variance).
-const markerFile = 'ci-marker.txt';
-const markerContent = 'ci-dsh-langfuse-marker-5566';
-writeFileSync(join(workDir, markerFile), `${markerContent}\n`);
-const prompt = `请用工具读取当前目录下的 ${markerFile}，并把它的内容原样复述给我`;
+  // 3. One real query per attempt, seeded to force a tool round-trip. The
+  //    marker FILE NAME is the codeword: it flows into the tool span's input
+  //    and the generation's IO, and is unique per CI run so concurrent jobs
+  //    against the same Langfuse project can't cross-match.
+  const runId = envOr(process.env.GITHUB_RUN_ID, 'local');
+  const runAttempt = envOr(process.env.GITHUB_RUN_ATTEMPT, '1');
+  const codeword = `ci-marker-${runId}-${runAttempt}`;
+  const markerFile = `${codeword}.txt`;
+  writeFileSync(join(workDir, markerFile), `${codeword}-content\n`);
+  const prompt = `请用工具读取当前目录下的 ${markerFile}，并把它的内容原样复述给我`;
+  const runStartedAt = new Date(Date.now() - 60_000).toISOString();
 
-function runQuery() {
-  console.log(`\n$ dsh --profile headless "${prompt}"`);
-  return new Promise((resolveRun, rejectRun) => {
-    let stdout = '';
-    const child = spawn(dsh, ['--profile', 'headless', prompt], {
-      cwd: workDir,
-      env: {
-        ...netEnv,
-        ...dshHomeEnv,
-        DSH_TELEMETRY_DISABLED: '1',
-        // Ephemeral CI workspace: never stall on tool approval prompts.
-        DSH_PERMISSION_MODE: 'danger-full-access',
-        DEEPSEEK_BASE_URL: DSH_INTEGRATION_BASE_URL,
-        DEEPSEEK_API_KEY: DSH_INTEGRATION_API_KEY,
-      },
+  function runQuery() {
+    console.log(`\n$ dsh --profile headless "${prompt}"`);
+    return new Promise((resolveRun, rejectRun) => {
+      let stdout = '';
+      const child = spawn(dsh, ['--profile', 'headless', prompt], {
+        cwd: workDir,
+        env: {
+          ...netEnv,
+          ...dshHomeEnv,
+          DSH_TELEMETRY_DISABLED: '1',
+          // Ephemeral CI workspace: never stall on tool approval prompts.
+          DSH_PERMISSION_MODE: 'danger-full-access',
+          DEEPSEEK_BASE_URL: DSH_INTEGRATION_BASE_URL,
+          DEEPSEEK_API_KEY: DSH_INTEGRATION_API_KEY,
+        },
+      });
+      child.stdout.on('data', (d) => {
+        stdout += d;
+        process.stdout.write(d);
+      });
+      child.stderr.on('data', (d) => process.stderr.write(d));
+      child.on('error', rejectRun);
+      const killer = setTimeout(() => child.kill('SIGKILL'), 8 * 60_000);
+      child.on('close', (code) => {
+        clearTimeout(killer);
+        if (code !== 0) return rejectRun(new Error(`dsh headless exited ${code}`));
+        if (!stdout.trim()) console.log('::warning::empty answer from dsh headless');
+        resolveRun();
+      });
     });
-    child.stdout.on('data', (d) => {
-      stdout += d;
-      process.stdout.write(d);
-    });
-    child.stderr.on('data', (d) => process.stderr.write(d));
-    child.on('error', rejectRun);
-    const killer = setTimeout(() => child.kill('SIGKILL'), 8 * 60_000);
-    child.on('close', (code) => {
-      clearTimeout(killer);
-      if (code !== 0) return rejectRun(new Error(`dsh headless exited ${code}`));
-      if (!stdout.trim()) console.log('::warning::empty answer from dsh headless');
-      resolveRun();
-    });
+  }
+
+  const spans = () => captured.filter((e) => e.type === 'span-create').map((e) => e.body);
+  const markerSpan = () =>
+    spans().find(
+      (b) => String(b.name).startsWith('tool:') && JSON.stringify(b.input ?? '').includes(markerFile),
+    );
+
+  // deepseek-v4-flash through the gateway stochastically garbles tool calls
+  // (observed in CI), so attempts retry. Fake mode gates cheaply on the
+  // captured marker span; real mode gates on the Langfuse read-back itself.
+  let verified = null;
+  const maxAttempts = realMode ? 2 : 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    console.log(`\n(attempt ${attempt}/${maxAttempts})`);
+    captured.length = 0;
+    await runQuery();
+    if (realMode) {
+      verified = await runVerification({
+        baseUrl,
+        publicKey,
+        secretKey,
+        fromStartTime: runStartedAt,
+        codeword,
+        log: (message) => console.log(message),
+      });
+      if (verified.ok) break;
+      console.log(`::warning::attempt ${attempt} did not verify: ${verified.state}`);
+    } else if (markerSpan()) {
+      break;
+    } else {
+      console.log('::warning::attempt produced no marker-bearing tool span');
+    }
+  }
+
+  // 4. Assert.
+  if (realMode) {
+    assert(verified?.ok, `Langfuse verification failed: ${verified?.state ?? 'never ran'}`);
+    console.log(`\nSCENARIO_OK (${verified.state})`);
+    return;
+  }
+
+  // Fake mode: assert the captured tree. The SDK envelope is upsert-based:
+  // creates and later updates share the observation id, so match follow-ups
+  // loosely by id instead of betting on exact event-type spellings.
+  console.log(`\n--- captured ${captured.length} ingestion events ---`);
+  for (const e of captured) console.log(` ${e.type} ${JSON.stringify(e.body).slice(0, 160)}`);
+
+  const traces = captured.filter((e) => e.type === 'trace-create').map((e) => e.body);
+  const generations = captured.filter((e) => e.type === 'generation-create').map((e) => e.body);
+
+  const trace = traces.find((b) => b.name === 'dsh-turn' && b.sessionId);
+  assert(trace, 'no dsh-turn trace with a sessionId was ingested');
+  const traceEvents = captured.filter((e) => e.body?.id === trace.id);
+
+  const generation = generations.find(
+    (b) => b.traceId === trace.id && b.model === EXPECTED_MODEL,
+  );
+  assert(generation, `no ${EXPECTED_MODEL} generation under the turn trace`);
+  const ended = captured.find(
+    (e) => e.body?.id === generation.id && (e.body.usage || e.body.usageDetails),
+  );
+  assert(ended, 'generation never closed with token usage');
+  const totalTokens = ended.body.usage?.total ?? ended.body.usageDetails?.total ?? 0;
+  assert(totalTokens > 0, `generation total token usage is ${totalTokens}`);
+
+  const toolSpan = markerSpan();
+  assert(toolSpan, 'no marker-bearing tool span — the model did not read the marker file');
+  assert(toolSpan.traceId === trace.id, 'tool span is not parented under the turn trace');
+
+  // Turn-boundary metadata rides session events near process teardown —
+  // useful signal, but the exact flush timing is dsh's business: warn only.
+  if (!traceEvents.some((e) => e.body?.metadata?.endReason)) {
+    console.log('::warning::turn trace has no endReason metadata');
+  }
+  if (!traceEvents.some((e) => JSON.stringify(e.body?.input ?? '').includes(markerFile))) {
+    console.log('::warning::turn trace input does not mention the marker file');
+  }
+
+  console.log(
+    `\nSCENARIO_OK (events=${captured.length}, traces=${traces.length}, generations=${generations.length}, spans=${spans().length})`,
+  );
+  fakeServer?.close();
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error(`::error::${error.message}`);
+    process.exit(1);
   });
 }
-
-const spans = () => captured.filter((e) => e.type === 'span-create').map((e) => e.body);
-const markerSpan = () =>
-  spans().find(
-    (b) => String(b.name).startsWith('tool:') && JSON.stringify(b.input ?? '').includes(markerFile),
-  );
-
-for (let attempt = 1; attempt <= 3; attempt++) {
-  // Each attempt is a fresh session; judge it on its own ingest.
-  captured.length = 0;
-  console.log(`\n(attempt ${attempt})`);
-  await runQuery();
-  if (markerSpan()) break;
-  console.log('::warning::attempt produced no marker-bearing tool span');
-}
-
-// 4. Assert the ingested tree. The SDK envelope is upsert-based: creates and
-//    later updates share the observation id, so match follow-ups loosely by
-//    id instead of betting on exact event-type spellings.
-console.log(`\n--- captured ${captured.length} ingestion events ---`);
-for (const e of captured) console.log(` ${e.type} ${JSON.stringify(e.body).slice(0, 160)}`);
-
-const traces = captured.filter((e) => e.type === 'trace-create').map((e) => e.body);
-const generations = captured.filter((e) => e.type === 'generation-create').map((e) => e.body);
-
-const trace = traces.find((b) => b.name === 'dsh-turn' && b.sessionId);
-assert(trace, 'no dsh-turn trace with a sessionId was ingested');
-const traceEvents = captured.filter((e) => e.body?.id === trace.id);
-
-const generation = generations.find((b) => b.traceId === trace.id && b.model === 'deepseek-v4-flash');
-assert(generation, 'no deepseek-v4-flash generation under the turn trace');
-const ended = captured.find((e) => e.body?.id === generation.id && (e.body.usage || e.body.usageDetails));
-assert(ended, 'generation never closed with token usage');
-const totalTokens = ended.body.usage?.total ?? ended.body.usageDetails?.total ?? 0;
-assert(totalTokens > 0, `generation total token usage is ${totalTokens}`);
-
-const toolSpan = markerSpan();
-assert(toolSpan, 'no marker-bearing tool span — the model did not read the marker file');
-assert(toolSpan.traceId === trace.id, 'tool span is not parented under the turn trace');
-
-// Turn-boundary metadata rides session events near process teardown — useful
-// signal, but the exact flush timing is dsh's business: warn, don't gate.
-if (!traceEvents.some((e) => e.body?.metadata?.endReason)) {
-  console.log('::warning::turn trace has no endReason metadata');
-}
-if (!traceEvents.some((e) => JSON.stringify(e.body?.input ?? '').includes(markerFile))) {
-  console.log('::warning::turn trace input does not mention the marker file');
-}
-
-console.log(
-  `\nSCENARIO_OK (events=${captured.length}, traces=${traces.length}, generations=${generations.length}, spans=${spans().length})`,
-);
-server.close();
