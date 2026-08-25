@@ -5,7 +5,9 @@
  *
  * - `llm/stream` waterfall  → one Langfuse **generation** per LLM call
  *   (input = full request; output, token usage and finish reason collected
- *   from the chunk stream).
+ *   from the chunk stream), plus a nested `llm-request` **span** holding the
+ *   verbatim loop-built request (the rawest request a plugin can observe —
+ *   the provider HTTP body is assembled inside the adapter).
  * - `tools/execute` waterfall → one Langfuse **span** per tool dispatch
  *   (routed to the session's trace via `exec.agent.id` — the agent/session
  *   shared identity).
@@ -105,6 +107,23 @@ function modelParametersOf(
   return Object.keys(params).length > 0 ? params : undefined;
 }
 
+/**
+ * The loop-built request as Langfuse input: verbatim (minus the AbortSignal,
+ * which is not JSON-safe) when content capture is on, counts-only otherwise.
+ */
+function requestBodyOf(options: GenerateOptions, captureContent: boolean): Record<string, unknown> {
+  if (!captureContent) {
+    return {
+      messageCount: options.messages.length,
+      hasSystem: options.system !== undefined,
+      toolCount: options.tools?.length,
+    };
+  }
+  const body: Partial<GenerateOptions> = { ...options };
+  delete body.signal;
+  return body;
+}
+
 export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void> | void {
   if (!config.enabled || !config.publicKey || !config.secretKey) return;
 
@@ -181,14 +200,30 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       metadata: { purpose: options.purpose },
     });
 
+    // The rawest request a plugin can observe: the loop-built GenerateOptions
+    // verbatim, pre-adapter (the provider HTTP body is assembled inside the
+    // adapter — dsh exposes no seam for it). Nested under the generation,
+    // closed alongside it with the same outcome.
+    const requestSpan = reporter.startSpan(generation, {
+      name: 'llm-request',
+      input: requestBodyOf(options, config.captureContent),
+      metadata: {
+        provider: options.provider,
+        reasoningEffort: options.reasoningEffort,
+        purpose: options.purpose,
+      },
+    });
+    const closeRequest = (level: ObservationLevel, statusMessage?: string) => {
+      reporter.endSpan(requestSpan, { level, statusMessage });
+    };
+
     let stream: AsyncIterable<StreamChunk>;
     try {
       stream = next();
     } catch (error) {
-      reporter.endGeneration(generation, {
-        level: 'ERROR',
-        statusMessage: contentMessage(config, messageOf(error)),
-      });
+      const statusMessage = contentMessage(config, messageOf(error));
+      closeRequest('ERROR', statusMessage);
+      reporter.endGeneration(generation, { level: 'ERROR', statusMessage });
       throw error;
     }
 
@@ -231,10 +266,9 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         }
       } catch (error) {
         failed = true;
-        reporter.endGeneration(generation, {
-          level: 'ERROR',
-          statusMessage: contentMessage(config, messageOf(error)),
-        });
+        const statusMessage = contentMessage(config, messageOf(error));
+        closeRequest('ERROR', statusMessage);
+        reporter.endGeneration(generation, { level: 'ERROR', statusMessage });
         throw error;
       } finally {
         if (!failed) {
@@ -252,6 +286,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
             level = 'WARNING';
             statusMessage = 'stream closed before the terminal finish chunk';
           }
+          closeRequest(level, statusMessage);
           reporter.endGeneration(generation, {
             output: config.captureContent
               ? toolCalls.length > 0

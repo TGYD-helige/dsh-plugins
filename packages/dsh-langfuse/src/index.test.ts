@@ -16,6 +16,8 @@ const mocks = vi.hoisted(() => {
   class FakeObservation {
     updates: unknown[] = [];
     ends: unknown[] = [];
+    generations: FakeObservation[] = [];
+    spans: FakeObservation[] = [];
     constructor(
       readonly kind: string,
       readonly body: unknown,
@@ -28,10 +30,6 @@ const mocks = vi.hoisted(() => {
       this.ends.push(body ?? {});
       return this;
     }
-  }
-  class FakeTrace extends FakeObservation {
-    generations: FakeObservation[] = [];
-    spans: FakeObservation[] = [];
     generation(body: unknown) {
       const generation = new FakeObservation('generation', body);
       this.generations.push(generation);
@@ -43,6 +41,7 @@ const mocks = vi.hoisted(() => {
       return span;
     }
   }
+  class FakeTrace extends FakeObservation {}
   class FakeLangfuse {
     traces: FakeTrace[] = [];
     flushAsync = vi.fn(async () => {});
@@ -338,6 +337,24 @@ describe('dsh-langfuse plugin', () => {
       });
     });
 
+    it('records the loop-built request as a nested llm-request span', async () => {
+      await setup();
+      await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(textDelta('hi'), finishStop())),
+      );
+      const generation = fakeObs(mocks.instances[0].traces[0].generations[0]);
+      expect(generation.spans).toHaveLength(1);
+      const requestSpan = generation.spans[0];
+      expect(requestSpan.body).toMatchObject({
+        name: 'llm-request',
+        input: { provider: 'test', model: 'deepseek-chat', messages: [], sessionId: 's1' },
+        metadata: { provider: 'test' },
+      });
+      // The AbortSignal is not JSON-safe and must not cross to Langfuse.
+      expect((requestSpan.body as { input: Record<string, unknown> }).input.signal).toBeUndefined();
+      expect(requestSpan.ends[0]).toMatchObject({ level: 'DEFAULT' });
+    });
+
     it('sets completionStartTime at the first token delta, not at block boundaries', async () => {
       await setup();
       await drain(
@@ -501,6 +518,17 @@ describe('dsh-langfuse plugin', () => {
         modelParameters?: Record<string, unknown>;
       };
       expect(body.modelParameters).toEqual({ temperature: 0.5, stopCount: 2 });
+    });
+
+    it('redacts the nested request span body to counts', async () => {
+      await setup(redacted);
+      await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
+      const requestSpan = fakeObs(mocks.instances[0].traces[0].generations[0]).spans[0];
+      expect(requestSpan.body).toMatchObject({
+        name: 'llm-request',
+        input: { messageCount: 0, hasSystem: false },
+        metadata: { provider: 'test' },
+      });
     });
 
     it('withholds finish failure text, keeping level and error code', async () => {

@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => {
   class FakeObservation {
     updates: unknown[] = [];
     ends: unknown[] = [];
+    generations: FakeObservation[] = [];
+    spans: FakeObservation[] = [];
     constructor(
       readonly kind: string,
       readonly body: unknown,
@@ -20,10 +22,6 @@ const mocks = vi.hoisted(() => {
       this.ends.push(body ?? {});
       return this;
     }
-  }
-  class FakeTrace extends FakeObservation {
-    generations: FakeObservation[] = [];
-    spans: FakeObservation[] = [];
     generation(body: unknown) {
       const generation = new FakeObservation('generation', body);
       this.generations.push(generation);
@@ -35,6 +33,7 @@ const mocks = vi.hoisted(() => {
       return span;
     }
   }
+  class FakeTrace extends FakeObservation {}
   class FakeLangfuse {
     traces: FakeTrace[] = [];
     flushAsync = vi.fn(async () => {});
@@ -144,6 +143,12 @@ describe('LangfuseReporter', () => {
     );
     reporter.endSpan(span, { output: [], level: 'ERROR', statusMessage: 'nope' });
     expect(span.ends[0]).toMatchObject({ level: 'ERROR', statusMessage: 'nope' });
+
+    // Observations parent nested spans (e.g. the llm-request detail span).
+    const nested = fakeSpan(reporter.startSpan(generation, { name: 'llm-request' }));
+    reporter.endSpan(nested, { level: 'DEFAULT' });
+    expect(generation.spans[0].body).toMatchObject({ name: 'llm-request' });
+    expect(nested.ends).toHaveLength(1);
   });
 
   it('is a silent no-op before init settles', () => {

@@ -97,6 +97,16 @@ export function evaluateTrace(observations, codeword) {
       `"${toolSpan.name}" span is not parented at the trace root`,
     );
   }
+
+  const requestSpan = spans.find((o) => o.name === 'llm-request');
+  need(requestSpan, 'missing nested "llm-request" span');
+  if (requestSpan && generation) {
+    need(
+      requestSpan.parentObservationId === generation.id,
+      '"llm-request" span is not parented under the generation',
+    );
+    need(requestSpan.endTime != null, '"llm-request" span has no endTime (never completed)');
+  }
   return problems;
 }
 

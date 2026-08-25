@@ -33,6 +33,9 @@ export interface LangfuseConnectionConfig {
 
 export type ObservationLevel = 'DEFAULT' | 'WARNING' | 'ERROR';
 
+/** Any observation client that can parent a span (trace, span, or generation). */
+export type SpanParent = LangfuseTraceClient | LangfuseSpanClient | LangfuseGenerationClient;
+
 /**
  * Map dsh token accounting onto Langfuse's usage fields, keeping every
  * `usageDetails` bucket mutually exclusive (Langfuse's flat-bucket rule:
@@ -174,14 +177,14 @@ export class LangfuseReporter {
     }
   }
 
-  /** Open a span (one per tool dispatch) under `trace`. */
+  /** Open a span (one per tool dispatch, or a nested detail span) under any observation parent. */
   startSpan(
-    trace: LangfuseTraceClient | null,
+    parent: SpanParent | null,
     input: { name: string; input?: unknown; metadata?: Record<string, unknown> },
   ): LangfuseSpanClient | null {
-    if (!trace) return null;
+    if (!parent) return null;
     try {
-      return trace.span({ name: input.name, input: input.input, metadata: input.metadata });
+      return parent.span({ name: input.name, input: input.input, metadata: input.metadata });
     } catch (error) {
       console.error('[dsh-langfuse] span creation failed:', error);
       return null;
