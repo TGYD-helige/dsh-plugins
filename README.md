@@ -120,7 +120,6 @@ pnpm test         # vitest (packages with a test script)
 Known scaffold gaps (help welcome):
 
 - `dsh-a2a`: the session-event → A2A event translation table is a stub (`translateSessionEvent` in `bridge.ts`); the `@a2a-js/sdk` transport (RequestHandler, ExecutionEventBus, resubscribe-with-replay) is not wired yet — the Redis/GCS `TaskStore`s are created from config but not yet fed by the SDK handler.
-- `dsh-langfuse`: turn-trace ↔ generation/span parenting needs the verified session identity path from `llm/stream` options.
 - `dsh-a2a` GCS store: workspace archiving shells out to `tar`.
 - No package ships its `preview.png` yet — the shared preview system (see AGENTS.md) is unbuilt; generate all three together when it lands.
 
