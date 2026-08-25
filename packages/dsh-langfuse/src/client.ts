@@ -50,12 +50,16 @@ export function usageOf(usage: TokenUsage): {
   usage: { input: number; output: number; total: number };
   usageDetails: Record<string, number>;
 } {
-  const input = usage.inputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0);
-  const output = usage.outputTokens;
+  // The dsh type marks the two primary fields required, but a non-conformant
+  // adapter emitting a partial usage chunk would otherwise turn every bucket
+  // NaN (serialized as null by the SDK — silently corrupting billed usage).
+  const input =
+    (usage.inputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0);
+  const output = usage.outputTokens ?? 0;
   const total = input + output;
   const usageDetails: Record<string, number> = {
-    input: usage.inputTokens,
-    output: output - (usage.reasoningTokens ?? 0),
+    input: usage.inputTokens ?? 0,
+    output: Math.max(0, output - (usage.reasoningTokens ?? 0)),
     total,
   };
   if (usage.cacheReadTokens) usageDetails.input_cache_read = usage.cacheReadTokens;
@@ -92,7 +96,6 @@ export class LangfuseReporter {
   openTrace(input: {
     name: string;
     sessionId?: string;
-    input?: unknown;
     metadata?: Record<string, unknown>;
   }): LangfuseTraceClient | null {
     if (!this.client) return null;
@@ -100,7 +103,6 @@ export class LangfuseReporter {
       return this.client.trace({
         name: input.name,
         sessionId: input.sessionId,
-        input: input.input,
         metadata: input.metadata,
       });
     } catch (error) {

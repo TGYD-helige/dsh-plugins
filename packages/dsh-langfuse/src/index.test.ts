@@ -7,21 +7,23 @@ import type {
   ToolExecutionResult,
   ToolExecutionToken,
 } from '@deepseek-ai/dsh-tools';
+import type { LangfuseGenerationClient, LangfuseSpanClient, LangfuseTraceClient } from 'langfuse';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { LangfuseReporter, usageOf } from './client.js';
 import { apply, inject, name } from './index.js';
 
+// The shared Langfuse SDK mock: captures every client, trace, generation and
+// span created through the mocked module (vi.mock below). Vitest isolates
+// this file, so the captured state is per-suite; beforeEach resets it.
 const mocks = vi.hoisted(() => {
-  const instances: FakeLangfuse[] = [];
-  const state = { failTrace: false };
-  class FakeObservation {
+  const instances: MockLangfuse[] = [];
+  const state = { failTrace: false, throwOnConstruct: false };
+  class MockObservation {
     updates: unknown[] = [];
     ends: unknown[] = [];
-    generations: FakeObservation[] = [];
-    spans: FakeObservation[] = [];
-    constructor(
-      readonly kind: string,
-      readonly body: unknown,
-    ) {}
+    generations: MockObservation[] = [];
+    spans: MockObservation[] = [];
+    constructor(readonly body: unknown) {}
     update(body: unknown) {
       this.updates.push(body);
       return this;
@@ -31,40 +33,50 @@ const mocks = vi.hoisted(() => {
       return this;
     }
     generation(body: unknown) {
-      const generation = new FakeObservation('generation', body);
+      const generation = new MockObservation(body);
       this.generations.push(generation);
       return generation;
     }
     span(body: unknown) {
-      const span = new FakeObservation('span', body);
+      const span = new MockObservation(body);
       this.spans.push(span);
       return span;
     }
   }
-  class FakeTrace extends FakeObservation {}
-  class FakeLangfuse {
-    traces: FakeTrace[] = [];
+  class MockLangfuse {
+    traces: MockObservation[] = [];
     flushAsync = vi.fn(async () => {});
     shutdownAsync = vi.fn(async () => {});
     constructor(readonly config: unknown) {
+      if (state.throwOnConstruct) throw new Error('bad keys');
       instances.push(this);
     }
     trace(body?: unknown) {
       if (state.failTrace) throw new Error('ingestion down');
-      const trace = new FakeTrace('trace', body ?? {});
+      const trace = new MockObservation(body ?? {});
       this.traces.push(trace);
       return trace;
     }
   }
-  return { instances, state, FakeLangfuse, FakeTrace, FakeObservation };
+  return { instances, state, MockLangfuse, MockObservation };
 });
 
-vi.mock('langfuse', () => ({ Langfuse: mocks.FakeLangfuse }));
+vi.mock('langfuse', () => ({ Langfuse: mocks.MockLangfuse }));
 
-type FakeTrace = InstanceType<typeof mocks.FakeTrace>;
-type FakeObservation = InstanceType<typeof mocks.FakeObservation>;
-const fakeTrace = (value: unknown): FakeTrace => value as FakeTrace;
-const fakeObs = (value: unknown): FakeObservation => value as FakeObservation;
+type MockObservation = InstanceType<typeof mocks.MockObservation>;
+/** The reporter/plugin speak langfuse client types; the objects behind them
+ * are the mocks. Intersections keep handles mock-readable and passable back
+ * into reporter methods. */
+const fakeTrace = (value: unknown): MockObservation & LangfuseTraceClient => value as never;
+const fakeSpan = (value: unknown): MockObservation & LangfuseSpanClient => value as never;
+const fakeGen = (value: unknown): MockObservation & LangfuseGenerationClient => value as never;
+const fakeObs = (value: unknown): MockObservation => value as MockObservation;
+
+beforeEach(() => {
+  mocks.instances.length = 0;
+  mocks.state.failTrace = false;
+  mocks.state.throwOnConstruct = false;
+});
 
 const enabledConfig = {
   enabled: true,
@@ -178,8 +190,6 @@ describe('dsh-langfuse plugin', () => {
   }
 
   beforeEach(() => {
-    mocks.instances.length = 0;
-    mocks.state.failTrace = false;
     seq = 0;
     ctx = new Context();
   });
@@ -208,11 +218,14 @@ describe('dsh-langfuse plugin', () => {
     await setup();
     expect(hookNames(ctx)).toEqual(
       expect.arrayContaining([
+        'session/created',
         'session/event',
         'session/disposed',
         'session/flush',
         'llm/stream',
         'tools/execute',
+        'subagent/start',
+        'subagent/end',
       ]),
     );
     expect(mocks.instances[0].config).toEqual({
@@ -440,14 +453,17 @@ describe('dsh-langfuse plugin', () => {
       });
     });
 
-    it('reports and rethrows mid-stream iteration failures', async () => {
+    it('reports and rethrows mid-stream iteration failures, keeping partial progress', async () => {
       await setup();
       const stream = ctx.waterfall('llm/stream', optionsOf(), async function* () {
-        yield textDelta('a');
+        yield textDelta('partial');
+        yield usageChunk({ inputTokens: 10, outputTokens: 5 });
         throw new Error('adapter boom');
       });
       await expect(drain(stream)).rejects.toThrow('adapter boom');
       expect(fakeObs(mocks.instances[0].traces[0].generations[0]).ends[0]).toMatchObject({
+        output: 'partial',
+        usage: { input: 10, output: 5, total: 15 },
         level: 'ERROR',
         statusMessage: 'adapter boom',
       });
@@ -490,10 +506,12 @@ describe('dsh-langfuse plugin', () => {
       await drain(ctx.waterfall('llm/stream', noSession, () => streamOf(finishStop())));
       expect(mocks.instances[0].traces[0].body).toMatchObject({ sessionId: undefined });
 
-      // Between-turns maintenance call: fresh trace with the sessionId, and a
-      // later turn/start still opens its own trace.
+      // Between-turns maintenance calls SHARE one cached one-off trace (no
+      // per-call fragmentation), and a later turn/start still opens its own.
+      await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
       await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
       expect(mocks.instances[0].traces[1].body).toMatchObject({ sessionId: 's1' });
+      expect(mocks.instances[0].traces).toHaveLength(2);
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
       expect(mocks.instances[0].traces).toHaveLength(3);
     });
@@ -724,7 +742,12 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit(
         'session/event',
         sessionOf('c1'),
-        ev('subagent/descriptor', { version: 2, mode: 'one-shot', provider: 'spawn', label: 'read marker' }),
+        ev('subagent/descriptor', {
+          version: 2,
+          mode: 'one-shot',
+          provider: 'spawn',
+          label: 'read marker',
+        }),
       );
       const subSpan = fakeObs(mocks.instances[0].traces[0]).spans[0];
       expect(subSpan.updates).toContainEqual({
@@ -780,11 +803,30 @@ describe('dsh-langfuse plugin', () => {
         metadata: { childSessionId: 'c2', delegationDepth: 2 },
       });
 
-      await drain(
-        ctx.waterfall('llm/stream', optionsFor('c2'), () => streamOf(finishStop())),
-      );
+      await drain(ctx.waterfall('llm/stream', optionsFor('c2'), () => streamOf(finishStop())));
       expect(mocks.instances[0].traces).toHaveLength(1);
       expect(c2Span.generations).toHaveLength(1);
+    });
+
+    it('nests the child session’s own tool spans under its subagent span', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/created', childSessionOf('c1', 's1'));
+
+      await ctx.waterfall(
+        'tools/execute',
+        execOf({ agent: agentOf('c1'), name: 'read_file', arguments: { path: 'ci-marker.txt' } }),
+        async () => okResult(),
+      );
+
+      const trace = fakeTrace(mocks.instances[0].traces[0]);
+      const subSpan = fakeObs(trace.spans[0]);
+      expect(subSpan.spans).toHaveLength(1);
+      expect(subSpan.spans[0].body).toMatchObject({
+        name: 'tool:read_file',
+        input: { path: 'ci-marker.txt' },
+      });
+      expect(trace.spans).toHaveLength(1);
     });
   });
 
@@ -801,5 +843,214 @@ describe('dsh-langfuse plugin', () => {
       expect(mocks.instances[0].flushAsync).toHaveBeenCalled();
       expect(mocks.instances[0].shutdownAsync).toHaveBeenCalledTimes(1);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// client.ts — reporter unit tests (colocated here with the plugin tests so
+// the whole package shares one inlined SDK mock)
+// ---------------------------------------------------------------------------
+
+const config = { publicKey: 'pk', secretKey: 'sk', baseUrl: 'https://langfuse.example' };
+
+describe('usageOf', () => {
+  it('keeps usageDetails buckets disjoint while usage carries billed totals', () => {
+    expect(
+      usageOf({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, cacheWriteTokens: 3 }),
+    ).toEqual({
+      usage: { input: 15, output: 5, total: 20 },
+      usageDetails: {
+        input: 10,
+        output: 5,
+        total: 20,
+        input_cache_read: 2,
+        input_cache_creation: 3,
+      },
+    });
+  });
+
+  it('omits absent buckets and subtracts reasoning into its own bucket', () => {
+    expect(usageOf({ inputTokens: 10, outputTokens: 5, reasoningTokens: 4 })).toEqual({
+      usage: { input: 10, output: 5, total: 15 },
+      usageDetails: { input: 10, output: 1, total: 15, output_reasoning: 4 },
+    });
+  });
+
+  it('coalesces absent primary fields instead of emitting NaN', () => {
+    expect(usageOf({} as never)).toEqual({
+      usage: { input: 0, output: 0, total: 0 },
+      usageDetails: { input: 0, output: 0, total: 0 },
+    });
+    expect(usageOf({ reasoningTokens: 4 } as never).usageDetails.output).toBe(0);
+  });
+});
+
+describe('LangfuseReporter', () => {
+  it('lazily constructs the SDK client with the connection config', async () => {
+    const reporter = new LangfuseReporter(config);
+    expect(mocks.instances).toHaveLength(0);
+    await reporter.ready;
+    expect(mocks.instances[0].config).toEqual(config);
+  });
+
+  it('creates traces, generations and spans through the stateful API', async () => {
+    const reporter = new LangfuseReporter(config);
+    await reporter.ready;
+    const trace = fakeTrace(
+      reporter.openTrace({ name: 'dsh-turn', sessionId: 's1', metadata: { turn: 0 } }),
+    );
+    expect(mocks.instances[0].traces[0].body).toEqual({
+      name: 'dsh-turn',
+      sessionId: 's1',
+      input: undefined,
+      metadata: { turn: 0 },
+    });
+
+    reporter.updateTrace(trace, { input: 'hello' });
+    expect(trace.updates[0]).toEqual({ input: 'hello', metadata: undefined });
+
+    const generation = fakeGen(
+      reporter.startGeneration(trace, {
+        name: 'llm-call',
+        model: 'deepseek-chat',
+        input: { messages: [] },
+      }),
+    );
+    expect(trace.generations[0].body).toMatchObject({ name: 'llm-call', model: 'deepseek-chat' });
+
+    reporter.endGeneration(generation, {
+      output: 'hi',
+      usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 2 },
+      level: 'DEFAULT',
+    });
+    expect(generation.ends[0]).toMatchObject({
+      output: 'hi',
+      usage: { input: 12, output: 5, total: 17 },
+      usageDetails: { input: 10, output: 5, total: 17, input_cache_read: 2 },
+      level: 'DEFAULT',
+    });
+
+    const span = fakeSpan(
+      reporter.startSpan(trace, { name: 'tool:write_file', input: { path: 'a' } }),
+    );
+    reporter.endSpan(span, { output: [], level: 'ERROR', statusMessage: 'nope' });
+    expect(span.ends[0]).toMatchObject({ level: 'ERROR', statusMessage: 'nope' });
+
+    // Observations parent nested spans (e.g. the llm-request detail span).
+    const nested = fakeSpan(reporter.startSpan(generation, { name: 'llm-request' }));
+    reporter.endSpan(nested, { level: 'DEFAULT' });
+    expect(generation.spans[0].body).toMatchObject({ name: 'llm-request' });
+    expect(nested.ends).toHaveLength(1);
+  });
+
+  it('is a silent no-op before init settles', () => {
+    const reporter = new LangfuseReporter(config);
+    expect(reporter.openTrace({ name: 't' })).toBeNull();
+    expect(mocks.instances).toHaveLength(0);
+  });
+
+  it('degrades to a no-op when client construction fails, logging with the prefix', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mocks.state.throwOnConstruct = true;
+    const reporter = new LangfuseReporter(config);
+    await reporter.ready;
+
+    expect(errorSpy).toHaveBeenCalledWith('[dsh-langfuse] client init failed:', expect.any(Error));
+    const trace = reporter.openTrace({ name: 't' });
+    expect(trace).toBeNull();
+    expect(reporter.startGeneration(trace, { name: 'g' })).toBeNull();
+    expect(reporter.startSpan(trace, { name: 's' })).toBeNull();
+    await expect(reporter.flush()).resolves.toBeUndefined();
+    await expect(reporter.shutdown()).resolves.toBeUndefined();
+    errorSpy.mockRestore();
+  });
+
+  it('swallows every SDK boundary failure with the prefixed console.error', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const reporter = new LangfuseReporter(config);
+    await reporter.ready;
+    const client = mocks.instances[0];
+    const trace = fakeTrace(reporter.openTrace({ name: 't' }));
+    const generation = fakeGen(reporter.startGeneration(trace, { name: 'g' }));
+    const span = fakeSpan(reporter.startSpan(trace, { name: 's' }));
+    errorSpy.mockClear();
+
+    const boom = () => {
+      throw new Error('ingestion down');
+    };
+    vi.spyOn(client, 'trace').mockImplementationOnce(boom);
+    expect(reporter.openTrace({ name: 't' })).toBeNull();
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[dsh-langfuse] trace creation failed:',
+      expect.any(Error),
+    );
+
+    vi.spyOn(trace, 'update').mockImplementationOnce(boom);
+    expect(() => reporter.updateTrace(trace, { input: 'x' })).not.toThrow();
+    expect(errorSpy).toHaveBeenCalledWith('[dsh-langfuse] trace update failed:', expect.any(Error));
+
+    vi.spyOn(trace, 'generation').mockImplementationOnce(boom);
+    expect(reporter.startGeneration(trace, { name: 'g' })).toBeNull();
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[dsh-langfuse] generation creation failed:',
+      expect.any(Error),
+    );
+
+    vi.spyOn(generation, 'end').mockImplementationOnce(boom);
+    expect(() => reporter.endGeneration(generation, { level: 'DEFAULT' })).not.toThrow();
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[dsh-langfuse] generation end failed:',
+      expect.any(Error),
+    );
+
+    vi.spyOn(trace, 'span').mockImplementationOnce(boom);
+    expect(reporter.startSpan(trace, { name: 's' })).toBeNull();
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[dsh-langfuse] span creation failed:',
+      expect.any(Error),
+    );
+
+    vi.spyOn(span, 'end').mockImplementationOnce(boom);
+    expect(() => reporter.endSpan(span, { level: 'DEFAULT' })).not.toThrow();
+    expect(errorSpy).toHaveBeenCalledWith('[dsh-langfuse] span end failed:', expect.any(Error));
+
+    vi.spyOn(span, 'update').mockImplementationOnce(boom);
+    expect(() => reporter.updateSpan(span, { name: 'x' })).not.toThrow();
+    expect(errorSpy).toHaveBeenCalledWith('[dsh-langfuse] span update failed:', expect.any(Error));
+    errorSpy.mockRestore();
+  });
+
+  it('flushes and shuts the SDK down, swallowing failures', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const reporter = new LangfuseReporter(config);
+    await reporter.ready;
+    const client = mocks.instances[0];
+
+    await reporter.flush();
+    expect(client.flushAsync).toHaveBeenCalledTimes(1);
+
+    client.flushAsync.mockRejectedValueOnce(new Error('flush boom'));
+    await expect(reporter.flush()).resolves.toBeUndefined();
+    expect(errorSpy).toHaveBeenCalledWith('[dsh-langfuse] flush failed:', expect.any(Error));
+
+    client.shutdownAsync.mockRejectedValueOnce(new Error('shutdown boom'));
+    await expect(reporter.shutdown()).resolves.toBeUndefined();
+    expect(errorSpy).toHaveBeenCalledWith('[dsh-langfuse] shutdown failed:', expect.any(Error));
+
+    // After shutdown the reporter is inert.
+    expect(reporter.openTrace({ name: 't' })).toBeNull();
+    errorSpy.mockRestore();
+  });
+
+  it('chains flush and shutdown behind the lazy init', async () => {
+    // Called synchronously after construction — before `ready` can have
+    // settled — both must still wait for the client to exist.
+    const flushing = new LangfuseReporter(config);
+    await flushing.flush();
+    expect(mocks.instances[0].flushAsync).toHaveBeenCalledTimes(1);
+
+    const shuttingDown = new LangfuseReporter(config);
+    await shuttingDown.shutdown();
+    expect(mocks.instances[1].shutdownAsync).toHaveBeenCalledTimes(1);
   });
 });

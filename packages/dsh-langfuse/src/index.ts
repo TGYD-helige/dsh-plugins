@@ -1,7 +1,7 @@
 /**
  * dsh-langfuse — Langfuse observability for DeepSeek Harness.
  *
- * Instruments three documented seams, with zero core patches:
+ * Instruments the documented seams, with zero core patches:
  *
  * - `llm/stream` waterfall  → one Langfuse **generation** per LLM call
  *   (input = full request; output, token usage and finish reason collected
@@ -21,7 +21,8 @@
  *   `subagent/descriptor` event).
  *
  * Event/waterfall shapes verified against the installed
- * @deepseek-ai/dsh-{llm,session,tools,agent}@0.1.0-rc.7 type declarations.
+ * @deepseek-ai/dsh-{llm,session,tools,agent,subagent}@0.1.0-rc.7 package sources
+ * (types for shapes; `lib/*.js` for the session/created ordering claim).
  *
  * @module dsh-langfuse
  */
@@ -157,10 +158,13 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
 
   /**
    * The trace an observation for `sessionId` belongs to: the session's open
-   * turn trace, else a fresh one-off (between-turn maintenance calls like
-   * compaction, sessions that started before the plugin loaded, and
-   * session-less hand-built calls all land on untracked traces). Subagent
-   * child sessions resolve through their parent chain to the root trace.
+   * turn trace, else a per-session one-off trace shared by everything outside
+   * a turn (between-turn maintenance calls like compaction, sessions that
+   * started before the plugin loaded, session-less hand-built calls) so those
+   * observations stay in one trace instead of fragmenting per call. The next
+   * `turn/start` replaces it. Subagent child sessions resolve through their
+   * parent chain to the root trace (the depth bound is a cycle guard —
+   * delegation depth is config-capped, 8 is purely defensive).
    */
   function traceFor(sessionId: string | undefined): TraceHandle {
     let id = sessionId;
@@ -169,7 +173,10 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     }
     const existing = id ? sessions.get(id) : undefined;
     if (existing) return existing.trace;
-    return reporter.openTrace({ name: config.traceName, sessionId: id });
+    const trace = reporter.openTrace({ name: config.traceName, sessionId: id });
+    // hasInput starts true: one-offs never take a turn's first-message input.
+    if (trace && id) sessions.set(id, { trace, hasInput: true });
+    return trace;
   }
 
   /**
@@ -193,11 +200,10 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     // Parent under the enclosing delegation tool span when one is open
     // (foreground runs execute inside the parent's tools/execute), else the
     // parent's own subagent span (nested delegation), else the root trace.
-    const openTools = openToolSpans.get(parentSessionId);
     const parentObservation =
-      openTools && openTools.length > 0
-        ? openTools[openTools.length - 1]
-        : (children.get(parentSessionId)?.span ?? traceFor(parentSessionId));
+      openToolSpans.get(parentSessionId)?.at(-1) ??
+      children.get(parentSessionId)?.span ??
+      traceFor(parentSessionId);
     const span = reporter.startSpan(parentObservation, {
       name: 'subagent',
       metadata: {
@@ -223,7 +229,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         stopReason: info.stopReason,
         ...(config.captureContent ? { lastAssistantMessage: info.lastAssistantMessage } : {}),
       },
-      level: info.stopReason === 'error' ? 'ERROR' : info.stopReason === 'aborted' ? 'WARNING' : 'DEFAULT',
+      level:
+        info.stopReason === 'error'
+          ? 'ERROR'
+          : info.stopReason === 'aborted'
+            ? 'WARNING'
+            : 'DEFAULT',
     });
   });
 
@@ -250,8 +261,9 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     }
     switch (event.type) {
       case 'turn/start': {
-        // A leftover entry means a `turn/end` was never seen (crash-orphaned
-        // turn): drop it — the stale trace keeps what it already recorded.
+        // A leftover entry is either a between-turns one-off trace or a turn
+        // whose `turn/end` was never seen (crash-orphaned): replace it — the
+        // stale trace keeps what it already recorded.
         const trace = reporter.openTrace({
           name: config.traceName,
           sessionId,
@@ -352,6 +364,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       let finish: FinishReason | undefined;
       let completionStartTime: Date | undefined;
       let failed = false;
+      const outputBody = () =>
+        config.captureContent
+          ? toolCalls.length > 0
+            ? { text, toolCalls }
+            : text || undefined
+          : undefined;
       try {
         for await (const chunk of stream) {
           // TTFT is the first real token — block boundaries, usage frames and
@@ -381,7 +399,14 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         failed = true;
         const statusMessage = contentMessage(config, messageOf(error));
         closeRequest('ERROR', statusMessage);
-        reporter.endGeneration(generation, { level: 'ERROR', statusMessage });
+        // Partial progress still counts: keep whatever streamed before the throw.
+        reporter.endGeneration(generation, {
+          output: outputBody(),
+          usage,
+          completionStartTime,
+          level: 'ERROR',
+          statusMessage,
+        });
         throw error;
       } finally {
         if (!failed) {
@@ -401,11 +426,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
           }
           closeRequest(level, statusMessage);
           reporter.endGeneration(generation, {
-            output: config.captureContent
-              ? toolCalls.length > 0
-                ? { text, toolCalls }
-                : text || undefined
-              : undefined,
+            output: outputBody(),
             usage,
             completionStartTime,
             level,
@@ -457,10 +478,9 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       throw error;
     } finally {
       if (sessionId && span) {
-        const stack = openToolSpans.get(sessionId);
-        const index = stack?.indexOf(span) ?? -1;
-        if (stack && index >= 0) stack.splice(index, 1);
-        if (stack?.length === 0) openToolSpans.delete(sessionId);
+        const remaining = (openToolSpans.get(sessionId) ?? []).filter((s) => s !== span);
+        if (remaining.length > 0) openToolSpans.set(sessionId, remaining);
+        else openToolSpans.delete(sessionId);
       }
     }
   });
