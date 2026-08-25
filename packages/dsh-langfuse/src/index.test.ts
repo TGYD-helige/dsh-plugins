@@ -1,4 +1,4 @@
-import { Context } from '@deepseek-ai/cordis';
+import { Context, type Events } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { CallId, GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
@@ -85,8 +85,19 @@ let seq = 0;
 const ev = (type: string, data: unknown): SessionEvent =>
   ({ type, seq: ++seq, time: 1700000000000, data }) as unknown as SessionEvent;
 
-const sessionOf = (id: string): Session => ({ id }) as unknown as Session;
+const sessionOf = (id: string, header: Record<string, unknown> = {}): Session =>
+  ({ id, header: { id, ...header } }) as unknown as Session;
 const agentOf = (id: string): Agent => ({ id }) as unknown as Agent;
+
+const childSessionOf = (id: string, parentSessionId: string, depth = 1): Session =>
+  sessionOf(id, { parentSession: parentSessionId, origin: 'subagent', delegationDepth: depth });
+
+type SubagentRunInfo = Parameters<Events['subagent/start']>[0];
+type SubagentRunEndInfo = Parameters<Events['subagent/end']>[0];
+const subagentStart = (id: string): SubagentRunInfo =>
+  ({ runId: `run-${id}`, provider: 'spawn', id, local: true }) as unknown as SubagentRunInfo;
+const subagentEnd = (id: string, stopReason: string): SubagentRunEndInfo =>
+  ({ ...subagentStart(id), stopReason }) as unknown as SubagentRunEndInfo;
 
 const turnStart = (turn: number) => ev('turn/start', { turn });
 const turnEnd = (turn: number) => ev('turn/end', { turn, reason: { kind: 'completed' } });
@@ -634,6 +645,146 @@ describe('dsh-langfuse plugin', () => {
       const trace = fakeTrace(mocks.instances[0].traces[0]);
       expect(trace.body).toMatchObject({ sessionId: undefined });
       expect(trace.spans).toHaveLength(1);
+    });
+  });
+
+  describe('subagent tracing', () => {
+    const optionsFor = (sessionId: string) =>
+      optionsOf({ sessionId: sessionId as unknown as GenerateOptions['sessionId'] });
+
+    it('nests a subagent run under the enclosing delegation tool span', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+
+      await ctx.waterfall(
+        'tools/execute',
+        execOf({ name: 'subagent', arguments: { description: 'read marker', prompt: 'go' } }),
+        async () => {
+          // Inside the foreground delegation dispatch: the child session
+          // appears, reports, runs its LLM call, and settles.
+          ctx.emit('session/created', childSessionOf('c1', 's1'));
+          ctx.emit('subagent/start', subagentStart('c1'));
+          await drain(
+            ctx.waterfall('llm/stream', optionsFor('c1'), () =>
+              streamOf(textDelta('child answer'), finishStop()),
+            ),
+          );
+          ctx.emit('subagent/end', subagentEnd('c1', 'completed'));
+          return okResult();
+        },
+      );
+
+      expect(mocks.instances[0].traces).toHaveLength(1);
+      const trace = fakeTrace(mocks.instances[0].traces[0]);
+      expect(trace.generations).toHaveLength(0);
+
+      const delegationSpan = fakeObs(trace.spans[0]);
+      expect(delegationSpan.body).toMatchObject({ name: 'tool:subagent' });
+      expect(delegationSpan.spans).toHaveLength(1);
+
+      const subSpan = fakeObs(delegationSpan.spans[0]);
+      expect(subSpan.body).toMatchObject({
+        name: 'subagent',
+        metadata: { childSessionId: 'c1', delegationDepth: 1 },
+      });
+      // subagent/start enriches with provider facts.
+      expect(subSpan.updates).toContainEqual({ metadata: { provider: 'spawn', local: true } });
+      // The child's generation nests under the subagent span, not the trace.
+      expect(subSpan.generations).toHaveLength(1);
+      expect(subSpan.generations[0].body).toMatchObject({ name: 'llm-call' });
+      expect(subSpan.ends[0]).toMatchObject({
+        output: { stopReason: 'completed' },
+        level: 'DEFAULT',
+      });
+      expect(delegationSpan.ends).toHaveLength(1);
+    });
+
+    it('gives child sessions no turn trace and feeds the prompt to the span', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/created', childSessionOf('c1', 's1'));
+
+      // The child's whole turn lifecycle must not open a trace of its own.
+      ctx.emit('session/event', sessionOf('c1'), turnStart(0));
+      ctx.emit('session/event', sessionOf('c1'), userMessage('read the marker file'));
+      ctx.emit('session/event', sessionOf('c1'), turnEnd(0));
+
+      expect(mocks.instances[0].traces).toHaveLength(1);
+      const trace = fakeTrace(mocks.instances[0].traces[0]);
+      // No open delegation span: the subagent span parents at the trace root.
+      const subSpan = fakeObs(trace.spans[0]);
+      expect(subSpan.body).toMatchObject({ name: 'subagent' });
+      expect(subSpan.updates).toContainEqual({ input: 'read the marker file' });
+    });
+
+    it('enriches the span name from the subagent/descriptor event', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/created', childSessionOf('c1', 's1'));
+      ctx.emit(
+        'session/event',
+        sessionOf('c1'),
+        ev('subagent/descriptor', { version: 2, mode: 'one-shot', provider: 'spawn', label: 'read marker' }),
+      );
+      const subSpan = fakeObs(mocks.instances[0].traces[0]).spans[0];
+      expect(subSpan.updates).toContainEqual({
+        name: 'subagent: read marker',
+        metadata: { mode: 'one-shot', provider: 'spawn' },
+      });
+    });
+
+    it('marks a failed subagent run as ERROR', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/created', childSessionOf('c1', 's1'));
+      ctx.emit('subagent/end', subagentEnd('c1', 'error'));
+      const subSpan = fakeObs(mocks.instances[0].traces[0]).spans[0];
+      expect(subSpan.ends[0]).toMatchObject({ level: 'ERROR', output: { stopReason: 'error' } });
+    });
+
+    it('withholds the final assistant message when captureContent is off', async () => {
+      await setup({ ...enabledConfig, captureContent: false });
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/created', childSessionOf('c1', 's1'));
+      ctx.emit('subagent/end', subagentEnd('c1', 'error'));
+      const subSpan = fakeObs(mocks.instances[0].traces[0]).spans[0];
+      expect(subSpan.ends[0]).toMatchObject({ output: { stopReason: 'error' } });
+      expect((subSpan.ends[0] as { output: Record<string, unknown> }).output).not.toHaveProperty(
+        'lastAssistantMessage',
+      );
+    });
+
+    it('closes a dangling child span on session/disposed', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/created', childSessionOf('c1', 's1'));
+      ctx.emit('session/disposed', sessionOf('c1'));
+      const subSpan = fakeObs(mocks.instances[0].traces[0]).spans[0];
+      expect(subSpan.ends[0]).toMatchObject({
+        level: 'WARNING',
+        statusMessage: 'session disposed before subagent/end',
+      });
+    });
+
+    it('resolves nested (depth-2) delegations to the root trace', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/created', childSessionOf('c1', 's1'));
+      ctx.emit('session/created', childSessionOf('c2', 'c1', 2));
+
+      const trace = fakeTrace(mocks.instances[0].traces[0]);
+      const c1Span = fakeObs(trace.spans[0]);
+      const c2Span = fakeObs(c1Span.spans[0]);
+      expect(c2Span.body).toMatchObject({
+        name: 'subagent',
+        metadata: { childSessionId: 'c2', delegationDepth: 2 },
+      });
+
+      await drain(
+        ctx.waterfall('llm/stream', optionsFor('c2'), () => streamOf(finishStop())),
+      );
+      expect(mocks.instances[0].traces).toHaveLength(1);
+      expect(c2Span.generations).toHaveLength(1);
     });
   });
 

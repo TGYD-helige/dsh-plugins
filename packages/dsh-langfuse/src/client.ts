@@ -125,9 +125,9 @@ export class LangfuseReporter {
     }
   }
 
-  /** Open a generation (one per LLM call) under `trace`. */
+  /** Open a generation (one per LLM call) under any observation parent. */
   startGeneration(
-    trace: LangfuseTraceClient | null,
+    parent: SpanParent | null,
     input: {
       name: string;
       model?: string;
@@ -136,9 +136,9 @@ export class LangfuseReporter {
       metadata?: Record<string, unknown>;
     },
   ): LangfuseGenerationClient | null {
-    if (!trace) return null;
+    if (!parent) return null;
     try {
-      return trace.generation({
+      return parent.generation({
         name: input.name,
         model: input.model,
         input: input.input,
@@ -188,6 +188,19 @@ export class LangfuseReporter {
     } catch (error) {
       console.error('[dsh-langfuse] span creation failed:', error);
       return null;
+    }
+  }
+
+  /** Merge fields into an open span (subagent enrichment: label, provider). */
+  updateSpan(
+    span: LangfuseSpanClient | null,
+    update: { name?: string; input?: unknown; metadata?: Record<string, unknown> },
+  ): void {
+    if (!span) return;
+    try {
+      span.update({ name: update.name, input: update.input, metadata: update.metadata });
+    } catch (error) {
+      console.error('[dsh-langfuse] span update failed:', error);
     }
   }
 

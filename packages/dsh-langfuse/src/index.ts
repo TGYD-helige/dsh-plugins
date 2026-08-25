@@ -14,6 +14,11 @@
  * - `session/event` emit    → one Langfuse **trace** per agent turn
  *   (`turn/start` opens, the turn's first `user/message` sets the input,
  *   `turn/end` stamps the end reason).
+ * - subagent child sessions (`session/created` with `header.parentSession`)
+ *   ride the parent's trace: a `subagent` **span** opened under the enclosing
+ *   delegation tool span, the child's generations/tool spans nested under it,
+ *   closed at `subagent/end` (enriched by `subagent/start` and the child's
+ *   `subagent/descriptor` event).
  *
  * Event/waterfall shapes verified against the installed
  * @deepseek-ai/dsh-{llm,session,tools,agent}@0.1.0-rc.7 type declarations.
@@ -25,6 +30,9 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { FinishReason, GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm';
 import { isTokenDelta } from '@deepseek-ai/dsh-llm/message';
 import type { UserMessage } from '@deepseek-ai/dsh-session';
+// Augmentation-only import: pulls the `subagent/start` / `subagent/end` Events
+// declarations into the compilation (the listeners are contextually typed).
+import type {} from '@deepseek-ai/dsh-subagent';
 // Augmentation-only import: pulls the `tools/execute` Events declaration into
 // the compilation (the listener itself is contextually typed).
 import type {} from '@deepseek-ai/dsh-tools';
@@ -61,11 +69,25 @@ export interface LangfusePluginConfig {
 }
 
 type TraceHandle = ReturnType<LangfuseReporter['openTrace']>;
+type SpanHandle = ReturnType<LangfuseReporter['startSpan']>;
 
 /** Per-session open turn trace. */
 interface SessionTrace {
   trace: NonNullable<TraceHandle>;
   /** Whether the trace input was set — the turn's first `user/message` wins. */
+  hasInput: boolean;
+}
+
+/**
+ * A subagent child session (header.parentSession set at session/created):
+ * rides the parent session's trace under one `subagent` span instead of
+ * opening own turn traces.
+ */
+interface ChildSession {
+  parentSessionId: string;
+  /** The open `subagent` span for this child (null when creation failed). */
+  span: SpanHandle;
+  /** Whether the span input was set — the child's first `user/message` wins. */
   hasInput: boolean;
 }
 
@@ -129,24 +151,103 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
 
   const reporter = new LangfuseReporter(config);
   const sessions = new Map<string, SessionTrace>();
+  const children = new Map<string, ChildSession>();
+  /** Per-session stack of currently open tools/execute spans (for subagent parenting). */
+  const openToolSpans = new Map<string, SpanHandle[]>();
 
   /**
    * The trace an observation for `sessionId` belongs to: the session's open
    * turn trace, else a fresh one-off (between-turn maintenance calls like
    * compaction, sessions that started before the plugin loaded, and
-   * session-less hand-built calls all land on untracked traces).
+   * session-less hand-built calls all land on untracked traces). Subagent
+   * child sessions resolve through their parent chain to the root trace.
    */
   function traceFor(sessionId: string | undefined): TraceHandle {
-    const existing = sessionId ? sessions.get(sessionId) : undefined;
+    let id = sessionId;
+    for (let depth = 0; id && children.has(id) && depth < 8; depth++) {
+      id = children.get(id)?.parentSessionId;
+    }
+    const existing = id ? sessions.get(id) : undefined;
     if (existing) return existing.trace;
-    return reporter.openTrace({ name: config.traceName, sessionId });
+    return reporter.openTrace({ name: config.traceName, sessionId: id });
+  }
+
+  /**
+   * The observation a generation/span for `sessionId` parents under: the
+   * child's own `subagent` span when there is one, else the turn trace.
+   */
+  function parentFor(sessionId: string | undefined): TraceHandle | SpanHandle {
+    const child = sessionId ? children.get(sessionId) : undefined;
+    return child?.span ?? traceFor(sessionId);
   }
 
   // ------------------------------------------------------------------
-  // Trace lifecycle: one trace per turn.
+  // Subagent child sessions: session/created precedes both subagent/start
+  // and the child's first generation, and the durable header already links
+  // child → parent (verified against dsh-subagent@0.1.0-rc.7).
+  // ------------------------------------------------------------------
+  ctx.on('session/created', (session) => {
+    const parentSessionId: string | undefined = session.header.parentSession;
+    if (!parentSessionId) return;
+    const childId: string = session.id;
+    // Parent under the enclosing delegation tool span when one is open
+    // (foreground runs execute inside the parent's tools/execute), else the
+    // parent's own subagent span (nested delegation), else the root trace.
+    const openTools = openToolSpans.get(parentSessionId);
+    const parentObservation =
+      openTools && openTools.length > 0
+        ? openTools[openTools.length - 1]
+        : (children.get(parentSessionId)?.span ?? traceFor(parentSessionId));
+    const span = reporter.startSpan(parentObservation, {
+      name: 'subagent',
+      metadata: {
+        childSessionId: childId,
+        delegationDepth: session.header.delegationDepth,
+      },
+    });
+    children.set(childId, { parentSessionId, span, hasInput: false });
+  });
+
+  ctx.on('subagent/start', (info) => {
+    const child = children.get(info.id);
+    if (!child) return; // remote (ACP) runs have no local session — nothing to nest
+    reporter.updateSpan(child.span, { metadata: { provider: info.provider, local: info.local } });
+  });
+
+  ctx.on('subagent/end', (info) => {
+    const child = children.get(info.id);
+    if (!child) return;
+    children.delete(info.id);
+    reporter.endSpan(child.span, {
+      output: {
+        stopReason: info.stopReason,
+        ...(config.captureContent ? { lastAssistantMessage: info.lastAssistantMessage } : {}),
+      },
+      level: info.stopReason === 'error' ? 'ERROR' : info.stopReason === 'aborted' ? 'WARNING' : 'DEFAULT',
+    });
+  });
+
+  // ------------------------------------------------------------------
+  // Trace lifecycle: one trace per turn (top-level sessions only — child
+  // sessions ride the parent's trace under their subagent span).
   // ------------------------------------------------------------------
   ctx.on('session/event', (session, event) => {
     const sessionId: string = session.id;
+    const child = children.get(sessionId);
+    if (child) {
+      // The delegated prompt (the child's first user/message) is the
+      // subagent span's input; the descriptor enriches the span name.
+      if (event.type === 'user/message' && !child.hasInput && config.captureContent) {
+        reporter.updateSpan(child.span, { input: messageText(event.data) });
+        child.hasInput = true;
+      } else if (event.type === 'subagent/descriptor') {
+        reporter.updateSpan(child.span, {
+          name: event.data.label ? `subagent: ${event.data.label}` : 'subagent',
+          metadata: { mode: event.data.mode, provider: event.data.provider },
+        });
+      }
+      return;
+    }
     switch (event.type) {
       case 'turn/start': {
         // A leftover entry means a `turn/end` was never seen (crash-orphaned
@@ -181,7 +282,19 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   });
 
   ctx.on('session/disposed', (session) => {
-    sessions.delete(session.id);
+    const sessionId: string = session.id;
+    sessions.delete(sessionId);
+    openToolSpans.delete(sessionId);
+    const child = children.get(sessionId);
+    if (child) {
+      children.delete(sessionId);
+      // A child torn down without a subagent/end (crash, abort): close its
+      // span instead of leaking it open.
+      reporter.endSpan(child.span, {
+        level: 'WARNING',
+        statusMessage: 'session disposed before subagent/end',
+      });
+    }
   });
 
   // ------------------------------------------------------------------
@@ -190,7 +303,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   // must not be async — it returns an async-generator tee instead.
   // ------------------------------------------------------------------
   ctx.on('llm/stream', (options, next) => {
-    const generation = reporter.startGeneration(traceFor(options.sessionId), {
+    const generation = reporter.startGeneration(parentFor(options.sessionId), {
       name: options.purpose ? `llm-call [${options.purpose}]` : 'llm-call',
       model: options.model,
       input: config.captureContent
@@ -311,14 +424,22 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
 
   // ------------------------------------------------------------------
   // Span per tool dispatch. This waterfall IS async: `next()` returns the
-  // normalized dispatch result promise.
+  // normalized dispatch result promise. Open spans are tracked per session
+  // so a subagent span opened mid-dispatch (foreground delegation) parents
+  // under the enclosing tool span.
   // ------------------------------------------------------------------
   ctx.on('tools/execute', async (exec, next) => {
-    const span = reporter.startSpan(traceFor(exec.agent?.id), {
+    const sessionId = exec.agent?.id;
+    const span = reporter.startSpan(parentFor(sessionId), {
       name: `tool:${exec.name}`,
       input: config.captureContent ? exec.arguments : undefined,
       metadata: { callId: exec.callId, toolName: exec.name },
     });
+    if (sessionId && span) {
+      const stack = openToolSpans.get(sessionId) ?? [];
+      stack.push(span);
+      openToolSpans.set(sessionId, stack);
+    }
     try {
       const result = await next();
       reporter.endSpan(span, {
@@ -334,6 +455,13 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         statusMessage: contentMessage(config, messageOf(error)),
       });
       throw error;
+    } finally {
+      if (sessionId && span) {
+        const stack = openToolSpans.get(sessionId);
+        const index = stack?.indexOf(span) ?? -1;
+        if (stack && index >= 0) stack.splice(index, 1);
+        if (stack?.length === 0) openToolSpans.delete(sessionId);
+      }
     }
   });
 
@@ -346,6 +474,8 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   ctx.effect(() => {
     return async () => {
       sessions.clear();
+      children.clear();
+      openToolSpans.clear();
       await reporter.shutdown();
     };
   });
