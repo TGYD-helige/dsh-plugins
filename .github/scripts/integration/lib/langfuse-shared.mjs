@@ -369,6 +369,12 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
 
   const publicKey = envOr(process.env.LANGFUSE_PUBLIC_KEY, '');
   const secretKey = envOr(process.env.LANGFUSE_SECRET_KEY, '');
+  // A half-configured pair is a misconfiguration — never silently fake it.
+  if (Boolean(publicKey) !== Boolean(secretKey)) {
+    console.log(
+      '::warning::only one of LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY is set — running in fake mode',
+    );
+  }
   const realMode = Boolean(publicKey && secretKey);
   const baseUrl = envOr(process.env.LANGFUSE_BASE_URL, DEFAULT_BASE_URL);
   console.log(`mode: ${realMode ? `real Langfuse (${baseUrl})` : 'fake ingestion endpoint'}`);
