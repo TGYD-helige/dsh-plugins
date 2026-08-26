@@ -1,10 +1,29 @@
 /**
- * Lazy Langfuse client wrapper.
+ * Langfuse reporter — thin synchronous wrapper over the `langfuse` v3 SDK's
+ * stateful API (`client.trace()` / `trace.generation()` / `trace.span()`), and
+ * the plugin's single no-throw seam: every method swallows SDK failures with a
+ * `[dsh-langfuse]` console.error so observability can never break the agent
+ * loop. The SDK batches and retries ingestion on its own; this wrapper only
+ * adds dsh→Langfuse mapping and error containment.
  *
- * All public methods are no-throw: observability must never break the agent
- * loop. The underlying `langfuse` package is a peer dependency so deployments
- * that disable the plugin do not pay for it.
+ * The `langfuse` peer is a heavy optional backend, so it loads via dynamic
+ * `import()` kicked off in the constructor — a disabled plugin never pays for
+ * it, and a missing or incompatible peer degrades the reporter to a no-op
+ * instead of breaking the plugin load. {@link LangfuseReporter.ready} settles
+ * (never rejects) once the import+construction finished: the plugin returns
+ * it from `apply()` so fiber readiness covers the import window, and
+ * {@link flush}/{@link shutdown} chain behind it. Observation calls landing
+ * before readiness are still dropped — a window that cannot exist once the
+ * plugin fiber has been awaited.
  */
+
+import type { TokenUsage } from '@deepseek-ai/dsh-llm';
+import type {
+  Langfuse,
+  LangfuseGenerationClient,
+  LangfuseSpanClient,
+  LangfuseTraceClient,
+} from 'langfuse';
 
 export interface LangfuseConnectionConfig {
   publicKey: string;
@@ -12,151 +31,214 @@ export interface LangfuseConnectionConfig {
   baseUrl: string;
 }
 
-export interface TokenUsage {
-  inputTokens?: number;
-  outputTokens?: number;
-  cacheReadTokens?: number;
-  cacheWriteTokens?: number;
-  reasoningTokens?: number;
+export type ObservationLevel = 'DEFAULT' | 'WARNING' | 'ERROR';
+
+/** Any observation client that can parent a span (trace, span, or generation). */
+type SpanParent = LangfuseTraceClient | LangfuseSpanClient | LangfuseGenerationClient;
+
+/**
+ * Map dsh token accounting onto Langfuse's `usageDetails`, keeping every
+ * bucket mutually exclusive (Langfuse's flat-bucket rule: `input` excludes
+ * `input_*`, `output` excludes `output_*`, `total` is the bucket sum —
+ * overlapping buckets double-count usage and inferred cost). dsh reports
+ * uncached input, separate cache buckets, and provider-style output that
+ * INCLUDES reasoning (verified in dsh-llm-deepseek@0.1.0-rc.7:
+ * `outputTokens: usage.completion_tokens`, with reasoning split out of
+ * `completion_tokens_details`), so the `output` bucket subtracts
+ * `reasoningTokens` into `output_reasoning`. Only `usageDetails` is sent —
+ * the SDK's legacy `usage` triple is deprecated.
+ */
+export function usageOf(usage: TokenUsage): Record<string, number> {
+  // The dsh type marks the two primary fields required, but a non-conformant
+  // adapter emitting a partial usage chunk would otherwise turn every bucket
+  // NaN (serialized as null by the SDK — silently corrupting billed usage).
+  const input =
+    (usage.inputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0);
+  const output = usage.outputTokens ?? 0;
+  const total = input + output;
+  // Clamp reasoning at the provider's output count: reasoning is a subset of
+  // output, and only a broken adapter would report more — clamping keeps the
+  // buckets summing to total even then.
+  const reasoning = Math.min(usage.reasoningTokens ?? 0, output);
+  const usageDetails: Record<string, number> = {
+    input: usage.inputTokens ?? 0,
+    output: output - reasoning,
+    total,
+  };
+  if (usage.cacheReadTokens) usageDetails.input_cache_read = usage.cacheReadTokens;
+  if (usage.cacheWriteTokens) usageDetails.input_cache_creation = usage.cacheWriteTokens;
+  if (reasoning) usageDetails.output_reasoning = reasoning;
+  return usageDetails;
 }
 
-// The langfuse v3 SDK surface we use. Declared structurally to keep this file
-// compilable before dependencies are installed; the real types come from the
-// `langfuse` peer dependency.
-/* eslint-disable @typescript-eslint/no-explicit-any */
-export type LangfuseClientLike = any;
-export type TraceLike = any;
-export type GenerationLike = any;
-export type SpanLike = any;
-
 export class LangfuseReporter {
-  private clientPromise: Promise<LangfuseClientLike> | null = null;
+  private client: Langfuse | null = null;
+  /** Settles (never rejects) once the lazy SDK import+construction finished. */
+  readonly ready: Promise<void>;
 
-  constructor(private config: LangfuseConnectionConfig) {}
-
-  private async client(): Promise<LangfuseClientLike> {
-    if (!this.clientPromise) {
-      this.clientPromise = import('langfuse').then(
-        (mod) =>
-          new (mod as any).Langfuse({
-            publicKey: this.config.publicKey,
-            secretKey: this.config.secretKey,
-            baseUrl: this.config.baseUrl,
-          }),
-      );
-    }
-    return this.clientPromise;
+  constructor(private config: LangfuseConnectionConfig) {
+    this.ready = this.init();
   }
 
-  /** Open (or fetch) the trace for one agent turn. */
-  async startTrace(input: {
-    traceId: string;
-    name: string;
-    sessionId: string;
-    userId?: string;
-    metadata?: Record<string, unknown>;
-  }): Promise<TraceLike> {
+  /** Dynamically import the SDK and construct the client. */
+  private async init(): Promise<void> {
     try {
-      const client = await this.client();
-      return client.trace({
-        id: input.traceId,
-        name: input.name,
-        sessionId: input.sessionId,
-        userId: input.userId,
-        metadata: input.metadata,
+      const { Langfuse } = await import('langfuse');
+      this.client = new Langfuse({
+        publicKey: this.config.publicKey,
+        secretKey: this.config.secretKey,
+        baseUrl: this.config.baseUrl,
       });
-    } catch {
+    } catch (error) {
+      console.error('[dsh-langfuse] client init failed:', error);
+    }
+  }
+
+  /** Open a trace (one per agent turn, or one-off for session-less calls). */
+  openTrace(input: {
+    name: string;
+    sessionId?: string;
+    metadata?: Record<string, unknown>;
+  }): LangfuseTraceClient | null {
+    if (!this.client) return null;
+    try {
+      return this.client.trace(input);
+    } catch (error) {
+      console.error('[dsh-langfuse] trace creation failed:', error);
       return null;
     }
   }
 
-  /** Record one LLM call as a Langfuse generation under `trace`. */
-  async generation(
-    trace: TraceLike,
+  /**
+   * Merge fields into an open trace: the input from the turn's first user
+   * message, the final answer and end reason at `turn/end` (Langfuse merges
+   * metadata on update).
+   */
+  updateTrace(
+    trace: LangfuseTraceClient | null,
+    update: { input?: unknown; output?: unknown; metadata?: Record<string, unknown> },
+  ): void {
+    if (!trace) return;
+    try {
+      trace.update(update);
+    } catch (error) {
+      console.error('[dsh-langfuse] trace update failed:', error);
+    }
+  }
+
+  /** Open a generation (one per LLM call) under any observation parent. */
+  startGeneration(
+    parent: SpanParent | null,
     input: {
       name: string;
       model?: string;
-      input: unknown;
+      input?: unknown;
+      modelParameters?: Record<string, string | number | boolean | string[] | null>;
       metadata?: Record<string, unknown>;
     },
-  ): Promise<GenerationLike> {
-    if (!trace) return null;
+  ): LangfuseGenerationClient | null {
+    if (!parent) return null;
     try {
-      return trace.generation({
-        name: input.name,
-        model: input.model,
-        input: input.input,
-        metadata: input.metadata,
-      });
-    } catch {
+      return parent.generation(input);
+    } catch (error) {
+      console.error('[dsh-langfuse] generation creation failed:', error);
       return null;
     }
   }
 
   endGeneration(
-    generation: GenerationLike,
-    output: {
+    generation: LangfuseGenerationClient | null,
+    update: {
+      name?: string;
       output?: unknown;
       usage?: TokenUsage;
-      level?: 'DEFAULT' | 'ERROR';
+      completionStartTime?: Date;
+      level?: ObservationLevel;
       statusMessage?: string;
+      metadata?: Record<string, unknown>;
     },
   ): void {
     if (!generation) return;
     try {
       generation.end({
-        output: output.output,
-        usage: output.usage
-          ? {
-              input: output.usage.inputTokens,
-              output: output.usage.outputTokens,
-              total: (output.usage.inputTokens ?? 0) + (output.usage.outputTokens ?? 0),
-            }
-          : undefined,
-        level: output.level ?? 'DEFAULT',
-        statusMessage: output.statusMessage,
+        name: update.name,
+        output: update.output,
+        ...(update.usage ? { usageDetails: usageOf(update.usage) } : {}),
+        completionStartTime: update.completionStartTime,
+        level: update.level,
+        statusMessage: update.statusMessage,
+        metadata: update.metadata,
       });
-    } catch {
-      /* observability must not throw */
+    } catch (error) {
+      console.error('[dsh-langfuse] generation end failed:', error);
     }
   }
 
-  /** Record one tool call as a span under `trace`. */
-  async span(
-    trace: TraceLike,
-    input: { name: string; input: unknown; metadata?: Record<string, unknown> },
-  ): Promise<SpanLike> {
-    if (!trace) return null;
+  /** Open a span (one per tool dispatch, or a nested detail span) under any observation parent. */
+  startSpan(
+    parent: SpanParent | null,
+    input: { name: string; input?: unknown; metadata?: Record<string, unknown> },
+  ): LangfuseSpanClient | null {
+    if (!parent) return null;
     try {
-      return trace.span({ name: input.name, input: input.input, metadata: input.metadata });
-    } catch {
+      return parent.span(input);
+    } catch (error) {
+      console.error('[dsh-langfuse] span creation failed:', error);
       return null;
     }
   }
 
-  endSpan(
-    span: SpanLike,
-    output: { output?: unknown; level?: 'DEFAULT' | 'ERROR'; statusMessage?: string },
+  /** Merge fields into an open span (subagent enrichment: label, provider). */
+  updateSpan(
+    span: LangfuseSpanClient | null,
+    update: { name?: string; input?: unknown; metadata?: Record<string, unknown> },
   ): void {
     if (!span) return;
     try {
-      span.end({
-        output: output.output,
-        level: output.level ?? 'DEFAULT',
-        statusMessage: output.statusMessage,
-      });
-    } catch {
-      /* observability must not throw */
+      span.update(update);
+    } catch (error) {
+      console.error('[dsh-langfuse] span update failed:', error);
     }
   }
 
-  async shutdown(): Promise<void> {
+  endSpan(
+    span: LangfuseSpanClient | null,
+    update: {
+      output?: unknown;
+      level?: ObservationLevel;
+      statusMessage?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ): void {
+    if (!span) return;
     try {
-      const client = await this.clientPromise;
-      await client?.flushAsync?.();
-      await client?.shutdownAsync?.();
-    } catch {
-      /* ignore */
+      span.end(update);
+    } catch (error) {
+      console.error('[dsh-langfuse] span end failed:', error);
+    }
+  }
+
+  /** Drain buffered ingestion events (the `session/flush` checkpoint). */
+  async flush(): Promise<void> {
+    await this.ready;
+    if (!this.client) return;
+    try {
+      await this.client.flushAsync();
+    } catch (error) {
+      console.error('[dsh-langfuse] flush failed:', error);
+    }
+  }
+
+  /** Shut the SDK down at fiber unload (its shutdownAsync flushes internally). */
+  async shutdown(): Promise<void> {
+    await this.ready;
+    const client = this.client;
+    this.client = null;
+    if (!client) return;
+    try {
+      await client.shutdownAsync();
+    } catch (error) {
+      console.error('[dsh-langfuse] shutdown failed:', error);
     }
   }
 }

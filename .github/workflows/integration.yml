@@ -2,8 +2,9 @@ name: Integration
 
 # Per-package E2E: boot the real dsh headless profile with the packed plugin,
 # run one LLM query, and verify the plugin's observable effect. A package
-# joins the matrix by shipping `.github/scripts/integration/<package>.mjs` —
-# see .github/scripts/integration-matrix.mjs.
+# joins the matrix by shipping `.github/scripts/integration/<package>.mjs`,
+# and may split into several legs as `<package>.<scenario>.mjs` sharing one
+# tarball — see .github/scripts/integration-matrix.mjs.
 #
 # Two leg shapes, split because `environment` is job-level:
 # - scenario: the base LLM leg. It receives DSH_INTEGRATION_* secrets and
@@ -49,7 +50,7 @@ jobs:
         run: node .github/scripts/integration-matrix.mjs
 
   scenario:
-    name: E2E (${{ matrix.package }})
+    name: E2E (${{ matrix.name }})
     needs: detect
     if: needs.detect.outputs.has_scenarios == 'true'
     runs-on: ubuntu-latest
@@ -144,7 +145,13 @@ jobs:
         env:
           DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
           DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
-        run: node ".github/scripts/integration/${{ matrix.package }}.mjs"
+          # dsh-langfuse only: blanked on other packages' legs (fork PRs get
+          # no secrets at all and the scenario self-skips Stage B). Absent
+          # keys flip the scenario to its fake-ingestion fallback.
+          LANGFUSE_PUBLIC_KEY: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_PUBLIC_KEY || '' }}
+          LANGFUSE_SECRET_KEY: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_SECRET_KEY || '' }}
+          LANGFUSE_BASE_URL: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_BASE_URL || '' }}
+        run: node ".github/scripts/integration/${{ matrix.name }}.mjs"
 
       # Runtime visibility: the full session event log (including
       # request/header — what the model actually saw) lives in the profile's
@@ -166,7 +173,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-${{ matrix.package }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: e2e-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 7
           path: |

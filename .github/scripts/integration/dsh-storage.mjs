@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
+import { netEnv, requireEnv, run } from './lib/ci-shared.mjs';
 
 const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), 'dsh-storage-e2e');
 mkdirSync(workDir, { recursive: true });
@@ -36,35 +37,19 @@ if (provider !== 'sqlite') {
 }
 
 const { DSH_INTEGRATION_BASE_URL, DSH_INTEGRATION_API_KEY, DSH_PKG_TARBALL } = process.env;
-for (const name of ['DSH_INTEGRATION_BASE_URL', 'DSH_INTEGRATION_API_KEY', 'DSH_PKG_TARBALL']) {
-  if (!process.env[name]) throw new Error(`${name} is required`);
-}
-
-// If the runner routes egress through a host-level proxy, fetch to the
-// gateway can break (pi's self-hosted integration jobs hit exactly that) —
-// drop proxy vars from the LLM-carrying processes entirely.
-const netEnv = Object.fromEntries(
-  Object.entries(process.env).filter(([k]) => !/^(https?_proxy|all_proxy|no_proxy)$/i.test(k)),
-);
-
-function run(cmd, args, env = {}) {
-  console.log(`\n$ ${cmd} ${args.join(' ')}`);
-  const r = spawnSync(cmd, args, { stdio: 'inherit', cwd: workDir, env: { ...process.env, ...env } });
-  if (r.error) throw r.error;
-  if (r.status !== 0) throw new Error(`${cmd} ${args.slice(0, 3).join(' ')} exited ${r.status}`);
-}
+requireEnv(['DSH_INTEGRATION_BASE_URL', 'DSH_INTEGRATION_API_KEY', 'DSH_PKG_TARBALL']);
 
 const dshHomeEnv = { DSH_HOME: dshHome };
 
 // 1. Install the packed bundle — `dsh plugin` forwards to pnpm in the profile
 //    directory and auto-registers any dependency with a dsh.bundle patch.
-run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], dshHomeEnv);
+run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], { cwd: workDir, env: dshHomeEnv });
 
 // 2. The profile template sets autoInstallPeers: false, so the plugin's
 //    runtime peers (Prisma 7 client + the sqlite driver adapter) must be
 //    added explicitly. The PrismaClient itself ships pre-generated in the
 //    bundle — no generate step here.
-run(dsh, ['plugin', '--profile', 'headless', 'add', '@prisma/client@7.9.1', '@prisma/adapter-libsql@7.9.1'], dshHomeEnv);
+run(dsh, ['plugin', '--profile', 'headless', 'add', '@prisma/client@7.9.1', '@prisma/adapter-libsql@7.9.1'], { cwd: workDir, env: dshHomeEnv });
 
 // 3. Enable the sqlite mirror through the profile's user patch layer (an
 //    id-targeted row replaces the bundle row's whole config). The template
@@ -110,7 +95,7 @@ const schemaPath = join(
   'prisma',
   'schema.sqlite.prisma',
 );
-run('pnpm', ['dlx', 'prisma@7.9.1', 'db', 'push', '--schema', schemaPath, '--url', `file:${dbPath}`]);
+run('pnpm', ['dlx', 'prisma@7.9.1', 'db', 'push', '--schema', schemaPath, '--url', `file:${dbPath}`], { cwd: workDir });
 
 // 5. One real query, seeded to force a tool round-trip: the marker file's
 //    unique content can only reach the transcript through a tool result, so
@@ -147,7 +132,7 @@ for (let attempt = 1; attempt <= 3; attempt++) {
   if (attempt > 1) {
     // A retried run is a new session in the same file — start clean.
     rmSync(dbPath, { force: true });
-    run('pnpm', ['dlx', 'prisma@7.9.1', 'db', 'push', '--schema', schemaPath, '--url', `file:${dbPath}`]);
+    run('pnpm', ['dlx', 'prisma@7.9.1', 'db', 'push', '--schema', schemaPath, '--url', `file:${dbPath}`], { cwd: workDir });
   }
   console.log(`\n$ dsh --profile headless "${prompt}" (attempt ${attempt})`);
   const query = spawnSync(dsh, ['--profile', 'headless', prompt], {
@@ -155,7 +140,7 @@ for (let attempt = 1; attempt <= 3; attempt++) {
     encoding: 'utf8',
     timeout: 8 * 60_000,
     env: {
-      ...netEnv,
+      ...netEnv(),
       ...dshHomeEnv,
       DSH_TELEMETRY_DISABLED: '1',
       // Ephemeral CI workspace: never stall on tool approval prompts.

@@ -4,7 +4,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 const severities = ['P0', 'P1', 'P2', 'P3']
-const axes = new Set(['Standards', 'Spec'])
+const axes = new Set(['Standards', 'Spec', 'Ponytail'])
 const sides = new Set(['LEFT', 'RIGHT'])
 const summaryMarker = '<!-- dsh-code-review -->'
 
@@ -191,13 +191,17 @@ export async function prepareDshReview({ github, context, core, contextPath, wor
   const reviewContext = [
     '# Trusted code-review task',
     '',
-    'Perform a read-only review of the supplied pull-request diff on exactly two independent axes:',
+    'Perform a read-only review of the supplied pull-request diff on exactly three independent axes:',
     'Standards checks the trusted repository instructions plus concrete correctness, security, reliability,',
     'maintainability, and test defects. Spec checks whether the diff implements the PR title, body, and linked',
-    'issues. If there is no stated intended behavior, return no Spec findings. Do not run tools or request more data.',
+    'issues. If there is no stated intended behavior, return no Spec findings. Ponytail checks only unnecessary',
+    'complexity: dead code, unused flexibility, speculative abstractions, hand-rolled equivalents of standard',
+    'library or platform features, and layers with one caller — the diff\'s best outcome is getting shorter.',
+    'Ponytail findings are taste-level by construction: mark them P3 and never let them block merge. Do not run',
+    'tools or request more data.',
     '',
     'Return ONLY one JSON object with this exact shape:',
-    '{"findings":[{"severity":"P0|P1|P2|P3","axis":"Standards|Spec","path":"repo/relative/file",',
+    '{"findings":[{"severity":"P0|P1|P2|P3","axis":"Standards|Spec|Ponytail","path":"repo/relative/file",',
     '"line":123,"side":"RIGHT|LEFT","title":"short defect","body":"evidence and impact","fix":"smallest fix"}]}.',
     'Every title, body, and fix must be concise English. Copy path, side, and line exactly from the Allowed',
     'changed-line locations. Omit a finding if no listed changed line fits. Combine related defects so there is',
@@ -276,7 +280,7 @@ function axisSummary(findings) {
 }
 
 export function summaryBody(findings, refs) {
-  const sections = ['Standards', 'Spec'].map((axis) => {
+  const sections = ['Standards', 'Spec', 'Ponytail'].map((axis) => {
     const axisFindings = findings.filter((finding) => finding.axis === axis)
     const content = axisFindings.length
       ? axisFindings.map((finding) => {
@@ -288,7 +292,8 @@ export function summaryBody(findings, refs) {
   })
   const standards = findings.filter((finding) => finding.axis === 'Standards')
   const spec = findings.filter((finding) => finding.axis === 'Spec')
-  return `${summaryMarker}\n${sections.join('\n\n')}\n\n**Summary:** Standards: ${axisSummary(standards)}; Spec: ${axisSummary(spec)}.`
+  const ponytail = findings.filter((finding) => finding.axis === 'Ponytail')
+  return `${summaryMarker}\n${sections.join('\n\n')}\n\n**Summary:** Standards: ${axisSummary(standards)}; Spec: ${axisSummary(spec)}; Ponytail: ${axisSummary(ponytail)}.`
 }
 
 export async function publishDshReview({ github, context, core, reviewPath }) {
@@ -327,7 +332,9 @@ export async function publishDshReview({ github, context, core, reviewPath }) {
     comments,
   })
 
-  const blocking = findings.filter((finding) => finding.severity === 'P0' || finding.severity === 'P1')
+  const blocking = findings.filter(
+    (finding) => (finding.severity === 'P0' || finding.severity === 'P1') && finding.axis !== 'Ponytail',
+  )
   core.info(
     `DSH review published ${findings.length} finding(s): ${comments.length} inline, ` +
       `${findings.length - comments.length} summary-only; blocking P0/P1: ${blocking.length}`,
