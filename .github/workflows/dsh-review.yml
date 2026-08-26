@@ -118,6 +118,9 @@ jobs:
           chmod 755 "$RUNNER_TEMP"
           sudo -n install -d -o nobody -g nogroup "$DSH_HOME"
           cd pr-head
+          # Redirects are evaluated by the runner shell on purpose: the report
+          # and stderr files must stay owned by the runner user, not `nobody`.
+          # shellcheck disable=SC2024
           if ! sudo -n -u nobody env \
             HOME="$DSH_HOME" \
             PATH="$PATH" \

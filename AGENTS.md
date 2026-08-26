@@ -95,5 +95,5 @@ PR automation (GitHub-hosted, `pull_request_target`; PR content is untrusted dat
 
 Workflow-file rules (learned the hard way — the E2E silently never triggered on the first PR):
 
-- **Lint workflow files like code.** The `lint` job runs pinned `actionlint` on `.github/workflows/*.yml`. GitHub evaluates expressions only at run time, and a bad context/expression fails the whole workflow with zero job logs — YAML that parses fine is not enough.
+- **Lint workflow files like code.** The `lint` job runs pinned `actionlint` on `.github/workflows/*.yml`. GitHub evaluates expressions only at run time, and a bad context/expression fails the whole workflow with zero job logs — YAML that parses fine is not enough. actionlint's shellcheck rule runs only when a `shellcheck` binary is on `PATH`: GitHub's ubuntu runners ship one, a bare macOS checkout does not — a local actionlint pass is not proof (this cost us a red lint job once). Lint locally with shellcheck next to actionlint.
 - **The `runner` context is not available in job-level `env:`** (only `github`, `inputs`, `matrix`, `needs`, `secrets`, `strategy`, `vars`). Use `$RUNNER_TEMP` inside `run:` steps, or let scripts default to it — never `${{ runner.temp }}` in `env:` blocks.
