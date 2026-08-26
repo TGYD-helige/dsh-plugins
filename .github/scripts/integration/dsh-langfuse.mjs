@@ -9,17 +9,9 @@
 
 import { evaluateReasoning, evaluateTrace, runScenario } from './lib/langfuse-shared.mjs';
 
-runScenario({
+await runScenario({
   tag: 'base',
-  phases: [
-    {
-      name: 'direct read (thinking at max)',
-      suffix: '',
-      prompt: (markerFile) => `请用工具读取当前目录下的 ${markerFile}，并把它的内容原样复述给我`,
-      evaluate: (obs, cw) => [...evaluateTrace(obs, cw), ...evaluateReasoning(obs)],
-    },
-  ],
-}).catch((error) => {
-  console.error(`::error::${error.message}`);
-  process.exit(1);
+  name: 'direct read (thinking at max)',
+  prompt: (markerFile) => `请用工具读取当前目录下的 ${markerFile}，并把它的内容原样复述给我`,
+  evaluate: (obs, cw) => [...evaluateTrace(obs, cw), ...evaluateReasoning(obs)],
 });

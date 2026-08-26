@@ -1,8 +1,6 @@
-#!/usr/bin/env node
-
 /**
  * Shared machinery for the dsh-langfuse integration legs. A leg is a thin
- * script declaring its phases; `runScenario` does the rest:
+ * script declaring its case; `runScenario` does the rest:
  *
  * - real mode (LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY present): boot the
  *   dsh headless profile with the packed plugin pointed at the REAL Langfuse
@@ -342,11 +340,20 @@ async function startFakeIngestion(captured) {
 }
 
 /**
- * Run one leg's phases to green. Each phase: { name, suffix, prompt,
- * evaluate } — the marker file `${codeword}${suffix}.txt` is written into the
- * workspace and its name is the codeword the phase verifies on.
+ * Run one leg to green: { tag, name, prompt, evaluate }. The marker file
+ * `${codeword}.txt` is written into the workspace and its name is the
+ * codeword the leg verifies on. Failures log `::error::` and exit non-zero.
  */
-export async function runScenario({ tag, phases }) {
+export async function runScenario(opts) {
+  try {
+    await scenarioMain(opts);
+  } catch (error) {
+    console.error(`::error::${error.message}`);
+    process.exit(1);
+  }
+}
+
+async function scenarioMain({ tag, name, prompt, evaluate }) {
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-langfuse-${tag}-e2e`);
   mkdirSync(workDir, { recursive: true });
   const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
@@ -486,9 +493,9 @@ export async function runScenario({ tag, phases }) {
   // (observed in CI), so attempts retry. Fake mode gates on the captured
   // shapes via the same evaluator; real mode gates on the Langfuse read-back.
   const maxAttempts = realMode ? 2 : 3;
-  async function runPhase(phase, prompt, codeword, evaluate) {
+  async function runPhase(prompt, codeword) {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      console.log(`\n(${phase} attempt ${attempt}/${maxAttempts})`);
+      console.log(`\n(${name} attempt ${attempt}/${maxAttempts})`);
       captured.length = 0;
       await runQuery(prompt);
       let result;
@@ -509,31 +516,26 @@ export async function runScenario({ tag, phases }) {
             : { ok: false, state: problems.join('; ') };
       }
       if (result.ok) return result;
-      console.log(`::warning::${phase} attempt ${attempt} did not verify: ${result.state}`);
+      console.log(`::warning::${name} attempt ${attempt} did not verify: ${result.state}`);
     }
-    return { ok: false, state: `${phase}: attempts exhausted` };
+    return { ok: false, state: `${name}: attempts exhausted` };
   }
 
-  const states = [];
-  for (const phase of phases) {
-    const phaseCodeword = `${codeword}${phase.suffix}`;
-    const markerFile = `${phaseCodeword}.txt`;
-    writeFileSync(join(workDir, markerFile), `${phaseCodeword}-content\n`);
-    const result = await runPhase(phase.name, phase.prompt(markerFile), phaseCodeword, phase.evaluate);
-    assert(result.ok, `${phase.name} failed: ${result.state}`);
-    states.push(`${phase.name}: ${result.state}`);
+  const markerFile = `${codeword}.txt`;
+  writeFileSync(join(workDir, markerFile), `${codeword}-content\n`);
+  const result = await runPhase(prompt(markerFile), codeword);
+  assert(result.ok, `${name} failed: ${result.state}`);
 
-    if (!realMode) {
-      // Fake mode: the loop already proved the shape; the trace itself is the
-      // one thing the evaluators (observation-scoped) don't cover.
-      console.log(`\n--- captured ${captured.length} ingestion events ---`);
-      for (const e of captured) console.log(` ${e.type} ${JSON.stringify(e.body).slice(0, 160)}`);
-      const trace = captured.find(
-        (e) => e.type === 'trace-create' && e.body?.name === 'dsh-turn' && e.body?.sessionId,
-      )?.body;
-      assert(trace, 'no dsh-turn trace with a sessionId was ingested');
-    }
+  if (!realMode) {
+    // Fake mode: the loop already proved the shape; the trace itself is the
+    // one thing the evaluators (observation-scoped) don't cover.
+    console.log(`\n--- captured ${captured.length} ingestion events ---`);
+    for (const e of captured) console.log(` ${e.type} ${JSON.stringify(e.body).slice(0, 160)}`);
+    const trace = captured.find(
+      (e) => e.type === 'trace-create' && e.body?.name === 'dsh-turn' && e.body?.sessionId,
+    )?.body;
+    assert(trace, 'no dsh-turn trace with a sessionId was ingested');
   }
 
-  console.log(`\nSCENARIO_OK (${states.join('; ')})`);
+  console.log(`\nSCENARIO_OK (${name}: ${result.state})`);
 }

@@ -178,8 +178,6 @@ jobs:
           retention-days: 7
           path: |
             ${{ runner.temp }}/dsh-storage-e2e/dsh.db
-            ${{ runner.temp }}/dsh-langfuse-e2e
-            !${{ runner.temp }}/dsh-langfuse-e2e/dsh-home/**
             ${{ runner.temp }}/dsh-home/sessions
 
       - name: Skipped — Stage B (secrets unavailable)
