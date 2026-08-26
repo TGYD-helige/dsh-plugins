@@ -6,9 +6,12 @@
  *
  * - real mode (LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY present): boot the
  *   dsh headless profile with the packed plugin pointed at the REAL Langfuse
- *   project, run one seeded LLM query (deepseek-v4-flash, marker file forces
- *   a tool round-trip), then poll the v1 Observations API until the ingested
- *   trace shows the expected shape — the data is really in Langfuse.
+ *   project, run three seeded LLM queries (deepseek-v4-flash, marker files
+ *   force tool round-trips: a direct read, a subagent delegation, and the
+ *   direct read again over the Anthropic-format route), then poll the v1
+ *   Observations API until the ingested traces show the expected shapes — the
+ *   data is really in Langfuse — and print what differs between the two wire
+ *   formats' records.
  * - fake mode (LANGFUSE_* absent): same boot against an in-process fake
  *   ingestion endpoint with in-memory assertions, so the leg still proves
  *   the plugin wiring without a Langfuse instance. Note fork PRs never
@@ -46,7 +49,7 @@ import { join, resolve } from 'node:path';
 // ---------------------------------------------------------------------------
 
 const DEFAULT_BASE_URL = 'https://cloud.langfuse.com';
-const DEFAULT_DEADLINE_MS = 5 * 60 * 1000;
+const VERIFY_DEADLINE_MS = 5 * 60 * 1000;
 const POLL_INTERVAL_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_PAGES = 20;
@@ -108,12 +111,26 @@ function evaluateTrace(observations, codeword) {
       '"llm-request" span is not parented under the generation',
     );
     need(requestSpan.endTime != null, '"llm-request" span has no endTime (never completed)');
-    need(
-      Array.isArray(requestSpan.output) && requestSpan.output.length > 0,
-      '"llm-request" span has no response chunks',
-    );
+    need(requestChunks(observations).length > 0, '"llm-request" span has no response chunks');
   }
   return problems;
+}
+
+/** The llm-request span's collected chunk stream (its output), or []. */
+function requestChunks(observations) {
+  const requestSpan = observations.find((o) => o.type === 'SPAN' && o.name === 'llm-request');
+  return Array.isArray(requestSpan?.output) ? requestSpan.output : [];
+}
+
+// Reasoning content lands as reasoning-delta chunks in the llm-request span's
+// raw stream output. The scenario runs thinking at max effort on the OpenAI
+// path (phase 1); the Anthropic path (phase 3) may or may not support
+// thinking — that difference is exactly what the comparison reports, so it
+// is asserted only here.
+function evaluateReasoning(observations) {
+  return requestChunks(observations).some((c) => c?.type === 'reasoning-delta')
+    ? []
+    : ['"llm-request" span output has no reasoning-delta chunk (thinking should be enabled at max)'];
 }
 
 // Phase-2 shape: the delegation tool call, the subagent span parented under
@@ -194,7 +211,7 @@ async function runVerification({
   evaluate,
 }) {
   const origin = baseUrl.replace(/\/+$/, '');
-  const deadline = Date.now() + DEFAULT_DEADLINE_MS;
+  const deadline = Date.now() + VERIFY_DEADLINE_MS;
   const auth = `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString('base64')}`;
 
   async function fetchObservations(params) {
@@ -282,7 +299,11 @@ async function runVerification({
         }
         const problems = evaluate(observations, codeword);
         if (problems.length === 0) {
-          return { ok: true, state: `trace ${traceId} matches the expected dsh-langfuse shape` };
+          return {
+            ok: true,
+            state: `trace ${traceId} matches the expected dsh-langfuse shape`,
+            observations,
+          };
         }
         lastState = `trace ${traceId} incomplete: ${problems.join('; ')}`;
         console.log(`  not complete yet: ${problems.join('; ')}`);
@@ -403,12 +424,18 @@ async function main() {
   // 2. Enable the plugin through the profile's user patch layer (an
   //    id-targeted row replaces the bundle row's whole config). The
   //    agent-default-model row pins deepseek-v4-flash; the llm-deepseek row
-  //    disables thinking — with reasoning enabled, this gateway
-  //    stochastically garbles tool calls (observed in CI).
+  //    turns thinking ON at max effort — phase 1 also verifies that reasoning
+  //    content lands in Langfuse (reasoning-delta chunks in the raw stream).
+  //    Caveat: reasoning enabled makes this gateway stochastically garble or
+  //    hang on tool calls (observed in CI) — the retry loops absorb it.
+  //    Phase 3 swaps in the Anthropic-format route (pi-ai's anthropic-messages
+  //    protocol through the same gateway's /anthropic path — DeepSeek's own
+  //    anthropic-compatible convention) and re-pins the default model to it.
   const patchPath = join(dshHome, 'profiles', 'headless', 'cordis.patch.yml');
-  writeFileSync(
-    patchPath,
-    `# dsh-langfuse integration scenario: enable the plugin against ${realMode ? 'the real Langfuse' : 'the fake endpoint'}.
+  const writePatch = (withAnthropic) => {
+    writeFileSync(
+      patchPath,
+      `# dsh-langfuse integration scenario: enable the plugin against ${realMode ? 'the real Langfuse' : 'the fake endpoint'}.
 - id: langfuse
   config:
     enabled: true
@@ -418,25 +445,49 @@ async function main() {
 
 - id: agent-default-model
   config:
-    provider: deepseek-official
+    provider: ${withAnthropic ? 'anthropic-ci' : 'deepseek-official'}
     model: deepseek-v4-flash
 
 - id: llm-deepseek
   config:
-    thinking: disabled
-`,
-  );
-  if (!realMode) console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);
+    thinking: enabled
+    reasoningEffort: max
+${
+  withAnthropic
+    ? `
+- id: llm-pi-ai
+  config:
+    providers:
+      anthropic-ci:
+        displayName: Anthropic CI
+        apiKeyEnv: DSH_INTEGRATION_API_KEY
+        api: anthropic-messages
+        baseURL: ${JSON.stringify(`${DSH_INTEGRATION_BASE_URL}/anthropic`)}
+        reasoning: xhigh
+        models:
+          - id: deepseek-v4-flash
+            name: V4 Flash
+            contextWindow: 262144
+            maxTokens: 32768
+`
+    : ''
+}`,
+    );
+    if (!realMode) console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);
+  };
+  writePatch(false);
   // The patch carries the real keys in real mode — it must not outlive the
   // scenario (CI uploads artifacts from the runner; process 'exit' also
   // covers the throw paths).
   process.once('exit', () => rmSync(patchPath, { force: true }));
 
-  // 3. Two seeded queries, each forcing a tool round-trip. The marker FILE
+  // 3. Three seeded queries, each forcing a tool round-trip. The marker FILE
   //    NAME is the codeword: it flows into the tool span's input and the
   //    generation's IO, and is unique per CI run so concurrent jobs against
-  //    the same Langfuse project can't cross-match. Phase 1 is a direct
-  //    read; phase 2 forces a subagent delegation whose child does the read.
+  //    the same Langfuse project can't cross-match. Phase 1 is a direct read
+  //    (OpenAI format, thinking at max); phase 2 forces a subagent delegation
+  //    whose child does the read; phase 3 repeats the direct read over the
+  //    Anthropic-format route for the format comparison.
   const runId = envOr(process.env.GITHUB_RUN_ID, 'local');
   const runAttempt = envOr(process.env.GITHUB_RUN_ATTEMPT, '1');
   const codeword = `ci-marker-${runId}-${runAttempt}`;
@@ -513,13 +564,17 @@ async function main() {
     return { ok: false, state: `${phase}: attempts exhausted` };
   }
 
-  // --- Phase 1: direct marker read → trace / generation / tool span --------
-  const phase1 = await runPhase('phase 1', prompt1, codeword, evaluateTrace);
+  // --- Phase 1: direct marker read → trace / generation / tool span, with
+  //    reasoning content in the raw stream (thinking at max effort) ----------
+  const phase1 = await runPhase('phase 1', prompt1, codeword, (obs, cw) => [
+    ...evaluateTrace(obs, cw),
+    ...evaluateReasoning(obs),
+  ]);
   assert(phase1.ok, `phase 1 failed: ${phase1.state}`);
 
   if (!realMode) {
-    // Fake mode: the loop already proved the shape; trace-level extras get
-    // their own checks.
+    // Fake mode: the loop already proved the shape; the trace itself is the
+    // one thing the evaluators (observation-scoped) don't cover.
     console.log(`\n--- captured ${captured.length} ingestion events ---`);
     for (const e of captured) console.log(` ${e.type} ${JSON.stringify(e.body).slice(0, 160)}`);
 
@@ -527,23 +582,68 @@ async function main() {
       (e) => e.type === 'trace-create' && e.body?.name === 'dsh-turn' && e.body?.sessionId,
     )?.body;
     assert(trace, 'no dsh-turn trace with a sessionId was ingested');
-
-    // Turn-boundary metadata rides session events near process teardown —
-    // useful signal, but the exact flush timing is dsh's business: warn only.
-    const traceEvents = captured.filter((e) => e.body?.id === trace.id);
-    if (!traceEvents.some((e) => e.body?.metadata?.endReason)) {
-      console.log('::warning::turn trace has no endReason metadata');
-    }
-    if (!traceEvents.some((e) => JSON.stringify(e.body?.input ?? '').includes(markerFile))) {
-      console.log('::warning::turn trace input does not mention the marker file');
-    }
   }
 
   // --- Phase 2: subagent delegation → delegation span / subagent span /
   //    child generation + child tool span, all in the one parent trace ------
   const phase2 = await runPhase('phase 2', prompt2, codeword2, evaluateSubagentTrace);
   assert(phase2.ok, `phase 2 failed: ${phase2.state}`);
-  console.log(`\nSCENARIO_OK (phase 1: ${phase1.state}; phase 2: ${phase2.state})`);
+
+  // --- Phase 3: same query over the Anthropic-format route (pi-ai's
+  //    anthropic-messages protocol through the gateway's /anthropic path) ----
+  const codeword3 = `${codeword}-anthropic`;
+  const markerFile3 = `${codeword3}.txt`;
+  writeFileSync(join(workDir, markerFile3), `${codeword3}-content\n`);
+  const prompt3 = `请用工具读取当前目录下的 ${markerFile3}，并把它的内容原样复述给我`;
+
+  // The gateway mirrors DeepSeek's own layout (api.deepseek.com/anthropic);
+  // probe it before paying for a full run so a wrong path fails loudly here.
+  const anthropicProbe = await fetch(`${DSH_INTEGRATION_BASE_URL}/anthropic/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  }).catch((error) => ({ status: 0, error }));
+  assert(
+    anthropicProbe.status !== 0 && anthropicProbe.status !== 404,
+    `gateway has no anthropic-format path at /anthropic/v1/messages (${
+      anthropicProbe.status === 0 ? anthropicProbe.error : `HTTP ${anthropicProbe.status}`
+    })`,
+  );
+
+  writePatch(true);
+  const phase3 = await runPhase('phase 3', prompt3, codeword3, evaluateTrace);
+  assert(phase3.ok, `phase 3 failed: ${phase3.state}`);
+
+  // What actually differs between the two wire formats in Langfuse (real mode
+  // only — the captured fake-mode events answer the same question, but the
+  // read-back records are the user-facing product).
+  if (realMode && phase1.observations && phase3.observations) {
+    const summarize = (obs) => {
+      const generation = obs.find(
+        (o) => o.type === 'GENERATION' && o.name?.startsWith('llm-call') && o.metadata?.purpose == null,
+      );
+      const chunkTypes = {};
+      for (const c of requestChunks(obs)) chunkTypes[c?.type] = (chunkTypes[c?.type] ?? 0) + 1;
+      return {
+        model: generation?.model,
+        modelParameters: generation?.modelParameters,
+        usageDetails: generation?.usageDetails,
+        chunkTypes,
+      };
+    };
+    const openai = summarize(phase1.observations);
+    const anthropic = summarize(phase3.observations);
+    console.log('\n--- format comparison (openai-format vs anthropic-format) ---');
+    for (const key of ['model', 'modelParameters', 'usageDetails', 'chunkTypes']) {
+      const a = JSON.stringify(openai[key]);
+      const b = JSON.stringify(anthropic[key]);
+      console.log(`${a === b ? 'same     ' : 'DIFFERS  '} ${key}: openai=${a} anthropic=${b}`);
+    }
+  }
+
+  console.log(
+    `\nSCENARIO_OK (phase 1: ${phase1.state}; phase 2: ${phase2.state}; phase 3: ${phase3.state})`,
+  );
 }
 
 main().catch((error) => {
