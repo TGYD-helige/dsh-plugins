@@ -61,12 +61,6 @@ export function assert(cond, msg) {
   if (!cond) throw new Error(`assertion failed: ${msg}`);
 }
 
-/** The llm-request span's collected chunk stream (its output), or []. */
-function requestChunks(observations) {
-  const requestSpan = observations.find((o) => o.type === 'SPAN' && o.name === 'llm-request');
-  return Array.isArray(requestSpan?.output) ? requestSpan.output : [];
-}
-
 // Returns a list of problems; empty list means the trace fully matches.
 export function evaluateTrace(observations, codeword) {
   const spans = observations.filter((o) => o.type === 'SPAN');
@@ -109,26 +103,36 @@ export function evaluateTrace(observations, codeword) {
     );
   }
 
-  const requestSpan = spans.find((o) => o.name === 'llm-request');
-  need(requestSpan, 'missing nested "llm-request" span');
-  if (requestSpan && generation) {
-    need(
-      requestSpan.parentObservationId === generation.id,
-      '"llm-request" span is not parented under the generation',
-    );
+  // A turn has several llm-request spans (one per generation, incl. purpose
+  // calls) — pin the check to the MAIN generation's own span.
+  const requestSpan = generation
+    ? spans.find((o) => o.name === 'llm-request' && o.parentObservationId === generation.id)
+    : undefined;
+  need(requestSpan, 'missing nested "llm-request" span under the main generation');
+  if (requestSpan) {
     need(requestSpan.endTime != null, '"llm-request" span has no endTime (never completed)');
-    need(requestChunks(observations).length > 0, '"llm-request" span has no response chunks');
+    need(
+      Array.isArray(requestSpan.output) && requestSpan.output.length > 0,
+      '"llm-request" span has no response chunks',
+    );
   }
   return problems;
 }
 
-// Reasoning content lands as reasoning-delta chunks in the llm-request span's
-// raw stream output. The scenario runs thinking at max effort, so it must be
-// there.
+// Reasoning content lands as reasoning-delta chunks in llm-request spans' raw
+// stream outputs. The scenario runs thinking at max effort, so SOME span in
+// the trace must carry one (purpose calls don't reason — check them all).
 export function evaluateReasoning(observations) {
-  return requestChunks(observations).some((c) => c?.type === 'reasoning-delta')
+  const has = observations.some(
+    (o) =>
+      o.type === 'SPAN' &&
+      o.name === 'llm-request' &&
+      Array.isArray(o.output) &&
+      o.output.some((c) => c?.type === 'reasoning-delta'),
+  );
+  return has
     ? []
-    : ['"llm-request" span output has no reasoning-delta chunk (thinking should be enabled at max)'];
+    : ['no llm-request span output has a reasoning-delta chunk (thinking should be enabled at max)'];
 }
 
 // The subagent shape: the delegation tool call, the subagent span parented
