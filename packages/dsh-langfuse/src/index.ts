@@ -29,14 +29,18 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis';
-import type { FinishReason, GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm';
+import type {
+  ContentBlock,
+  FinishReason,
+  GenerateOptions,
+  StreamChunk,
+  TokenUsage,
+} from '@deepseek-ai/dsh-llm';
 import { isTokenDelta } from '@deepseek-ai/dsh-llm/message';
-import type { UserMessage } from '@deepseek-ai/dsh-session';
-// Augmentation-only import: pulls the `subagent/start` / `subagent/end` Events
-// declarations into the compilation (the listeners are contextually typed).
+// Augmentation-only imports: pull the dsh packages' Events declarations into
+// the compilation (the listeners are contextually typed).
+import type {} from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-subagent';
-// Augmentation-only import: pulls the `tools/execute` Events declaration into
-// the compilation (the listener itself is contextually typed).
 import type {} from '@deepseek-ai/dsh-tools';
 import Schema from '@deepseek-ai/schemastery';
 import { LangfuseReporter, type ObservationLevel } from './client.js';
@@ -78,6 +82,8 @@ interface SessionTrace {
   trace: NonNullable<TraceHandle>;
   /** Whether the trace input was set — the turn's first `user/message` wins. */
   hasInput: boolean;
+  /** The turn's latest assistant text — becomes the trace's output at `turn/end`. */
+  lastAssistantText?: string;
 }
 
 /**
@@ -104,8 +110,8 @@ const messageOf = (error: unknown): string =>
 const contentMessage = (config: LangfusePluginConfig, text: string): string | undefined =>
   config.captureContent ? text : undefined;
 
-/** Trace input: the user message's text blocks, joined. */
-function messageText(message: UserMessage): string | undefined {
+/** Trace input/output text: the message's text blocks, joined. */
+function messageText(message: { content: ContentBlock[] }): string | undefined {
   const text = message.content.flatMap((block) => (block.type === 'text' ? [block.text] : []));
   return text.length > 0 ? text.join('\n') : undefined;
 }
@@ -285,8 +291,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         reporter.updateSpan(child.span, { input: messageText(event.data) });
         child.hasInput = true;
       } else if (event.type === 'subagent/descriptor') {
+        // The label is the delegation's model-authored description — content.
         reporter.updateSpan(child.span, {
-          name: event.data.label ? `subagent: ${event.data.label}` : 'subagent',
+          name:
+            config.captureContent && event.data.label
+              ? `subagent: ${event.data.label}`
+              : 'subagent',
           metadata: { mode: event.data.mode, provider: event.data.provider },
         });
       }
@@ -313,11 +323,20 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         }
         break;
       }
+      case 'assistant/message': {
+        // The turn's final answer becomes the trace's output at turn/end.
+        const state = sessions.get(sessionId);
+        if (state && config.captureContent) {
+          state.lastAssistantText = messageText(event.data.message) ?? state.lastAssistantText;
+        }
+        break;
+      }
       case 'turn/end': {
         const state = sessions.get(sessionId);
         if (state) {
           sessions.delete(sessionId);
           reporter.updateTrace(state.trace, {
+            output: state.lastAssistantText,
             metadata: { turn: event.data.turn, endReason: event.data.reason.kind },
           });
         }
@@ -330,16 +349,11 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     const sessionId: string = session.id;
     sessions.delete(sessionId);
     openToolSpans.delete(sessionId);
-    const child = children.get(sessionId);
-    if (child) {
-      children.delete(sessionId);
-      // A child torn down without a subagent/end (crash, abort): close its
-      // span instead of leaking it open.
-      reporter.endSpan(child.span, {
-        level: 'WARNING',
-        statusMessage: 'session disposed before subagent/end',
-      });
-    }
+    // Children: keep the entry — background/continuable subagents dispose
+    // their session BEFORE subagent/end fires, and the span's close must ride
+    // subagent/end (disposing first would either leak the span or close it
+    // with a bogus WARNING, the latter seen on a healthy run in a real
+    // trace). A crashed run leaves the span open — an honest record.
   });
 
   // ------------------------------------------------------------------

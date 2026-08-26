@@ -120,6 +120,17 @@ const userMessage = (text: string) =>
     content: [{ type: 'text', text }],
     source: { kind: 'user' },
   });
+const assistantMessage = (text: string) =>
+  ev('assistant/message', {
+    turn: 0,
+    step: 0,
+    message: {
+      id: 'a1',
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+      source: { kind: 'model', provider: 'test', model: 'm' },
+    },
+  });
 
 const optionsOf = (over: Partial<GenerateOptions> = {}): GenerateOptions => ({
   provider: 'test',
@@ -253,9 +264,12 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit('session/event', sessionOf('s1'), userMessage('ignored second'));
       expect(client.traces[0].updates).toEqual([{ input: 'fix the bug', metadata: undefined }]);
 
+      // The turn's final answer becomes the trace's output at turn/end.
+      ctx.emit('session/event', sessionOf('s1'), assistantMessage('done, the bug is fixed'));
       ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
       expect(client.traces[0].updates[1]).toEqual({
         input: undefined,
+        output: 'done, the bug is fixed',
         metadata: { turn: 0, endReason: 'completed' },
       });
 
@@ -265,11 +279,15 @@ describe('dsh-langfuse plugin', () => {
       expect(client.traces[1].body).toMatchObject({ sessionId: 's1', metadata: { turn: 1 } });
     });
 
-    it('redacts the trace input when captureContent is off', async () => {
+    it('redacts the trace input and output when captureContent is off', async () => {
       await setup({ ...enabledConfig, captureContent: false });
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
       ctx.emit('session/event', sessionOf('s1'), userMessage('secret'));
-      expect(mocks.instances[0].traces[0].updates).toHaveLength(0);
+      ctx.emit('session/event', sessionOf('s1'), assistantMessage('secret answer'));
+      ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+      expect(mocks.instances[0].traces[0].updates).toEqual([
+        { input: undefined, output: undefined, metadata: { turn: 0, endReason: 'completed' } },
+      ]);
     });
 
     it('drops the session state on session/disposed', async () => {
@@ -791,23 +809,44 @@ describe('dsh-langfuse plugin', () => {
       await setup({ ...enabledConfig, captureContent: false });
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
       ctx.emit('session/created', childSessionOf('c1', 's1'));
+      ctx.emit(
+        'session/event',
+        sessionOf('c1'),
+        ev('subagent/descriptor', {
+          version: 2,
+          mode: 'one-shot',
+          provider: 'spawn',
+          label: 'secret delegation label',
+        }),
+      );
       ctx.emit('subagent/end', subagentEnd('c1', 'error'));
       const subSpan = fakeObs(mocks.instances[0].traces[0]).spans[0];
       expect(subSpan.ends[0]).toMatchObject({ output: { stopReason: 'error' } });
       expect((subSpan.ends[0] as { output: Record<string, unknown> }).output).not.toHaveProperty(
         'lastAssistantMessage',
       );
+      // The descriptor label is model-authored content — the span keeps the
+      // bare name when redacted.
+      for (const update of subSpan.updates) {
+        expect(JSON.stringify(update)).not.toContain('secret delegation label');
+      }
     });
 
-    it('closes a dangling child span on session/disposed', async () => {
+    it('keeps the child span open on session/disposed so subagent/end can close it', async () => {
       await setup();
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
       ctx.emit('session/created', childSessionOf('c1', 's1'));
-      ctx.emit('session/disposed', sessionOf('c1'));
       const subSpan = fakeObs(mocks.instances[0].traces[0]).spans[0];
+
+      // Background/continuable children dispose their session before
+      // subagent/end fires — the dispose must NOT close the span.
+      ctx.emit('session/disposed', sessionOf('c1'));
+      expect(subSpan.ends).toHaveLength(0);
+
+      ctx.emit('subagent/end', subagentEnd('c1', 'completed'));
       expect(subSpan.ends[0]).toMatchObject({
-        level: 'WARNING',
-        statusMessage: 'session disposed before subagent/end',
+        output: { stopReason: 'completed' },
+        level: 'DEFAULT',
       });
     });
 

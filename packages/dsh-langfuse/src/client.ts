@@ -57,14 +57,18 @@ export function usageOf(usage: TokenUsage): {
     (usage.inputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0);
   const output = usage.outputTokens ?? 0;
   const total = input + output;
+  // Clamp reasoning at the provider's output count: reasoning is a subset of
+  // output, and only a broken adapter would report more — clamping keeps the
+  // buckets summing to total even then.
+  const reasoning = Math.min(usage.reasoningTokens ?? 0, output);
   const usageDetails: Record<string, number> = {
     input: usage.inputTokens ?? 0,
-    output: Math.max(0, output - (usage.reasoningTokens ?? 0)),
+    output: output - reasoning,
     total,
   };
   if (usage.cacheReadTokens) usageDetails.input_cache_read = usage.cacheReadTokens;
   if (usage.cacheWriteTokens) usageDetails.input_cache_creation = usage.cacheWriteTokens;
-  if (usage.reasoningTokens) usageDetails.output_reasoning = usage.reasoningTokens;
+  if (reasoning) usageDetails.output_reasoning = reasoning;
   return { usage: { input, output, total }, usageDetails };
 }
 
@@ -99,11 +103,7 @@ export class LangfuseReporter {
   }): LangfuseTraceClient | null {
     if (!this.client) return null;
     try {
-      return this.client.trace({
-        name: input.name,
-        sessionId: input.sessionId,
-        metadata: input.metadata,
-      });
+      return this.client.trace(input);
     } catch (error) {
       console.error('[dsh-langfuse] trace creation failed:', error);
       return null;
@@ -112,11 +112,12 @@ export class LangfuseReporter {
 
   /**
    * Merge fields into an open trace: the input from the turn's first user
-   * message, the end reason at `turn/end` (Langfuse merges metadata on update).
+   * message, the final answer and end reason at `turn/end` (Langfuse merges
+   * metadata on update).
    */
   updateTrace(
     trace: LangfuseTraceClient | null,
-    update: { input?: unknown; metadata?: Record<string, unknown> },
+    update: { input?: unknown; output?: unknown; metadata?: Record<string, unknown> },
   ): void {
     if (!trace) return;
     try {
