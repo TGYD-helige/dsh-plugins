@@ -22,13 +22,23 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      # pull_request_target provides secrets, so only trusted base code is
-      # checked out. PR files are passed to DSH as untrusted review data.
+      # pull_request_target provides secrets. The base revision is checked out
+      # for the trusted workflow scripts only; the PR head is checked out as
+      # inert review data for the model's read-only tools — nothing from it is
+      # ever installed, built, or executed.
       - name: Check out trusted base revision
         uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out untrusted PR head (review data only)
+        uses: actions/checkout@v7
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          path: pr-head
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Node.js
@@ -62,26 +72,64 @@ jobs:
 
       - name: Prepare untrusted PR data for review
         uses: actions/github-script@v9
-        env:
-          CONTEXT_PATH: ${{ runner.temp }}/dsh-review-context.md
         with:
           script: |
             const { pathToFileURL } = require('node:url');
             const scriptUrl = pathToFileURL(`${process.env.GITHUB_WORKSPACE}/.github/scripts/publish-dsh-review.mjs`);
             const { prepareDshReview } = await import(scriptUrl.href);
-            await prepareDshReview({ github, context, core, contextPath: process.env.CONTEXT_PATH });
+            await prepareDshReview({ github, context, core, contextPath: process.env.DSH_REVIEW_CONTEXT });
 
+      - name: Materialize the PR diff for the review agent
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # A PR could ship .dsh-review (or diff.patch) as a symlink; never
+          # write through it as the runner user.
+          test ! -L pr-head/.dsh-review
+          test ! -L pr-head/.dsh-review/diff.patch
+          mkdir -p pr-head/.dsh-review
+          # base.sha can sit ahead of the head's history (a fork branched
+          # before the base tip), so fetch it explicitly — GitHub allows
+          # fetching reachable SHAs. Full depth: a shallow base has its parent
+          # links cut, and `A...B` then finds no merge base.
+          git -C pr-head fetch --quiet origin "$BASE_SHA"
+          git -C pr-head diff "$BASE_SHA...HEAD" > pr-head/.dsh-review/diff.patch
+          test -s pr-head/.dsh-review/diff.patch || echo '(empty diff)' > pr-head/.dsh-review/diff.patch
+
+      # The model process must never hold a secret: dsh runs as `nobody` with a
+      # scrubbed env, and the loopback proxy (runner user) injects the gateway
+      # key. tool-fs read is ungated in dsh rc.7, so Unix permissions are the
+      # real boundary: `nobody` cannot read the proxy's /proc environ or the
+      # runner's credentials, and cannot write outside its own DSH_HOME — which
+      # also backstops the write ops inside tool-fs.
       - name: Run DSH code review
         env:
           DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
           DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
-          DSH_PERMISSION_MODE: read-only
-          DSH_TELEMETRY_DISABLED: '1'
         run: |
           set -euo pipefail
-          if ! dsh \
+          node .github/scripts/review-gateway-proxy.mjs > "$RUNNER_TEMP/review-proxy-port" &
+          proxy_pid=$!
+          trap 'kill "$proxy_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 100); do [ -s "$RUNNER_TEMP/review-proxy-port" ] && break; sleep 0.1; done
+          port="$(cat "$RUNNER_TEMP/review-proxy-port")"
+          test -n "$port"
+          chmod 755 "$RUNNER_TEMP"
+          sudo -n install -d -o nobody -g nogroup "$DSH_HOME"
+          cd pr-head
+          if ! sudo -n -u nobody env \
+            HOME="$DSH_HOME" \
+            PATH="$PATH" \
+            DSH_HOME="$DSH_HOME" \
+            DSH_REVIEW_CONTEXT="$DSH_REVIEW_CONTEXT" \
+            DSH_REVIEW_GATEWAY_URL="http://127.0.0.1:${port}" \
+            DSH_REVIEW_API_KEY=via-loopback-proxy \
+            DSH_PERMISSION_MODE=read-only \
+            DSH_TELEMETRY_DISABLED=1 \
+            "$(command -v dsh)" \
             --profile headless \
-            --patch .github/dsh-review/model.patch.yml \
+            --patch "$GITHUB_WORKSPACE/.github/dsh-review/model.patch.yml" \
             'Run the trusted code review task.' \
             > "$DSH_REVIEW_OUTPUT" \
             2> "$DSH_REVIEW_STDERR"; then
@@ -93,14 +141,12 @@ jobs:
 
       - name: Publish review comment
         uses: actions/github-script@v9
-        env:
-          REVIEW_PATH: ${{ runner.temp }}/dsh-review-output.json
         with:
           script: |
             const { pathToFileURL } = require('node:url');
             const scriptUrl = pathToFileURL(`${process.env.GITHUB_WORKSPACE}/.github/scripts/publish-dsh-review.mjs`);
             const { publishDshReview } = await import(scriptUrl.href);
-            await publishDshReview({ github, context, core, reviewPath: process.env.REVIEW_PATH });
+            await publishDshReview({ github, context, core, reviewPath: process.env.DSH_REVIEW_OUTPUT });
 
       - name: Upload DSH review artifacts
         if: always()
