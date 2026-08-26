@@ -1,5 +1,7 @@
 node_modules/
 lib/
+# but scenario support code may live in a lib/ dir (kept out of the leg matrix)
+!.github/scripts/integration/lib/
 *.tgz
 *.log
 .DS_Store

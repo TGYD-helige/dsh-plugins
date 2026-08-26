@@ -1,11 +1,16 @@
 /**
  * Integration matrix discovery: every `.github/scripts/integration/<pkg>.mjs`
  * becomes one base-leg entry (full dsh + LLM query, environment-gated). A
- * sibling `<pkg>.providers` file (one provider per line) becomes backend-only
- * legs (service db + writes/reads, no secrets — always run, forks included).
+ * package may split its scenario into several legs as `<pkg>.<scenario>.mjs`
+ * (e.g. dsh-langfuse.subagent.mjs) — the package key is the part before the
+ * first dot and all of a package's legs share its tarball. A sibling
+ * `<pkg>.providers` file (one provider per line) adds backend-only legs
+ * (service db + writes/reads, no secrets — always run, forks included).
  *
  * Outputs (GITHUB_OUTPUT):
- *   matrix          — [{ package }] for the `scenario` job
+ *   matrix          — [{ package, name }] for the `scenario` job (name = leg
+ *                     label and scenario script basename; package = the
+ *                     packed/tested package)
  *   backend_matrix  — [{ package, provider }] for the `scenario-backends` job
  *   has_scenarios / has_backends — 'true' | 'false'
  */
@@ -18,12 +23,13 @@ const base = [];
 const backends = [];
 for (const d of readdirSync(scenariosDir, { withFileTypes: true })) {
   if (!d.isFile() || !d.name.endsWith('.mjs')) continue;
-  const pkg = d.name.slice(0, -'.mjs'.length);
+  const leg = d.name.slice(0, -'.mjs'.length);
+  const pkg = leg.split('.', 1)[0];
   if (!existsSync(`packages/${pkg}/package.json`)) {
     console.log(`::warning::scenario ${d.name} has no packages/${pkg} — skipped`);
     continue;
   }
-  base.push({ package: pkg });
+  base.push({ package: pkg, name: leg });
   const providersFile = `${scenariosDir}/${pkg}.providers`;
   if (existsSync(providersFile)) {
     for (const provider of readFileSync(providersFile, 'utf8')
@@ -34,10 +40,10 @@ for (const d of readdirSync(scenariosDir, { withFileTypes: true })) {
     }
   }
 }
-base.sort((a, b) => a.package.localeCompare(b.package));
+base.sort((a, b) => a.name.localeCompare(b.name));
 backends.sort((a, b) => a.package.localeCompare(b.package) || a.provider.localeCompare(b.provider));
 
-console.log(`base legs: ${base.map((e) => e.package).join(', ') || '(none)'}`);
+console.log(`base legs: ${base.map((e) => e.name).join(', ') || '(none)'}`);
 console.log(`backend legs: ${backends.map((e) => `${e.package}/${e.provider}`).join(', ') || '(none)'}`);
 appendFileSync(
   process.env.GITHUB_OUTPUT,
