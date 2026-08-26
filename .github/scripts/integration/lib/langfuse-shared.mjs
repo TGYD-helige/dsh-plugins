@@ -4,10 +4,9 @@
  *
  * - real mode (LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY present): boot the
  *   dsh headless profile with the packed plugin pointed at the REAL Langfuse
- *   project, run each phase's seeded LLM query (deepseek-v4-flash, a marker
- *   file forces a tool round-trip), then poll the v1 Observations API until
- *   the ingested trace shows the expected shape — the data is really in
- *   Langfuse.
+ *   project, run the leg's seeded LLM query (deepseek-v4-flash, a marker file
+ *   forces a tool round-trip), then poll the v1 Observations API until the
+ *   ingested trace shows the expected shape — the data is really in Langfuse.
  * - fake mode (LANGFUSE_* absent): same boot against an in-process fake
  *   ingestion endpoint with in-memory assertions, so the leg still proves the
  *   plugin wiring without a Langfuse instance. Note fork PRs never reach
@@ -497,38 +496,36 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
   // (observed in CI), so attempts retry. Fake mode gates on the captured
   // shapes via the same evaluator; real mode gates on the Langfuse read-back.
   const maxAttempts = realMode ? 2 : 3;
-  async function runPhase(prompt, codeword) {
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      console.log(`\n(${name} attempt ${attempt}/${maxAttempts})`);
-      captured.length = 0;
-      await runQuery(prompt);
-      let result;
-      if (realMode) {
-        result = await runVerification({
-          baseUrl,
-          publicKey,
-          secretKey,
-          fromStartTime: runStartedAt,
-          codeword,
-          evaluate,
-        });
-      } else {
-        const problems = evaluate(capturedToObservations(captured), codeword);
-        result =
-          problems.length === 0
-            ? { ok: true, state: 'captured shape matches' }
-            : { ok: false, state: problems.join('; ') };
-      }
-      if (result.ok) return result;
-      console.log(`::warning::${name} attempt ${attempt} did not verify: ${result.state}`);
-    }
-    return { ok: false, state: `${name}: attempts exhausted` };
-  }
-
   const markerFile = `${codeword}.txt`;
   writeFileSync(join(workDir, markerFile), `${codeword}-content\n`);
-  const result = await runPhase(prompt(markerFile), codeword);
-  assert(result.ok, `${name} failed: ${result.state}`);
+  let state;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    console.log(`\n(${name} attempt ${attempt}/${maxAttempts})`);
+    captured.length = 0;
+    await runQuery(prompt(markerFile));
+    let problems;
+    if (realMode) {
+      const result = await runVerification({
+        baseUrl,
+        publicKey,
+        secretKey,
+        fromStartTime: runStartedAt,
+        codeword,
+        evaluate,
+      });
+      if (result.ok) {
+        state = result.state;
+        break;
+      }
+      console.log(`::warning::${name} attempt ${attempt} did not verify: ${result.state}`);
+    } else if ((problems = evaluate(capturedToObservations(captured), codeword)).length === 0) {
+      state = 'captured shape matches';
+      break;
+    } else {
+      console.log(`::warning::${name} attempt ${attempt} did not verify: ${problems.join('; ')}`);
+    }
+  }
+  assert(state !== undefined, `${name}: attempts exhausted`);
 
   if (!realMode) {
     // Fake mode: the loop already proved the shape; the trace itself is the
@@ -541,5 +538,5 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
     assert(trace, 'no dsh-turn trace with a sessionId was ingested');
   }
 
-  console.log(`\nSCENARIO_OK (${name}: ${result.state})`);
+  console.log(`\nSCENARIO_OK (${name}: ${state})`);
 }
