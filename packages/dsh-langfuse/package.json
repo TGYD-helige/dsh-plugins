@@ -38,6 +38,9 @@
     "@deepseek-ai/dsh-tools": "0.1.0-rc.7",
     "langfuse": "^3.0.0"
   },
+  "peerDependenciesMeta": {
+    "langfuse": { "optional": true }
+  },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-agent": "0.1.0-rc.7",

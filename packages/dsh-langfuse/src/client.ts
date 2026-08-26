@@ -37,19 +37,18 @@ export type ObservationLevel = 'DEFAULT' | 'WARNING' | 'ERROR';
 type SpanParent = LangfuseTraceClient | LangfuseSpanClient | LangfuseGenerationClient;
 
 /**
- * Map dsh token accounting onto Langfuse's usage fields, keeping every
- * `usageDetails` bucket mutually exclusive (Langfuse's flat-bucket rule:
- * `input` excludes `input_*`, `output` excludes `output_*`, `total` is the
- * bucket sum — overlapping buckets double-count usage and inferred cost).
- * dsh reports uncached input, separate cache buckets, and provider-style
- * output that includes reasoning, so the `output` bucket subtracts
- * `reasoningTokens` into `output_reasoning`. The legacy `usage` triple keeps
- * the provider's inclusive billed counts.
+ * Map dsh token accounting onto Langfuse's `usageDetails`, keeping every
+ * bucket mutually exclusive (Langfuse's flat-bucket rule: `input` excludes
+ * `input_*`, `output` excludes `output_*`, `total` is the bucket sum —
+ * overlapping buckets double-count usage and inferred cost). dsh reports
+ * uncached input, separate cache buckets, and provider-style output that
+ * INCLUDES reasoning (verified in dsh-llm-deepseek@0.1.0-rc.7:
+ * `outputTokens: usage.completion_tokens`, with reasoning split out of
+ * `completion_tokens_details`), so the `output` bucket subtracts
+ * `reasoningTokens` into `output_reasoning`. Only `usageDetails` is sent —
+ * the SDK's legacy `usage` triple is deprecated.
  */
-export function usageOf(usage: TokenUsage): {
-  usage: { input: number; output: number; total: number };
-  usageDetails: Record<string, number>;
-} {
+export function usageOf(usage: TokenUsage): Record<string, number> {
   // The dsh type marks the two primary fields required, but a non-conformant
   // adapter emitting a partial usage chunk would otherwise turn every bucket
   // NaN (serialized as null by the SDK — silently corrupting billed usage).
@@ -69,7 +68,7 @@ export function usageOf(usage: TokenUsage): {
   if (usage.cacheReadTokens) usageDetails.input_cache_read = usage.cacheReadTokens;
   if (usage.cacheWriteTokens) usageDetails.input_cache_creation = usage.cacheWriteTokens;
   if (reasoning) usageDetails.output_reasoning = reasoning;
-  return { usage: { input, output, total }, usageDetails };
+  return usageDetails;
 }
 
 export class LangfuseReporter {
@@ -164,7 +163,7 @@ export class LangfuseReporter {
       generation.end({
         name: update.name,
         output: update.output,
-        ...(update.usage ? usageOf(update.usage) : {}),
+        ...(update.usage ? { usageDetails: usageOf(update.usage) } : {}),
         completionStartTime: update.completionStartTime,
         level: update.level,
         statusMessage: update.statusMessage,
@@ -230,17 +229,12 @@ export class LangfuseReporter {
     }
   }
 
-  /** Flush and shut the SDK down at fiber unload. */
+  /** Shut the SDK down at fiber unload (its shutdownAsync flushes internally). */
   async shutdown(): Promise<void> {
     await this.ready;
     const client = this.client;
     this.client = null;
     if (!client) return;
-    try {
-      await client.flushAsync();
-    } catch (error) {
-      console.error('[dsh-langfuse] flush failed:', error);
-    }
     try {
       await client.shutdownAsync();
     } catch (error) {

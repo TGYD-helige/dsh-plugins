@@ -331,7 +331,7 @@ describe('dsh-langfuse plugin', () => {
         // The generation name gains the reply's first line at close.
         name: 'llm-call [hello]',
         output: 'hello',
-        usage: { input: 10, output: 5, total: 15 },
+        usageDetails: { input: 10, output: 5, total: 15 },
         level: 'DEFAULT',
         metadata: { finishReason: 'stop' },
       });
@@ -448,7 +448,7 @@ describe('dsh-langfuse plugin', () => {
       expect(generation.body).toMatchObject({ input: { messageCount: 0 } });
       expect(generation.ends[0]).toMatchObject({
         output: undefined,
-        usage: { input: 1, output: 1, total: 2 },
+        usageDetails: { input: 1, output: 1, total: 2 },
       });
     });
 
@@ -489,7 +489,7 @@ describe('dsh-langfuse plugin', () => {
       expect(generation.ends[0]).toMatchObject({
         name: 'llm-call [partial]',
         output: 'partial',
-        usage: { input: 10, output: 5, total: 15 },
+        usageDetails: { input: 10, output: 5, total: 15 },
         level: 'ERROR',
         statusMessage: 'adapter boom',
       });
@@ -898,10 +898,9 @@ describe('dsh-langfuse plugin', () => {
       expect(mocks.instances[0].flushAsync).toHaveBeenCalledTimes(1);
     });
 
-    it('flushes and shuts the SDK down when the fiber unloads', async () => {
+    it('shuts the SDK down when the fiber unloads (its shutdownAsync flushes internally)', async () => {
       await setup();
       await ctx.fiber.dispose();
-      expect(mocks.instances[0].flushAsync).toHaveBeenCalled();
       expect(mocks.instances[0].shutdownAsync).toHaveBeenCalledTimes(1);
     });
   });
@@ -915,34 +914,30 @@ describe('dsh-langfuse plugin', () => {
 const config = { publicKey: 'pk', secretKey: 'sk', baseUrl: 'https://langfuse.example' };
 
 describe('usageOf', () => {
-  it('keeps usageDetails buckets disjoint while usage carries billed totals', () => {
+  it('keeps usageDetails buckets disjoint while totals stay the bucket sum', () => {
     expect(
       usageOf({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, cacheWriteTokens: 3 }),
     ).toEqual({
-      usage: { input: 15, output: 5, total: 20 },
-      usageDetails: {
-        input: 10,
-        output: 5,
-        total: 20,
-        input_cache_read: 2,
-        input_cache_creation: 3,
-      },
+      input: 10,
+      output: 5,
+      total: 20,
+      input_cache_read: 2,
+      input_cache_creation: 3,
     });
   });
 
   it('omits absent buckets and subtracts reasoning into its own bucket', () => {
     expect(usageOf({ inputTokens: 10, outputTokens: 5, reasoningTokens: 4 })).toEqual({
-      usage: { input: 10, output: 5, total: 15 },
-      usageDetails: { input: 10, output: 1, total: 15, output_reasoning: 4 },
+      input: 10,
+      output: 1,
+      total: 15,
+      output_reasoning: 4,
     });
   });
 
   it('coalesces absent primary fields instead of emitting NaN', () => {
-    expect(usageOf({} as never)).toEqual({
-      usage: { input: 0, output: 0, total: 0 },
-      usageDetails: { input: 0, output: 0, total: 0 },
-    });
-    expect(usageOf({ reasoningTokens: 4 } as never).usageDetails.output).toBe(0);
+    expect(usageOf({} as never)).toEqual({ input: 0, output: 0, total: 0 });
+    expect(usageOf({ reasoningTokens: 4 } as never).output).toBe(0);
   });
 });
 
@@ -986,7 +981,6 @@ describe('LangfuseReporter', () => {
     });
     expect(generation.ends[0]).toMatchObject({
       output: 'hi',
-      usage: { input: 12, output: 5, total: 17 },
       usageDetails: { input: 10, output: 5, total: 17, input_cache_read: 2 },
       level: 'DEFAULT',
     });
