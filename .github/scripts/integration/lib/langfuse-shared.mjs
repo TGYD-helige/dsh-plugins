@@ -26,11 +26,12 @@
  *   exit   : non-zero on any failure
  */
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { netEnv, requireEnv, run } from './ci-shared.mjs';
 
 // ---------------------------------------------------------------------------
 // Real-Langfuse verification (v1 Observations API — v2 observations is
@@ -363,9 +364,7 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
   const dsh = process.env.DSH_CLI ?? 'dsh';
 
   const { DSH_INTEGRATION_BASE_URL, DSH_INTEGRATION_API_KEY, DSH_PKG_TARBALL } = process.env;
-  for (const name of ['DSH_INTEGRATION_BASE_URL', 'DSH_INTEGRATION_API_KEY', 'DSH_PKG_TARBALL']) {
-    if (!process.env[name]) throw new Error(`${name} is required`);
-  }
+  requireEnv(['DSH_INTEGRATION_BASE_URL', 'DSH_INTEGRATION_API_KEY', 'DSH_PKG_TARBALL']);
 
   const publicKey = envOr(process.env.LANGFUSE_PUBLIC_KEY, '');
   const secretKey = envOr(process.env.LANGFUSE_SECRET_KEY, '');
@@ -397,31 +396,14 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
     pluginConnection = { publicKey: 'pk-lf-ci', secretKey: 'sk-lf-ci', baseUrl: fakeUrl };
   }
 
-  // If the runner routes egress through a host-level proxy, fetch to the
-  // gateway can break — drop proxy vars from the LLM-carrying process.
-  const netEnv = Object.fromEntries(
-    Object.entries(process.env).filter(([k]) => !/^(https?_proxy|all_proxy|no_proxy)$/i.test(k)),
-  );
-
-  function run(cmd, args, env = {}) {
-    console.log(`\n$ ${cmd} ${args.join(' ')}`);
-    const r = spawnSync(cmd, args, {
-      stdio: 'inherit',
-      cwd: workDir,
-      env: { ...process.env, ...env },
-    });
-    if (r.error) throw r.error;
-    if (r.status !== 0) throw new Error(`${cmd} ${args.slice(0, 3).join(' ')} exited ${r.status}`);
-  }
-
   const dshHomeEnv = { DSH_HOME: dshHome };
 
   // Install the packed bundle (idempotent — the workflow's Stage A already
   // did it once), then the langfuse peer: the profile template sets
   // autoInstallPeers: false, so runtime peers are added explicitly. The
   // dsh-* peers ship with the profile itself.
-  run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], dshHomeEnv);
-  run(dsh, ['plugin', '--profile', 'headless', 'add', 'langfuse@3.38.20'], dshHomeEnv);
+  run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], { cwd: workDir, env: dshHomeEnv });
+  run(dsh, ['plugin', '--profile', 'headless', 'add', 'langfuse@3.38.20'], { cwd: workDir, env: dshHomeEnv });
 
   // Enable the plugin through the profile's user patch layer (an id-targeted
   // row replaces the bundle row's whole config). The agent-default-model row
@@ -473,7 +455,7 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
       const child = spawn(dsh, ['--profile', 'headless', prompt], {
         cwd: workDir,
         env: {
-          ...netEnv,
+          ...netEnv(),
           ...dshHomeEnv,
           DSH_TELEMETRY_DISABLED: '1',
           // Ephemeral CI workspace: never stall on tool approval prompts.
