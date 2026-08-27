@@ -6,18 +6,25 @@
  * for the process lifetime, and disposes everything on unload.
  *
  * Security note: dsh ships no authn/authz. This plugin binds 127.0.0.1 by
- * default; put a real authentication layer in front (or contribute an auth
- * middleware hook here) before exposing it beyond loopback.
+ * default; put a real authentication layer in front before exposing it
+ * beyond loopback.
  *
  * @module dsh-a2a
  */
 
+import { InMemoryTaskStore } from '@a2a-js/sdk/server';
 import type { Context } from '@deepseek-ai/cordis';
+// Augmentation-only imports: pull ctx.agents and the session Events
+// declarations into the compilation (listeners are contextually typed).
+import type {} from '@deepseek-ai/dsh-agent';
+import type {} from '@deepseek-ai/dsh-session';
 import Schema from '@deepseek-ai/schemastery';
 import { A2aBridge } from './bridge.js';
+import { DshAgentExecutor } from './executor.js';
 import { startA2aServer } from './server.js';
 import { GcsTaskStore } from './stores/gcs.js';
 import { RedisTaskStore } from './stores/redis.js';
+import { type ManagedTaskStore, SanitizedTaskStore } from './task-store.js';
 
 export const name = 'dsh-a2a';
 
@@ -51,7 +58,7 @@ export const Config = Schema.object({
     Schema.const('gcs'),
   ]).default('memory'),
   redis: Schema.object({
-    url: Schema.string().default('redis://127.0.0.1:6379'),
+    url: Schema.string().role('secret').default('redis://127.0.0.1:6379'),
     keyPrefix: Schema.string().default('a2a'),
     ttlSeconds: Schema.natural().default(86400),
   }),
@@ -75,51 +82,76 @@ export interface A2aPluginConfig {
   gcs: { bucket: string; prefix: string; keyFilename: string };
 }
 
-export function apply(ctx: Context, config: A2aPluginConfig): void {
-  // dsh event names come from declaration merging in @deepseek-ai/* packages that are
-  // not all published yet; cast once here. TODO(verify): drop when installable.
-  const on = ctx.on.bind(ctx) as (name: string, handler: (...args: any[]) => unknown) => void;
+export function apply(
+  ctx: Context,
+  config: A2aPluginConfig,
+): Promise<{ port: number }> | undefined {
   if (!config.enabled) return;
 
-  const bridge = new A2aBridge(ctx, {
-    cwd: config.cwd,
-    agentOptions: {
-      provider: config.agent.provider || undefined,
-      model: config.agent.model || undefined,
-    },
+  // This cordis fork has no ready/dispose events: startup runs inside
+  // ctx.effect() (executed at fiber load) and its returned disposer runs on
+  // fiber unload. apply() returns the startup promise so fiber readiness
+  // covers the bind.
+  let ready!: Promise<{ port: number }>;
+  let serverPort = 0;
+  ctx.effect(() => {
+    const startup = start();
+    ready = startup.then(() => ({ port: serverPort }));
+    return startup;
   });
+  return ready;
 
-  // Task state store (metadata only). Wired into the @a2a-js/sdk
-  // RequestHandler when the SDK transport lands (see server.ts TODO); the
-  // bridge keeps an in-memory task map until then.
-  let taskStore: { init(): Promise<void>; close?(): Promise<void> } | null = null;
-  if (config.taskStore === 'redis') {
-    taskStore = new RedisTaskStore(config.redis);
-  } else if (config.taskStore === 'gcs' && config.gcs.bucket) {
-    taskStore = new GcsTaskStore(config.gcs);
-  }
+  async function start(): Promise<() => Promise<void>> {
+    const bridge = new A2aBridge(ctx, {
+      cwd: config.cwd,
+      agentOptions: {
+        provider: config.agent.provider || undefined,
+        model: config.agent.model || undefined,
+      },
+    });
 
-  let server: { close(): Promise<void> } | null = null;
+    const store = createTaskStore(config);
+    await store.init?.();
 
-  on('ready', async () => {
-    await taskStore?.init();
-    server = await startA2aServer(bridge, {
+    const executor = new DshAgentExecutor(bridge);
+    const server = await startA2aServer({
       host: config.host,
       port: config.port,
       basePath: config.basePath,
-      agentCard: {
+      card: {
         name: config.card.name,
         description: config.card.description,
         version: config.card.version,
         publicUrl: config.card.publicUrl || undefined,
       },
+      executor,
+      taskStore: store,
     });
-    console.log(`[dsh-a2a] A2A endpoint: http://${config.host}:${config.port}${config.basePath}/`);
-  });
+    serverPort = server.port;
 
-  on('dispose', async () => {
-    await server?.close();
-    await bridge.dispose();
-    await taskStore?.close?.();
-  });
+    console.log(
+      `[dsh-a2a] A2A endpoint: http://${config.host}:${server.port}${config.basePath}/ ` +
+        `(agent card: /.well-known/agent-card.json)`,
+    );
+
+    return async () => {
+      await server.close();
+      await bridge.dispose();
+      await store.close?.();
+    };
+  }
+}
+
+function createTaskStore(config: A2aPluginConfig): ManagedTaskStore {
+  switch (config.taskStore) {
+    case 'redis':
+      return new SanitizedTaskStore(new RedisTaskStore(config.redis));
+    case 'gcs':
+      if (!config.gcs.bucket) {
+        throw new Error("[dsh-a2a] taskStore 'gcs' requires gcs.bucket");
+      }
+      return new SanitizedTaskStore(new GcsTaskStore(config.gcs));
+    default:
+      return new SanitizedTaskStore(new InMemoryTaskStore());
+  }
 }

@@ -2,19 +2,23 @@
  * GCS TaskStore for @a2a-js/sdk. `@google-cloud/storage` is an optional peer.
  *
  * Ported from the source project's packages/a2a-server/src/persistence/gcs.ts:
- *   tasks/{taskId}/metadata.json.gz  — gzipped task metadata
+ *   tasks/{taskId}/metadata.json.gz  — gzipped task state (pre-sanitized by
+ *                                      SanitizedTaskStore: no history)
  *   tasks/{taskId}/workspace.tar.gz  — tar of the task's workspace directory
  *
- * The workspace archive is written explicitly via `archiveWorkspace()` (e.g.
- * on task completion), not on every save — the source project wrapped this
- * store in a NoOpTaskStore so SDK-driven saves skip the re-upload; do the
- * same or call archiveWorkspace from the terminal-event path.
+ * The workspace archive is written explicitly via `archiveWorkspace()` (not
+ * wired to any lifecycle event yet — A2A tasks share one configured cwd, so a
+ * per-task snapshot needs a per-task workspace story first).
  */
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
-
+import { execFile } from 'node:child_process';
 import { createReadStream } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
+import { promisify } from 'node:util';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import type { Task } from '@a2a-js/sdk';
 import type { TaskStore } from '@a2a-js/sdk/server';
 
@@ -44,7 +48,6 @@ export class GcsTaskStore implements TaskStore {
 
   async save(task: Task): Promise<void> {
     if (!this.bucket) return;
-    const { gzipSync } = await import('node:zlib');
     await this.bucket
       .file(`${this.prefix}/${task.id}/metadata.json.gz`)
       .save(gzipSync(JSON.stringify(task)), { contentType: 'application/gzip', resumable: false });
@@ -56,7 +59,6 @@ export class GcsTaskStore implements TaskStore {
     const [exists] = await file.exists();
     if (!exists) return undefined;
     const [buf] = await file.download();
-    const { gunzipSync } = await import('node:zlib');
     return JSON.parse(gunzipSync(buf).toString('utf8')) as Task;
   }
 
@@ -67,12 +69,6 @@ export class GcsTaskStore implements TaskStore {
    */
   async archiveWorkspace(taskId: string, cwd: string): Promise<void> {
     if (!this.bucket) return;
-    const { execFile } = await import('node:child_process');
-    const { promisify } = await import('node:util');
-    const { mkdtemp, rm } = await import('node:fs/promises');
-    const { tmpdir } = await import('node:os');
-    const { join } = await import('node:path');
-
     const dir = await mkdtemp(join(tmpdir(), 'dsh-a2a-archive-'));
     const tarball = join(dir, 'workspace.tar.gz');
     try {
