@@ -60,6 +60,12 @@ const mocks = vi.hoisted(() => {
       this.updates.push(attrs);
     }
 
+    /** The real SDK serializes non-strings; the mock keeps the raw value. */
+    setTraceIO(io: { input?: unknown; output?: unknown }) {
+      if (io.input !== undefined) this.attributes['langfuse.trace.input'] = io.input;
+      if (io.output !== undefined) this.attributes['langfuse.trace.output'] = io.output;
+    }
+
     end() {
       this.ended += 1;
     }
@@ -322,12 +328,18 @@ describe('dsh-langfuse plugin', () => {
       const root = fakeObs(mocks.roots[0]);
       expect(root.name).toBe('dsh-turn');
       expect(root.body).toEqual({ metadata: { turn: 0 } });
-      // v5 correlating attribute: the session id rides every observation.
+      // v5 correlating attributes ride every observation: the session id and
+      // the trace name (older Langfuse servers derive the trace row from any
+      // span carrying them — a root-only stamp can lose to child events).
       expect(root.attributes['session.id']).toBe('s1');
+      expect(root.attributes['langfuse.trace.name']).toBe('dsh-turn');
 
       ctx.emit('session/event', sessionOf('s1'), userMessage('fix the bug'));
       ctx.emit('session/event', sessionOf('s1'), userMessage('ignored second'));
       expect(root.updates).toEqual([{ input: 'fix the bug' }]);
+      // The trace-level input also rides the deprecated langfuse.trace.* keys
+      // (older servers derive the trace row's IO from exactly those).
+      expect(root.attributes['langfuse.trace.input']).toBe('fix the bug');
 
       // The turn's final answer becomes the trace's output at turn/end, and
       // ending the root is what exports the trace.
@@ -337,6 +349,7 @@ describe('dsh-langfuse plugin', () => {
         output: 'done, the bug is fixed',
         metadata: { turn: 0, endReason: 'completed' },
       });
+      expect(root.attributes['langfuse.trace.output']).toBe('done, the bug is fixed');
       expect(root.ended).toBe(1);
 
       // The next turn opens a fresh trace.
@@ -367,6 +380,10 @@ describe('dsh-langfuse plugin', () => {
         { output: undefined, metadata: { turn: 0, endReason: 'completed' } },
       ]);
       expect(JSON.stringify(root.updates)).not.toContain('secret');
+      // The trace-level IO keys (langfuse.trace.*) live in attributes, not
+      // updates — they must stay empty under redaction too.
+      expect(root.attributes['langfuse.trace.input']).toBeUndefined();
+      expect(root.attributes['langfuse.trace.output']).toBeUndefined();
     });
 
     it('ends the abandoned root on session/disposed (un-ended spans never export)', async () => {
@@ -427,6 +444,7 @@ describe('dsh-langfuse plugin', () => {
       expect(generation.ended).toBe(1);
       // The session id propagates down the explicit handle tree.
       expect(generation.attributes['session.id']).toBe('s1');
+      expect(generation.attributes['langfuse.trace.name']).toBe('dsh-turn');
     });
 
     it('nests a purpose call under the turn trace with a purpose-tagged name', async () => {
@@ -852,6 +870,7 @@ describe('dsh-langfuse plugin', () => {
       expect(subSpan.generations[0].name).toBe('llm-call [child answer]');
       // The session id propagates down the whole delegation chain.
       expect(subSpan.attributes['session.id']).toBe('s1');
+      expect(subSpan.attributes['langfuse.trace.name']).toBe('dsh-turn');
       expect(subSpan.generations[0].attributes['session.id']).toBe('s1');
       expect(lastUpdate(subSpan)).toMatchObject({
         output: { stopReason: 'completed' },
@@ -877,6 +896,11 @@ describe('dsh-langfuse plugin', () => {
       const subSpan = root.spans[0];
       expect(subSpan.name).toBe('subagent');
       expect(subSpan.updates).toContainEqual({ input: 'read the marker file' });
+      // The subagent span is not a trace root: it carries the trace name but
+      // never the trace-level IO keys.
+      expect(subSpan.attributes['langfuse.trace.name']).toBe('dsh-turn');
+      expect(subSpan.attributes['langfuse.trace.input']).toBeUndefined();
+      expect(subSpan.attributes['langfuse.trace.output']).toBeUndefined();
     });
 
     it('enriches the span name from the subagent/descriptor event', async () => {
@@ -1081,6 +1105,7 @@ describe('LangfuseReporter', () => {
     expect(root.name).toBe('dsh-turn');
     expect(root.body).toEqual({ metadata: { turn: 0 } });
     expect(root.attributes['session.id']).toBe('s1');
+    expect(root.attributes['langfuse.trace.name']).toBe('dsh-turn');
     expect(root.parentContext).toEqual({
       traceId: '0'.repeat(32),
       spanId: '0'.repeat(16),
@@ -1089,6 +1114,9 @@ describe('LangfuseReporter', () => {
 
     reporter.updateSpan(root, { input: 'hello' });
     expect(root.updates[0]).toEqual({ input: 'hello' });
+    // Trace roots also carry the deprecated langfuse.trace.* IO keys (older
+    // Langfuse servers derive the trace row's IO from exactly those).
+    expect(root.attributes['langfuse.trace.input']).toBe('hello');
 
     const generation = fakeGen(
       reporter.startGeneration(root, {
@@ -1100,6 +1128,7 @@ describe('LangfuseReporter', () => {
     expect(generation.asType).toBe('generation');
     expect(generation.body).toMatchObject({ model: 'deepseek-chat' });
     expect(generation.attributes['session.id']).toBe('s1');
+    expect(generation.attributes['langfuse.trace.name']).toBe('dsh-turn');
 
     reporter.endGeneration(generation, {
       name: 'llm-call [hi]',

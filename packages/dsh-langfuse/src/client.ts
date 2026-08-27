@@ -49,6 +49,12 @@ export type ObservationLevel = 'DEFAULT' | 'WARNING' | 'ERROR';
 /** Any observation that can parent a span (trace root span or nested span/generation). */
 type Observation = LangfuseSpan | LangfuseGeneration;
 
+/** The trace-correlating attributes stamped on every observation of a trace. */
+interface TraceContext {
+  sessionId?: string;
+  traceName: string;
+}
+
 /**
  * OTEL's canonical invalid span context as a literal (a static
  * `INVALID_SPAN_CONTEXT` import would load @opentelemetry/api eagerly, even
@@ -94,8 +100,20 @@ export function usageOf(usage: TokenUsage): Record<string, number> {
 export class LangfuseReporter {
   private tracing: typeof import('@langfuse/tracing') | null = null;
   private provider: NodeTracerProvider | null = null;
-  /** Observation → the session id stamped on it; children inherit their parent's. */
-  private sessionIds = new WeakMap<Observation, string>();
+  /**
+   * Observation → its trace's correlating attributes; children inherit their
+   * parent's. Stamped on every observation (`session.id`,
+   * `langfuse.trace.name`): v5's observations-first model wants trace context
+   * on every span (the v4 migration doc: "copied to every span where the name
+   * must be queryable"), and older Langfuse servers derive the trace row from
+   * ANY span carrying these — a root-only stamp can lose to child-derived
+   * trace events depending on ingestion order. This is the explicit
+   * handle-tree equivalent of v5's context-scoped propagateAttributes, which
+   * cannot wrap this plugin's event-driven lifecycle.
+   */
+  private traceContext = new WeakMap<Observation, TraceContext>();
+  /** Trace roots (created by openTrace) — the spans that may carry trace-level IO. */
+  private roots = new WeakSet<Observation>();
   /** Settles (never rejects) once the lazy SDK import+wiring finished. */
   readonly ready: Promise<void>;
 
@@ -128,16 +146,15 @@ export class LangfuseReporter {
   }
 
   /**
-   * Stamp the v5 correlating session attribute
-   * (`LangfuseOtelSpanAttributes.TRACE_SESSION_ID` — the OTEL semconv key) on
-   * an observation and record it for future children. Explicit on trace
-   * roots; inherited from the parent everywhere else (the handle-tree
-   * equivalent of propagateAttributes).
+   * Stamp the trace-correlating attributes on an observation and record them
+   * for future children. `session.id` = `LangfuseOtelSpanAttributes.TRACE_SESSION_ID`
+   * (the OTEL semconv key); `langfuse.trace.name` = `TRACE_NAME`.
    */
-  private stampSession(observation: Observation, sessionId: string | undefined): void {
-    if (!sessionId) return;
-    observation.otelSpan.setAttribute('session.id', sessionId);
-    this.sessionIds.set(observation, sessionId);
+  private stampTraceContext(observation: Observation, context: TraceContext | undefined): void {
+    if (!context) return;
+    observation.otelSpan.setAttribute('langfuse.trace.name', context.traceName);
+    if (context.sessionId) observation.otelSpan.setAttribute('session.id', context.sessionId);
+    this.traceContext.set(observation, context);
   }
 
   /** Open a trace (one per agent turn, or one-off for session-less calls). */
@@ -153,7 +170,8 @@ export class LangfuseReporter {
         { metadata: input.metadata },
         { parentSpanContext: NO_PARENT },
       );
-      this.stampSession(root, input.sessionId);
+      this.stampTraceContext(root, { sessionId: input.sessionId, traceName: input.name });
+      this.roots.add(root);
       return root;
     } catch (error) {
       console.error('[dsh-langfuse] trace creation failed:', error);
@@ -184,7 +202,7 @@ export class LangfuseReporter {
         },
         { asType: 'generation' },
       );
-      this.stampSession(generation, this.sessionIds.get(parent));
+      this.stampTraceContext(generation, this.traceContext.get(parent));
       return generation;
     } catch (error) {
       console.error('[dsh-langfuse] generation creation failed:', error);
@@ -233,7 +251,7 @@ export class LangfuseReporter {
         input: input.input,
         metadata: input.metadata,
       });
-      this.stampSession(span, this.sessionIds.get(parent));
+      this.stampTraceContext(span, this.traceContext.get(parent));
       return span;
     } catch (error) {
       console.error('[dsh-langfuse] span creation failed:', error);
@@ -245,7 +263,9 @@ export class LangfuseReporter {
    * Merge fields into an open span — subagent enrichment (label, provider),
    * and the trace root's input (a v5 trace IS its root span, so trace-level
    * updates are span updates; OTEL attributes merge per key, so partial
-   * updates compose).
+   * updates compose). On trace roots the input/output also rides the
+   * deprecated `langfuse.trace.*` attributes (setTraceIO): older Langfuse
+   * servers derive the trace row's IO from exactly those keys.
    */
   updateSpan(
     span: LangfuseSpan | null,
@@ -255,6 +275,9 @@ export class LangfuseReporter {
     try {
       span.update({ input: update.input, metadata: update.metadata });
       if (update.name) span.otelSpan.updateName(update.name);
+      if (update.input !== undefined && this.roots.has(span)) {
+        span.setTraceIO({ input: update.input });
+      }
     } catch (error) {
       console.error('[dsh-langfuse] span update failed:', error);
     }
@@ -263,6 +286,8 @@ export class LangfuseReporter {
   /**
    * Close any span observation, trace roots included: final fields, then end —
    * v5 spans only export on end, so an un-ended root never reaches Langfuse.
+   * On trace roots the output also rides the deprecated `langfuse.trace.*`
+   * attributes (setTraceIO) for older servers — same rule as updateSpan.
    */
   endSpan(
     span: LangfuseSpan | null,
@@ -276,6 +301,9 @@ export class LangfuseReporter {
     if (!span) return;
     try {
       span.update(update);
+      if (update.output !== undefined && this.roots.has(span)) {
+        span.setTraceIO({ output: update.output });
+      }
       span.end();
     } catch (error) {
       console.error('[dsh-langfuse] span end failed:', error);
