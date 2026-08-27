@@ -1,0 +1,310 @@
+name: Publish npm Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      npm_tag:
+        description: npm dist-tag to publish with
+        required: true
+        default: beta
+        type: choice
+        options:
+          - beta
+          - latest
+      release_version:
+        description: npm version to publish, or auto to compute the next version
+        required: true
+        default: auto
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GIT_ACTOR: ${{ github.actor }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      # pnpm version comes from the packageManager field in package.json —
+      # do not set it here too (pnpm/action-setup errors on duplicates).
+      - uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile=false
+
+      - name: Check npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN repository secret is not configured."
+            exit 1
+          fi
+
+      - name: Ensure release branch
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "Publishing is only allowed from the main branch."
+            exit 1
+          fi
+
+      - name: Configure git identity
+        run: |
+          git config user.name "$GIT_ACTOR"
+          git config user.email "${GIT_ACTOR}@users.noreply.github.com"
+
+      # All packages share one release version. The next version is resolved
+      # from what npm already has, not from the committed package.json files.
+      - name: Resolve release version
+        id: versioning
+        env:
+          RELEASE_CHANNEL: ${{ inputs.npm_tag }}
+          RELEASE_VERSION_INPUT: ${{ inputs.release_version }}
+        run: |
+          node <<'EOF'
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const { execFileSync } = require("node:child_process");
+
+          const channel = process.env.RELEASE_CHANNEL;
+          const versionInput = (process.env.RELEASE_VERSION_INPUT || "auto").trim();
+          if (channel !== "beta" && channel !== "latest") {
+            throw new Error(`Unsupported release channel: ${channel}`);
+          }
+
+          const packagesDir = path.join(process.cwd(), "packages");
+          const packageFiles = fs.readdirSync(packagesDir, { withFileTypes: true })
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => path.join(packagesDir, entry.name, "package.json"))
+            .filter((file) => fs.existsSync(file));
+
+          const packages = packageFiles.map((file) => ({
+            file,
+            pkg: JSON.parse(fs.readFileSync(file, "utf8")),
+          }));
+          const publishablePackages = packages.filter(({ pkg }) => !pkg.private);
+          const publishedPackages = publishablePackages.map(({ pkg }) => pkg.name);
+          if (publishablePackages.length === 0) {
+            throw new Error("No publishable packages found.");
+          }
+
+          const parseVersion = (version) => {
+            const match = version.match(/^(\d+)\.(\d+)\.(\d+)(?:-beta\.(\d+))?$/);
+            if (!match) {
+              throw new Error(`Unsupported version format: ${version}`);
+            }
+            return {
+              major: Number(match[1]),
+              minor: Number(match[2]),
+              patch: Number(match[3]),
+              beta: match[4] === undefined ? null : Number(match[4]),
+            };
+          };
+          const formatVersion = (version) => {
+            const base = `${version.major}.${version.minor}.${version.patch}`;
+            return version.beta === null ? base : `${base}-beta.${version.beta}`;
+          };
+          const compareVersions = (left, right) => {
+            for (const part of ["major", "minor", "patch"]) {
+              if (left[part] !== right[part]) {
+                return left[part] - right[part];
+              }
+            }
+            if (left.beta === right.beta) return 0;
+            if (left.beta === null) return 1;
+            if (right.beta === null) return -1;
+            return left.beta - right.beta;
+          };
+          const maxVersion = (versions) =>
+            versions.reduce((highest, version) =>
+              highest === null || compareVersions(version, highest) > 0 ? version : highest,
+              null
+            );
+          const writePackageVersion = (file, version) => {
+            const source = fs.readFileSync(file, "utf8");
+            const versionFieldPattern = /"version"\s*:\s*"[^"]+"/;
+            if (!versionFieldPattern.test(source)) {
+              throw new Error(`Could not update version field in ${file}`);
+            }
+            const nextSource = source.replace(versionFieldPattern, `"version": "${version}"`);
+            if (nextSource !== source) {
+              fs.writeFileSync(file, nextSource);
+            }
+          };
+
+          const npmViewJson = (packageName, field) => {
+            try {
+              const output = execFileSync("npm", ["view", packageName, field, "--json"], {
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "pipe"],
+              }).trim();
+              return output ? JSON.parse(output) : {};
+            } catch (error) {
+              const stderr = error.stderr?.toString?.() ?? "";
+              if (stderr.includes("E404")) {
+                return null;
+              }
+              throw new Error(`Failed to read npm ${field} for ${packageName}: ${stderr || error.message}`);
+            }
+          };
+          const normalizeVersions = (versions) => {
+            if (versions === null) return null;
+            if (Array.isArray(versions)) return versions;
+            if (typeof versions === "string") return [versions];
+            return [];
+          };
+
+          const remoteInfos = publishedPackages.map((packageName) => ({
+            packageName,
+            versions: normalizeVersions(npmViewJson(packageName, "versions")),
+          }));
+          const isFullyPublished = (version) => remoteInfos.every((info) => info.versions?.includes(version));
+          const publishedVersions = remoteInfos
+            .flatMap((info) => info.versions ?? [])
+            .map((version) => {
+              try {
+                return parseVersion(version);
+              } catch {
+                return null;
+              }
+            })
+            .filter((version) => version !== null);
+
+          const computeNextBetaVersion = () => {
+            const highestBeta = maxVersion(publishedVersions.filter((version) => version.beta !== null));
+            if (highestBeta === null) {
+              throw new Error(
+                "Cannot auto-publish a beta release because npm has no published beta versions. Provide release_version."
+              );
+            }
+
+            const highestBetaVersion = formatVersion(highestBeta);
+            if (!isFullyPublished(highestBetaVersion)) {
+              return highestBetaVersion;
+            }
+
+            return formatVersion({ ...highestBeta, beta: highestBeta.beta + 1 });
+          };
+          const computeLatestVersion = () => {
+            const highestStable = maxVersion(publishedVersions.filter((version) => version.beta === null));
+            if (highestStable === null) {
+              throw new Error(
+                "Cannot auto-publish with the latest dist-tag because npm has no published stable versions. Provide release_version."
+              );
+            }
+
+            const highestStableVersion = formatVersion(highestStable);
+            if (isFullyPublished(highestStableVersion)) {
+              throw new Error(
+                `${highestStableVersion} is already published for every package. Provide a stable release_version.`
+              );
+            }
+            return highestStableVersion;
+          };
+          const computeNextVersion = () => {
+            if (versionInput !== "" && versionInput !== "auto") {
+              const parsedInputVersion = parseVersion(versionInput);
+              if (channel === "beta" && parsedInputVersion.beta === null) {
+                throw new Error(`Beta releases must use a beta version, received ${versionInput}`);
+              }
+              if (channel === "latest" && parsedInputVersion.beta !== null) {
+                throw new Error(`Latest releases must use a stable version, received ${versionInput}`);
+              }
+              return versionInput;
+            }
+
+            if (channel === "beta") {
+              return computeNextBetaVersion();
+            }
+
+            return computeLatestVersion();
+          };
+
+          const nextVersion = computeNextVersion();
+          for (const { file } of packages) {
+            writePackageVersion(file, nextVersion);
+          }
+
+          const packagesToPublish = remoteInfos
+            .filter((info) => !info.versions?.includes(nextVersion))
+            .map((info) => info.packageName);
+
+          console.log(`release version: ${nextVersion}`);
+          console.log(`requested release version: ${versionInput || "auto"}`);
+          console.log("release version source: npm published package versions");
+          console.log("package.json versions are updated only in this workflow workspace and are not committed");
+          console.log(`packages to publish: ${packagesToPublish.length > 0 ? packagesToPublish.join(", ") : "(none)"}`);
+          if (packagesToPublish.length === 0) {
+            throw new Error(
+              `No packages can be published for ${nextVersion}; choose a new release_version before running the release workflow.`
+            );
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `release_version=${nextVersion}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `publish_filters=${packagesToPublish.join(" ")}\n`);
+          EOF
+
+      - name: Run checks
+        run: |
+          pnpm typecheck
+          pnpm build
+          pnpm test
+          pnpm lint
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          publish_cmd=(pnpm publish -r --access public --no-git-checks)
+          for package_name in ${{ steps.versioning.outputs.publish_filters }}; do
+            publish_cmd+=(--filter "$package_name")
+          done
+          if [ "${{ inputs.npm_tag }}" = "beta" ]; then
+            publish_cmd+=(--tag beta)
+          fi
+          "${publish_cmd[@]}"
+
+      - name: Tag release
+        env:
+          RELEASE_VERSION: ${{ steps.versioning.outputs.release_version }}
+        run: |
+          tag_name="v${RELEASE_VERSION}"
+          if git rev-parse "${tag_name}" >/dev/null 2>&1; then
+            echo "Tag ${tag_name} already exists locally."
+          else
+            git tag -a "${tag_name}" -m "${tag_name}"
+          fi
+          git push origin "refs/tags/${tag_name}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.versioning.outputs.release_version }}
+        run: |
+          tag_name="v${RELEASE_VERSION}"
+          if gh release view "${tag_name}" >/dev/null 2>&1; then
+            echo "GitHub release ${tag_name} already exists."
+            exit 0
+          fi
+          gh release create "${tag_name}" \
+            --verify-tag \
+            --title "${tag_name}" \
+            --generate-notes
