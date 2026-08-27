@@ -116,6 +116,11 @@ jobs:
           port="$(cat "$RUNNER_TEMP/review-proxy-port")"
           test -n "$port"
           chmod 755 "$RUNNER_TEMP"
+          # nobody must TRAVERSE the directory chain down to the checkout
+          # (inert review data) and its own DSH_HOME — the runner's parents
+          # are not world-searchable by default. o+x grants search without
+          # directory listing, so the containment boundary is unchanged.
+          chmod o+x /home/runner /home/runner/work "$(dirname "$GITHUB_WORKSPACE")" "$GITHUB_WORKSPACE"
           sudo -n install -d -o nobody -g nogroup "$DSH_HOME"
           cd pr-head
           # Redirects are evaluated by the runner shell on purpose: the report

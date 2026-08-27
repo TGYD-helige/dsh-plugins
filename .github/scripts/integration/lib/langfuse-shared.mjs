@@ -8,7 +8,7 @@
  *   forces a tool round-trip), then poll the v1 Observations API until the
  *   ingested trace shows the expected shape — the data is really in Langfuse.
  * - fake mode (LANGFUSE_* absent): same boot against an in-process fake
- *   ingestion endpoint with in-memory assertions, so the leg still proves the
+ *   OTLP endpoint with in-memory assertions, so the leg still proves the
  *   plugin wiring without a Langfuse instance. Note fork PRs never reach
  *   these scripts at all — Stage B is gated on the DSH_INTEGRATION_* secrets,
  *   which forks don't receive; fake mode covers LANGFUSE-keyless same-repo
@@ -62,6 +62,8 @@ export function assert(cond, msg) {
 }
 
 // Returns a list of problems; empty list means the trace fully matches.
+// Parenting note (v5): the trace IS its root span, so "parented at the trace
+// root" means parentObservationId === the `dsh-turn` root span's id, not null.
 export function evaluateTrace(observations, codeword) {
   const spans = observations.filter((o) => o.type === 'SPAN');
   const generations = observations.filter((o) => o.type === 'GENERATION');
@@ -69,6 +71,10 @@ export function evaluateTrace(observations, codeword) {
   const need = (condition, message) => {
     if (!condition) problems.push(message);
   };
+
+  const root = spans.find((o) => o.name === 'dsh-turn' && o.parentObservationId == null);
+  need(root, 'missing "dsh-turn" root span');
+  need(!root || root.endTime != null, '"dsh-turn" root span has no endTime (never completed)');
 
   const generation = generations.find(
     // The plugin renames generations to `llm-call [<first line>]` at close,
@@ -83,8 +89,9 @@ export function evaluateTrace(observations, codeword) {
       `generation model is ${generation.model ?? 'null'}, expected ${EXPECTED_MODEL}`,
     );
     need(generation.endTime != null, 'generation "llm-call" has no endTime (never completed)');
+    // Skipped (not misreported) when the root itself is missing.
     need(
-      generation.parentObservationId == null,
+      !root || generation.parentObservationId === root.id,
       'generation "llm-call" is not parented at the trace root',
     );
     const total = generation.usage?.total ?? generation.usageDetails?.total ?? 0;
@@ -98,7 +105,7 @@ export function evaluateTrace(observations, codeword) {
   if (toolSpan) {
     need(toolSpan.endTime != null, `"${toolSpan.name}" span has no endTime (never completed)`);
     need(
-      toolSpan.parentObservationId == null,
+      !root || toolSpan.parentObservationId === root.id,
       `"${toolSpan.name}" span is not parented at the trace root`,
     );
   }
@@ -138,7 +145,8 @@ export function evaluateReasoning(observations) {
 // The subagent shape: the delegation tool call, the subagent span parented
 // under it, and the child's own generation + tool span nested one level
 // deeper — all inside the ONE parent trace (a child leaking its own trace
-// fails the delegation-span check).
+// fails the delegation-span check). Parenting note (v5): the trace IS its
+// root span, so the delegation span parents at the `dsh-turn` root span's id.
 export function evaluateSubagentTrace(observations, codeword) {
   const spans = observations.filter((o) => o.type === 'SPAN');
   const generations = observations.filter((o) => o.type === 'GENERATION');
@@ -147,12 +155,16 @@ export function evaluateSubagentTrace(observations, codeword) {
     if (!condition) problems.push(message);
   };
 
+  const root = spans.find((o) => o.name === 'dsh-turn' && o.parentObservationId == null);
+  need(root, 'missing "dsh-turn" root span');
+  need(!root || root.endTime != null, '"dsh-turn" root span has no endTime (never completed)');
+
   const delegation = spans.find((o) => o.name?.startsWith('tool:subagent'));
   need(delegation, 'missing delegation "tool:subagent*" span');
   if (delegation) {
     need(delegation.endTime != null, 'delegation span has no endTime (never completed)');
     need(
-      delegation.parentObservationId == null,
+      !root || delegation.parentObservationId === root.id,
       'delegation span is not parented at the trace root',
     );
   }
@@ -188,18 +200,58 @@ export function evaluateSubagentTrace(observations, codeword) {
   return problems;
 }
 
-// Fake-mode captures are upsert envelopes ({type, body} sharing observation
-// ids); fold them into the observation shape the evaluators consume. Span and
-// generation bodies never carry a `type` of their own, so it doubles as the
-// observation kind.
-function capturedToObservations(captured) {
-  const byId = new Map();
-  for (const e of captured) {
-    if (!e.body?.id || !/^(span|generation)-/.test(e.type)) continue;
-    const kind = e.type.startsWith('generation-') ? 'GENERATION' : 'SPAN';
-    byId.set(e.body.id, { ...byId.get(e.body.id), ...e.body, type: kind });
+// Fake mode folds exported OTLP spans into the same observation shape the
+// evaluators consume (identical to what the v1 Observations API returns in
+// real mode): a span's OTEL spanId/parentSpanId become id/parentObservationId,
+// and the `langfuse.*` span attributes carry the observation's kind, IO,
+// model, usage and metadata (the v5 SDK serializes IO/usage as JSON strings;
+// metadata flattens to per-key attributes with serialized values).
+function otlpAttrValue(entry) {
+  const v = entry?.value ?? {};
+  return v.stringValue ?? v.intValue ?? v.doubleValue ?? v.boolValue ?? null;
+}
+
+function otlpAttr(span, key) {
+  const entry = (span.attributes ?? []).find((a) => a.key === key);
+  return entry ? otlpAttrValue(entry) : null;
+}
+
+function otlpJsonAttr(span, key) {
+  const raw = otlpAttr(span, key);
+  if (typeof raw !== 'string') return undefined;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
   }
-  return [...byId.values()];
+}
+
+function spanToObservation(span) {
+  const metadataPrefix = 'langfuse.observation.metadata.';
+  const metadata = {};
+  for (const entry of span.attributes ?? []) {
+    if (entry.key.startsWith(metadataPrefix)) {
+      metadata[entry.key.slice(metadataPrefix.length)] = otlpAttrValue(entry);
+    }
+  }
+  return {
+    id: span.spanId,
+    parentObservationId: span.parentSpanId || null,
+    name: span.name,
+    type: otlpAttr(span, 'langfuse.observation.type') === 'generation' ? 'GENERATION' : 'SPAN',
+    input: otlpJsonAttr(span, 'langfuse.observation.input'),
+    output: otlpJsonAttr(span, 'langfuse.observation.output'),
+    model: otlpAttr(span, 'langfuse.observation.model.name') ?? undefined,
+    usageDetails: otlpJsonAttr(span, 'langfuse.observation.usage_details'),
+    sessionId: otlpAttr(span, 'session.id') ?? undefined,
+    metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+    endTime: span.endTimeUnixNano ?? null,
+  };
+}
+
+// Spans export exactly once (on end), so folding is a plain map.
+function capturedToObservations(captured) {
+  return captured.map(spanToObservation);
 }
 
 // Polls the v1 Observations API until a codeworded generation's trace matches
@@ -320,11 +372,12 @@ async function runVerification({ baseUrl, publicKey, secretKey, fromStartTime, c
   }
 }
 
-// In-process fake Langfuse endpoint for the secrets-free mode: captures
-// POST /api/public/ingestion batches in memory; anything else 404s loudly.
+// In-process fake Langfuse endpoint for the secrets-free mode: the v5 SDK
+// exports OTLP/HTTP JSON (application/json) — capture every span from
+// POST /api/public/otel/v1/traces in memory; anything else 404s loudly.
 async function startFakeIngestion(captured) {
   const server = createServer((req, res) => {
-    if (req.method !== 'POST' || !req.url?.startsWith('/api/public/ingestion')) {
+    if (req.method !== 'POST' || !req.url?.startsWith('/api/public/otel/v1/traces')) {
       console.log(`::warning::unexpected ${req.method} ${req.url}`);
       res.writeHead(404).end();
       return;
@@ -333,9 +386,13 @@ async function startFakeIngestion(captured) {
     req.on('data', (chunk) => chunks.push(chunk));
     req.on('end', () => {
       const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      for (const item of payload.batch ?? []) captured.push({ type: item.type, body: item.body });
+      for (const resourceSpan of payload.resourceSpans ?? []) {
+        for (const scopeSpan of resourceSpan.scopeSpans ?? []) {
+          captured.push(...(scopeSpan.spans ?? []));
+        }
+      }
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end('{"successes":[],"errors":[]}');
+      res.end('{}');
     });
   });
   server.unref();
@@ -376,7 +433,7 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
   }
   const realMode = Boolean(publicKey && secretKey);
   const baseUrl = envOr(process.env.LANGFUSE_BASE_URL, DEFAULT_BASE_URL);
-  console.log(`mode: ${realMode ? `real Langfuse (${baseUrl})` : 'fake ingestion endpoint'}`);
+  console.log(`mode: ${realMode ? `real Langfuse (${baseUrl})` : 'fake OTLP endpoint'}`);
 
   // Fake mode only: the capture sink the assertions read from.
   const captured = [];
@@ -392,18 +449,26 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
   } else {
     const fakeServer = await startFakeIngestion(captured);
     const fakeUrl = `http://127.0.0.1:${fakeServer.address().port}`;
-    console.log(`fake langfuse ingestion at ${fakeUrl}`);
+    console.log(`fake langfuse OTLP endpoint at ${fakeUrl}`);
     pluginConnection = { publicKey: 'pk-lf-ci', secretKey: 'sk-lf-ci', baseUrl: fakeUrl };
   }
 
   const dshHomeEnv = { DSH_HOME: dshHome };
 
   // Install the packed bundle (idempotent — the workflow's Stage A already
-  // did it once), then the langfuse peer: the profile template sets
-  // autoInstallPeers: false, so runtime peers are added explicitly. The
-  // dsh-* peers ship with the profile itself.
+  // did it once), then the Langfuse SDK v5 peer stack: the profile template
+  // sets autoInstallPeers: false, so runtime peers are added explicitly —
+  // including the OTEL api/exporter packages @langfuse/otel itself peers on.
+  // The dsh-* peers ship with the profile itself.
   run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], { cwd: workDir, env: dshHomeEnv });
-  run(dsh, ['plugin', '--profile', 'headless', 'add', 'langfuse@3.38.20'], { cwd: workDir, env: dshHomeEnv });
+  run(dsh, [
+    'plugin', '--profile', 'headless', 'add',
+    '@langfuse/tracing@5.10.1',
+    '@langfuse/otel@5.10.1',
+    '@opentelemetry/sdk-trace-node@2.10.0',
+    '@opentelemetry/api@1.9.1',
+    '@opentelemetry/exporter-trace-otlp-http@0.221.0',
+  ], { cwd: workDir, env: dshHomeEnv });
 
   // Enable the plugin through the profile's user patch layer (an id-targeted
   // row replaces the bundle row's whole config). The agent-default-model row
@@ -517,13 +582,18 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
 
   if (!realMode) {
     // Fake mode: the loop already proved the shape; the trace itself is the
-    // one thing the evaluators (observation-scoped) don't cover.
-    console.log(`\n--- captured ${captured.length} ingestion events ---`);
-    for (const e of captured) console.log(` ${e.type} ${JSON.stringify(e.body).slice(0, 160)}`);
-    const trace = captured.find(
-      (e) => e.type === 'trace-create' && e.body?.name === 'dsh-turn' && e.body?.sessionId,
-    )?.body;
-    assert(trace, 'no dsh-turn trace with a sessionId was ingested');
+    // one thing the evaluators (observation-scoped) don't cover. In v5 a
+    // trace IS its root span: look for the `dsh-turn` root carrying the
+    // correlating session.id attribute.
+    const observations = capturedToObservations(captured);
+    console.log(`\n--- captured ${observations.length} spans ---`);
+    for (const o of observations) {
+      console.log(` ${o.type}:${o.name} parent=${o.parentObservationId ?? 'null'} end=${o.endTime ?? 'null'}`);
+    }
+    const trace = observations.find(
+      (o) => o.name === 'dsh-turn' && o.parentObservationId == null && o.sessionId,
+    );
+    assert(trace, 'no dsh-turn root span with a session id was exported');
   }
 
   console.log(`\nSCENARIO_OK (${name}: ${state})`);
