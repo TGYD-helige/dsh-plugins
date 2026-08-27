@@ -6,7 +6,7 @@ Monorepo of generic [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deep
 
 - `dsh-a2a` — A2A protocol (JSON-RPC + SSE) server driving `ctx.agents`
 - `dsh-storage` — mirrors `session/event` into MySQL/PostgreSQL/SQLite/SQL Server (`prisma/schema.{mysql,postgresql,sqlite,sqlserver}.prisma`: `ai_messages` / `ai_chat_histories`, same tables as the source project; **Prisma 7** — clients are pre-generated per provider at build time (`pnpm generate`, output `src/generated/`, compiled into `lib/generated`; consumers never generate) and driven through the matching driver adapter (`@prisma/adapter-{mariadb,pg,libsql,mssql}`, optional peers); SQL Server has no Prisma `Json` type — text columns, serialized automatically when `provider: sqlserver`). A2A task state (Redis/GCS TaskStores) lives in `dsh-a2a`, NOT here — task metadata ≠ conversation history.
-- `dsh-langfuse` — Langfuse observability: one generation per LLM call (`llm/stream`, plus a nested `llm-request` span with the verbatim loop-built request), one span per tool call (`tools/execute`), one trace per turn (`session/event`), and subagent child sessions nested under the parent's tree (`session/created` header link + `subagent/start`/`subagent/end`). Lazy dynamic `import('langfuse')` — `apply()` returns the init promise so fiber readiness covers it.
+- `dsh-langfuse` — Langfuse observability: one generation per LLM call (`llm/stream`, plus a nested `llm-request` span with the verbatim loop-built request), one span per tool call (`tools/execute`), one trace per turn (`session/event`), and subagent child sessions nested under the parent's tree (`session/created` header link + `subagent/start`/`subagent/end`). Langfuse JS SDK v5 (observations-first OTEL model: the trace IS its root span, **ended** at `turn/end` — un-ended spans never export; `session.id` stamped per observation via handle-tree propagation). Lazy dynamic `import()` of `@langfuse/tracing` + `@langfuse/otel` + `@opentelemetry/sdk-trace-node` on an isolated tracer provider (never the global one) — `apply()` returns the init promise so fiber readiness covers it.
 
 dsh is developer preview: **pin versions, keep README's compat matrix current**, and verify every `TODO(verify)` marker against the pinned dsh source before removing it.
 
@@ -42,7 +42,7 @@ Use for process work: `to-spec`/`to-tickets` before non-trivial implementations,
 
 ## Conventions
 
-- **Peer deps**: `@deepseek-ai/*` packages and heavy clients (`langfuse`, `@prisma/client`, `ioredis`, `@google-cloud/storage`) go in `peerDependencies` — never bundle the harness or optional backends.
+- **Peer deps**: `@deepseek-ai/*` packages and heavy clients (`@langfuse/tracing` + `@langfuse/otel`, `@prisma/client`, `ioredis`, `@google-cloud/storage`) go in `peerDependencies` — never bundle the harness or optional backends.
 - **Optional backends**: load via dynamic `import()` inside `init()`, so unused backends cost nothing.
 - **No-throw seams**: plugin hooks (waterfalls, event listeners) catch and `console.error` with a `[dsh-*]` prefix; never let observability/storage errors escape into the agent loop.
 - **Config**: Schemastery `Config` schema per plugin, everything disabled by default; secrets use `.role('secret')`.
@@ -60,7 +60,7 @@ Runner: **vitest** (per-package devDep, `"test": "vitest run"`; root `pnpm test`
 - **tsconfig split**: `tsconfig.json` typechecks everything (tests included, `--noEmit`); `tsconfig.build.json` emits and excludes `*.test.ts` — `lib/` must never contain test files.
 - **Pure logic** (projectors, mappers): direct input/output tests, no harness.
 - **Plugin wiring**: drive a real `Context` from `@deepseek-ai/cordis` (event dispatch, `ctx.effect`, fiber unload) and `vi.mock` the backend module — capture instances via `vi.hoisted`. Lifecycle assertions: init at load, cleanup via `ctx.fiber.dispose()`, drains at `session/flush`.
-- **External clients** (`@prisma/client`, `langfuse`, redis, ...): `vi.mock` the module — unit tests never touch a real database or network.
+- **External clients** (`@prisma/client`, `@langfuse/*`, redis, ...): `vi.mock` the module — unit tests never touch a real database or network.
 - **No-throw seams**: assert backend/hook errors are swallowed with the `[dsh-*]` `console.error` prefix (spy on `console.error`).
 - **Unit ≠ E2E**: anything needing the real dsh runtime, an LLM, or a real database belongs in `.github/scripts/integration/`, not here.
 

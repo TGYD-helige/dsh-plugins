@@ -147,7 +147,7 @@ jobs:
           DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
           # dsh-langfuse only: blanked on other packages' legs (fork PRs get
           # no secrets at all and the scenario self-skips Stage B). Absent
-          # keys flip the scenario to its fake-ingestion fallback.
+          # keys flip the scenario to its fake-OTLP fallback.
           LANGFUSE_PUBLIC_KEY: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_PUBLIC_KEY || '' }}
           LANGFUSE_SECRET_KEY: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_SECRET_KEY || '' }}
           LANGFUSE_BASE_URL: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_BASE_URL || '' }}

@@ -1,16 +1,33 @@
 /**
- * Langfuse reporter — thin synchronous wrapper over the `langfuse` v3 SDK's
- * stateful API (`client.trace()` / `trace.generation()` / `trace.span()`), and
- * the plugin's single no-throw seam: every method swallows SDK failures with a
- * `[dsh-langfuse]` console.error so observability can never break the agent
- * loop. The SDK batches and retries ingestion on its own; this wrapper only
- * adds dsh→Langfuse mapping and error containment.
+ * Langfuse reporter — thin synchronous wrapper over the Langfuse JS SDK v5's
+ * OpenTelemetry-based tracing API (`@langfuse/tracing` + `@langfuse/otel`),
+ * and the plugin's single no-throw seam: every method swallows SDK failures
+ * with a `[dsh-langfuse]` console.error so observability can never break the
+ * agent loop.
  *
- * The `langfuse` peer is a heavy optional backend, so it loads via dynamic
+ * v5's observations-first data model has no trace object: a trace is the root
+ * observation plus the correlating attributes every observation carries. So:
+ * - a "trace" here is a root `LangfuseSpan` created with {@link NO_PARENT} —
+ *   without it the SDK parents to whatever span is active in the host's
+ *   ambient OTEL context (e.g. an instrumented HTTP server around dsh),
+ *   smearing turn traces into foreign traces;
+ * - trace-level input/output/metadata live on that root span (the v5
+ *   replacement for the removed `trace.update()`), and the root must be
+ *   ENDED — spans only export on end, so an un-ended root never leaves the
+ *   process;
+ * - the correlating `session.id` attribute is stamped on every observation
+ *   via a handle-keyed WeakMap — the explicit-tree equivalent of v5's
+ *   context-scoped `propagateAttributes()`, which cannot wrap this plugin's
+ *   event-driven lifecycle.
+ *
+ * The SDK stack is a heavy optional peer set, so it loads via dynamic
  * `import()` kicked off in the constructor — a disabled plugin never pays for
  * it, and a missing or incompatible peer degrades the reporter to a no-op
- * instead of breaking the plugin load. {@link LangfuseReporter.ready} settles
- * (never rejects) once the import+construction finished: the plugin returns
+ * instead of breaking the plugin load. The exporter runs on an ISOLATED
+ * tracer provider (`setLangfuseTracerProvider`) rather than
+ * `provider.register()`: the process-global OTEL provider stays untouched and
+ * the host keeps its own tracing pipeline. {@link LangfuseReporter.ready}
+ * settles (never rejects) once the import+wiring finished: the plugin returns
  * it from `apply()` so fiber readiness covers the import window, and
  * {@link flush}/{@link shutdown} chain behind it. Observation calls landing
  * before readiness are still dropped — a window that cannot exist once the
@@ -18,12 +35,8 @@
  */
 
 import type { TokenUsage } from '@deepseek-ai/dsh-llm';
-import type {
-  Langfuse,
-  LangfuseGenerationClient,
-  LangfuseSpanClient,
-  LangfuseTraceClient,
-} from 'langfuse';
+import type { LangfuseGeneration, LangfuseSpan } from '@langfuse/tracing';
+import type { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 
 export interface LangfuseConnectionConfig {
   publicKey: string;
@@ -33,8 +46,16 @@ export interface LangfuseConnectionConfig {
 
 export type ObservationLevel = 'DEFAULT' | 'WARNING' | 'ERROR';
 
-/** Any observation client that can parent a span (trace, span, or generation). */
-type SpanParent = LangfuseTraceClient | LangfuseSpanClient | LangfuseGenerationClient;
+/** Any observation that can parent a span (trace root span or nested span/generation). */
+type Observation = LangfuseSpan | LangfuseGeneration;
+
+/**
+ * OTEL's canonical invalid span context as a literal (a static
+ * `INVALID_SPAN_CONTEXT` import would load @opentelemetry/api eagerly, even
+ * for a disabled plugin): the SDK starts a fresh traceId for an invalid
+ * parent instead of adopting the ambient context's active span.
+ */
+const NO_PARENT = { traceId: '0'.repeat(32), spanId: '0'.repeat(16), traceFlags: 0 };
 
 /**
  * Map dsh token accounting onto Langfuse's `usageDetails`, keeping every
@@ -45,8 +66,7 @@ type SpanParent = LangfuseTraceClient | LangfuseSpanClient | LangfuseGenerationC
  * INCLUDES reasoning (verified in dsh-llm-deepseek@0.1.0-rc.7:
  * `outputTokens: usage.completion_tokens`, with reasoning split out of
  * `completion_tokens_details`), so the `output` bucket subtracts
- * `reasoningTokens` into `output_reasoning`. Only `usageDetails` is sent —
- * the SDK's legacy `usage` triple is deprecated.
+ * `reasoningTokens` into `output_reasoning`. Only `usageDetails` is sent.
  */
 export function usageOf(usage: TokenUsage): Record<string, number> {
   // The dsh type marks the two primary fields required, but a non-conformant
@@ -72,26 +92,52 @@ export function usageOf(usage: TokenUsage): Record<string, number> {
 }
 
 export class LangfuseReporter {
-  private client: Langfuse | null = null;
-  /** Settles (never rejects) once the lazy SDK import+construction finished. */
+  private tracing: typeof import('@langfuse/tracing') | null = null;
+  private provider: NodeTracerProvider | null = null;
+  /** Observation → the session id stamped on it; children inherit their parent's. */
+  private sessionIds = new WeakMap<Observation, string>();
+  /** Settles (never rejects) once the lazy SDK import+wiring finished. */
   readonly ready: Promise<void>;
 
   constructor(private config: LangfuseConnectionConfig) {
     this.ready = this.init();
   }
 
-  /** Dynamically import the SDK and construct the client. */
+  /** Dynamically import the SDK and wire the isolated export pipeline. */
   private async init(): Promise<void> {
     try {
-      const { Langfuse } = await import('langfuse');
-      this.client = new Langfuse({
+      const [tracing, otel, sdkNode] = await Promise.all([
+        import('@langfuse/tracing'),
+        import('@langfuse/otel'),
+        import('@opentelemetry/sdk-trace-node'),
+      ]);
+      const processor = new otel.LangfuseSpanProcessor({
         publicKey: this.config.publicKey,
         secretKey: this.config.secretKey,
         baseUrl: this.config.baseUrl,
       });
+      this.provider = new sdkNode.NodeTracerProvider({ spanProcessors: [processor] });
+      // Isolated provider, not provider.register(): the process-global OTEL
+      // provider stays untouched. Set `tracing` last — observation methods
+      // gate on it, and it must never be visible before the provider is wired.
+      tracing.setLangfuseTracerProvider(this.provider);
+      this.tracing = tracing;
     } catch (error) {
       console.error('[dsh-langfuse] client init failed:', error);
     }
+  }
+
+  /**
+   * Stamp the v5 correlating session attribute
+   * (`LangfuseOtelSpanAttributes.TRACE_SESSION_ID` — the OTEL semconv key) on
+   * an observation and record it for future children. Explicit on trace
+   * roots; inherited from the parent everywhere else (the handle-tree
+   * equivalent of propagateAttributes).
+   */
+  private stampSession(observation: Observation, sessionId: string | undefined): void {
+    if (!sessionId) return;
+    observation.otelSpan.setAttribute('session.id', sessionId);
+    this.sessionIds.set(observation, sessionId);
   }
 
   /** Open a trace (one per agent turn, or one-off for session-less calls). */
@@ -99,47 +145,47 @@ export class LangfuseReporter {
     name: string;
     sessionId?: string;
     metadata?: Record<string, unknown>;
-  }): LangfuseTraceClient | null {
-    if (!this.client) return null;
+  }): LangfuseSpan | null {
+    if (!this.tracing) return null;
     try {
-      return this.client.trace(input);
+      const root = this.tracing.startObservation(
+        input.name,
+        { metadata: input.metadata },
+        { parentSpanContext: NO_PARENT },
+      );
+      this.stampSession(root, input.sessionId);
+      return root;
     } catch (error) {
       console.error('[dsh-langfuse] trace creation failed:', error);
       return null;
     }
   }
 
-  /**
-   * Merge fields into an open trace: the input from the turn's first user
-   * message, the final answer and end reason at `turn/end` (Langfuse merges
-   * metadata on update).
-   */
-  updateTrace(
-    trace: LangfuseTraceClient | null,
-    update: { input?: unknown; output?: unknown; metadata?: Record<string, unknown> },
-  ): void {
-    if (!trace) return;
-    try {
-      trace.update(update);
-    } catch (error) {
-      console.error('[dsh-langfuse] trace update failed:', error);
-    }
-  }
-
   /** Open a generation (one per LLM call) under any observation parent. */
   startGeneration(
-    parent: SpanParent | null,
+    parent: Observation | null,
     input: {
       name: string;
       model?: string;
       input?: unknown;
-      modelParameters?: Record<string, string | number | boolean | string[] | null>;
+      modelParameters?: Record<string, string | number>;
       metadata?: Record<string, unknown>;
     },
-  ): LangfuseGenerationClient | null {
+  ): LangfuseGeneration | null {
     if (!parent) return null;
     try {
-      return parent.generation(input);
+      const generation = parent.startObservation(
+        input.name,
+        {
+          model: input.model,
+          input: input.input,
+          modelParameters: input.modelParameters,
+          metadata: input.metadata,
+        },
+        { asType: 'generation' },
+      );
+      this.stampSession(generation, this.sessionIds.get(parent));
+      return generation;
     } catch (error) {
       console.error('[dsh-langfuse] generation creation failed:', error);
       return null;
@@ -147,7 +193,7 @@ export class LangfuseReporter {
   }
 
   endGeneration(
-    generation: LangfuseGenerationClient | null,
+    generation: LangfuseGeneration | null,
     update: {
       name?: string;
       output?: unknown;
@@ -160,15 +206,17 @@ export class LangfuseReporter {
   ): void {
     if (!generation) return;
     try {
-      generation.end({
-        name: update.name,
+      generation.update({
         output: update.output,
-        ...(update.usage ? { usageDetails: usageOf(update.usage) } : {}),
+        usageDetails: update.usage ? usageOf(update.usage) : undefined,
         completionStartTime: update.completionStartTime,
         level: update.level,
         statusMessage: update.statusMessage,
         metadata: update.metadata,
       });
+      // v5 observation attributes have no `name` — renames ride the OTEL span.
+      if (update.name) generation.otelSpan.updateName(update.name);
+      generation.end();
     } catch (error) {
       console.error('[dsh-langfuse] generation end failed:', error);
     }
@@ -176,69 +224,91 @@ export class LangfuseReporter {
 
   /** Open a span (one per tool dispatch, or a nested detail span) under any observation parent. */
   startSpan(
-    parent: SpanParent | null,
+    parent: Observation | null,
     input: { name: string; input?: unknown; metadata?: Record<string, unknown> },
-  ): LangfuseSpanClient | null {
+  ): LangfuseSpan | null {
     if (!parent) return null;
     try {
-      return parent.span(input);
+      const span = parent.startObservation(input.name, {
+        input: input.input,
+        metadata: input.metadata,
+      });
+      this.stampSession(span, this.sessionIds.get(parent));
+      return span;
     } catch (error) {
       console.error('[dsh-langfuse] span creation failed:', error);
       return null;
     }
   }
 
-  /** Merge fields into an open span (subagent enrichment: label, provider). */
+  /**
+   * Merge fields into an open span — subagent enrichment (label, provider),
+   * and the trace root's input (a v5 trace IS its root span, so trace-level
+   * updates are span updates; OTEL attributes merge per key, so partial
+   * updates compose).
+   */
   updateSpan(
-    span: LangfuseSpanClient | null,
+    span: LangfuseSpan | null,
     update: { name?: string; input?: unknown; metadata?: Record<string, unknown> },
   ): void {
     if (!span) return;
     try {
-      span.update(update);
+      span.update({ input: update.input, metadata: update.metadata });
+      if (update.name) span.otelSpan.updateName(update.name);
     } catch (error) {
       console.error('[dsh-langfuse] span update failed:', error);
     }
   }
 
+  /**
+   * Close any span observation, trace roots included: final fields, then end —
+   * v5 spans only export on end, so an un-ended root never reaches Langfuse.
+   */
   endSpan(
-    span: LangfuseSpanClient | null,
+    span: LangfuseSpan | null,
     update: {
       output?: unknown;
       level?: ObservationLevel;
       statusMessage?: string;
       metadata?: Record<string, unknown>;
-    },
+    } = {},
   ): void {
     if (!span) return;
     try {
-      span.end(update);
+      span.update(update);
+      span.end();
     } catch (error) {
       console.error('[dsh-langfuse] span end failed:', error);
     }
   }
 
-  /** Drain buffered ingestion events (the `session/flush` checkpoint). */
+  /** Drain buffered spans (the `session/flush` checkpoint). */
   async flush(): Promise<void> {
     await this.ready;
-    if (!this.client) return;
+    if (!this.provider) return;
     try {
-      await this.client.flushAsync();
+      await this.provider.forceFlush();
     } catch (error) {
       console.error('[dsh-langfuse] flush failed:', error);
     }
   }
 
-  /** Shut the SDK down at fiber unload (its shutdownAsync flushes internally). */
+  /** Shut the exporter down at fiber unload (provider.shutdown flushes internally). */
   async shutdown(): Promise<void> {
     await this.ready;
-    const client = this.client;
-    this.client = null;
-    if (!client) return;
+    const provider = this.provider;
+    const tracing = this.tracing;
+    this.provider = null;
+    this.tracing = null;
+    if (!provider || !tracing) return;
     try {
-      await client.shutdownAsync();
+      await provider.shutdown();
     } catch (error) {
       console.error('[dsh-langfuse] shutdown failed:', error);
+    } finally {
+      // Release the module-global isolated-provider slot so a reloaded fiber
+      // starts clean — even when the shutdown flush failed.
+      tracing.setLangfuseTracerProvider(null);
     }
   }
 }

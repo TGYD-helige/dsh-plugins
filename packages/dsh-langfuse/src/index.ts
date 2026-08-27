@@ -13,8 +13,9 @@
  *   (routed to the session's trace via `exec.agent.id` — the agent/session
  *   shared identity).
  * - `session/event` emit    → one Langfuse **trace** per agent turn
- *   (`turn/start` opens, the turn's first `user/message` sets the input,
- *   `turn/end` stamps the end reason).
+ *   (`turn/start` opens a root span — in the v5 SDK the root observation IS
+ *   the trace — the turn's first `user/message` sets the input, `turn/end`
+ *   stamps the end reason and ends the root, which is what exports it).
  * - subagent child sessions (`session/created` with `header.parentSession`)
  *   ride the parent's trace: a `subagent` **span** opened under the enclosing
  *   delegation tool span, the child's generations/tool spans nested under it,
@@ -74,12 +75,12 @@ export interface LangfusePluginConfig {
   captureContent: boolean;
 }
 
-type TraceHandle = ReturnType<LangfuseReporter['openTrace']>;
-type SpanHandle = ReturnType<LangfuseReporter['startSpan']>;
+/** Any observation handle the plugin tracks (v5: trace roots and spans are the same type). */
+type ObservationHandle = ReturnType<LangfuseReporter['startSpan']>;
 
 /** Per-session open turn trace. */
 interface SessionTrace {
-  trace: NonNullable<TraceHandle>;
+  trace: NonNullable<ObservationHandle>;
   /** Whether the trace input was set — the turn's first `user/message` wins. */
   hasInput: boolean;
   /** The turn's latest assistant text — becomes the trace's output at `turn/end`. */
@@ -94,7 +95,7 @@ interface SessionTrace {
 interface ChildSession {
   parentSessionId: string;
   /** The open `subagent` span for this child (null when creation failed). */
-  span: SpanHandle;
+  span: ObservationHandle;
   /** Whether the span input was set — the child's first `user/message` wins. */
   hasInput: boolean;
 }
@@ -117,19 +118,20 @@ function messageText(message: { content: ContentBlock[] }): string | undefined {
 }
 
 /**
- * Langfuse model parameters: only the request fields actually set. Stop
+ * Langfuse model parameters: only the request fields actually set, coerced to
+ * the v5 value type (`string | number` — the stop list serializes). Stop
  * sequences are arbitrary request strings — content, not metadata — so under
  * `captureContent: false` they collapse to a count.
  */
 function modelParametersOf(
   options: GenerateOptions,
   captureContent: boolean,
-): Record<string, string | number | boolean | string[] | null> | undefined {
+): Record<string, string | number> | undefined {
   const params = Object.fromEntries(
     Object.entries({
       temperature: options.temperature,
       maxTokens: options.maxTokens,
-      stop: captureContent ? options.stop : undefined,
+      stop: captureContent && options.stop ? JSON.stringify(options.stop) : undefined,
       stopCount: captureContent ? undefined : options.stop?.length,
       reasoningEffort: options.reasoningEffort,
     }).filter(([, value]) => value !== undefined),
@@ -195,7 +197,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   const sessions = new Map<string, SessionTrace>();
   const children = new Map<string, ChildSession>();
   /** Per-session stack of currently open tools/execute spans (for subagent parenting). */
-  const openToolSpans = new Map<string, SpanHandle[]>();
+  const openToolSpans = new Map<string, ObservationHandle[]>();
 
   /**
    * The trace an observation for `sessionId` belongs to: the session's open
@@ -207,7 +209,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
    * cache under. Subagent child sessions resolve through their parent chain
    * (a tree by construction) to the root trace.
    */
-  function traceFor(sessionId: string | undefined): TraceHandle {
+  function traceFor(sessionId: string | undefined): ObservationHandle {
     let id = sessionId;
     while (id && children.has(id)) id = children.get(id)?.parentSessionId;
     const existing = id ? sessions.get(id) : undefined;
@@ -222,7 +224,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
    * The observation a generation/span for `sessionId` parents under: the
    * child's own `subagent` span when there is one, else the turn trace.
    */
-  function parentFor(sessionId: string | undefined): TraceHandle | SpanHandle {
+  function parentFor(sessionId: string | undefined): ObservationHandle {
     const child = sessionId ? children.get(sessionId) : undefined;
     return child?.span ?? traceFor(sessionId);
   }
@@ -305,8 +307,11 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     switch (event.type) {
       case 'turn/start': {
         // A leftover entry is either a between-turns one-off trace or a turn
-        // whose `turn/end` was never seen (crash-orphaned): replace it — the
-        // stale trace keeps what it already recorded.
+        // whose `turn/end` was never seen (crash-orphaned): end and replace
+        // it — v5 spans only export on end, so the stale root must close to
+        // keep what it already recorded.
+        const stale = sessions.get(sessionId);
+        if (stale) reporter.endSpan(stale.trace);
         const trace = reporter.openTrace({
           name: config.traceName,
           sessionId,
@@ -318,13 +323,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       case 'user/message': {
         const state = sessions.get(sessionId);
         if (state && !state.hasInput && config.captureContent) {
-          reporter.updateTrace(state.trace, { input: messageText(event.data) });
+          reporter.updateSpan(state.trace, { input: messageText(event.data) });
           state.hasInput = true;
         }
         break;
       }
       case 'assistant/message': {
-        // The turn's final answer becomes the trace's output at turn/end.
         const state = sessions.get(sessionId);
         if (state && config.captureContent) {
           state.lastAssistantText = messageText(event.data.message) ?? state.lastAssistantText;
@@ -335,7 +339,9 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         const state = sessions.get(sessionId);
         if (state) {
           sessions.delete(sessionId);
-          reporter.updateTrace(state.trace, {
+          // The turn's final answer becomes the trace's output; ending the
+          // root span is what exports the trace (v5 exports spans on end).
+          reporter.endSpan(state.trace, {
             output: state.lastAssistantText,
             metadata: { turn: event.data.turn, endReason: event.data.reason.kind },
           });
@@ -347,13 +353,18 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
 
   ctx.on('session/disposed', (session) => {
     const sessionId: string = session.id;
+    const state = sessions.get(sessionId);
     sessions.delete(sessionId);
     openToolSpans.delete(sessionId);
+    // End an abandoned root (crash-orphaned turn or between-turns one-off
+    // trace) — v5 spans only export on end, so dropping it open would lose
+    // everything it recorded.
+    if (state) reporter.endSpan(state.trace);
     // Children: keep the entry — background/continuable subagents dispose
     // their session BEFORE subagent/end fires, and the span's close must ride
     // subagent/end (disposing first would either leak the span or close it
     // with a bogus WARNING, the latter seen on a healthy run in a real
-    // trace). A crashed run leaves the span open — an honest record.
+    // trace). A crashed run leaves the span open — it never exports.
   });
 
   // ------------------------------------------------------------------
@@ -362,8 +373,13 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   // must not be async — it returns an async-generator tee instead.
   // ------------------------------------------------------------------
   ctx.on('llm/stream', (options, next) => {
+    const parent = parentFor(options.sessionId);
+    // A session-less call's trace root has no session lifecycle to close it
+    // (it is never cached in `sessions`), so it rides this call's: un-ended
+    // spans never export in v5 — end it when the call settles.
+    const oneOffRoot = options.sessionId ? null : parent;
     const generationName = options.purpose ? `llm-call [${options.purpose}]` : 'llm-call';
-    const generation = reporter.startGeneration(parentFor(options.sessionId), {
+    const generation = reporter.startGeneration(parent, {
       name: generationName,
       model: options.model,
       input: config.captureContent
@@ -400,6 +416,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       const statusMessage = contentMessage(config, messageOf(error));
       closeRequest('ERROR', statusMessage);
       reporter.endGeneration(generation, { level: 'ERROR', statusMessage });
+      reporter.endSpan(oneOffRoot);
       throw error;
     }
 
@@ -490,6 +507,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
             toolCallCount: toolCalls.length > 0 ? toolCalls.length : undefined,
           },
         });
+        reporter.endSpan(oneOffRoot);
       }
     })();
   });
@@ -502,9 +520,13 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   // ------------------------------------------------------------------
   ctx.on('tools/execute', async (exec, next) => {
     const sessionId = exec.agent?.id;
+    const parent = parentFor(sessionId);
+    // An agent-less dispatch's trace root has no session lifecycle to close
+    // it — it rides this dispatch's (same one-off rule as llm/stream).
+    const oneOffRoot = sessionId ? null : parent;
     // Argument summaries are argument content — they ride captureContent.
     const argSummary = config.captureContent ? toolCallSummary(exec.arguments) : undefined;
-    const span = reporter.startSpan(parentFor(sessionId), {
+    const span = reporter.startSpan(parent, {
       name: `tool:${exec.name}${argSummary ? ` [${argSummary}]` : ''}`,
       input: config.captureContent ? exec.arguments : undefined,
       metadata: { callId: exec.callId, toolName: exec.name },
@@ -528,6 +550,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       });
       throw error;
     } finally {
+      reporter.endSpan(oneOffRoot);
       if (sessionId && span) {
         const remaining = (openToolSpans.get(sessionId) ?? []).filter((s) => s !== span);
         if (remaining.length > 0) openToolSpans.set(sessionId, remaining);
@@ -541,9 +564,18 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
 
   // Lifecycle: this cordis fork has no ready/dispose events — cleanup rides
   // the fiber unload via ctx.effect() (shutdown() chains behind the lazy
-  // import, so a still-importing client is never shut down mid-construction).
+  // import, so a still-importing SDK is never shut down mid-construction).
   ctx.effect(() => {
     return async () => {
+      // End every tracked observation still open before shutting the exporter
+      // down — v5 spans only export on end, so unloading mid-turn (profile
+      // reload) would otherwise silently drop them. (An in-flight generation
+      // isn't tracked; its own tee finally closes it if the stream settles.)
+      for (const state of sessions.values()) reporter.endSpan(state.trace);
+      for (const child of children.values()) reporter.endSpan(child.span);
+      for (const spans of openToolSpans.values()) {
+        for (const span of spans) reporter.endSpan(span);
+      }
       sessions.clear();
       children.clear();
       openToolSpans.clear();
