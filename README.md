@@ -4,7 +4,7 @@ Generic, config-driven plugins for [DeepSeek Harness (dsh)](https://github.com/d
 
 | Package | What it does | Seams used |
 | --- | --- | --- |
-| [`dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) (JSON-RPC + SSE): task create/cancel, streaming, agent card; pluggable task-state stores (memory/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, own HTTP server |
+| [`dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) **1.0** (JSON-RPC + SSE, with a v0.3 compatibility layer): streaming turns, task cancel, task list, agent card; pluggable task-state stores (memory/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, own HTTP server |
 | [`dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
 | [`dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call (plus a nested `llm-request` span with the verbatim loop-built request), one span per tool call, one trace per turn; subagent child sessions nested under the parent's tree | `llm/stream` + `tools/execute` waterfalls, `session/event`, `session/created` + `subagent/start`/`subagent/end` |
 
@@ -14,9 +14,9 @@ Early scaffold. The plugin shapes, config schemas, and seam choices are in place
 
 ## Compatibility
 
-| dsh-plugins | dsh | cordis |
-| --- | --- | --- |
-| 0.1.x | `0.1.0-rc.7` (source) / `0.1.0-rc.7` (npm) | `^4.0.1` |
+| dsh-plugins | dsh | cordis | @a2a-js/sdk (dsh-a2a) |
+| --- | --- | --- | --- |
+| 0.1.x | `0.1.0-rc.7` (source) / `0.1.0-rc.7` (npm) | `^4.0.1` | `^1.1.0` (A2A 1.0 + v0.3 compat) |
 
 dsh is in developer preview and **will** break compatibility between releases. Every release of these plugins pins a tested dsh version in this matrix; upgrade deliberately.
 
@@ -93,7 +93,7 @@ SQL Server note: Prisma's sqlserver connector has no `Json` type, so its variant
 
 The logical message id rides in `metadata.id`; message rows use a deterministic hash of `(session_id, message id)` as their primary key, so re-projected events upsert in place rather than duplicate — on every connector (the source project's `metadata.id` JSON-path lookup only works on PostgreSQL/MySQL). Session rows are matched by `session_id` and keep their cuid primary keys — the per-session serialization chain makes the find-then-write safe, and rows from the early scaffold (or the source project) are continued, never duplicated. Upgrade note: the early scaffold wrote messages with cuid keys; if you ran it, dedupe those by `metadata.id` before enabling this version.
 
-A2A **task state** is a separate concern from conversation history: `dsh-a2a` ships pluggable `TaskStore` backends — in-memory (default), Redis (task metadata JSON + TTL, `contextId → taskId` index), and GCS (gzipped task metadata + optional workspace tar archive, same layout as the source project's `GCSTaskStore`).
+A2A **task state** is a separate concern from conversation history: `dsh-a2a` ships pluggable `TaskStore` backends — in-memory (default), Redis (task state JSON + TTL), and GCS (gzipped task state, same object layout as the source project's `GCSTaskStore`). Every backend persists a metadata shell only (history/artifacts are stripped before saving — conversation history belongs to `dsh-storage`), and saves are collapsed to task-state transitions so streamed text deltas never reach the backend.
 
 ## Security
 
@@ -119,8 +119,8 @@ pnpm test         # vitest (packages with a test script)
 
 Known scaffold gaps (help welcome):
 
-- `dsh-a2a`: the session-event → A2A event translation table is a stub (`translateSessionEvent` in `bridge.ts`); the `@a2a-js/sdk` transport (RequestHandler, ExecutionEventBus, resubscribe-with-replay) is not wired yet — the Redis/GCS `TaskStore`s are created from config but not yet fed by the SDK handler.
-- `dsh-a2a` GCS store: workspace archiving shells out to `tar`.
+- `dsh-a2a` is text-only at the protocol boundary (non-text message parts are rejected), has no approval/`input-required` mid-turn bridge (dsh rc.7 ships none), and does not resume live sessions across restarts — persisted task shells survive in Redis/GCS, but continuing a conversation starts a fresh session. No event replay is retained for subscriptions: `SubscribeToTask` opens with the current task snapshot and follows the live bus only.
+- `dsh-a2a` GCS store: workspace archiving (`archiveWorkspace`) shells out to `tar` and is not wired to the task lifecycle yet.
 - No package ships its `preview.png` yet — the shared preview system (see AGENTS.md) is unbuilt; generate all three together when it lands.
 
 ## License

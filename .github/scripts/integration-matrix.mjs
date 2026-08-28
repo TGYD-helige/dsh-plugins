@@ -1,6 +1,7 @@
 /**
  * Integration matrix discovery: every `.github/scripts/integration/<pkg>.mjs`
- * becomes one base-leg entry (full dsh + LLM query, environment-gated). A
+ * becomes one base-leg entry (full dsh + LLM query; secrets reach only
+ * same-repo runs, fork PRs self-skip Stage B). A
  * package may split its scenario into several legs as `<pkg>.<scenario>.mjs`
  * (e.g. dsh-langfuse.subagent.mjs) — the package key is the part before the
  * first dot and all of a package's legs share its tarball. A sibling
@@ -21,6 +22,9 @@ const scenariosDir = '.github/scripts/integration';
 
 const base = [];
 const backends = [];
+// Providers are per-PACKAGE: dedupe so multi-leg packages (<pkg>.<scenario>.mjs)
+// don't register the same backend leg once per leg file.
+const backendSeen = new Set();
 for (const d of readdirSync(scenariosDir, { withFileTypes: true })) {
   if (!d.isFile() || !d.name.endsWith('.mjs')) continue;
   const leg = d.name.slice(0, -'.mjs'.length);
@@ -36,6 +40,9 @@ for (const d of readdirSync(scenariosDir, { withFileTypes: true })) {
       .split('\n')
       .map((l) => l.trim())
       .filter(Boolean)) {
+      const key = `${pkg}/${provider}`;
+      if (backendSeen.has(key)) continue;
+      backendSeen.add(key);
       backends.push({ package: pkg, provider });
     }
   }
