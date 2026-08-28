@@ -69,7 +69,7 @@ jobs:
 
       # pnpm version comes from the packageManager field in package.json —
       # do not set it here too (pnpm/action-setup errors on duplicates).
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
 
       # Node 24 (not ci.yml's 22): scenario scripts read SQLite through
       # node:sqlite, which is unflagged since 23.4.
@@ -134,7 +134,8 @@ jobs:
           set -euo pipefail
           dsh plugin --profile headless add "$DSH_PKG_TARBALL"
           dsh --profile headless --dump-config | tee /tmp/dsh-config.yml
-          grep -F "name: ${{ matrix.package }}" /tmp/dsh-config.yml
+          package_name="$(node -p "require('./packages/${{ matrix.package }}/package.json').name")"
+          grep -F "name: '$package_name'" /tmp/dsh-config.yml
 
       # Stage B: the package's scenario script — the real LLM round-trip.
       # Secrets are scoped to this step only.
@@ -198,7 +199,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
 
       - uses: actions/setup-node@v7
         with:

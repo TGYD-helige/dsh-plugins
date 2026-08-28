@@ -1,4 +1,4 @@
-# dsh-a2a
+# @amaster.ai/dsh-a2a
 
 ![dsh-a2a preview](preview.png)
 
@@ -9,7 +9,7 @@ A2A protocol server plugin for [DeepSeek Harness (dsh)](https://github.com/deeps
 ## Install
 
 ```sh
-dsh plugin --profile my-agent add dsh-a2a
+dsh plugin --profile my-agent add @amaster.ai/dsh-a2a
 ```
 
 ## Configuration
@@ -19,7 +19,7 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
 ```yaml
 - insert:
     - id: a2a
-      name: dsh-a2a
+      name: '@amaster.ai/dsh-a2a'
       config:
         enabled: true
         host: 127.0.0.1        # no auth built in — keep loopback or front with a proxy

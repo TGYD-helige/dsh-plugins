@@ -25,7 +25,7 @@ jobs:
 
       # pnpm version comes from the packageManager field in package.json —
       # do not set it here too (pnpm/action-setup errors on duplicates).
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
 
       - uses: actions/setup-node@v7
         with:
@@ -42,7 +42,7 @@ jobs:
       - name: Lint workflow files (actionlint, pinned)
         run: |
           set -euo pipefail
-          curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz | tar xz actionlint
+          curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz | tar xz actionlint
           ./actionlint .github/workflows/*.yml
 
   build:
@@ -52,7 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
 
       - uses: actions/setup-node@v7
         with:

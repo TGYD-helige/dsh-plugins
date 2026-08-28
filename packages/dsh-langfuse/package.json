@@ -1,5 +1,5 @@
 {
-  "name": "dsh-langfuse",
+  "name": "@amaster.ai/dsh-langfuse",
   "version": "0.1.0",
   "description": "Langfuse observability plugin for DeepSeek Harness: one generation per LLM call with a nested llm-request span, one span per tool call, one trace per session turn, subagent child sessions nested under the parent's tree.",
   "type": "module",
@@ -18,6 +18,14 @@
     "preview.png"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TGYD-helige/dsh-plugins.git",
+    "directory": "packages/dsh-langfuse"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

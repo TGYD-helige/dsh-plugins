@@ -91,6 +91,7 @@ const schemaPath = join(
   'profiles',
   'headless',
   'node_modules',
+  '@amaster.ai',
   'dsh-storage',
   'prisma',
   'schema.sqlite.prisma',

@@ -2,4 +2,4 @@
 # src/index.ts (overridable in the profile's own cordis.patch.yml).
 - insert:
     - id: langfuse
-      name: dsh-langfuse
+      name: '@amaster.ai/dsh-langfuse'

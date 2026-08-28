@@ -1,5 +1,5 @@
 {
-  "name": "dsh-a2a",
+  "name": "@amaster.ai/dsh-a2a",
   "version": "0.1.0",
   "description": "A2A protocol (JSON-RPC + SSE) server plugin for DeepSeek Harness: expose dsh agents as A2A agents.",
   "type": "module",
@@ -18,6 +18,14 @@
     "preview.png"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TGYD-helige/dsh-plugins.git",
+    "directory": "packages/dsh-a2a"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

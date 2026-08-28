@@ -1,4 +1,4 @@
-# dsh-langfuse
+# @amaster.ai/dsh-langfuse
 
 ![dsh-langfuse preview](preview.png)
 
@@ -12,7 +12,7 @@ Langfuse observability for [DeepSeek Harness (dsh)](https://github.com/deepseek-
 ## Install
 
 ```sh
-dsh plugin --profile my-agent add dsh-langfuse \
+dsh plugin --profile my-agent add @amaster.ai/dsh-langfuse \
   @langfuse/tracing @langfuse/otel @opentelemetry/sdk-trace-node \
   @opentelemetry/api @opentelemetry/exporter-trace-otlp-http
 ```
@@ -26,7 +26,7 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
 ```yaml
 - insert:
     - id: langfuse
-      name: dsh-langfuse
+      name: '@amaster.ai/dsh-langfuse'
       config:
         enabled: true
         publicKey: pk-lf-...

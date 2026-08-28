@@ -1,4 +1,4 @@
-# dsh-storage
+# @amaster.ai/dsh-storage
 
 ![dsh-storage preview](preview.png)
 
@@ -9,7 +9,7 @@ Use it when a dsh profile needs durable, queryable session data in an existing r
 ## Install
 
 ```sh
-dsh plugin --profile my-agent add dsh-storage
+dsh plugin --profile my-agent add @amaster.ai/dsh-storage
 ```
 
 Runtime peers: `@prisma/client` (**Prisma 7**) plus the driver adapter for your database:
@@ -30,7 +30,7 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
 ```yaml
 - insert:
     - id: storage-mirror
-      name: dsh-storage
+      name: '@amaster.ai/dsh-storage'
       config:
         enabled: true
         database:
@@ -42,7 +42,7 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
 Create or upgrade the tables with the shipped schema variant:
 
 ```sh
-npx prisma db push --schema node_modules/dsh-storage/prisma/schema.mysql.prisma --url "mysql://user:pass@host:3306/agent"
+npx prisma db push --schema node_modules/@amaster.ai/dsh-storage/prisma/schema.mysql.prisma --url "mysql://user:pass@host:3306/agent"
 # schema.postgresql.prisma / schema.sqlite.prisma / schema.sqlserver.prisma work the same way
 ```
 
