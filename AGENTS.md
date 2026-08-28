@@ -68,14 +68,25 @@ Runner: **vitest** (per-package devDep, `"test": "vitest run"`; root `pnpm test`
 
 ## Preview Images
 
-Each plugin package ships a package-root `preview.png` (e.g. `packages/dsh-a2a/preview.png`) for plugin listings and the package README.
+All preview assets are `1672 x 941` PNGs. The repository ships an evergreen root `preview.png`; each package ships its own package-root `preview.png` for plugin listings and its README, and includes it in `package.json#files`.
 
-- Size: `1672 x 941` PNG, consistent layout across packages: left-side plugin name + tagline, right-side domain cards/icons, and a central whale mascot (nod to DeepSeek's whale)
-- Do not reuse the same whale image across packages; each plugin gets a distinct pose, outfit, expression, or instrument
-- Include a musical instrument when possible; Chinese and Western instruments both welcome, and the instrument should help differentiate the plugin
-- The tagline and right-side visuals must reflect the plugin's actual domain (protocol/storage/observability), not generic decoration
-- One shared visual system across the three packages (same palette/typography); each package distinguished by its own accent color and domain motif, not by a different style
-- When a plugin's name, tagline, or scope changes, regenerate its `preview.png` together with the root README table and package README
+### Package previews
+
+- Use one shared layout: plugin name + tagline on the left, a beaver character in the center, and a compact domain system on the right. Keep the hierarchy readable at README-thumbnail size.
+- Match the accepted Pi-style beaver system in the existing previews: polished cartoon 3D, matte short-plush fur rendered in broad shapes, rounded face and paws, balanced expressive eyes, adult proportions, diffuse cloth, and dry surfaces. Keep highlights restrained; the result should feel soft rather than glossy or photoreal.
+- Give every plugin a genuinely distinct character identity, pose, outfit, and action — not one body template with recolored hair. Use a musical instrument when it fits; vary standing/seated poses and instrument families across packages.
+- Use a medium-deep navy underwater-tech gradient, matte floor, soft cyan fill, and enough ambient light to read the character and clothing. Accent colors distinguish packages; the violet-to-cyan `dsh-langfuse` gradient is the reference for observability visuals.
+- Integrate a bold white whale symbol into the functional system core and connect it to the plugin's real data flow. The core carries the symbol only; keep `deepseek` / `Harness` words out of it.
+- Make the right-side motifs specific and sparse: protocol transports/endpoints for A2A, mirrored database forms for storage, and traces/spans/metrics for Langfuse. Prefer a few differentiated motifs over repeated cards or robots.
+- Keep in-image copy to the exact plugin name, tagline, and essential protocol labels. Keep Pi / `π` marks and unrelated logos out of every preview.
+
+Use the current accepted package previews as primary style references when generating another package. A package preview is complete only when its text is exact, its character differs from every sibling, its domain flow is legible, and the PNG is `1672 x 941`.
+
+### Root preview
+
+- Keep root `preview.png` evergreen and character-free. Use the project name + tagline on the left and a generic, expandable plugin network on the right: one white-whale core, cyan-to-violet data paths, and abstract module sockets at varied depths.
+- Represent extensibility rather than the current package inventory. Do not encode a fixed plugin count, package names, mascots, instruments, or package-specific cards; adding a plugin must not require regenerating the root image.
+- Regenerate the root preview only when the repository name, tagline, or shared visual system changes. When a package name, tagline, or scope changes, regenerate that package's preview and update its package README plus the root README table.
 
 ## Build & Test
 

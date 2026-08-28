@@ -1,5 +1,7 @@
 # dsh-langfuse
 
+![dsh-langfuse preview](preview.png)
+
 Langfuse observability for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness):
 
 - one **generation** per LLM call (`llm/stream` waterfall), plus a nested `llm-request` span carrying the verbatim loop-built request
