@@ -13,7 +13,7 @@ const config = (overrides: Partial<A2aPluginConfig> = {}): A2aPluginConfig => ({
   port: 0,
   basePath: '/a2a',
   cwd: process.cwd(),
-  agent: { provider: '', model: '' },
+  agent: { provider: '', model: '', preset: '' },
   card: { name: 'test-agent', description: 'd', version: '0.0.0', publicUrl: '' },
   taskStore: 'memory',
   redis: { url: '', keyPrefix: 'a2a', ttlSeconds: 1 },

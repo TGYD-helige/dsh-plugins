@@ -25,6 +25,7 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
         agent:
           provider: ''       # dsh provider/model for A2A sessions; empty = profile default
           model: ''
+          preset: ''         # agent preset mounted per task; empty = deployment default
         card:
           name: my-agent
           description: My dsh agent over A2A
@@ -49,6 +50,7 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
 ## Behavior notes
 
 - **One task = one dsh session.** The A2A `contextId` IS the dsh session id. A completed turn ends `input-required` (final), not `completed` — the task is a conversation and stays continuable; `tasks/cancel` and turn errors are terminal (`canceled` / `failed`), and the SDK rejects follow-ups addressed at a terminal `taskId` (send with only the `contextId` to continue the session under a fresh task id).
+- **Agents are full preset citizens.** Each task's agent is created with the deployment's default model selection (`agentDefaultModel`) and mounts its agent preset (the web profile keeps all tools inside presets — without one the agent would see an empty tool catalog). `agent.preset` pins a specific preset.
 - **Streaming aggregation.** Text deltas of a turn share one `messageId`, so clients accumulate them into a single message; reasoning deltas ride a separate `messageId` and are marked `metadata.dshAgent.kind: 'thought'`. The turn-final event's message carries the full assembled text, so blocking `message/send` clients read the answer from `result.status.message`. Tool calls/results are data parts marked `tool-call` / `tool-result`; token usage lands in `metadata.usage` of the final event.
 - **Text-only boundary** for now: `message/send` rejects messages with non-text parts (file/data) with a JSON-RPC error.
 - **No approval bridge**: dsh rc.7 has no mid-turn approval seam, so tools that would ask are governed by the profile's own approval setup; the A2A side never enters a mid-turn `input-required`.

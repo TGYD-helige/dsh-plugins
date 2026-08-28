@@ -41,6 +41,12 @@ export const Config = Schema.object({
   agent: Schema.object({
     provider: Schema.string().default(''),
     model: Schema.string().default(''),
+    /**
+     * Agent preset to mount per task (empty = the deployment default when the
+     * profile composes a preset roster). The web profile keeps tools inside
+     * presets — without one the agent sees an empty tool catalog.
+     */
+    preset: Schema.string().default(''),
   }),
   card: Schema.object({
     name: Schema.string().default('dsh-a2a-agent'),
@@ -75,7 +81,7 @@ export interface A2aPluginConfig {
   port: number;
   basePath: string;
   cwd: string;
-  agent: { provider: string; model: string };
+  agent: { provider: string; model: string; preset: string };
   card: { name: string; description: string; version: string; publicUrl: string };
   taskStore: 'memory' | 'redis' | 'gcs';
   redis: { url: string; keyPrefix: string; ttlSeconds: number };
@@ -108,6 +114,7 @@ export function apply(
         provider: config.agent.provider || undefined,
         model: config.agent.model || undefined,
       },
+      preset: config.agent.preset || undefined,
     });
 
     const store = createTaskStore(config);

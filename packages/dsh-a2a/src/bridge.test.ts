@@ -98,8 +98,8 @@ function fakeAgents(ctx: Context) {
         } as unknown as Agent;
         fake.agent = agent;
         fake.handle = { agent, dispose: vi.fn(async () => {}) };
-        // The real factory runs creation-time setup before publication.
-        options.setup?.(ctx);
+        // The real factory awaits creation-time setup before publication.
+        await options.setup?.(ctx);
         created.push(fake);
         return fake.handle;
       },
@@ -140,6 +140,8 @@ describe('A2aBridge + DshAgentExecutor', () => {
     bridge = new A2aBridge(ctx, { cwd: '/tmp', agentOptions: { model: 'm' } });
     mocks.installModelSelection.mockClear();
   });
+
+  const createCalls = () => (agents.registry.create as ReturnType<typeof vi.fn>).mock.calls;
 
   async function execute(taskId: string, contextId: string, text = 'hi') {
     const executor = new DshAgentExecutor(bridge);
@@ -311,8 +313,6 @@ describe('A2aBridge + DshAgentExecutor', () => {
   });
 
   describe('model selection', () => {
-    const createCalls = () => (agents.registry.create as ReturnType<typeof vi.fn>).mock.calls;
-
     it('resolves the deployment default and installs the selection at setup', async () => {
       ctx.provide('agentDefaultModel', {
         currentSelection: () => ({
@@ -364,6 +364,47 @@ describe('A2aBridge + DshAgentExecutor', () => {
       expect(createCalls()[0][0].agentOptions).toBeUndefined();
       expect(createCalls()[0][0].setup).toBeUndefined();
       expect(mocks.installModelSelection).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('agent presets', () => {
+    function fakePresets() {
+      const presets = {
+        resolve: vi.fn(async (id?: string) => ({ id: id ?? 'standard' })),
+        mount: vi.fn(async () => ({})),
+      };
+      ctx.provide('agentPresets', presets);
+      return presets;
+    }
+
+    it('mounts the deployment default preset and records it on the session meta', async () => {
+      const presets = fakePresets();
+      await execute('t1', 'ctx1');
+      expect(presets.resolve).toHaveBeenCalledWith(undefined);
+      expect(presets.mount).toHaveBeenCalledWith(ctx, 'standard');
+      expect(createCalls()[0][0].meta).toEqual({ cwd: '/tmp', agentPreset: 'standard' });
+    });
+
+    it('mounts the configured preset instead of the default', async () => {
+      const presets = fakePresets();
+      bridge = new A2aBridge(ctx, { cwd: '/tmp', preset: 'code' });
+      await execute('t1', 'ctx1');
+      expect(presets.resolve).toHaveBeenCalledWith('code');
+      expect(presets.mount).toHaveBeenCalledWith(ctx, 'code');
+    });
+
+    it('fails the task when the preset is unknown', async () => {
+      const presets = fakePresets();
+      presets.resolve.mockRejectedValue(new Error('unknown preset "nope"'));
+      bridge = new A2aBridge(ctx, { cwd: '/tmp', preset: 'nope' });
+      const { seen, isFinished } = await execute('t1', 'ctx1');
+      expect(isFinished()).toBe(true);
+      const final = seen.at(-1) as Extract<AgentExecutionEvent, { kind: 'status-update' }>;
+      expect(final.status.state).toBe('failed');
+      expect((final.status.message as Message).parts[0]).toEqual({
+        kind: 'text',
+        text: 'unknown preset "nope"',
+      });
     });
   });
 

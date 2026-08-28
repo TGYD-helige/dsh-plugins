@@ -33,6 +33,19 @@ export interface BridgeOptions {
   cwd: string;
   /** Optional provider/model overrides for created agents. */
   agentOptions?: { provider?: string; model?: string };
+  /** Agent preset id; empty/absent = the deployment default (when a roster exists). */
+  preset?: string;
+}
+
+/**
+ * The opportunistic slice of `dsh-agent-presets` we use. Profiles that mount
+ * tools per-agent (the web profile disables the host-plane tool plugins) keep
+ * them inside preset compositions, so an agent created without one sees an
+ * empty tool catalog.
+ */
+interface AgentPresetsLike {
+  resolve(id?: string): Promise<{ id: string }>;
+  mount(agentCtx: Context, id?: string): Promise<unknown>;
 }
 
 export interface TaskEntry {
@@ -92,9 +105,21 @@ export class A2aBridge {
     // client-supplied contextId simply names the fresh session.
     const sessionId = SessionId(contextId);
     const selection = this.resolveSelection();
+
+    // The web profile disables the host-plane tool plugins — agents get tools
+    // only through a mounted agent preset (dsh-host-apiproxy's composeAgent is
+    // the reference: resolve the id up front so it lands on the session header,
+    // mount inside setup). Profiles without a preset roster (headless) keep
+    // host-plane tools and skip this entirely.
+    const presets = this.ctx.get('agentPresets') as AgentPresetsLike | undefined;
+    let agentPreset: string | undefined;
+    if (presets) {
+      agentPreset = (await presets.resolve(this.options.preset || undefined)).id;
+    }
+
     const handle = await this.ctx.agents.create({
       sessionId,
-      meta: { cwd: this.options.cwd },
+      meta: { cwd: this.options.cwd, ...(agentPreset ? { agentPreset } : {}) },
       agentOptions: selection
         ? { provider: selection.provider, model: selection.model }
         : undefined,
@@ -104,13 +129,19 @@ export class A2aBridge {
       // assembly and the request config). Verified against
       // @deepseek-ai/dsh-headless@0.1.0-rc.7's run() — entry points are
       // expected to resolve the deployment default themselves.
-      setup: selection
-        ? (agentCtx) => {
-            // Statement, deliberately not returned: a returned disposer would
-            // be invoked as the setup commit and immediately unwired.
-            installModelSelection(agentCtx, { current: selection, assembled: undefined });
-          }
-        : undefined,
+      setup:
+        selection || agentPreset
+          ? async (agentCtx) => {
+              if (selection) {
+                // Statement, deliberately not returned: a returned disposer would
+                // be invoked as the setup commit and immediately unwired. Likewise
+                // the mount result must not escape — setup's return value is
+                // commit()-shaped to the factory.
+                installModelSelection(agentCtx, { current: selection, assembled: undefined });
+              }
+              if (agentPreset) await presets!.mount(agentCtx, agentPreset);
+            }
+          : undefined,
     });
     const entry: TaskEntry = {
       taskId,
@@ -135,12 +166,25 @@ export class A2aBridge {
     entry.settled.push(resolveSettled);
     entry.bus = bus;
     try {
-      entry.handle.agent.followup(
+      const result = entry.handle.agent.followup(
         createUserMessage({
           content: [{ type: 'text', text }],
           source: { kind: 'user' },
         }),
-      );
+      ) as unknown;
+      // followup() is typed void; guard a mistyped async impl anyway — an
+      // unhandled rejection would crash the host process, and no turn/end
+      // would ever settle this waiter.
+      void Promise.resolve(result).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('[dsh-a2a] followup failed:', error);
+        if (entry.bus === bus) {
+          entry.bus.publish(
+            terminalStatusUpdate(entry.taskId, entry.sessionId as string, 'failed', message),
+          );
+        }
+        resolveSettled();
+      });
       // Never rejects: waiters only resolve. A synchronous followup() throw is
       // the one failure path — it means no turn ever started, so pull this
       // waiter back out of the FIFO before it can be settled by the NEXT
@@ -159,7 +203,11 @@ export class A2aBridge {
   cancel(taskId: string): string | undefined {
     const entry = this.tasks.get(taskId);
     if (!entry) return undefined;
-    entry.handle.agent.cancel({ kind: 'user' });
+    // cancel() is typed void; the guard keeps a mistyped async impl from
+    // crashing the host (the caller already published its canceled final).
+    void Promise.resolve(entry.handle.agent.cancel({ kind: 'user' }) as unknown).catch(
+      (error: unknown) => console.error('[dsh-a2a] cancel failed:', error),
+    );
     return entry.sessionId as string;
   }
 
