@@ -7,8 +7,9 @@
  * conversation history is dsh-storage's job (ai_messages), not this store's.
  */
 
-import type { Task } from '@a2a-js/sdk';
+import type { ListTasksRequest, ListTasksResponse, Task } from '@a2a-js/sdk';
 import type { TaskStore } from '@a2a-js/sdk/server';
+import { listShells } from '../task-store.js';
 
 export interface RedisTaskStoreConfig {
   url: string;
@@ -44,6 +45,28 @@ export class RedisTaskStore implements TaskStore {
     if (!this.redis) return undefined;
     const raw: string | null = await this.redis.get(this.taskKey(taskId));
     return raw ? (JSON.parse(raw) as Task) : undefined;
+  }
+
+  async list(params: ListTasksRequest): Promise<ListTasksResponse> {
+    if (!this.redis) return { tasks: [], nextPageToken: '', pageSize: 0, totalSize: 0 };
+    // Task shells are few and TTL-bound — a paged SCAN over the prefix is ample.
+    const shells: Task[] = [];
+    let cursor = '0';
+    do {
+      const [next, keys]: [string, string[]] = await this.redis.scan(
+        cursor,
+        'MATCH',
+        `${this.prefix}:tasks:*`,
+        'COUNT',
+        100,
+      );
+      cursor = next;
+      for (const key of keys) {
+        const raw: string | null = await this.redis.get(key);
+        if (raw) shells.push(JSON.parse(raw) as Task);
+      }
+    } while (cursor !== '0');
+    return listShells(shells, params);
   }
 
   async close(): Promise<void> {

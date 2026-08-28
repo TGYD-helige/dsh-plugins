@@ -19,8 +19,9 @@ import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
 import { gunzipSync, gzipSync } from 'node:zlib';
-import type { Task } from '@a2a-js/sdk';
+import type { ListTasksRequest, ListTasksResponse, Task } from '@a2a-js/sdk';
 import type { TaskStore } from '@a2a-js/sdk/server';
+import { listShells } from '../task-store.js';
 
 export interface GcsTaskStoreConfig {
   bucket: string;
@@ -60,6 +61,18 @@ export class GcsTaskStore implements TaskStore {
     if (!exists) return undefined;
     const [buf] = await file.download();
     return JSON.parse(gunzipSync(buf).toString('utf8')) as Task;
+  }
+
+  async list(params: ListTasksRequest): Promise<ListTasksResponse> {
+    if (!this.bucket) return { tasks: [], nextPageToken: '', pageSize: 0, totalSize: 0 };
+    const [files] = await this.bucket.getFiles({ prefix: `${this.prefix}/` });
+    const shells: Task[] = [];
+    for (const file of files) {
+      if (!file.name.endsWith('/metadata.json.gz')) continue;
+      const [buf] = await file.download();
+      shells.push(JSON.parse(gunzipSync(buf).toString('utf8')) as Task);
+    }
+    return listShells(shells, params);
   }
 
   /**

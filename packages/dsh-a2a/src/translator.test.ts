@@ -1,4 +1,5 @@
-import type { Message, TaskStatusUpdateEvent } from '@a2a-js/sdk';
+import { type Message, Role, TaskState } from '@a2a-js/sdk';
+import type { AgentExecutionEvent } from '@a2a-js/sdk/server';
 import type { CallId, TokenUsage } from '@deepseek-ai/dsh-llm';
 import type { SessionEvent, TurnEndReason } from '@deepseek-ai/dsh-session';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -39,16 +40,19 @@ const assistantMessage = (text: string, usage?: TokenUsage) =>
     ...(usage ? { usage } : {}),
   } as never);
 
-const updates = (events: ReturnType<SessionTranslator['handle']>) =>
-  events.filter((e): e is TaskStatusUpdateEvent => e.kind === 'status-update');
+type StatusUpdate = Extract<AgentExecutionEvent, { kind: 'statusUpdate' }>['data'];
+const updates = (events: AgentExecutionEvent[]): StatusUpdate[] =>
+  events.filter((e) => e.kind === 'statusUpdate').map((e) => e.data as StatusUpdate);
 
-describe('SessionTranslator', () => {
-  it('emits a working status-update on turn/start', () => {
+const textPartOf = (message?: Message) =>
+  message?.parts[0]?.content?.$case === 'text' ? message.parts[0].content.value : undefined;
+
+describe('SessionTranslator (A2A 1.0 model)', () => {
+  it('emits a working statusUpdate on turn/start', () => {
     const t = new SessionTranslator('task1', 'ctx1', 'deepseek-chat');
     const out = updates(t.handle(turnStart()));
     expect(out).toHaveLength(1);
-    expect(out[0].status.state).toBe('working');
-    expect(out[0].final).toBe(false);
+    expect(out[0].status?.state).toBe(TaskState.TASK_STATE_WORKING);
     expect(out[0].taskId).toBe('task1');
     expect(out[0].contextId).toBe('ctx1');
     expect(out[0].metadata?.dshAgent).toEqual({ kind: 'state-change' });
@@ -60,20 +64,19 @@ describe('SessionTranslator', () => {
     t.handle(turnStart());
     const a = updates(t.handle(textDelta('hello ')));
     const b = updates(t.handle(textDelta('world')));
-    expect(a).toHaveLength(1);
-    expect(b).toHaveLength(1);
-    const ma = a[0].status.message as Message;
-    const mb = b[0].status.message as Message;
-    expect(ma.parts).toEqual([{ kind: 'text', text: 'hello ' }]);
-    expect(mb.parts).toEqual([{ kind: 'text', text: 'world' }]);
-    expect(ma.messageId).toBe(mb.messageId);
+    const ma = a[0].status?.message;
+    const mb = b[0].status?.message;
+    expect(ma?.role).toBe(Role.ROLE_AGENT);
+    expect(textPartOf(ma)).toBe('hello ');
+    expect(textPartOf(mb)).toBe('world');
+    expect(ma?.messageId).toBe(mb?.messageId);
     expect(a[0].metadata?.dshAgent).toEqual({ kind: 'text-content' });
 
     // next turn rotates the messageId
     t.handle(turnEnd({ kind: 'completed' }));
     t.handle(turnStart(2));
     const c = updates(t.handle(textDelta('again')));
-    expect((c[0].status.message as Message).messageId).not.toBe(ma.messageId);
+    expect(c[0].status?.message?.messageId).not.toBe(ma?.messageId);
   });
 
   it('routes reasoning deltas to a separate thought messageId', () => {
@@ -82,9 +85,7 @@ describe('SessionTranslator', () => {
     const text = updates(t.handle(textDelta('answer')));
     const thought = updates(t.handle(reasoningDelta('thinking')));
     expect(thought[0].metadata?.dshAgent).toEqual({ kind: 'thought' });
-    expect((thought[0].status.message as Message).messageId).not.toBe(
-      (text[0].status.message as Message).messageId,
-    );
+    expect(thought[0].status?.message?.messageId).not.toBe(text[0].status?.message?.messageId);
   });
 
   it('ignores non-visible chunk types and log-only events', () => {
@@ -118,9 +119,12 @@ describe('SessionTranslator', () => {
       ),
     );
     expect(call[0].metadata?.dshAgent).toEqual({ kind: 'tool-call' });
-    expect((call[0].status.message as Message).parts).toEqual([
-      { kind: 'data', data: { callId: 'c1', name: 'bash', arguments: '{"cmd":"ls"}' } },
-    ]);
+    const callPart = call[0].status?.message?.parts[0];
+    expect(callPart?.content?.$case === 'data' && callPart.content.value).toEqual({
+      callId: 'c1',
+      name: 'bash',
+      arguments: '{"cmd":"ls"}',
+    });
 
     const result = updates(
       t.handle(
@@ -143,9 +147,12 @@ describe('SessionTranslator', () => {
       ),
     );
     expect(result[0].metadata?.dshAgent).toEqual({ kind: 'tool-result' });
-    expect((result[0].status.message as Message).parts[0]).toEqual({
-      kind: 'data',
-      data: { callId: 'c1', name: 'bash', result: 'file.txt', isError: false },
+    const resultPart = result[0].status?.message?.parts[0];
+    expect(resultPart?.content?.$case === 'data' && resultPart.content.value).toEqual({
+      callId: 'c1',
+      name: 'bash',
+      result: 'file.txt',
+      isError: false,
     });
   });
 
@@ -174,9 +181,10 @@ describe('SessionTranslator', () => {
         } as never),
       ),
     );
-    const data = (out[0].status.message as Message).parts[0] as { data: Record<string, unknown> };
-    expect(data.data.isError).toBe(true);
-    expect(data.data.error).toBe('ToolError: EXEC_FAILED');
+    const part = out[0].status?.message?.parts[0];
+    const data = part?.content?.$case === 'data' ? part.content.value : undefined;
+    expect(data.isError).toBe(true);
+    expect(data.error).toBe('ToolError: EXEC_FAILED');
   });
 
   it('ends a completed turn input-required (continuable) with the assembled text and usage', () => {
@@ -189,8 +197,7 @@ describe('SessionTranslator', () => {
     );
     const final = updates(t.handle(turnEnd({ kind: 'completed' })));
     expect(final).toHaveLength(1);
-    expect(final[0].status.state).toBe('input-required');
-    expect(final[0].final).toBe(true);
+    expect(final[0].status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
     expect(final[0].metadata?.dshAgent).toEqual({ kind: 'state-change', reason: 'completed' });
     expect(final[0].metadata?.usage).toEqual({
       inputTokens: 14,
@@ -198,9 +205,8 @@ describe('SessionTranslator', () => {
       reasoningTokens: 7,
     });
     // the final message carries the authoritative assembled text so blocking
-    // message/send clients can read the answer from the final task status
-    const message = final[0].status.message as Message;
-    expect(message.parts).toEqual([{ kind: 'text', text: 'partial answer and more' }]);
+    // SendMessage clients read the answer from the final task status
+    expect(textPartOf(final[0].status?.message)).toBe('partial answer and more');
   });
 
   it('falls back to accumulated deltas when no assistant/message was recorded', () => {
@@ -209,17 +215,14 @@ describe('SessionTranslator', () => {
     t.handle(textDelta('streamed '));
     t.handle(textDelta('only'));
     const final = updates(t.handle(turnEnd({ kind: 'completed' })));
-    expect((final[0].status.message as Message).parts).toEqual([
-      { kind: 'text', text: 'streamed only' },
-    ]);
+    expect(textPartOf(final[0].status?.message)).toBe('streamed only');
   });
 
   it('maps max-tokens to input-required with the reason recorded', () => {
     const t = new SessionTranslator('task1', 'ctx1');
     t.handle(turnStart());
     const final = updates(t.handle(turnEnd({ kind: 'max-tokens' })));
-    expect(final[0].status.state).toBe('input-required');
-    expect(final[0].final).toBe(true);
+    expect(final[0].status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
     expect(final[0].metadata?.dshAgent).toEqual({ kind: 'state-change', reason: 'max-tokens' });
   });
 
@@ -227,8 +230,8 @@ describe('SessionTranslator', () => {
     const t = new SessionTranslator('task1', 'ctx1');
     t.handle(turnStart());
     expect(
-      updates(t.handle(turnEnd({ kind: 'aborted', reason: { kind: 'user' } })))[0].status.state,
-    ).toBe('canceled');
+      updates(t.handle(turnEnd({ kind: 'aborted', reason: { kind: 'user' } })))[0].status?.state,
+    ).toBe(TaskState.TASK_STATE_CANCELED);
 
     t.handle(turnStart(2));
     const failed = updates(
@@ -242,15 +245,14 @@ describe('SessionTranslator', () => {
         ),
       ),
     );
-    expect(failed[0].status.state).toBe('failed');
-    expect(failed[0].final).toBe(true);
+    expect(failed[0].status?.state).toBe(TaskState.TASK_STATE_FAILED);
     expect(failed[0].metadata?.error).toBe('provider down');
-    expect((failed[0].status.message as Message).parts).toEqual([
-      { kind: 'text', text: 'provider down' },
-    ]);
+    expect(textPartOf(failed[0].status?.message)).toBe('provider down');
 
     t.handle(turnStart(3));
-    expect(updates(t.handle(turnEnd({ kind: 'blocked' }, 3)))[0].status.state).toBe('failed');
+    expect(updates(t.handle(turnEnd({ kind: 'blocked' }, 3)))[0].status?.state).toBe(
+      TaskState.TASK_STATE_FAILED,
+    );
   });
 
   it('ignores the crash-recovery interrupted marker', () => {
@@ -258,11 +260,11 @@ describe('SessionTranslator', () => {
     expect(t.handle(turnEnd({ kind: 'interrupted' }))).toEqual([]);
   });
 
-  it('builds terminal status-updates for the bridge/executor paths', () => {
+  it('builds terminal statusUpdates for the bridge/executor paths', () => {
     const event = terminalStatusUpdate('t', 'c', 'canceled', 'bye');
-    expect(event.kind).toBe('status-update');
-    expect(event.status.state).toBe('canceled');
-    expect(event.final).toBe(true);
-    expect((event.status.message as Message).parts).toEqual([{ kind: 'text', text: 'bye' }]);
+    expect(event.kind).toBe('statusUpdate');
+    if (event.kind !== 'statusUpdate') throw new Error('unreachable');
+    expect(event.data.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
+    expect(textPartOf(event.data.status?.message)).toBe('bye');
   });
 });

@@ -117,21 +117,34 @@ export async function stopA2a(proc) {
   }
 }
 
-/** A minimal A2A JSON-RPC client over the plugin endpoint. */
+/** A2A 1.0 wire states (proto-JSON enum names). */
+export const STATES = {
+  submitted: 'TASK_STATE_SUBMITTED',
+  working: 'TASK_STATE_WORKING',
+  failed: 'TASK_STATE_FAILED',
+  canceled: 'TASK_STATE_CANCELED',
+  inputRequired: 'TASK_STATE_INPUT_REQUIRED',
+};
+
+/**
+ * A minimal A2A JSON-RPC client over the plugin endpoint, on the 1.0 wire
+ * format (PascalCase methods, oneof-shaped results; the compat layer routes
+ * by method name, and the `A2A-Version: 1.0` header passes card version
+ * validation).
+ */
 export function a2aClient(a2a) {
   let id = 0;
   const userMessage = (text, extra = {}) => ({
-    kind: 'message',
     messageId: `m-${++id}`,
-    role: 'user',
-    parts: [{ kind: 'text', text }],
+    role: 'ROLE_USER',
+    parts: [{ text }],
     ...extra,
   });
   const call = (method, params) =>
     fetch(`${a2a}/a2a/`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: `r-${++id}`, method, params }),
+      headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: `r-${++id}`, method, params: { tenant: '', ...params } }),
     });
   return {
     userMessage,
@@ -141,23 +154,35 @@ export function a2aClient(a2a) {
     },
     /** Raw streaming response — caller reads the body (whole or incrementally). */
     stream: call,
+    /** The v0.3 spelling, served by the SDK's legacyCompat layer (no version header). */
+    legacy: (method, params) =>
+      fetch(`${a2a}/a2a/`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: `r-${++id}`, method, params }),
+      }),
   };
 }
 
-/** Read a streaming response to the end and return its A2A events. */
+/** Normalize a v1 SSE frame's oneof-keyed result to `{ kind, value }`. */
+export function frameOf(result) {
+  const kind = ['task', 'message', 'statusUpdate', 'artifactUpdate'].find((k) => result?.[k]);
+  return kind ? { kind, value: result[k] } : null;
+}
+
+/** Read a streaming response to the end; frames normalized via {@link frameOf}. */
 export async function readEvents(res) {
   return (await res.text())
     .split('\n\n')
     .filter((f) => f.startsWith('data: '))
-    .map((f) => JSON.parse(f.slice(6)))
-    .map((f) => f.result)
+    .map((f) => frameOf(JSON.parse(f.slice(6)).result))
     .filter(Boolean);
 }
 
-/** The text of a task result's final status message (blocking message/send answer). */
-export function textOf(task) {
-  return (task?.status?.message?.parts ?? [])
-    .filter((p) => p.kind === 'text')
+/** Text of a task's or statusUpdate value's status message. */
+export function textOf(x) {
+  return (x?.status?.message?.parts ?? [])
+    .filter((p) => p.text !== undefined)
     .map((p) => p.text)
     .join('');
 }

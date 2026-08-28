@@ -3,29 +3,32 @@
  *
  * One {@link SessionTranslator} serves one A2A task (one dsh session). It is
  * deliberately free of cordis/HTTP concerns so the mapping is unit-testable
- * without a harness. The mapping is a port of the source project's
+ * without a harness. The mapping ports the source project's
  * `packages/a2a-server/src/agent/task.ts` event switch onto dsh's
- * `SessionEventMap` (verified against @deepseek-ai/dsh-session@0.1.0-rc.7):
+ * `SessionEventMap` (verified against @deepseek-ai/dsh-session@0.1.0-rc.7),
+ * emitting the A2A 1.0 data model (@a2a-js/sdk 1.1.0):
  *
- *   turn/start                         → status-update(working), ids rotate
- *   assistant/chunk (text-delta)       → status-update(working, text part),
+ *   turn/start                         → statusUpdate(WORKING), ids rotate
+ *   assistant/chunk (text-delta)       → statusUpdate(WORKING, text part),
  *                                        reusing the turn's messageId so
  *                                        clients aggregate deltas into one message
- *   assistant/chunk (reasoning-delta)  → status-update(working, thought metadata)
+ *   assistant/chunk (reasoning-delta)  → statusUpdate(WORKING, thought metadata)
  *   assistant/message                  → no event; text + usage captured for the
- *                                        turn-final message (blocking `message/send`
+ *                                        turn-final message (blocking `SendMessage`
  *                                        clients read the answer from the final
  *                                        task status, not from streamed deltas)
- *   tool/call                          → status-update(working, data part)
- *   tool/result                        → status-update(working, data part)
- *   turn/end completed | max-tokens    → status-update(input-required, final) —
- *                                        input-required, not completed: the task is
- *                                        a conversation and stays continuable
- *                                        (completed is terminal in A2A and the SDK
+ *   tool/call                          → statusUpdate(WORKING, data part)
+ *   tool/result                        → statusUpdate(WORKING, data part)
+ *   turn/end completed | max-tokens    → statusUpdate(INPUT_REQUIRED) — the task
+ *                                        is a conversation and stays continuable
+ *                                        (COMPLETED is terminal in A2A and the SDK
  *                                        refuses follow-ups to terminal tasks)
- *   turn/end aborted                   → status-update(canceled, final)
- *   turn/end blocked | error           → status-update(failed, final)
+ *   turn/end aborted                   → statusUpdate(CANCELED)
+ *   turn/end blocked | error           → statusUpdate(FAILED)
  *   everything else                    → no event
+ *
+ * A2A 1.0 removed the `final` flag: the SDK's event queue stops on terminal
+ * and interrupted (input-required) states, which is exactly the set above.
  *
  * dsh rc.7 has no approval/`input-required` mid-turn seam (the unpublished
  * dsh-user-approval package is not installed anywhere; `tools/pre-execute`'s
@@ -34,8 +37,8 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import type { Message, TaskState, TaskStatusUpdateEvent } from '@a2a-js/sdk';
-import type { AgentExecutionEvent } from '@a2a-js/sdk/server';
+import { type Message, type Part, Role, TaskState } from '@a2a-js/sdk';
+import { AgentEvent, type AgentExecutionEvent } from '@a2a-js/sdk/server';
 import type { ContentBlock, TokenUsage } from '@deepseek-ai/dsh-llm';
 import type { SessionEvent, TurnEndReason } from '@deepseek-ai/dsh-session';
 
@@ -54,6 +57,26 @@ interface DshAgentEventMetadata {
   error?: string;
 }
 
+/** One text part in the 1.0 wire model. */
+function textPart(text: string): Part {
+  return {
+    content: { $case: 'text', value: text },
+    metadata: undefined,
+    filename: '',
+    mediaType: 'text/plain',
+  };
+}
+
+/** One structured-data part in the 1.0 wire model. */
+function dataPart(data: Record<string, unknown>): Part {
+  return {
+    content: { $case: 'data', value: data },
+    metadata: undefined,
+    filename: '',
+    mediaType: 'application/json',
+  };
+}
+
 /** One agent-role text message — the single construction site for the plugin's message payloads. */
 export function agentTextMessage(
   taskId: string,
@@ -62,34 +85,34 @@ export function agentTextMessage(
   messageId: string = randomUUID(),
 ): Message {
   return {
-    kind: 'message',
-    role: 'agent',
-    parts: [{ kind: 'text', text }],
     messageId,
-    taskId,
     contextId,
+    taskId,
+    role: Role.ROLE_AGENT,
+    parts: [textPart(text)],
+    metadata: undefined,
+    extensions: [],
+    referenceTaskIds: [],
   };
 }
 
-/** Build a terminal (final) status-update — shared by the bridge's dispose path and the executor's failure/cancel paths. */
+/** A terminal (stream-closing) statusUpdate — shared by the bridge's settle path and the executor's failure/cancel paths. */
 export function terminalStatusUpdate(
   taskId: string,
   contextId: string,
   state: 'canceled' | 'failed',
   text: string,
-): TaskStatusUpdateEvent {
-  return {
-    kind: 'status-update',
+): AgentExecutionEvent {
+  return AgentEvent.statusUpdate({
     taskId,
     contextId,
     status: {
-      state,
+      state: state === 'canceled' ? TaskState.TASK_STATE_CANCELED : TaskState.TASK_STATE_FAILED,
       message: agentTextMessage(taskId, contextId, text),
       timestamp: new Date().toISOString(),
     },
-    final: true,
-    metadata: { dshAgent: { kind: 'state-change', reason: state } } satisfies DshAgentEventMetadata,
-  };
+    metadata: { dshAgent: { kind: 'state-change', reason: state } },
+  });
 }
 
 export class SessionTranslator {
@@ -121,7 +144,7 @@ export class SessionTranslator {
         this.deltaText = '';
         this.sawAssistantMessage = false;
         this.usage = undefined;
-        return [this.status('working', { kind: 'state-change' })];
+        return [this.status(TaskState.TASK_STATE_WORKING, { kind: 'state-change' })];
       }
       case 'assistant/chunk': {
         const chunk = event.data.chunk;
@@ -129,7 +152,7 @@ export class SessionTranslator {
           this.deltaText += chunk.text;
           return [
             this.status(
-              'working',
+              TaskState.TASK_STATE_WORKING,
               { kind: 'text-content' },
               agentTextMessage(this.taskId, this.contextId, chunk.text, this.textMessageId),
             ),
@@ -138,7 +161,7 @@ export class SessionTranslator {
         if (chunk.type === 'reasoning-delta') {
           return [
             this.status(
-              'working',
+              TaskState.TASK_STATE_WORKING,
               { kind: 'thought' },
               agentTextMessage(this.taskId, this.contextId, chunk.text, this.thoughtMessageId),
             ),
@@ -160,7 +183,7 @@ export class SessionTranslator {
         this.toolNames.set(callId, name);
         return [
           this.status(
-            'working',
+            TaskState.TASK_STATE_WORKING,
             { kind: 'tool-call' },
             this.dataMessage({ callId, name, arguments: args }),
           ),
@@ -173,7 +196,7 @@ export class SessionTranslator {
         const callId = block?.type === 'tool-result' ? block.toolCallId : undefined;
         return [
           this.status(
-            'working',
+            TaskState.TASK_STATE_WORKING,
             { kind: 'tool-result' },
             this.dataMessage({
               callId,
@@ -199,7 +222,7 @@ export class SessionTranslator {
     }
   }
 
-  private turnEnd(reason: TurnEndReason): TaskStatusUpdateEvent | undefined {
+  private turnEnd(reason: TurnEndReason): AgentExecutionEvent | undefined {
     const text = this.sawAssistantMessage ? this.turnText : this.deltaText;
     const finalMessage = text
       ? agentTextMessage(this.taskId, this.contextId, text, this.textMessageId)
@@ -209,27 +232,28 @@ export class SessionTranslator {
       case 'max-tokens':
         // The task stays continuable; the reason records which ceiling hit.
         return this.status(
-          'input-required',
+          TaskState.TASK_STATE_INPUT_REQUIRED,
           { kind: 'state-change', reason: reason.kind },
           finalMessage,
-          true,
         );
       case 'aborted':
         return this.status(
-          'canceled',
+          TaskState.TASK_STATE_CANCELED,
           { kind: 'state-change', reason: 'aborted' },
           undefined,
-          true,
         );
       case 'blocked':
-        return this.status('failed', { kind: 'state-change', reason: 'blocked' }, undefined, true);
+        return this.status(
+          TaskState.TASK_STATE_FAILED,
+          { kind: 'state-change', reason: 'blocked' },
+          undefined,
+        );
       case 'error': {
         const message = reason.error.message || 'Agent turn failed.';
         return this.status(
-          'failed',
+          TaskState.TASK_STATE_FAILED,
           { kind: 'state-change', reason: 'error' },
           agentTextMessage(this.taskId, this.contextId, message),
-          true,
           message,
         );
       }
@@ -244,31 +268,31 @@ export class SessionTranslator {
     state: TaskState,
     dshAgent: DshAgentEventMetadata['dshAgent'],
     message?: Message,
-    final = false,
     error?: string,
-  ): TaskStatusUpdateEvent {
+  ): AgentExecutionEvent {
     const metadata: Record<string, unknown> = { dshAgent };
     if (this.model) metadata.model = this.model;
-    if (final && this.usage) metadata.usage = this.usage;
+    const terminal = state !== TaskState.TASK_STATE_WORKING;
+    if (terminal && this.usage) metadata.usage = this.usage;
     if (error) metadata.error = error;
-    return {
-      kind: 'status-update',
+    return AgentEvent.statusUpdate({
       taskId: this.taskId,
       contextId: this.contextId,
       status: { state, message, timestamp: new Date().toISOString() },
-      final,
       metadata,
-    };
+    });
   }
 
   private dataMessage(data: Record<string, unknown>): Message {
     return {
-      kind: 'message',
-      role: 'agent',
-      parts: [{ kind: 'data', data }],
       messageId: randomUUID(),
-      taskId: this.taskId,
       contextId: this.contextId,
+      taskId: this.taskId,
+      role: Role.ROLE_AGENT,
+      parts: [dataPart(data)],
+      metadata: undefined,
+      extensions: [],
+      referenceTaskIds: [],
     };
   }
 }

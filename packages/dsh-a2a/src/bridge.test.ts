@@ -1,6 +1,6 @@
-import type { Message } from '@a2a-js/sdk';
+import { type Message, Role, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutionEvent, ExecutionEventBus } from '@a2a-js/sdk/server';
-import { DefaultExecutionEventBus, RequestContext } from '@a2a-js/sdk/server';
+import { DefaultExecutionEventBus, RequestContext, ServerCallContext } from '@a2a-js/sdk/server';
 import { Context } from '@deepseek-ai/cordis';
 import type { Agent, AgentHandle, AgentRegistry } from '@deepseek-ai/dsh-agent';
 import type { Session, SessionEvent, SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
@@ -68,7 +68,8 @@ function fakeAgents(ctx: Context) {
       async (options: {
         sessionId: SessionId;
         agentOptions?: { provider?: string; model?: string };
-        setup?: (agentCtx: Context) => void;
+        meta?: Record<string, unknown>;
+        setup?: (agentCtx: Context) => void | Promise<void>;
       }): Promise<AgentHandle> => {
         const session = { id: options.sessionId } as Session;
         const fake: FakeAgent = {
@@ -111,11 +112,31 @@ function fakeAgents(ctx: Context) {
 
 function userMessage(text: string): Message {
   return {
-    kind: 'message',
     messageId: 'user-1',
-    role: 'user',
-    parts: [{ kind: 'text', text }],
+    contextId: '',
+    taskId: '',
+    role: Role.ROLE_USER,
+    parts: [
+      {
+        content: { $case: 'text', value: text },
+        metadata: undefined,
+        filename: '',
+        mediaType: 'text/plain',
+      },
+    ],
+    metadata: undefined,
+    extensions: [],
+    referenceTaskIds: [],
   };
+}
+
+function requestContext(message: Message, taskId: string, contextId: string): RequestContext {
+  return new RequestContext(
+    { tenant: '', message, configuration: undefined, metadata: undefined },
+    taskId,
+    contextId,
+    new ServerCallContext(),
+  );
 }
 
 function collect(bus: ExecutionEventBus) {
@@ -128,10 +149,26 @@ function collect(bus: ExecutionEventBus) {
   return { seen, isFinished: () => finished };
 }
 
+type StatusUpdate = Extract<AgentExecutionEvent, { kind: 'statusUpdate' }>['data'];
+
+const statusUpdates = (events: AgentExecutionEvent[]) =>
+  events
+    .filter(
+      (e): e is Extract<AgentExecutionEvent, { kind: 'statusUpdate' }> => e.kind === 'statusUpdate',
+    )
+    .map((e) => e.data);
+
+const textOfStatus = (update: StatusUpdate | undefined) => {
+  const part = update?.status?.message?.parts[0];
+  return part?.content?.$case === 'text' ? part.content.value : undefined;
+};
+
 describe('A2aBridge + DshAgentExecutor', () => {
   let ctx: Context;
   let bridge: A2aBridge;
   let agents: ReturnType<typeof fakeAgents>;
+
+  const createCalls = () => (agents.registry.create as ReturnType<typeof vi.fn>).mock.calls;
 
   beforeEach(() => {
     seq = 0;
@@ -141,13 +178,11 @@ describe('A2aBridge + DshAgentExecutor', () => {
     mocks.installModelSelection.mockClear();
   });
 
-  const createCalls = () => (agents.registry.create as ReturnType<typeof vi.fn>).mock.calls;
-
   async function execute(taskId: string, contextId: string, text = 'hi') {
     const executor = new DshAgentExecutor(bridge);
     const bus = new DefaultExecutionEventBus();
     const collector = collect(bus);
-    await executor.execute(new RequestContext(userMessage(text), taskId, contextId), bus);
+    await executor.execute(requestContext(userMessage(text), taskId, contextId), bus);
     return { bus, ...collector };
   }
 
@@ -159,36 +194,31 @@ describe('A2aBridge + DshAgentExecutor', () => {
     expect(agents.created[0].sessionId).toBe('ctx1');
     expect(agents.created[0].prompts).toEqual(['fix the bug']);
 
-    const task = seen[0] as { kind: string; status: { state: string }; history: Message[] };
+    const task = seen[0];
     expect(task.kind).toBe('task');
-    expect(task.status.state).toBe('submitted');
-    expect(task.history[0].messageId).toBe('user-1');
+    if (task.kind !== 'task') throw new Error('unreachable');
+    expect(task.data.status?.state).toBe(TaskState.TASK_STATE_SUBMITTED);
+    expect(task.data.history[0].messageId).toBe('user-1');
 
-    const statuses = seen.filter(
-      (e): e is Extract<AgentExecutionEvent, { kind: 'status-update' }> =>
-        e.kind === 'status-update',
-    );
-    expect(statuses[0].status.state).toBe('working');
-    const texts = statuses
-      .map((s) => s.status.message?.parts?.[0])
-      .filter((p): p is Extract<NonNullable<typeof p>, { kind: 'text' }> => p?.kind === 'text')
-      .map((p) => p.text);
+    const statuses = statusUpdates(seen);
+    expect(statuses[0].status?.state).toBe(TaskState.TASK_STATE_WORKING);
+    const texts = statuses.map(textOfStatus).filter(Boolean);
     expect(texts).toContain('hello ');
     expect(texts).toContain('there');
     const final = statuses.at(-1)!;
-    expect(final.status.state).toBe('input-required');
-    expect(final.final).toBe(true);
-    expect((final.status.message as Message).parts).toEqual([
-      { kind: 'text', text: 'hello there' },
-    ]);
+    expect(final.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
+    expect(textOfStatus(final)).toBe('hello there');
     expect(final.metadata?.usage).toEqual({ inputTokens: 3, outputTokens: 4 });
   });
 
-  it('continues an existing task by taskId without a new agent or task anchor', async () => {
+  it('continues an existing task by taskId with a working anchor', async () => {
     await execute('t1', 'ctx1');
     const { seen } = await execute('t1', 'ctx1', 'again');
     expect(agents.created).toHaveLength(1);
-    expect(seen[0].kind).toBe('status-update');
+    // A2A 1.0 stream ordering: the first event of every execute is a task snapshot.
+    expect(seen[0].kind).toBe('task');
+    if (seen[0].kind !== 'task') throw new Error('unreachable');
+    expect(seen[0].data.status?.state).toBe(TaskState.TASK_STATE_WORKING);
     expect(agents.created[0].prompts).toEqual(['hi', 'again']);
   });
 
@@ -197,11 +227,11 @@ describe('A2aBridge + DshAgentExecutor', () => {
     const { seen } = await execute('t2', 'ctx1', 'context follow-up');
     expect(agents.created).toHaveLength(1);
     expect(seen[0].kind).toBe('task');
-    expect((seen[0] as { id: string }).id).toBe('t2');
-    const final = (
-      seen.filter((e) => e.kind === 'status-update') as Array<{ status: { state: string } }>
-    ).at(-1)!;
-    expect(final.status.state).toBe('input-required');
+    if (seen[0].kind !== 'task') throw new Error('unreachable');
+    expect(seen[0].data.id).toBe('t2');
+    expect(seen[0].data.status?.state).toBe(TaskState.TASK_STATE_SUBMITTED);
+    const final = statusUpdates(seen).at(-1)!;
+    expect(final.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
   });
 
   it('fails the task when agent creation throws', async () => {
@@ -211,29 +241,31 @@ describe('A2aBridge + DshAgentExecutor', () => {
     const { seen, isFinished } = await execute('t9', 'ctx9');
     expect(isFinished()).toBe(true);
     expect(seen[0].kind).toBe('task');
-    const final = seen.at(-1) as Extract<AgentExecutionEvent, { kind: 'status-update' }>;
-    expect(final.status.state).toBe('failed');
-    expect(final.final).toBe(true);
-    expect((final.status.message as Message).parts[0]).toEqual({
-      kind: 'text',
-      text: 'no agent factory registered',
-    });
+    if (seen[0].kind !== 'task') throw new Error('unreachable');
+    expect(seen[0].data.status?.state).toBe(TaskState.TASK_STATE_FAILED);
+    const final = statusUpdates(seen).at(-1)!;
+    expect(final.status?.state).toBe(TaskState.TASK_STATE_FAILED);
+    expect(textOfStatus(final)).toBe('no agent factory registered');
   });
 
   it('fails fast on messages without text parts', async () => {
     const executor = new DshAgentExecutor(bridge);
     const bus = new DefaultExecutionEventBus();
     const { seen } = collect(bus);
-    await executor.execute(
-      new RequestContext(
-        { kind: 'message', messageId: 'u2', role: 'user', parts: [{ kind: 'data', data: {} }] },
-        't5',
-        'ctx5',
-      ),
-      bus,
-    );
-    const final = seen.at(-1) as Extract<AgentExecutionEvent, { kind: 'status-update' }>;
-    expect(final.status.state).toBe('failed');
+    const message: Message = {
+      ...userMessage(''),
+      parts: [
+        {
+          content: { $case: 'data', value: {} },
+          metadata: undefined,
+          filename: '',
+          mediaType: 'application/json',
+        },
+      ],
+    };
+    await executor.execute(requestContext(message, 't5', 'ctx5'), bus);
+    const final = statusUpdates(seen).at(-1)!;
+    expect(final.status?.state).toBe(TaskState.TASK_STATE_FAILED);
     expect(agents.created).toHaveLength(0);
   });
 
@@ -244,8 +276,8 @@ describe('A2aBridge + DshAgentExecutor', () => {
     const { seen } = collect(bus);
     await executor.cancelTask('t1', bus);
     expect(agents.created[0].agent.cancel).toHaveBeenCalledWith({ kind: 'user' });
-    const final = seen.at(-1) as Extract<AgentExecutionEvent, { kind: 'status-update' }>;
-    expect(final.status.state).toBe('canceled');
+    const final = statusUpdates(seen).at(-1)!;
+    expect(final.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
     expect(final.contextId).toBe('ctx1');
   });
 
@@ -254,9 +286,8 @@ describe('A2aBridge + DshAgentExecutor', () => {
     const bus = new DefaultExecutionEventBus();
     const { seen } = collect(bus);
     await executor.cancelTask('ghost', bus);
-    const final = seen.at(-1) as Extract<AgentExecutionEvent, { kind: 'status-update' }>;
-    expect(final.status.state).toBe('canceled');
-    expect(final.final).toBe(true);
+    const final = statusUpdates(seen).at(-1)!;
+    expect(final.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
   });
 
   it('resolves an in-flight execute with a canceled final when the session is disposed', async () => {
@@ -279,15 +310,15 @@ describe('A2aBridge + DshAgentExecutor', () => {
       },
     );
 
-    const pending = executor.execute(new RequestContext(userMessage('hi'), 't7', 'ctx7'), bus);
+    const pending = executor.execute(requestContext(userMessage('hi'), 't7', 'ctx7'), bus);
     await new Promise((resolve) => setImmediate(resolve));
     // external disposal (e.g. another plugin tearing the session down)
     const entry = (bridge as unknown as { tasks: Map<string, TaskEntry> }).tasks.get('t7')!;
     ctx.emit('session/disposed', { id: entry.sessionId } as Session);
     await pending;
     expect(isFinished()).toBe(true);
-    const final = seen.at(-1) as Extract<AgentExecutionEvent, { kind: 'status-update' }>;
-    expect(final.status.state).toBe('canceled');
+    const final = statusUpdates(seen).at(-1)!;
+    expect(final.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
   });
 
   it('dispose() cancels active turns and disposes every owned agent', async () => {
@@ -399,12 +430,9 @@ describe('A2aBridge + DshAgentExecutor', () => {
       bridge = new A2aBridge(ctx, { cwd: '/tmp', preset: 'nope' });
       const { seen, isFinished } = await execute('t1', 'ctx1');
       expect(isFinished()).toBe(true);
-      const final = seen.at(-1) as Extract<AgentExecutionEvent, { kind: 'status-update' }>;
-      expect(final.status.state).toBe('failed');
-      expect((final.status.message as Message).parts[0]).toEqual({
-        kind: 'text',
-        text: 'unknown preset "nope"',
-      });
+      const final = statusUpdates(seen).at(-1)!;
+      expect(final.status?.state).toBe(TaskState.TASK_STATE_FAILED);
+      expect(textOfStatus(final)).toBe('unknown preset "nope"');
     });
   });
 
@@ -414,23 +442,17 @@ describe('A2aBridge + DshAgentExecutor', () => {
     fake.failFollowup = true;
 
     const failed = await execute('t1', 'ctx1', 'boom');
-    const failedFinal = failed.seen.at(-1) as Extract<
-      AgentExecutionEvent,
-      { kind: 'status-update' }
-    >;
+    const failedFinal = statusUpdates(failed.seen).at(-1)!;
     expect(failed.isFinished()).toBe(true);
-    expect(failedFinal.status.state).toBe('failed');
-    expect((failedFinal.status.message as Message).parts[0]).toEqual({
-      kind: 'text',
-      text: 'inbox closed',
-    });
+    expect(failedFinal.status?.state).toBe(TaskState.TASK_STATE_FAILED);
+    expect(textOfStatus(failedFinal)).toBe('inbox closed');
 
     // The stale waiter was spliced out: the next turn settles on its own
     // turn/end instead of inheriting the poisoned FIFO slot.
     fake.failFollowup = false;
     const recovered = await execute('t1', 'ctx1', 'again');
-    const final = recovered.seen.at(-1) as Extract<AgentExecutionEvent, { kind: 'status-update' }>;
-    expect(final.status.state).toBe('input-required');
+    const final = statusUpdates(recovered.seen).at(-1)!;
+    expect(final.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
     expect(agents.created[0].prompts).toEqual(['hi', 'again']);
   });
 });

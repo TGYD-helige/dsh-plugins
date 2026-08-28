@@ -3,17 +3,24 @@
  *
  * - `GET /.well-known/agent-card.json` (and the legacy `agent.json` alias) —
  *   agent card, via the SDK's `agentCardHandler`
- * - `POST <basePath>/` — JSON-RPC, via the SDK's `jsonRpcHandler`
- *   (`message/send`, `message/stream` as SSE, `tasks/get`, `tasks/cancel`,
- *   `tasks/resubscribe`, and the push-notification methods)
+ * - `POST <basePath>/` — JSON-RPC: A2A 1.0 methods (`SendMessage`,
+ *   `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`,
+ *   `SubscribeToTask`, ...) plus the v0.3 spellings (`message/send`, ...)
+ *   through the SDK's opt-in legacyCompat layer
  *
- * The SSE framing, heartbeat-free streaming, and error envelopes are the
- * SDK's; this layer only binds the server and builds the card.
+ * The SSE framing and error envelopes are the SDK's; this layer only binds
+ * the server and builds the card.
  */
 
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { AGENT_CARD_PATH, type AgentCard } from '@a2a-js/sdk';
+import {
+  A2A_PROTOCOL_VERSION,
+  AGENT_CARD_PATH,
+  type AgentCard,
+  type AgentInterface,
+} from '@a2a-js/sdk';
+import { duplicateInterfacesForLegacy } from '@a2a-js/sdk/compat/v0_3';
 import { type AgentExecutor, DefaultRequestHandler, type TaskStore } from '@a2a-js/sdk/server';
 import { agentCardHandler, jsonRpcHandler, UserBuilder } from '@a2a-js/sdk/server/express';
 import express from 'express';
@@ -46,16 +53,34 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     '',
   );
 
+  const interfaces: AgentInterface[] = [
+    {
+      url: `${publicUrl}${base}/`,
+      protocolBinding: 'JSONRPC',
+      tenant: '',
+      protocolVersion: A2A_PROTOCOL_VERSION,
+    },
+  ];
   const card: AgentCard = {
     name: options.card.name,
     description: options.card.description,
     version: options.card.version,
-    protocolVersion: '0.3.0',
-    url: `${publicUrl}${base}/`,
-    capabilities: { streaming: true, pushNotifications: false },
+    // The v0.3 mirror entries let pre-1.0 clients keep working through the
+    // legacyCompat layer (they discover the card without an A2A-Version header).
+    supportedInterfaces: duplicateInterfacesForLegacy(interfaces, ['JSONRPC']),
+    provider: undefined,
+    capabilities: {
+      streaming: true,
+      pushNotifications: false,
+      extensions: [],
+      extendedAgentCard: false,
+    },
+    securitySchemes: {},
+    securityRequirements: [],
     defaultInputModes: ['text'],
     defaultOutputModes: ['text'],
     skills: [],
+    signatures: [],
   };
 
   const requestHandler = new DefaultRequestHandler(card, options.taskStore, options.executor);
@@ -64,12 +89,22 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
   // The SDK's jsonRpcHandler parses bodies with express.json()'s 100kb default;
   // raise the ceiling here — body-parser skips re-parsing an already-read body.
   app.use(express.json({ limit: '16mb' }));
-  const cardHandler = agentCardHandler({ agentCardProvider: requestHandler });
+  const cardHandler = agentCardHandler({
+    agentCardProvider: requestHandler,
+    legacyCompat: { enabled: true },
+  });
   app.use(`/${AGENT_CARD_PATH}`, cardHandler);
-  // Pre-0.3 discovery path, kept as a convenience alias.
+  // Pre-1.0 discovery path, kept as a convenience alias.
   app.use('/.well-known/agent.json', cardHandler);
   // dsh ships no authn/authz — the loopback default binding is the boundary.
-  app.use(base, jsonRpcHandler({ requestHandler, userBuilder: UserBuilder.noAuthentication }));
+  app.use(
+    base,
+    jsonRpcHandler({
+      requestHandler,
+      userBuilder: UserBuilder.noAuthentication,
+      legacyCompat: { enabled: true },
+    }),
+  );
 
   const server: Server = createServer(app);
   await new Promise<void>((resolve, reject) => {

@@ -1,60 +1,81 @@
+import { Role, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutor, ExecutionEventBus } from '@a2a-js/sdk/server';
-import { InMemoryTaskStore, type RequestContext } from '@a2a-js/sdk/server';
+import { AgentEvent, InMemoryTaskStore, type RequestContext } from '@a2a-js/sdk/server';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { type A2aServer, startA2aServer } from './server.js';
 import { SanitizedTaskStore } from './task-store.js';
 
-// A stub executor with the same event contract the real one uses.
+// A stub executor with the same event contract the real one uses: a task
+// anchor first (A2A 1.0 stream ordering), then working, then input-required.
 const stubExecutor: AgentExecutor = {
   async execute(requestContext: RequestContext, bus: ExecutionEventBus): Promise<void> {
     const { userMessage, taskId, contextId } = requestContext;
     const now = new Date().toISOString();
-    bus.publish({
-      kind: 'task',
-      id: taskId,
-      contextId,
-      status: { state: 'submitted', timestamp: now },
-      history: [userMessage],
-    });
-    bus.publish({
-      kind: 'status-update',
-      taskId,
-      contextId,
-      status: { state: 'working', timestamp: now },
-      final: false,
-    });
-    bus.publish({
-      kind: 'status-update',
-      taskId,
-      contextId,
-      status: {
-        state: 'input-required',
-        message: {
-          kind: 'message',
-          role: 'agent',
-          messageId: 'a1',
-          parts: [{ kind: 'text', text: 'done' }],
-          taskId,
-          contextId,
+    bus.publish(
+      AgentEvent.task({
+        id: taskId,
+        contextId,
+        status: { state: TaskState.TASK_STATE_SUBMITTED, message: undefined, timestamp: now },
+        history: [userMessage],
+        artifacts: [],
+        metadata: undefined,
+      }),
+    );
+    bus.publish(
+      AgentEvent.statusUpdate({
+        taskId,
+        contextId,
+        status: { state: TaskState.TASK_STATE_WORKING, message: undefined, timestamp: now },
+        metadata: undefined,
+      }),
+    );
+    bus.publish(
+      AgentEvent.statusUpdate({
+        taskId,
+        contextId,
+        status: {
+          state: TaskState.TASK_STATE_INPUT_REQUIRED,
+          message: {
+            messageId: 'a1',
+            contextId,
+            taskId,
+            role: Role.ROLE_AGENT,
+            parts: [
+              {
+                content: { $case: 'text', value: 'done' },
+                metadata: undefined,
+                filename: '',
+                mediaType: 'text/plain',
+              },
+            ],
+            metadata: undefined,
+            extensions: [],
+            referenceTaskIds: [],
+          },
+          timestamp: now,
         },
-        timestamp: now,
-      },
-      final: true,
-    });
+        metadata: undefined,
+      }),
+    );
     bus.finished();
   },
   cancelTask: async (taskId, bus) => {
-    bus.publish({
-      kind: 'status-update',
-      taskId,
-      contextId: '',
-      status: { state: 'canceled', timestamp: new Date().toISOString() },
-      final: true,
-    });
+    bus.publish(
+      AgentEvent.statusUpdate({
+        taskId,
+        contextId: '',
+        status: {
+          state: TaskState.TASK_STATE_CANCELED,
+          message: undefined,
+          timestamp: new Date().toISOString(),
+        },
+        metadata: undefined,
+      }),
+    );
   },
 };
 
-describe('A2A HTTP server', () => {
+describe('A2A HTTP server (v1 + legacy compat)', () => {
   let server: A2aServer;
   let base: string;
 
@@ -77,94 +98,122 @@ describe('A2A HTTP server', () => {
   const rpc = (method: string, params: unknown, id: number | string = 1) =>
     fetch(`${base}/a2a/`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
       body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
     });
 
   const json = (res: Response): Promise<any> => res.json();
 
-  const sendParams = (text: string, extra: Record<string, unknown> = {}) => ({
+  const v1Message = (text: string, extra: Record<string, unknown> = {}) => ({
     message: {
-      kind: 'message',
       messageId: `m-${Math.random()}`,
       role: 'user',
-      parts: [{ kind: 'text', text }],
+      parts: [{ text }],
       ...extra,
     },
   });
 
-  it('serves the agent card on the well-known path and the legacy alias', async () => {
-    for (const path of ['/.well-known/agent-card.json', '/.well-known/agent.json']) {
-      const res = await fetch(`${base}${path}`);
-      expect(res.status).toBe(200);
-      const card = await json(res);
-      expect(card.name).toBe('test-agent');
-      expect(card.capabilities).toEqual({ streaming: true, pushNotifications: false });
-      expect(card.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/a2a\/$/);
-    }
+  it('serves the v1 agent card on the well-known path', async () => {
+    const res = await fetch(`${base}/.well-known/agent-card.json`, {
+      headers: { 'A2A-Version': '1.0' },
+    });
+    expect(res.status).toBe(200);
+    const card = await json(res);
+    expect(card.name).toBe('test-agent');
+    const interfaces = card.supportedInterfaces;
+    expect(interfaces).toHaveLength(2);
+    expect(interfaces[0]).toMatchObject({
+      protocolBinding: 'JSONRPC',
+      protocolVersion: '1.0',
+    });
+    expect(interfaces[0].url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/a2a\/$/);
+    // the legacyCompat mirror lets pre-1.0 clients in
+    expect(interfaces[1]).toMatchObject({ protocolBinding: 'JSONRPC', protocolVersion: '0.3' });
   });
 
-  it('answers a blocking message/send with the final task state', async () => {
-    const res = await rpc('message/send', sendParams('hello'));
+  it('serves a 0.3-shaped card to clients without an A2A-Version header', async () => {
+    const res = await fetch(`${base}/.well-known/agent-card.json`);
+    const card = await json(res);
+    expect(card.protocolVersion).toBe('0.3');
+    expect(card.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/a2a\/$/);
+  });
+
+  it('answers a blocking SendMessage with the final task state', async () => {
+    const res = await rpc('SendMessage', { tenant: '', ...v1Message('hello') });
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.error).toBeUndefined();
+    expect(body.result.task.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    expect(body.result.task.status.message.parts[0].text).toBe('done');
+  });
+
+  it('streams SendStreamingMessage over SSE with oneof-keyed frames', async () => {
+    const res = await rpc('SendStreamingMessage', { tenant: '', ...v1Message('hello') });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/event-stream');
+    const frames = (await res.text())
+      .split('\n\n')
+      .filter((f) => f.startsWith('data: '))
+      .map((f) => JSON.parse(f.slice(6)));
+    expect(frames[0].result.task.status.state).toBe('TASK_STATE_SUBMITTED');
+    const last = frames.at(-1);
+    expect(last.result.statusUpdate.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+  });
+
+  it('lists tasks via ListTasks with history stripped', async () => {
+    await rpc('SendMessage', { tenant: '', ...v1Message('hello') });
+    const body = await json(await rpc('ListTasks', { tenant: '' }, 2));
+    expect(body.error).toBeUndefined();
+    expect(body.result.tasks).toHaveLength(1);
+    expect(body.result.tasks[0].status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    expect(body.result.tasks[0].history ?? []).toEqual([]);
+    expect(body.result.totalSize).toBe(1);
+  });
+
+  it('round-trips GetTask and cancels via CancelTask', async () => {
+    const sent = await json(await rpc('SendMessage', { tenant: '', ...v1Message('hello') }));
+    const taskId = sent.result.task.id;
+    const got = await json(await rpc('GetTask', { tenant: '', id: taskId }, 3));
+    expect(got.result.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    const canceled = await json(await rpc('CancelTask', { tenant: '', id: taskId }, 4));
+    expect(canceled.result.status.state).toBe('TASK_STATE_CANCELED');
+    // terminal tasks reject follow-ups
+    const rejected = await json(
+      await rpc('SendMessage', { tenant: '', ...v1Message('again', { taskId }) }, 5),
+    );
+    expect(rejected.error).toBeDefined();
+    expect(rejected.error.message).toMatch(/terminal state/);
+  });
+
+  it('serves legacy 0.3 method spellings through the compat layer', async () => {
+    const res = await fetch(`${base}/a2a/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 9,
+        method: 'message/send',
+        params: {
+          message: {
+            kind: 'message',
+            messageId: 'legacy-1',
+            role: 'user',
+            parts: [{ kind: 'text', text: 'hello' }],
+          },
+        },
+      }),
+    });
     expect(res.status).toBe(200);
     const body = await json(res);
     expect(body.error).toBeUndefined();
     expect(body.result.kind).toBe('task');
     expect(body.result.status.state).toBe('input-required');
-    expect(body.result.status.message.parts).toEqual([{ kind: 'text', text: 'done' }]);
-    expect(body.result.history[0].parts).toEqual([{ kind: 'text', text: 'hello' }]);
-  });
-
-  it('streams message/stream over SSE and terminates on the final event', async () => {
-    const res = await rpc('message/stream', sendParams('hello'));
-    expect(res.status).toBe(200);
-    expect(res.headers.get('content-type')).toContain('text/event-stream');
-    const text = await res.text();
-    const frames = text
-      .split('\n\n')
-      .filter((f) => f.startsWith('data: '))
-      .map((f) => JSON.parse(f.slice(6)));
-    expect(frames.every((f) => f.jsonrpc === '2.0')).toBe(true);
-    const results = frames.map((f) => f.result);
-    expect(results[0].kind).toBe('task');
-    const final = results.at(-1);
-    expect(final.kind).toBe('status-update');
-    expect(final.status.state).toBe('input-required');
-    expect(final.final).toBe(true);
-  });
-
-  it('round-trips tasks/get with history stripped (task state only)', async () => {
-    const sent = await json(await rpc('message/send', sendParams('hello')));
-    const taskId = sent.result.id;
-    const res = await rpc('tasks/get', { id: taskId }, 2);
-    const body = await json(res);
-    expect(body.result.id).toBe(taskId);
-    expect(body.result.status.state).toBe('input-required');
-    expect(body.result.history).toEqual([]);
-  });
-
-  it('cancels a non-terminal task', async () => {
-    const sent = await json(await rpc('message/send', sendParams('hello')));
-    const res = await rpc('tasks/cancel', { id: sent.result.id }, 3);
-    const body = await json(res);
-    expect(body.result.status.state).toBe('canceled');
   });
 
   it('rejects unknown methods and unknown tasks with JSON-RPC errors', async () => {
-    const bad = await json(await rpc('foo/bar', {}, 4));
+    const bad = await json(await rpc('Foo/Bar', {}, 6));
     expect(bad.error).toBeDefined();
-    expect(bad.error.code).toBe(-32601);
-
-    const missing = await json(await rpc('tasks/get', { id: 'nope' }, 5));
-    expect(missing.error.code).toBe(-32001); // A2A taskNotFound
-  });
-
-  it('rejects follow-ups to terminal tasks (SDK terminal-state guard)', async () => {
-    const sent = await json(await rpc('message/send', sendParams('hello')));
-    await rpc('tasks/cancel', { id: sent.result.id }, 6);
-    const res = await json(
-      await rpc('message/send', sendParams('again', { taskId: sent.result.id }), 7),
-    );
-    expect(res.error).toBeDefined();
+    const missing = await json(await rpc('GetTask', { tenant: '', id: 'nope' }, 7));
+    expect(missing.error).toBeDefined();
   });
 });
