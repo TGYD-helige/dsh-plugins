@@ -8,9 +8,9 @@ Composable, config-driven plugins for [DeepSeek Harness (dsh)](https://github.co
 
 | Package | What it does | Primary seams |
 | --- | --- | --- |
-| [`dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) **1.0** (JSON-RPC + SSE, with a v0.3 compatibility layer): streaming turns, task cancel, task list, agent card; pluggable task-state stores (memory/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, own HTTP server |
-| [`dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
-| [`dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call (plus a nested `llm-request` span with the verbatim loop-built request), one span per tool call, one trace per turn; subagent child sessions nested under the parent's tree | `llm/stream` + `tools/execute` waterfalls, `session/event`, `session/created` + `subagent/start`/`subagent/end` |
+| [`@amaster.ai/dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) **1.0** (JSON-RPC + SSE, with a v0.3 compatibility layer): streaming turns, task cancel, task list, agent card; pluggable task-state stores (memory/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, own HTTP server |
+| [`@amaster.ai/dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
+| [`@amaster.ai/dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call (plus a nested `llm-request` span with the verbatim loop-built request), one span per tool call, one trace per turn; subagent child sessions nested under the parent's tree | `llm/stream` + `tools/execute` waterfalls, `session/event`, `session/created` + `subagent/start`/`subagent/end` |
 
 ## Plugin previews
 
@@ -28,7 +28,7 @@ This is an early dsh-preview ecosystem. The plugin shapes, config schemas, and s
 
 ## Compatibility
 
-| dsh-plugins | dsh | cordis | @a2a-js/sdk (dsh-a2a) |
+| @amaster.ai/dsh-* | dsh | cordis | @a2a-js/sdk (dsh-a2a) |
 | --- | --- | --- | --- |
 | 0.1.x | `0.1.0-rc.7` (source) / `0.1.0-rc.7` (npm) | `^4.0.1` | `^1.1.0` (A2A 1.0 + v0.3 compat) |
 
@@ -39,7 +39,7 @@ dsh is in developer preview and **will** break compatibility between releases. E
 Every package is a dsh **bundle** and ships a `cordis.patch.yml`. With the dsh CLI:
 
 ```sh
-dsh plugin --profile my-agent add dsh-a2a dsh-storage dsh-langfuse
+dsh plugin --profile my-agent add @amaster.ai/dsh-a2a @amaster.ai/dsh-storage @amaster.ai/dsh-langfuse
 dsh --profile my-agent
 ```
 
@@ -63,14 +63,14 @@ All three plugins are **disabled by default** and configured through the standar
 ```yaml
 - insert:
     - id: langfuse
-      name: dsh-langfuse
+      name: '@amaster.ai/dsh-langfuse'
       config:
         enabled: true
         publicKey: pk-lf-...
         secretKey: sk-lf-...
         baseUrl: https://cloud.langfuse.com
     - id: storage-mirror
-      name: dsh-storage
+      name: '@amaster.ai/dsh-storage'
       config:
         enabled: true
         database:
@@ -78,7 +78,7 @@ All three plugins are **disabled by default** and configured through the standar
           provider: mysql   # mysql | postgresql | sqlite | sqlserver
           url: mysql://user:pass@host:3306/agent
     - id: a2a
-      name: dsh-a2a
+      name: '@amaster.ai/dsh-a2a'
       config:
         enabled: true
         host: 127.0.0.1   # no auth built in — keep loopback or front with a proxy
@@ -96,7 +96,7 @@ All three plugins are **disabled by default** and configured through the standar
 `dsh-storage`'s relational shape matches the source project's `ai_messages` / `ai_chat_histories` tables, so existing data stays compatible (one deviation: no `user_id` column — tenancy rides on `session_id`). It requires **Prisma 7** peer packages at runtime: `@prisma/client` plus the driver adapter for your database (`@prisma/adapter-mariadb` for MySQL, `@prisma/adapter-pg` for PostgreSQL, `@prisma/adapter-libsql` for SQLite, `@prisma/adapter-mssql` for SQL Server). The PrismaClient is pre-generated per provider and shipped in the package — **no `prisma generate` step**. Create or upgrade the tables with the shipped schema variant:
 
 ```sh
-npx prisma db push --schema node_modules/dsh-storage/prisma/schema.mysql.prisma --url "mysql://user:pass@host:3306/agent"
+npx prisma db push --schema node_modules/@amaster.ai/dsh-storage/prisma/schema.mysql.prisma --url "mysql://user:pass@host:3306/agent"
 # schema.postgresql.prisma / schema.sqlite.prisma / schema.sqlserver.prisma work the same way
 ```
 

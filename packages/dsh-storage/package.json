@@ -1,5 +1,5 @@
 {
-  "name": "dsh-storage",
+  "name": "@amaster.ai/dsh-storage",
   "version": "0.1.0",
   "description": "Session storage mirror for DeepSeek Harness: projects the session event stream into MySQL/PostgreSQL/SQLite/SQL Server (ai_messages / ai_chat_histories) without replacing dsh's local persistence.",
   "type": "module",
@@ -19,6 +19,14 @@
     "preview.png"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TGYD-helige/dsh-plugins.git",
+    "directory": "packages/dsh-storage"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

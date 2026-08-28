@@ -102,6 +102,7 @@ jobs:
           }));
           const publishablePackages = packages.filter(({ pkg }) => !pkg.private);
           const publishedPackages = publishablePackages.map(({ pkg }) => pkg.name);
+          const committedVersions = [...new Set(publishablePackages.map(({ pkg }) => pkg.version))];
           if (publishablePackages.length === 0) {
             throw new Error("No publishable packages found.");
           }
@@ -206,18 +207,18 @@ jobs:
           const computeLatestVersion = () => {
             const highestStable = maxVersion(publishedVersions.filter((version) => version.beta === null));
             if (highestStable === null) {
+              if (publishedVersions.length === 0 && committedVersions.length === 1) {
+                const committedVersion = parseVersion(committedVersions[0]);
+                if (committedVersion.beta === null) return formatVersion(committedVersion);
+              }
               throw new Error(
-                "Cannot auto-publish with the latest dist-tag because npm has no published stable versions. Provide release_version."
+                "Cannot auto-publish with the latest dist-tag because npm has no published stable versions and the packages are not a fresh uniform stable release. Provide release_version."
               );
             }
 
             const highestStableVersion = formatVersion(highestStable);
-            if (isFullyPublished(highestStableVersion)) {
-              throw new Error(
-                `${highestStableVersion} is already published for every package. Provide a stable release_version.`
-              );
-            }
-            return highestStableVersion;
+            if (!isFullyPublished(highestStableVersion)) return highestStableVersion;
+            return formatVersion({ ...highestStable, patch: highestStable.patch + 1 });
           };
           const computeNextVersion = () => {
             if (versionInput !== "" && versionInput !== "auto") {
