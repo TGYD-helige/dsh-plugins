@@ -167,7 +167,7 @@ export function a2aClient(a2a) {
 /** Normalize a v1 SSE frame's oneof-keyed result to `{ kind, value }`. */
 export function frameOf(result) {
   const kind = ['task', 'message', 'statusUpdate', 'artifactUpdate'].find((k) => result?.[k]);
-  return kind ? { kind, value: result[k] } : null;
+  return kind ? { kind, value: result[kind] } : null;
 }
 
 /** Read a streaming response to the end; frames normalized via {@link frameOf}. */
