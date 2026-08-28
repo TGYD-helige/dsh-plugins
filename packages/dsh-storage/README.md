@@ -1,6 +1,10 @@
 # dsh-storage
 
+![dsh-storage preview](preview.png)
+
 Session storage mirror for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness): projects the `session/event` stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`, same tables as the source project) without replacing dsh's local persistence — local files stay authoritative, this is a mirror.
+
+Use it when a dsh profile needs durable, queryable session data in an existing relational database while preserving the runtime's local session store as the source of truth.
 
 ## Install
 

@@ -15,7 +15,8 @@
   "files": [
     "lib",
     "prisma",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "preview.png"
   ],
   "license": "MIT",
   "dsh": {

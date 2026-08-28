@@ -1,16 +1,30 @@
 # dsh-plugins
 
-Generic, config-driven plugins for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness). No dsh core patches required — everything is built on documented Cordis seams (services, typed events, waterfalls).
+![dsh-plugins preview](preview.png)
 
-| Package | What it does | Seams used |
+Composable, config-driven plugins for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness). Each package is a publishable dsh bundle: install only what an agent needs, configure it through Cordis, and keep dsh itself unpatched.
+
+## Packages
+
+| Package | What it does | Primary seams |
 | --- | --- | --- |
 | [`dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) **1.0** (JSON-RPC + SSE, with a v0.3 compatibility layer): streaming turns, task cancel, task list, agent card; pluggable task-state stores (memory/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, own HTTP server |
 | [`dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
 | [`dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call (plus a nested `llm-request` span with the verbatim loop-built request), one span per tool call, one trace per turn; subagent child sessions nested under the parent's tree | `llm/stream` + `tools/execute` waterfalls, `session/event`, `session/created` + `subagent/start`/`subagent/end` |
 
+## Plugin previews
+
+<table>
+  <tr>
+    <td><strong>dsh-a2a</strong><br><a href="packages/dsh-a2a"><img src="packages/dsh-a2a/preview.png" alt="dsh-a2a preview" width="260"></a></td>
+    <td><strong>dsh-storage</strong><br><a href="packages/dsh-storage"><img src="packages/dsh-storage/preview.png" alt="dsh-storage preview" width="260"></a></td>
+    <td><strong>dsh-langfuse</strong><br><a href="packages/dsh-langfuse"><img src="packages/dsh-langfuse/preview.png" alt="dsh-langfuse preview" width="260"></a></td>
+  </tr>
+</table>
+
 ## Status
 
-Early scaffold. The plugin shapes, config schemas, and seam choices are in place; event-payload field names are marked `TODO(verify)` where dsh pre-release APIs may shift. Pin your dsh version and check the markers before production use.
+This is an early dsh-preview ecosystem. The plugin shapes, config schemas, and seam choices are in place; event-payload field names are marked `TODO(verify)` where dsh pre-release APIs may shift. Pin your dsh version and check those markers before production use.
 
 ## Compatibility
 
@@ -22,7 +36,7 @@ dsh is in developer preview and **will** break compatibility between releases. E
 
 ## Install
 
-Each package is a dsh **bundle** (ships a `cordis.patch.yml`). With the dsh CLI:
+Every package is a dsh **bundle** and ships a `cordis.patch.yml`. With the dsh CLI:
 
 ```sh
 dsh plugin --profile my-agent add dsh-a2a dsh-storage dsh-langfuse
@@ -117,11 +131,12 @@ pnpm typecheck
 pnpm test         # vitest (packages with a test script)
 ```
 
-Known scaffold gaps (help welcome):
+## Current limitations
+
+- All plugins are disabled by default; enable and configure each explicitly in the profile.
 
 - `dsh-a2a` is text-only at the protocol boundary (non-text message parts are rejected), has no approval/`input-required` mid-turn bridge (dsh rc.7 ships none), and does not resume live sessions across restarts — persisted task shells survive in Redis/GCS, but continuing a conversation starts a fresh session. No event replay is retained for subscriptions: `SubscribeToTask` opens with the current task snapshot and follows the live bus only.
 - `dsh-a2a` GCS store: workspace archiving (`archiveWorkspace`) shells out to `tar` and is not wired to the task lifecycle yet.
-- No package ships its `preview.png` yet — the shared preview system (see AGENTS.md) is unbuilt; generate all three together when it lands.
 
 ## License
 
