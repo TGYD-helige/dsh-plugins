@@ -16,7 +16,11 @@
 
 import type { ExecutionEventBus } from '@a2a-js/sdk/server';
 import type { Context } from '@deepseek-ai/cordis';
-import type { AgentHandle } from '@deepseek-ai/dsh-agent';
+import type { AgentHandle, ModelSelection } from '@deepseek-ai/dsh-agent';
+// installModelSelection is a root-module runtime import: the dsh-agent index
+// pulls workspace-internal packages (dsh-scope) that are absent from the
+// plugin's dev install, so unit tests vi.mock this module.
+import { installModelSelection } from '@deepseek-ai/dsh-agent';
 // Runtime helpers ride the clean subpaths: the dsh-llm/dsh-session index
 // modules import packages that are not on npm yet (dsh-timeout, dsh-scope).
 import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
@@ -87,10 +91,26 @@ export class A2aBridge {
     // restart — needs dsh's sessionPersistence service composed. For now a
     // client-supplied contextId simply names the fresh session.
     const sessionId = SessionId(contextId);
+    const selection = this.resolveSelection();
     const handle = await this.ctx.agents.create({
       sessionId,
       meta: { cwd: this.options.cwd },
-      agentOptions: this.options.agentOptions,
+      agentOptions: selection
+        ? { provider: selection.provider, model: selection.model }
+        : undefined,
+      // The loop's `{{model}}` prompt variable and request routing resolve from
+      // the agent's installed model selection (dsh-agent-loop's variables read
+      // agent.options; the scoped waterfalls wire provider/model into prompt
+      // assembly and the request config). Verified against
+      // @deepseek-ai/dsh-headless@0.1.0-rc.7's run() — entry points are
+      // expected to resolve the deployment default themselves.
+      setup: selection
+        ? (agentCtx) => {
+            // Statement, deliberately not returned: a returned disposer would
+            // be invoked as the setup commit and immediately unwired.
+            installModelSelection(agentCtx, { current: selection, assembled: undefined });
+          }
+        : undefined,
     });
     const entry: TaskEntry = {
       taskId,
@@ -108,16 +128,28 @@ export class A2aBridge {
 
   /** Queue one user-message turn on the task's agent and await its `turn/end`. */
   async runTurn(entry: TaskEntry, text: string, bus: ExecutionEventBus): Promise<void> {
-    const settled = new Promise<void>((resolve) => entry.settled.push(resolve));
+    let resolveSettled!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    });
+    entry.settled.push(resolveSettled);
     entry.bus = bus;
-    entry.handle.agent.followup(
-      createUserMessage({
-        content: [{ type: 'text', text }],
-        source: { kind: 'user' },
-      }),
-    );
     try {
+      entry.handle.agent.followup(
+        createUserMessage({
+          content: [{ type: 'text', text }],
+          source: { kind: 'user' },
+        }),
+      );
+      // Never rejects: waiters only resolve. A synchronous followup() throw is
+      // the one failure path — it means no turn ever started, so pull this
+      // waiter back out of the FIFO before it can be settled by the NEXT
+      // turn's turn/end (which would resolve one execute() too early).
       await settled;
+    } catch (error) {
+      const index = entry.settled.indexOf(resolveSettled);
+      if (index >= 0) entry.settled.splice(index, 1);
+      throw error;
     } finally {
       if (entry.bus === bus) entry.bus = null;
     }
@@ -183,5 +215,21 @@ export class A2aBridge {
     }
     entry.turnActive = false;
     for (const resolve of entry.settled.splice(0)) resolve();
+  }
+
+  /**
+   * Config override wins per field; otherwise the deployment default read from
+   * the `agentDefaultModel` service (the entry-point contract — the loop
+   * itself does not apply it). Undefined when neither source has a pair
+   * (persona-less minimal compositions stay valid).
+   */
+  private resolveSelection(): ModelSelection | undefined {
+    const defaults = (
+      this.ctx.get('agentDefaultModel') as { currentSelection?: () => ModelSelection } | undefined
+    )?.currentSelection?.();
+    const provider = this.options.agentOptions?.provider || defaults?.provider;
+    const model = this.options.agentOptions?.model || defaults?.model;
+    if (!provider || !model) return undefined;
+    return { provider, model, reasoningEffort: defaults?.reasoningEffort };
   }
 }

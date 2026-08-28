@@ -5,6 +5,13 @@ import { Context } from '@deepseek-ai/cordis';
 import type { Agent, AgentHandle, AgentRegistry } from '@deepseek-ai/dsh-agent';
 import type { Session, SessionEvent, SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The real dsh-agent root module imports workspace-internal packages
+// (dsh-scope) absent from this dev install — the bridge needs only
+// installModelSelection from it.
+const mocks = vi.hoisted(() => ({ installModelSelection: vi.fn() }));
+vi.mock('@deepseek-ai/dsh-agent', () => ({ installModelSelection: mocks.installModelSelection }));
+
 import { A2aBridge, type TaskEntry } from './bridge.js';
 import { DshAgentExecutor } from './executor.js';
 
@@ -57,35 +64,46 @@ interface FakeAgent {
 function fakeAgents(ctx: Context) {
   const created: FakeAgent[] = [];
   const registry = {
-    create: vi.fn(async (options: { sessionId: SessionId }): Promise<AgentHandle> => {
-      const session = { id: options.sessionId } as Session;
-      const fake: FakeAgent = {
-        sessionId: options.sessionId,
-        prompts: [],
-        emit: (events) => {
-          for (const e of events) ctx.emit('session/event', session, e);
-        },
-        agent: undefined as never,
-        handle: undefined as never,
-      };
-      const agent = {
-        id: options.sessionId,
-        options: {},
-        status: 'idle',
-        followup: vi.fn((message: { content: Array<{ type: string; text?: string }> }) => {
-          fake.prompts.push(message.content.map((b) => b.text ?? '').join(''));
-          fake.emit(SCRIPTED_TURN);
-        }),
-        cancel: vi.fn(() => {
-          fake.emit([turnEnd({ kind: 'aborted', reason: { kind: 'user' } })]);
-        }),
-        whenIdle: vi.fn(async () => {}),
-      } as unknown as Agent;
-      fake.agent = agent;
-      fake.handle = { agent, dispose: vi.fn(async () => {}) };
-      created.push(fake);
-      return fake.handle;
-    }),
+    create: vi.fn(
+      async (options: {
+        sessionId: SessionId;
+        agentOptions?: { provider?: string; model?: string };
+        setup?: (agentCtx: Context) => void;
+      }): Promise<AgentHandle> => {
+        const session = { id: options.sessionId } as Session;
+        const fake: FakeAgent = {
+          sessionId: options.sessionId,
+          prompts: [],
+          emit: (events) => {
+            for (const e of events) ctx.emit('session/event', session, e);
+          },
+          agent: undefined as never,
+          handle: undefined as never,
+        };
+        const agent = {
+          id: options.sessionId,
+          options: options.agentOptions ?? {},
+          status: 'idle',
+          followup: vi.fn((message: { content: Array<{ type: string; text?: string }> }) => {
+            if ((fake as FakeAgent & { failFollowup?: boolean }).failFollowup) {
+              throw new Error('inbox closed');
+            }
+            fake.prompts.push(message.content.map((b) => b.text ?? '').join(''));
+            fake.emit(SCRIPTED_TURN);
+          }),
+          cancel: vi.fn(() => {
+            fake.emit([turnEnd({ kind: 'aborted', reason: { kind: 'user' } })]);
+          }),
+          whenIdle: vi.fn(async () => {}),
+        } as unknown as Agent;
+        fake.agent = agent;
+        fake.handle = { agent, dispose: vi.fn(async () => {}) };
+        // The real factory runs creation-time setup before publication.
+        options.setup?.(ctx);
+        created.push(fake);
+        return fake.handle;
+      },
+    ),
   } as unknown as AgentRegistry;
   ctx.provide('agents', registry);
   return { registry, created };
@@ -120,6 +138,7 @@ describe('A2aBridge + DshAgentExecutor', () => {
     ctx = new Context();
     agents = fakeAgents(ctx);
     bridge = new A2aBridge(ctx, { cwd: '/tmp', agentOptions: { model: 'm' } });
+    mocks.installModelSelection.mockClear();
   });
 
   async function execute(taskId: string, contextId: string, text = 'hi') {
@@ -289,5 +308,88 @@ describe('A2aBridge + DshAgentExecutor', () => {
     );
     expect(spy.mock.calls.some(([prefix]) => String(prefix).includes('[dsh-a2a]'))).toBe(true);
     spy.mockRestore();
+  });
+
+  describe('model selection', () => {
+    const createCalls = () => (agents.registry.create as ReturnType<typeof vi.fn>).mock.calls;
+
+    it('resolves the deployment default and installs the selection at setup', async () => {
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({
+          provider: 'deepseek-official',
+          model: 'deepseek-v4-flash',
+          reasoningEffort: 'low',
+        }),
+      });
+      bridge = new A2aBridge(ctx, { cwd: '/tmp' });
+      await execute('t1', 'ctx1');
+      expect(createCalls()[0][0].agentOptions).toEqual({
+        provider: 'deepseek-official',
+        model: 'deepseek-v4-flash',
+      });
+      expect(mocks.installModelSelection).toHaveBeenCalledWith(ctx, {
+        current: {
+          provider: 'deepseek-official',
+          model: 'deepseek-v4-flash',
+          reasoningEffort: 'low',
+        },
+        assembled: undefined,
+      });
+    });
+
+    it('prefers the configured provider/model over the deployment default', async () => {
+      ctx.provide('agentDefaultModel', {
+        currentSelection: () => ({ provider: 'default-p', model: 'default-m' }),
+      });
+      bridge = new A2aBridge(ctx, {
+        cwd: '/tmp',
+        agentOptions: { provider: 'my-provider', model: 'my-model' },
+      });
+      await execute('t1', 'ctx1');
+      expect(createCalls()[0][0].agentOptions).toEqual({
+        provider: 'my-provider',
+        model: 'my-model',
+      });
+      expect(mocks.installModelSelection).toHaveBeenCalledWith(
+        ctx,
+        expect.objectContaining({
+          current: expect.objectContaining({ provider: 'my-provider', model: 'my-model' }),
+        }),
+      );
+    });
+
+    it('creates the agent without a selection when neither source has one', async () => {
+      bridge = new A2aBridge(ctx, { cwd: '/tmp' });
+      await execute('t1', 'ctx1');
+      expect(createCalls()[0][0].agentOptions).toBeUndefined();
+      expect(createCalls()[0][0].setup).toBeUndefined();
+      expect(mocks.installModelSelection).not.toHaveBeenCalled();
+    });
+  });
+
+  it('fails the task when followup throws and does not poison later turns', async () => {
+    await execute('t1', 'ctx1');
+    const fake = agents.created[0] as FakeAgent & { failFollowup?: boolean };
+    fake.failFollowup = true;
+
+    const failed = await execute('t1', 'ctx1', 'boom');
+    const failedFinal = failed.seen.at(-1) as Extract<
+      AgentExecutionEvent,
+      { kind: 'status-update' }
+    >;
+    expect(failed.isFinished()).toBe(true);
+    expect(failedFinal.status.state).toBe('failed');
+    expect((failedFinal.status.message as Message).parts[0]).toEqual({
+      kind: 'text',
+      text: 'inbox closed',
+    });
+
+    // The stale waiter was spliced out: the next turn settles on its own
+    // turn/end instead of inheriting the poisoned FIFO slot.
+    fake.failFollowup = false;
+    const recovered = await execute('t1', 'ctx1', 'again');
+    const final = recovered.seen.at(-1) as Extract<AgentExecutionEvent, { kind: 'status-update' }>;
+    expect(final.status.state).toBe('input-required');
+    expect(agents.created[0].prompts).toEqual(['hi', 'again']);
   });
 });

@@ -1,5 +1,10 @@
 import { Context } from '@deepseek-ai/cordis';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The plugin's bridge imports installModelSelection from the dsh-agent root
+// module, which pulls workspace-internal packages absent here (dsh-scope).
+vi.mock('@deepseek-ai/dsh-agent', () => ({ installModelSelection: vi.fn() }));
+
 import { type A2aPluginConfig, apply, inject, name } from './index.js';
 
 const config = (overrides: Partial<A2aPluginConfig> = {}): A2aPluginConfig => ({
