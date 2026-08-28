@@ -67,16 +67,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # pnpm version comes from the packageManager field in package.json —
-      # do not set it here too (pnpm/action-setup errors on duplicates).
-      - uses: pnpm/action-setup@v4
-
       # Node 24 (not ci.yml's 22): scenario scripts read SQLite through
       # node:sqlite, which is unflagged since 23.4.
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-          cache: pnpm
+
+      - name: Setup pnpm
+        run: |
+          corepack enable
+          corepack install -g pnpm@9.15.0
 
       - run: pnpm install --frozen-lockfile=false
       - run: pnpm build
@@ -101,12 +101,11 @@ jobs:
           set -euo pipefail
           # `dsh plugin` forwards to pnpm; the profile template's pnpm-workspace
           # settings (nodeLinker: hoisted, autoInstallPeers: false) need pnpm 10.
-          # pnpm/action-setup's 9.x lives in PNPM_HOME and shadows npm-global —
-          # override PATH wholesale so npm-global wins (GITHUB_PATH only prepends).
+          # Repository checks use pnpm 9; dsh profiles require pnpm 10.
           # npm's allow-scripts gate: dsh's subprocess helper needs its postinstall.
           npm i -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs \
-            "@deepseek-ai/dsh@${{ env.DSH_CLI_VERSION }}" pnpm@10
-          echo "PATH=$(npm prefix -g)/bin:$PATH" >> "$GITHUB_ENV"
+            "@deepseek-ai/dsh@${{ env.DSH_CLI_VERSION }}"
+          corepack install -g pnpm@10
           dsh --version
           pnpm --version
 
@@ -134,7 +133,8 @@ jobs:
           set -euo pipefail
           dsh plugin --profile headless add "$DSH_PKG_TARBALL"
           dsh --profile headless --dump-config | tee /tmp/dsh-config.yml
-          grep -F "name: ${{ matrix.package }}" /tmp/dsh-config.yml
+          package_name="$(node -p "require('./packages/${{ matrix.package }}/package.json').name")"
+          grep -F "name: '$package_name'" /tmp/dsh-config.yml
 
       # Stage B: the package's scenario script — the real LLM round-trip.
       # Secrets are scoped to this step only.
@@ -198,12 +198,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v4
-
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-          cache: pnpm
+
+      - name: Setup pnpm
+        run: |
+          corepack enable
+          corepack install -g pnpm@9.15.0
 
       - run: pnpm install --frozen-lockfile=false
       - run: pnpm build
