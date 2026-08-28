@@ -23,14 +23,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # pnpm version comes from the packageManager field in package.json —
+      # do not set it here too (pnpm/action-setup errors on duplicates).
+      - uses: pnpm/action-setup@v6
+
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-
-      - name: Setup pnpm
-        run: |
-          corepack enable
-          corepack install -g pnpm@9.15.0
+          cache: pnpm
 
       - run: pnpm install --frozen-lockfile=false
       - run: pnpm lint
@@ -52,14 +52,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: pnpm/action-setup@v6
+
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-
-      - name: Setup pnpm
-        run: |
-          corepack enable
-          corepack install -g pnpm@9.15.0
+          cache: pnpm
 
       - run: pnpm install --frozen-lockfile=false
       - run: pnpm typecheck
