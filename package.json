@@ -4,6 +4,9 @@
   "type": "module",
   "description": "Generic DeepSeek Harness (dsh) plugins: A2A protocol server, session storage mirror, Langfuse observability.",
   "packageManager": "pnpm@9.15.0",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "build": "pnpm -r run build",
     "typecheck": "pnpm -r run typecheck",
