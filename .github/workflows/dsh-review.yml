@@ -109,6 +109,8 @@ jobs:
           DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
           # Optional model override; unset/empty falls back to deepseek-v4-flash.
           DSH_INTEGRATION_MODEL: ${{ secrets.DSH_INTEGRATION_MODEL }}
+          # Optional output-token cap (substituted for the patch's 384000).
+          DSH_INTEGRATION_MAX_TOKENS: ${{ secrets.DSH_INTEGRATION_MAX_TOKENS }}
         run: |
           set -euo pipefail
           node .github/scripts/review-gateway-proxy.mjs > "$RUNNER_TEMP/review-proxy-port" &
@@ -122,7 +124,12 @@ jobs:
           # simple tokens — reject anything else rather than break the YAML.
           review_model="${DSH_INTEGRATION_MODEL:-deepseek-v4-flash}"
           [[ "$review_model" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid DSH_INTEGRATION_MODEL: $review_model"; exit 1; }
-          sed "s/deepseek-v4-flash/${review_model}/g" "$GITHUB_WORKSPACE/.github/dsh-review/model.patch.yml" > "$RUNNER_TEMP/model.patch.yml"
+          sed_args=(-e "s/deepseek-v4-flash/${review_model}/g")
+          if [[ -n "${DSH_INTEGRATION_MAX_TOKENS:-}" ]]; then
+            [[ "$DSH_INTEGRATION_MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::invalid DSH_INTEGRATION_MAX_TOKENS: $DSH_INTEGRATION_MAX_TOKENS"; exit 1; }
+            sed_args+=(-e "s/maxTokens: 384000/maxTokens: ${DSH_INTEGRATION_MAX_TOKENS}/")
+          fi
+          sed "${sed_args[@]}" "$GITHUB_WORKSPACE/.github/dsh-review/model.patch.yml" > "$RUNNER_TEMP/model.patch.yml"
           chmod 755 "$RUNNER_TEMP"
           # nobody must TRAVERSE the directory chain down to the checkout
           # (inert review data) and its own DSH_HOME — the runner's parents

@@ -82,6 +82,9 @@ writeFileSync(
 - id: llm-deepseek
   config:
     thinking: disabled
+    # Scenarios need only short answers; dsh's 256000 default is rejected by
+    # smaller-cap models (glm-5.3-flash caps max_tokens at 131072).
+    maxTokens: 16384
 `,
 );
 console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);

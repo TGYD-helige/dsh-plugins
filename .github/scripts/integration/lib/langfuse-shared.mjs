@@ -498,6 +498,9 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
   config:
     thinking: enabled
     reasoningEffort: max
+    # Scenarios need only short answers; dsh's 256000 default is rejected by
+    # smaller-cap models (glm-5.3-flash caps max_tokens at 131072).
+    maxTokens: 16384
 `,
   );
   if (!realMode) console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);

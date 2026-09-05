@@ -1,6 +1,8 @@
 # dsh-review.yml substitutes the model id with $DSH_INTEGRATION_MODEL at run
 # time; the literal id below is only the fallback default, and the models
-# row's display metadata describes that default.
+# row's display metadata describes that default. When
+# $DSH_INTEGRATION_MAX_TOKENS is set, the 384000 output cap is substituted
+# the same way (gateways serving smaller models reject it as out of range).
 - id: agent-default-model
   config:
     provider: deepseek-official

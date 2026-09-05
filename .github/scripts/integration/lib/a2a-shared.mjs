@@ -191,6 +191,9 @@ export function textOf(x) {
 export const THINKING_OFF = `- id: llm-deepseek
   config:
     thinking: disabled
+    # Scenarios need only short answers; dsh's 256000 default is rejected by
+    # smaller-cap models (glm-5.3-flash caps max_tokens at 131072).
+    maxTokens: 16384
 `;
 
 /** Thinking at max effort, for the reasoning-stream leg (no tools in that leg). */
@@ -198,4 +201,6 @@ export const THINKING_MAX = `- id: llm-deepseek
   config:
     thinking: enabled
     reasoningEffort: max
+    # Same short-answer cap as THINKING_OFF; ample for a max-effort verdict.
+    maxTokens: 16384
 `;
