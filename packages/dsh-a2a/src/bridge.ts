@@ -127,7 +127,7 @@ export class A2aBridge {
       // the agent's installed model selection (dsh-agent-loop's variables read
       // agent.options; the scoped waterfalls wire provider/model into prompt
       // assembly and the request config). Verified against
-      // @deepseek-ai/dsh-headless@0.1.0-rc.7's run() — entry points are
+      // @deepseek-ai/dsh-headless@0.1.2-rc.1's run() — entry points are
       // expected to resolve the deployment default themselves.
       setup:
         selection || agentPreset

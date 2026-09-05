@@ -38,7 +38,7 @@
 # capability beyond read-only fs stays disabled even if untrusted PR text tries
 # to request one. Ids are the tool rows of the pinned dsh-base (see
 # DSH_CLI_VERSION in integration.yml). tool-fs read has no sandbox gate in dsh
-# rc.7, so containment comes from the OS instead: the agent runs as `nobody`
+# 0.1.2-rc.1, so containment comes from the OS instead: the agent runs as `nobody`
 # with a scrubbed env, which also backstops the write ops inside tool-fs.
 - id: tool-bash
   disabled: true

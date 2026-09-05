@@ -67,7 +67,7 @@ jobs:
 
       - name: Install DSH (pinned)
         run: |
-          npm install --global @deepseek-ai/dsh@0.1.0-rc.7
+          npm install --global @deepseek-ai/dsh@0.1.2-rc.1
           dsh --version
 
       - name: Prepare untrusted PR data for review
@@ -99,7 +99,7 @@ jobs:
 
       # The model process must never hold a secret: dsh runs as `nobody` with a
       # scrubbed env, and the loopback proxy (runner user) injects the gateway
-      # key. tool-fs read is ungated in dsh rc.7, so Unix permissions are the
+      # key. tool-fs read is ungated in dsh 0.1.2-rc.1, so Unix permissions are the
       # real boundary: `nobody` cannot read the proxy's /proc environ or the
       # runner's credentials, and cannot write outside its own DSH_HOME — which
       # also backstops the write ops inside tool-fs.

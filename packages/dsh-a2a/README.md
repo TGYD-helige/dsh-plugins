@@ -57,7 +57,7 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
 - **Agents are full preset citizens.** Each task's agent is created with the deployment's default model selection (`agentDefaultModel`) and mounts its agent preset (the web profile keeps all tools inside presets — without one the agent would see an empty tool catalog). `agent.preset` pins a specific preset.
 - **Streaming aggregation.** Text deltas of a turn share one `messageId`, so clients accumulate them into a single message; reasoning deltas ride a separate `messageId` and are marked `metadata.dshAgent.kind: 'thought'`. The turn-final event's message carries the full assembled text, so blocking `SendMessage` clients read the answer from `result.task.status.message`. Tool calls/results are data parts marked `tool-call` / `tool-result`; token usage lands in `metadata.usage` of the final event. A2A 1.0 has no `final` flag — terminal and interrupted states close the stream.
 - **Text-only boundary** for now: `SendMessage` rejects messages with non-text parts (file/url/data) with a failed task.
-- **No approval bridge**: dsh rc.7 has no mid-turn approval seam, so tools that would ask are governed by the profile's own approval setup; the A2A side never enters a mid-turn `input-required`.
+- **No approval bridge**: dsh 0.1.2 ships the mid-turn approval seam only as the optional `dsh-user-approval` package, which headless profiles do not compose, so tools that would ask are governed by the profile's own approval setup; the A2A side never enters a mid-turn `input-required`.
 - **One in-flight message per task** is the supported flow (send the next message after the turn-final event). dsh serializes queued follow-ups into successive turns, but concurrent requests share one event bus — a second in-flight request may resolve with the first turn's final event.
 - **Restart**: persisted task shells survive in Redis/GCS, but live agents do not — continuing after a restart starts a fresh session (a client-supplied `contextId` names it).
 
@@ -75,7 +75,7 @@ dsh ships **no authentication or authorization**. The server binds `127.0.0.1` b
 
 ## Compatibility
 
-Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm}@0.1.0-rc.7`) — check the `TODO(verify)` markers in `src/` before upgrading dsh.
+Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm}@0.1.2-rc.1`) — check the `TODO(verify)` markers in `src/` before upgrading dsh.
 
 ## License
 

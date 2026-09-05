@@ -96,7 +96,9 @@ function taskEvent(
 
 // TODO(verify): non-text parts (file/raw/url/data) — dsh supports image
 // content blocks; map them when a client needs it. The confirmation data-part
-// protocol ({callId, outcome}) has no dsh rc.7 counterpart to bridge to.
+// protocol ({callId, outcome}) maps onto the optional dsh-user-approval
+// service (0.1.2+, asks carry the exact tool call) — bridge it once a
+// deployment composes that service.
 function extractText(message: Message): string {
   const nonText = message.parts.filter((part) => part.content?.$case !== 'text');
   if (nonText.length > 0) {

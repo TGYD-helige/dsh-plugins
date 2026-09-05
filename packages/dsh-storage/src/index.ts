@@ -84,7 +84,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   // Lifecycle: this cordis fork has no 'ready'/'dispose' events — startup
   // work goes in ctx.effect() (runs immediately at plugin load; the returned
   // disposer runs on fiber unload at shutdown). Event taps verified against
-  // @deepseek-ai/dsh-session@0.1.0-rc.7: session/event(session, event),
+  // @deepseek-ai/dsh-session@0.1.2-rc.1: session/event(session, event),
   // session/disposed(session), and the awaited session/flush(session)
   // durability checkpoint. The cast stays because the dsh-session types that
   // declare these event names are not installed.
@@ -225,7 +225,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
       }
 
       // Latest-wins title snapshot (log-only `session/title` event; payload
-      // { title, messageSeqs, source } verified against dsh-session-title@0.1.0-rc.7).
+      // { title, messageSeqs, source } verified against dsh-session-title@0.1.2-rc.1).
       if (event?.type === 'session/title' && typeof event.data?.title === 'string') {
         accum.title = event.data.title;
       }

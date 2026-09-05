@@ -5,7 +5,7 @@
  * deliberately free of cordis/HTTP concerns so the mapping is unit-testable
  * without a harness. The mapping ports the source project's
  * `packages/a2a-server/src/agent/task.ts` event switch onto dsh's
- * `SessionEventMap` (verified against @deepseek-ai/dsh-session@0.1.0-rc.7),
+ * `SessionEventMap` (verified against @deepseek-ai/dsh-session@0.1.2-rc.1),
  * emitting the A2A 1.0 data model (@a2a-js/sdk 1.1.0):
  *
  *   turn/start                         → statusUpdate(WORKING), ids rotate
@@ -30,10 +30,12 @@
  * A2A 1.0 removed the `final` flag: the SDK's event queue stops on terminal
  * and interrupted (input-required) states, which is exactly the set above.
  *
- * dsh rc.7 has no approval/`input-required` mid-turn seam (the unpublished
- * dsh-user-approval package is not installed anywhere; `tools/pre-execute`'s
- * `ask` degrades to deny without an approval service), so no approval bridge
- * exists here. TODO(verify) when dsh ships one.
+ * dsh 0.1.2 ships the approval seam as the optional
+ * @deepseek-ai/dsh-user-approval package (the `ctx.approval` service), but
+ * headless profiles do not compose it and `tools/pre-execute`'s `ask` fails
+ * closed without one, so no approval bridge exists here. TODO(verify):
+ * bridge approval asks to A2A input-required once a deployment composes the
+ * service.
  */
 
 import { randomUUID } from 'node:crypto';
