@@ -23,7 +23,7 @@
  *   `subagent/descriptor` event).
  *
  * Event/waterfall shapes verified against the installed
- * @deepseek-ai/dsh-{llm,session,tools,agent,subagent}@0.1.0-rc.7 package sources
+ * @deepseek-ai/dsh-{llm,session,tools,agent,subagent}@0.1.2-rc.1 package sources
  * (types for shapes; `lib/*.js` for the session/created ordering claim).
  *
  * @module dsh-langfuse
@@ -37,7 +37,6 @@ import type {
   StreamChunk,
   TokenUsage,
 } from '@deepseek-ai/dsh-llm';
-import { isTokenDelta } from '@deepseek-ai/dsh-llm/message';
 // Augmentation-only imports: pull the dsh packages' Events declarations into
 // the compilation (the listeners are contextually typed).
 import type {} from '@deepseek-ai/dsh-session';
@@ -111,6 +110,15 @@ const messageOf = (error: unknown): string =>
 const contentMessage = (config: LangfusePluginConfig, text: string): string | undefined =>
   config.captureContent ? text : undefined;
 
+// dsh-llm ≤0.1.0 exported this shared predicate from './message'; 0.1.2
+// removed it without a replacement (0.1.3 keeps per-package private copies),
+// so the TTFT rule lives here: the first real token is a non-empty
+// text/reasoning delta or a tool-call delta with content — block boundaries,
+// usage frames and empty heartbeat deltas are not completions.
+const isTokenDelta = (chunk: StreamChunk): boolean =>
+  ((chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') && chunk.text !== '') ||
+  (chunk.type === 'tool-call-delta' && (chunk.argumentsDelta !== '' || chunk.name !== undefined));
+
 /** Trace input/output text: the message's text blocks, joined. */
 function messageText(message: { content: ContentBlock[] }): string | undefined {
   const text = message.content.flatMap((block) => (block.type === 'text' ? [block.text] : []));
@@ -134,7 +142,11 @@ function modelParametersOf(
       stop: captureContent && options.stop ? JSON.stringify(options.stop) : undefined,
       stopCount: captureContent ? undefined : options.stop?.length,
       reasoningEffort: options.reasoningEffort,
-    }).filter(([, value]) => value !== undefined),
+      // Narrowing predicate: drops the undefined-valued keys for the type
+      // checker too (dsh-llm ≥0.1.2 resolves its branded ids for real —
+      // dsh-brand became a runtime dependency — so the unfiltered union no
+      // longer collapses to any).
+    }).filter((entry): entry is [string, string | number] => entry[1] !== undefined),
   );
   return Object.keys(params).length > 0 ? params : undefined;
 }
@@ -232,7 +244,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   // ------------------------------------------------------------------
   // Subagent child sessions: session/created precedes both subagent/start
   // and the child's first generation, and the durable header already links
-  // child → parent (verified against dsh-subagent@0.1.0-rc.7).
+  // child → parent (verified against dsh-subagent@0.1.2-rc.1).
   // ------------------------------------------------------------------
   ctx.on('session/created', (session) => {
     const parentSessionId: string | undefined = session.header.parentSession;
@@ -442,7 +454,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         for await (const chunk of stream) {
           rawChunks.push(chunk);
           // TTFT is the first real token — block boundaries, usage frames and
-          // empty heartbeat deltas are not completions (dsh's shared predicate).
+          // empty heartbeat deltas are not completions (the predicate above).
           if (completionStartTime === undefined && isTokenDelta(chunk)) {
             completionStartTime = new Date();
           }

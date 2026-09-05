@@ -10,7 +10,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { netEnv, requireEnv, run } from './ci-shared.mjs';
+import { integrationModel, netEnv, requireEnv, run } from './ci-shared.mjs';
 
 export function assert(cond, msg) {
   if (!cond) throw new Error(`assertion failed: ${msg}`);
@@ -42,9 +42,9 @@ export async function waitFor(url, timeoutMs) {
 
 /**
  * Install the bundle into the web profile, write the user patch (plugin
- * enabled on a free port + model pinned to deepseek-v4-flash; legs pass
- * extraPatch for e.g. the thinking rows), boot `dsh web`, and wait for the
- * agent card to answer.
+ * enabled on a free port + model pinned via $DSH_INTEGRATION_MODEL, default
+ * deepseek-v4-flash; legs pass extraPatch for e.g. the thinking rows), boot
+ * `dsh web`, and wait for the agent card to answer.
  */
 export async function bootA2a({ tag, extraPatch = '' }) {
   requireEnv(['DSH_INTEGRATION_BASE_URL', 'DSH_INTEGRATION_API_KEY', 'DSH_PKG_TARBALL']);
@@ -78,7 +78,7 @@ export async function bootA2a({ tag, extraPatch = '' }) {
 - id: agent-default-model
   config:
     provider: deepseek-official
-    model: deepseek-v4-flash
+    model: ${integrationModel()}
 
 ${extraPatch}`,
   );
@@ -191,6 +191,9 @@ export function textOf(x) {
 export const THINKING_OFF = `- id: llm-deepseek
   config:
     thinking: disabled
+    # Scenarios need only short answers; dsh's 256000 default is rejected by
+    # smaller-cap models (glm-5.3-flash caps max_tokens at 131072).
+    maxTokens: 16384
 `;
 
 /** Thinking at max effort, for the reasoning-stream leg (no tools in that leg). */
@@ -198,4 +201,6 @@ export const THINKING_MAX = `- id: llm-deepseek
   config:
     thinking: enabled
     reasoningEffort: max
+    # Same short-answer cap as THINKING_OFF; ample for a max-effort verdict.
+    maxTokens: 16384
 `;

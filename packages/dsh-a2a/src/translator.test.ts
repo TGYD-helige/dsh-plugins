@@ -1,6 +1,6 @@
 import { type Message, Role, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutionEvent } from '@a2a-js/sdk/server';
-import type { CallId, TokenUsage } from '@deepseek-ai/dsh-llm';
+import type { TokenUsage, ToolCallId } from '@deepseek-ai/dsh-llm';
 import type { SessionEvent, TurnEndReason } from '@deepseek-ai/dsh-session';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { SessionTranslator, terminalStatusUpdate } from './translator.js';
@@ -101,7 +101,7 @@ describe('SessionTranslator (A2A 1.0 model)', () => {
       ),
     ).toEqual([]);
     expect(t.handle(event('step/start', { turn: 1, step: 1 }))).toEqual([]);
-    expect(t.handle(event('todo/write', { todos: [] }))).toEqual([]);
+    expect(t.handle(event('session/end-seed', {}))).toEqual([]);
   });
 
   it('serializes tool calls and results as data parts, pairing by callId', () => {
@@ -112,7 +112,7 @@ describe('SessionTranslator (A2A 1.0 model)', () => {
         event('tool/call', {
           turn: 1,
           step: 1,
-          callId: 'c1' as CallId,
+          callId: 'c1' as ToolCallId,
           name: 'bash',
           arguments: '{"cmd":"ls"}',
         }),

@@ -4,7 +4,8 @@
  *
  * - real mode (LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY present): boot the
  *   dsh headless profile with the packed plugin pointed at the REAL Langfuse
- *   project, run the leg's seeded LLM query (deepseek-v4-flash, a marker file
+ *   project, run the leg's seeded LLM query (the $DSH_INTEGRATION_MODEL,
+ *   default deepseek-v4-flash; a marker file
  *   forces a tool round-trip), then poll the v1 Observations API until the
  *   ingested trace shows the expected shape — the data is really in Langfuse.
  * - fake mode (LANGFUSE_* absent): same boot against an in-process fake
@@ -31,7 +32,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { netEnv, requireEnv, run } from './ci-shared.mjs';
+import { integrationModel, netEnv, requireEnv, run } from './ci-shared.mjs';
 
 // ---------------------------------------------------------------------------
 // Real-Langfuse verification (v1 Observations API — v2 observations is
@@ -49,7 +50,7 @@ const VERIFY_DEADLINE_MS = 5 * 60 * 1000;
 const POLL_INTERVAL_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_PAGES = 20;
-const EXPECTED_MODEL = 'deepseek-v4-flash';
+const EXPECTED_MODEL = integrationModel();
 
 // Non-empty trimmed value or fallback — GitHub injects unset secrets as '',
 // which `??` would happily keep.
@@ -472,7 +473,7 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
 
   // Enable the plugin through the profile's user patch layer (an id-targeted
   // row replaces the bundle row's whole config). The agent-default-model row
-  // pins deepseek-v4-flash; the llm-deepseek row turns thinking ON at max
+  // pins the integration model; the llm-deepseek row turns thinking ON at max
   // effort — reasoning content must land in Langfuse (reasoning-delta chunks
   // in the raw stream). Caveat: reasoning enabled makes this gateway
   // stochastically garble or hang on tool calls (observed in CI) — the retry
@@ -491,12 +492,15 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
 - id: agent-default-model
   config:
     provider: deepseek-official
-    model: deepseek-v4-flash
+    model: ${EXPECTED_MODEL}
 
 - id: llm-deepseek
   config:
     thinking: enabled
     reasoningEffort: max
+    # Scenarios need only short answers; dsh's 256000 default is rejected by
+    # smaller-cap models (glm-5.3-flash caps max_tokens at 131072).
+    maxTokens: 16384
 `,
   );
   if (!realMode) console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);

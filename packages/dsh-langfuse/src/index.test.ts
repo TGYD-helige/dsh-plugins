@@ -1,6 +1,6 @@
 import { Context, type Events } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
-import type { CallId, GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm';
+import type { GenerateOptions, StreamChunk, TokenUsage, ToolCallId } from '@deepseek-ai/dsh-llm';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import type {
   ToolDispatchExecution,
@@ -226,7 +226,7 @@ const finishAborted = (message: string): StreamChunk => ({
 const toolCallEnd = (toolName: string, args = '{}'): StreamChunk => ({
   type: 'block-end',
   index: 0,
-  block: { type: 'tool-call', id: 'c1' as CallId, name: toolName, arguments: args },
+  block: { type: 'tool-call', id: 'c1' as ToolCallId, name: toolName, arguments: args },
 });
 
 async function drain(stream: AsyncIterable<StreamChunk>): Promise<StreamChunk[]> {
@@ -236,8 +236,8 @@ async function drain(stream: AsyncIterable<StreamChunk>): Promise<StreamChunk[]>
 }
 
 const execOf = (over: Partial<ToolDispatchExecution> = {}): ToolDispatchExecution => ({
-  callId: 'c1' as CallId,
-  rootCallId: 'c1' as CallId,
+  callId: 'c1' as ToolCallId,
+  rootCallId: 'c1' as ToolCallId,
   name: 'write_file',
   arguments: { path: 'a.ts' },
   token: Symbol('exec') as unknown as ToolExecutionToken,

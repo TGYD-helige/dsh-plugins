@@ -30,7 +30,7 @@ This is an early dsh-preview ecosystem. The plugin shapes, config schemas, and s
 
 | @amaster.ai/dsh-* | dsh | cordis | @a2a-js/sdk (dsh-a2a) |
 | --- | --- | --- | --- |
-| 0.1.x | `0.1.0-rc.7` (source) / `0.1.0-rc.7` (npm) | `^4.0.1` | `^1.1.0` (A2A 1.0 + v0.3 compat) |
+| 0.1.x | `0.1.2-rc.1` (source) / `0.1.2-rc.1` (npm) | `^4.0.1` | `^1.1.0` (A2A 1.0 + v0.3 compat) |
 
 dsh is in developer preview and **will** break compatibility between releases. Every release of these plugins pins a tested dsh version in this matrix; upgrade deliberately.
 
@@ -135,7 +135,7 @@ pnpm test         # vitest (packages with a test script)
 
 - All plugins are disabled by default; enable and configure each explicitly in the profile.
 
-- `dsh-a2a` is text-only at the protocol boundary (non-text message parts are rejected), has no approval/`input-required` mid-turn bridge (dsh rc.7 ships none), and does not resume live sessions across restarts — persisted task shells survive in Redis/GCS, but continuing a conversation starts a fresh session. No event replay is retained for subscriptions: `SubscribeToTask` opens with the current task snapshot and follows the live bus only.
+- `dsh-a2a` is text-only at the protocol boundary (non-text message parts are rejected), has no approval/`input-required` mid-turn bridge (dsh 0.1.2 ships the approval seam only as the optional `dsh-user-approval` package, not composed by headless profiles), and does not resume live sessions across restarts — persisted task shells survive in Redis/GCS, but continuing a conversation starts a fresh session. No event replay is retained for subscriptions: `SubscribeToTask` opens with the current task snapshot and follows the live bus only.
 - `dsh-a2a` GCS store: workspace archiving (`archiveWorkspace`) shells out to `tar` and is not wired to the task lifecycle yet.
 
 ## License

@@ -126,8 +126,9 @@ async function proposePriority(github, { owner, repo }, core, pr, files, size) {
     .slice(0, 80)
     .map((file) => `${file.filename} (+${file.additions}/-${file.deletions})`);
   if (files.length > 80) fileLines.push(`… and ${files.length - 80} more files`);
+  const model = process.env.DSH_INTEGRATION_MODEL?.trim() || 'deepseek-v4-flash';
   const requestBody = {
-    model: 'deepseek-v4-flash',
+    model,
     temperature: 0,
     max_tokens: 256,
     messages: [

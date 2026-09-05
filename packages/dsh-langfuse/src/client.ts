@@ -69,7 +69,7 @@ const NO_PARENT = { traceId: '0'.repeat(32), spanId: '0'.repeat(16), traceFlags:
  * `input_*`, `output` excludes `output_*`, `total` is the bucket sum —
  * overlapping buckets double-count usage and inferred cost). dsh reports
  * uncached input, separate cache buckets, and provider-style output that
- * INCLUDES reasoning (verified in dsh-llm-deepseek@0.1.0-rc.7:
+ * INCLUDES reasoning (verified in dsh-llm-deepseek@0.1.2-rc.1:
  * `outputTokens: usage.completion_tokens`, with reasoning split out of
  * `completion_tokens_details`), so the `output` bucket subtracts
  * `reasoningTokens` into `output_reasoning`. Only `usageDetails` is sent.

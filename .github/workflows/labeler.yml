@@ -31,6 +31,8 @@ jobs:
     env:
       DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
       DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
+      # Optional model override; unset/empty falls back to deepseek-v4-flash.
+      DSH_INTEGRATION_MODEL: ${{ secrets.DSH_INTEGRATION_MODEL }}
 
     steps:
       # pull_request_target checks out the trusted default branch (the labeler
