@@ -107,6 +107,8 @@ jobs:
         env:
           DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
           DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
+          # Optional model override; unset/empty falls back to deepseek-v4-flash.
+          DSH_INTEGRATION_MODEL: ${{ secrets.DSH_INTEGRATION_MODEL }}
         run: |
           set -euo pipefail
           node .github/scripts/review-gateway-proxy.mjs > "$RUNNER_TEMP/review-proxy-port" &
@@ -115,6 +117,12 @@ jobs:
           for _ in $(seq 1 100); do [ -s "$RUNNER_TEMP/review-proxy-port" ] && break; sleep 0.1; done
           port="$(cat "$RUNNER_TEMP/review-proxy-port")"
           test -n "$port"
+          # Render the review patch runner-side with the integration model so
+          # the nobody process never receives secret-derived env. Model ids are
+          # simple tokens — reject anything else rather than break the YAML.
+          review_model="${DSH_INTEGRATION_MODEL:-deepseek-v4-flash}"
+          [[ "$review_model" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid DSH_INTEGRATION_MODEL: $review_model"; exit 1; }
+          sed "s/deepseek-v4-flash/${review_model}/g" "$GITHUB_WORKSPACE/.github/dsh-review/model.patch.yml" > "$RUNNER_TEMP/model.patch.yml"
           chmod 755 "$RUNNER_TEMP"
           # nobody must TRAVERSE the directory chain down to the checkout
           # (inert review data) and its own DSH_HOME — the runner's parents
@@ -137,7 +145,7 @@ jobs:
             DSH_TELEMETRY_DISABLED=1 \
             "$(command -v dsh)" \
             --profile headless \
-            --patch "$GITHUB_WORKSPACE/.github/dsh-review/model.patch.yml" \
+            --patch "$RUNNER_TEMP/model.patch.yml" \
             'Run the trusted code review task.' \
             > "$DSH_REVIEW_OUTPUT" \
             2> "$DSH_REVIEW_STDERR"; then

@@ -11,6 +11,15 @@ export function requireEnv(names) {
   }
 }
 
+/**
+ * The integration model: `$DSH_INTEGRATION_MODEL`, defaulting to the
+ * gateway's deepseek-v4-flash. GitHub injects unset secrets as '', hence
+ * trim-or-default rather than `??`.
+ */
+export function integrationModel() {
+  return process.env.DSH_INTEGRATION_MODEL?.trim() || 'deepseek-v4-flash';
+}
+
 // If the runner routes egress through a host-level proxy, fetch to the
 // gateway can break — drop proxy vars from the LLM-carrying process.
 export function netEnv() {

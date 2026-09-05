@@ -2,8 +2,9 @@
  * dsh-storage integration scenario, two leg shapes driven by DSH_PROVIDER:
  *
  * - base leg (DSH_PROVIDER unset / 'sqlite'): boot the dsh headless profile
- *   with the packed plugin, run one real LLM query (deepseek-v4-flash through
- *   the integration gateway), then assert the session mirror landed in SQLite.
+ *   with the packed plugin, run one real LLM query ($DSH_INTEGRATION_MODEL,
+ *   default deepseek-v4-flash, through the integration gateway), then assert
+ *   the session mirror landed in SQLite.
  * - backend-only leg (DSH_PROVIDER = mysql | postgresql | sqlserver): no dsh
  *   boot, no LLM, no secrets — db push the variant schema and drive
  *   DatabaseBackend against the service database in DSH_DB_URL.
@@ -11,8 +12,9 @@
  * Contract with .github/workflows/integration.yml:
  *   env in : DSH_INTEGRATION_BASE_URL, DSH_INTEGRATION_API_KEY, DSH_PKG_TARBALL (base leg)
  *            DSH_DB_URL (provider legs)
- *   env opt: DSH_PROVIDER, DSH_HOME (default <workdir>/dsh-home),
- *            DSH_CLI (default 'dsh'), RUNNER_TEMP (default os.tmpdir())
+ *   env opt: DSH_PROVIDER, DSH_INTEGRATION_MODEL, DSH_HOME (default
+ *            <workdir>/dsh-home), DSH_CLI (default 'dsh'), RUNNER_TEMP
+ *            (default os.tmpdir())
  *   exit   : non-zero on any failure
  */
 
@@ -22,7 +24,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
-import { netEnv, requireEnv, run } from './lib/ci-shared.mjs';
+import { integrationModel, netEnv, requireEnv, run } from './lib/ci-shared.mjs';
 
 const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), 'dsh-storage-e2e');
 mkdirSync(workDir, { recursive: true });
@@ -38,6 +40,7 @@ if (provider !== 'sqlite') {
 
 const { DSH_INTEGRATION_BASE_URL, DSH_INTEGRATION_API_KEY, DSH_PKG_TARBALL } = process.env;
 requireEnv(['DSH_INTEGRATION_BASE_URL', 'DSH_INTEGRATION_API_KEY', 'DSH_PKG_TARBALL']);
+const expectedModel = integrationModel();
 
 const dshHomeEnv = { DSH_HOME: dshHome };
 
@@ -54,8 +57,8 @@ run(dsh, ['plugin', '--profile', 'headless', 'add', '@prisma/client@7.9.1', '@pr
 // 3. Enable the sqlite mirror through the profile's user patch layer (an
 //    id-targeted row replaces the bundle row's whole config). The template
 //    file is one top-level YAML array (`[]`), so rewrite it wholesale. The
-//    agent-default-model row restates the dsh-base default explicitly so the
-//    scenario is pinned to deepseek-v4-flash rather than inheriting it. The
+//    agent-default-model row restates the model explicitly so the scenario is
+//    pinned rather than inheriting the dsh-base default. The
 //    llm-deepseek row disables thinking: with reasoning enabled, this
 //    gateway stochastically garbles tool calls (empty tool name — observed
 //    in CI), and the scenario does not need thinking.
@@ -74,7 +77,7 @@ writeFileSync(
 - id: agent-default-model
   config:
     provider: deepseek-official
-    model: deepseek-v4-flash
+    model: ${expectedModel}
 
 - id: llm-deepseek
   config:
@@ -186,7 +189,7 @@ const user = messages.find((m) => m.type === 'user' && String(m.content).include
 const model = messages.find((m) => m.type === 'model');
 assert(user, 'user message row with the prompt missing');
 assert(model, 'assistant message row missing');
-assert(model.model === 'deepseek-v4-flash', `expected model=deepseek-v4-flash, got ${model.model}`);
+assert(model.model === expectedModel, `expected model=${expectedModel}, got ${model.model}`);
 for (const m of messages) {
   const meta = JSON.parse(m.metadata);
   assert(typeof meta.id === 'string' && meta.id.length > 0, `row missing metadata.id: ${m.metadata}`);

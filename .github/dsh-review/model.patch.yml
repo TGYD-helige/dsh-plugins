@@ -1,3 +1,6 @@
+# dsh-review.yml substitutes the model id with $DSH_INTEGRATION_MODEL at run
+# time; the literal id below is only the fallback default, and the models
+# row's display metadata describes that default.
 - id: agent-default-model
   config:
     provider: deepseek-official

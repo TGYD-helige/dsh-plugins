@@ -2,7 +2,8 @@
  * dsh-a2a base integration leg — the A2A 1.0 protocol surface against a real
  * dsh `web` profile boot: agent card discovery (v1 card + legacy card for
  * headerless clients), a marker-file tool round-trip over SSE
- * (deepseek-v4-flash through the integration gateway) asserting the
+ * (the $DSH_INTEGRATION_MODEL, default deepseek-v4-flash, through the
+ * integration gateway) asserting the
  * tool-call/tool-result data parts, the text-delta messageId aggregation, and
  * the final event's usage metadata, a blocking SendMessage follow-up on the
  * same task, ListTasks, the text-only boundary, GetTask, CancelTask, the

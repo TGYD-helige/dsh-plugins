@@ -146,6 +146,9 @@ jobs:
         env:
           DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
           DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
+          # Optional model override for the scenarios; unset/empty falls back
+          # to deepseek-v4-flash inside the scripts.
+          DSH_INTEGRATION_MODEL: ${{ secrets.DSH_INTEGRATION_MODEL }}
           # dsh-langfuse only: blanked on other packages' legs (fork PRs get
           # no secrets at all and the scenario self-skips Stage B). Absent
           # keys flip the scenario to its fake-OTLP fallback.
