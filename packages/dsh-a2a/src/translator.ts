@@ -5,14 +5,17 @@
  * deliberately free of cordis/HTTP concerns so the mapping is unit-testable
  * without a harness. The mapping ports the source project's
  * `packages/a2a-server/src/agent/task.ts` event switch onto dsh's
- * `SessionEventMap` (verified against @deepseek-ai/dsh-session@0.1.2-rc.1),
- * emitting the A2A 1.0 data model (@a2a-js/sdk 1.1.0):
+ * `SessionEventMap` (verified against @deepseek-ai/dsh-session@0.1.5-rc.1),
+ * emitting the A2A 1.0 data model (@a2a-js/sdk 1.1.0). As of the V3 session
+ * format the durable log carries no incremental chunks — live text/reasoning
+ * deltas arrive as `agent/assistant-stream` chunk frames
+ * (@deepseek-ai/dsh-agent@0.1.5-rc.1) through {@link handleStreamFrame}:
  *
  *   turn/start                         → statusUpdate(WORKING), ids rotate
- *   assistant/chunk (text-delta)       → statusUpdate(WORKING, text part),
+ *   stream chunk (text-delta)          → statusUpdate(WORKING, text part),
  *                                        reusing the turn's messageId so
  *                                        clients aggregate deltas into one message
- *   assistant/chunk (reasoning-delta)  → statusUpdate(WORKING, thought metadata)
+ *   stream chunk (reasoning-delta)     → statusUpdate(WORKING, thought metadata)
  *   assistant/message                  → no event; text + usage captured for the
  *                                        turn-final message (blocking `SendMessage`
  *                                        clients read the answer from the final
@@ -30,7 +33,7 @@
  * A2A 1.0 removed the `final` flag: the SDK's event queue stops on terminal
  * and interrupted (input-required) states, which is exactly the set above.
  *
- * dsh 0.1.2 ships the approval seam as the optional
+ * dsh ships the approval seam as the optional
  * @deepseek-ai/dsh-user-approval package (the `ctx.approval` service), but
  * headless profiles do not compose it and `tools/pre-execute`'s `ask` fails
  * closed without one, so no approval bridge exists here. TODO(verify):
@@ -41,6 +44,7 @@
 import { randomUUID } from 'node:crypto';
 import { type Message, type Part, Role, TaskState } from '@a2a-js/sdk';
 import { AgentEvent, type AgentExecutionEvent } from '@a2a-js/sdk/server';
+import type { AssistantStreamFrame } from '@deepseek-ai/dsh-agent';
 import type { ContentBlock, TokenUsage } from '@deepseek-ai/dsh-llm';
 import type { SessionEvent, TurnEndReason } from '@deepseek-ai/dsh-session';
 
@@ -148,29 +152,6 @@ export class SessionTranslator {
         this.usage = undefined;
         return [this.status(TaskState.TASK_STATE_WORKING, { kind: 'state-change' })];
       }
-      case 'assistant/chunk': {
-        const chunk = event.data.chunk;
-        if (chunk.type === 'text-delta') {
-          this.deltaText += chunk.text;
-          return [
-            this.status(
-              TaskState.TASK_STATE_WORKING,
-              { kind: 'text-content' },
-              agentTextMessage(this.taskId, this.contextId, chunk.text, this.textMessageId),
-            ),
-          ];
-        }
-        if (chunk.type === 'reasoning-delta') {
-          return [
-            this.status(
-              TaskState.TASK_STATE_WORKING,
-              { kind: 'thought' },
-              agentTextMessage(this.taskId, this.contextId, chunk.text, this.thoughtMessageId),
-            ),
-          ];
-        }
-        return [];
-      }
       case 'assistant/message': {
         this.sawAssistantMessage = true;
         for (const block of event.data.message.content) {
@@ -222,6 +203,32 @@ export class SessionTranslator {
       default:
         return [];
     }
+  }
+
+  /**
+   * Translate one live `agent/assistant-stream` frame into zero or more A2A
+   * events. Chunk frames carry the transient deltas; start/end frames bracket
+   * an attempt and produce nothing (the settled `assistant/message` session
+   * event captures text + usage).
+   */
+  handleStreamFrame(frame: AssistantStreamFrame): AgentExecutionEvent[] {
+    if (frame.type !== 'chunk') return [];
+    const { chunk } = frame;
+    if (chunk.type !== 'text-delta' && chunk.type !== 'reasoning-delta') return [];
+    const text = chunk.type === 'text-delta';
+    if (text) this.deltaText += chunk.text;
+    return [
+      this.status(
+        TaskState.TASK_STATE_WORKING,
+        { kind: text ? 'text-content' : 'thought' },
+        agentTextMessage(
+          this.taskId,
+          this.contextId,
+          chunk.text,
+          text ? this.textMessageId : this.thoughtMessageId,
+        ),
+      ),
+    ];
   }
 
   private turnEnd(reason: TurnEndReason): AgentExecutionEvent | undefined {

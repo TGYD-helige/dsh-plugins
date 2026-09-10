@@ -202,7 +202,7 @@ describe('projectEvent', () => {
   });
 
   it.each([
-    ['assistant/chunk', { type: 'assistant/chunk', seq: 1, time: 1, data: { chunk: {} } }],
+    ['assistant/attempt', { type: 'assistant/attempt', seq: 1, time: 1, data: { stream: [] } }],
     ['turn/end', { type: 'turn/end', seq: 9, time: 1, data: { turn: 0, reason: 'done' } }],
     ['session/title', { type: 'session/title', seq: 3, time: 1, data: { title: 't' } }],
     ['unknown event', { type: 'approval/asked', seq: 1, time: 1, data: {} }],
@@ -213,14 +213,20 @@ describe('projectEvent', () => {
 });
 
 describe('usageSampleOf', () => {
-  it('samples an assistant/chunk usage record with its step key', () => {
+  it("samples an assistant/attempt's embedded usage record with its step key", () => {
     expect(
       usageSampleOf({
-        type: 'assistant/chunk',
+        type: 'assistant/attempt',
         data: {
           turn: 1,
           step: 2,
-          chunk: { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
+          stream: [
+            {
+              type: 'chunk',
+              time: 1,
+              chunk: { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
+            },
+          ],
         },
       }),
     ).toEqual({ key: '1:2', sample: { input: 10, output: 5 } });
@@ -248,11 +254,15 @@ describe('usageSampleOf', () => {
     ).toEqual({ key: '0:0', sample: { input: 1030, output: 7 } });
   });
 
-  it('returns null for non-usage chunks and other events', () => {
+  it('returns null for streams without usage and other events', () => {
     expect(
       usageSampleOf({
-        type: 'assistant/chunk',
-        data: { turn: 0, step: 0, chunk: { type: 'text', text: 'x' } },
+        type: 'assistant/attempt',
+        data: {
+          turn: 0,
+          step: 0,
+          stream: [{ type: 'text-chunks', time0: 1, index: 0, dt: [0], texts: ['x'] }],
+        },
       }),
     ).toBeNull();
     expect(usageSampleOf({ type: 'turn/end', data: { turn: 0 } })).toBeNull();

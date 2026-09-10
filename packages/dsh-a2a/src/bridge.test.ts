@@ -2,7 +2,12 @@ import { type Message, Role, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutionEvent, ExecutionEventBus } from '@a2a-js/sdk/server';
 import { DefaultExecutionEventBus, RequestContext, ServerCallContext } from '@a2a-js/sdk/server';
 import { Context } from '@deepseek-ai/cordis';
-import type { Agent, AgentHandle, AgentRegistry } from '@deepseek-ai/dsh-agent';
+import type {
+  Agent,
+  AgentHandle,
+  AgentRegistry,
+  AssistantStreamFrame,
+} from '@deepseek-ai/dsh-agent';
 import type { Session, SessionEvent, SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -27,8 +32,9 @@ function event<T extends SessionEvent['type']>(
   return { type, seq: seq++, time: Date.now(), data } as SessionEvent;
 }
 
-const textDelta = (text: string) =>
-  event('assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text } });
+/** One live `agent/assistant-stream` text-delta frame (the V3 delta channel) — minimal shape; the bridge reads only `type` and `chunk`. */
+const textDelta = (text: string): AssistantStreamFrame =>
+  ({ type: 'chunk', chunk: { type: 'text-delta', index: 0, text } }) as never;
 const assistantMessage = (text: string) =>
   event('assistant/message', {
     turn: 1,
@@ -43,13 +49,12 @@ const assistantMessage = (text: string) =>
   } as never);
 const turnEnd = (reason: TurnEndReason) => event('turn/end', { turn: 1, reason });
 
-const SCRIPTED_TURN: SessionEvent[] = [
-  event('turn/start', { turn: 1 }),
-  textDelta('hello '),
-  textDelta('there'),
-  assistantMessage('hello there'),
-  turnEnd({ kind: 'completed' }),
-];
+/** One scripted turn: durable session events interleaved with live stream frames. */
+function scriptTurn(fake: FakeAgent): void {
+  fake.emit([event('turn/start', { turn: 1 })]);
+  fake.stream([textDelta('hello '), textDelta('there')]);
+  fake.emit([assistantMessage('hello there'), turnEnd({ kind: 'completed' })]);
+}
 
 interface FakeAgent {
   agent: Agent;
@@ -59,6 +64,8 @@ interface FakeAgent {
   prompts: string[];
   /** Emitted session events are scripted here per test. */
   emit: (events: SessionEvent[]) => void;
+  /** Live assistant-stream frames are scripted here per test. */
+  stream: (frames: AssistantStreamFrame[]) => void;
 }
 
 function fakeAgents(ctx: Context) {
@@ -78,11 +85,16 @@ function fakeAgents(ctx: Context) {
           emit: (events) => {
             for (const e of events) ctx.emit('session/event', session, e);
           },
+          stream: (frames) => {
+            for (const frame of frames)
+              ctx.emit('agent/assistant-stream', { agent: fake.agent, frame });
+          },
           agent: undefined as never,
           handle: undefined as never,
         };
         const agent = {
           id: options.sessionId,
+          session,
           options: options.agentOptions ?? {},
           status: 'idle',
           followup: vi.fn((message: { content: Array<{ type: string; text?: string }> }) => {
@@ -90,7 +102,7 @@ function fakeAgents(ctx: Context) {
               throw new Error('inbox closed');
             }
             fake.prompts.push(message.content.map((b) => b.text ?? '').join(''));
-            fake.emit(SCRIPTED_TURN);
+            scriptTurn(fake);
           }),
           cancel: vi.fn(() => {
             fake.emit([turnEnd({ kind: 'aborted', reason: { kind: 'user' } })]);
@@ -333,12 +345,16 @@ describe('A2aBridge + DshAgentExecutor', () => {
     const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
     await execute('t1', 'ctx1');
     const session = { id: agents.created[0].sessionId } as Session;
-    // malformed event: chunk missing — translator would throw inside
+    // malformed durable event: message missing — translator would throw inside
     ctx.emit(
       'session/event',
       session,
-      event('assistant/chunk', { turn: 1, step: 1, chunk: undefined as never }),
+      event('assistant/message', { turn: 1, step: 1, message: undefined } as never),
     );
+    // malformed live frame: chunk missing — the stream path would throw inside
+    agents.created[0].stream([
+      { type: 'chunk', chunk: undefined } as unknown as AssistantStreamFrame,
+    ]);
     expect(spy.mock.calls.some(([prefix]) => String(prefix).includes('[dsh-a2a]'))).toBe(true);
     spy.mockRestore();
   });
