@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * dsh-policy shell leg: the gate in front of the REAL bash tool and executor
+ * dsh-policy bash leg: the gate in front of the REAL bash tool and executor
  * in a real dsh boot. Ground truth is the filesystem, not the model's answer:
  * the allowed `touch` must create its file, the denied `touch` must leave no
  * file at all (the command never reached the shell). The deny message in the
@@ -16,7 +16,7 @@ import { runPolicyScenario } from './lib/policy-shared.mjs';
 const DENY_MESSAGE = 'touch ci-blocked is denied by dsh-policy E2E';
 
 await runPolicyScenario({
-  tag: 'shell',
+  tag: 'bash',
   name: 'real bash tool: allowed side effect lands, denied command never runs',
   rulesYaml: `      - tool: '*'
         decision: allow
