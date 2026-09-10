@@ -31,12 +31,22 @@ export interface PolicyRuleConfig {
   priority?: number;
   /** Deny reason / ask explanation, surfaced to the model and the answerer. */
   message?: string;
-  /** Regex(es) matched against the JSON-stringified arguments (any-of). */
-  argsPattern?: string | string[];
+  /**
+   * Regex(es) matched against the JSON-stringified arguments (any-of) — or a
+   * map of argument name → regex(es) matched against that argument's value
+   * (stringified when not a string; AND across keys, any-of within a list).
+   */
+  argsPattern?: string | string[] | Record<string, string | string[]>;
   /** Anchored, word-boundary prefix match on each shell command segment (any-of). */
   commandPrefix?: string | string[];
   /** Regex(es) anchored at each shell command segment's start (any-of). */
   commandRegex?: string | string[];
+}
+
+/** One compiled args condition: a whole-JSON regex set, or one argument key's regex set. */
+interface ArgsCondition {
+  key?: string;
+  res: RegExp[];
 }
 
 export interface CompiledRule {
@@ -44,7 +54,7 @@ export interface CompiledRule {
   decision: PolicyDecisionKind;
   priority: number;
   message?: string;
-  argsRes?: RegExp[];
+  argsConds?: ArgsCondition[];
   commandPrefixes?: string[];
   commandRes?: RegExp[];
 }
@@ -68,6 +78,17 @@ const asArray = (value: string | string[] | undefined): string[] | undefined =>
 /** Anchor at the (already trimmed) segment start, Gemini-style. */
 const anchored = (pattern: string): RegExp => new RegExp(`^(?:${pattern})`);
 
+/** Compile the argsPattern field: string/list → whole-JSON condition; object → per-key conditions. */
+function compileArgsConditions(
+  pattern: PolicyRuleConfig['argsPattern'],
+): ArgsCondition[] | undefined {
+  if (pattern === undefined) return undefined;
+  const compile = (value: string | string[]) =>
+    (Array.isArray(value) ? value : [value]).map((p) => new RegExp(p));
+  if (typeof pattern === 'string' || Array.isArray(pattern)) return [{ res: compile(pattern) }];
+  return Object.entries(pattern).map(([key, value]) => ({ key, res: compile(value) }));
+}
+
 /** Compile config rules for evaluation. Invalid regexes are config errors: they throw here, at plugin load. */
 export function compileRules(configs: PolicyRuleConfig[]): CompiledRule[] {
   return configs.map((rule, index) => {
@@ -78,7 +99,7 @@ export function compileRules(configs: PolicyRuleConfig[]): CompiledRule[] {
         decision: rule.decision,
         priority: rule.priority ?? 0,
         message: rule.message,
-        argsRes: asArray(rule.argsPattern)?.map((pattern) => new RegExp(pattern)),
+        argsConds: compileArgsConditions(rule.argsPattern),
         commandPrefixes: asArray(rule.commandPrefix),
         commandRes: asArray(rule.commandRegex)?.map(anchored),
       };
@@ -97,7 +118,13 @@ export function describeRule(rule: CompiledRule): string {
   const parts = [`tool ${quoted(rule.tools)}`];
   if (rule.commandPrefixes) parts.push(`commandPrefix ${quoted(rule.commandPrefixes)}`);
   if (rule.commandRes) parts.push(`commandRegex ${rule.commandRes.join(' | ')}`);
-  if (rule.argsRes) parts.push(`argsPattern ${rule.argsRes.join(' | ')}`);
+  if (rule.argsConds) {
+    parts.push(
+      `argsPattern ${rule.argsConds
+        .map((cond) => `${cond.key === undefined ? '' : `${cond.key}=`}${cond.res.join(' | ')}`)
+        .join(', ')}`,
+    );
+  }
   return `${parts.join(', ')} (priority ${rule.priority})`;
 }
 
@@ -113,6 +140,19 @@ function extractCommand(args: unknown, keys: string[]): string | undefined {
 
 const anyMatch = <T>(values: T[] | undefined, test: (value: T) => boolean): boolean =>
   values === undefined || values.some(test);
+
+/** Every args condition holds: whole-JSON sets test the serialized args; keyed sets test that argument's (stringified) value. */
+function argsMatch(rule: CompiledRule, args: unknown, argsJson: string): boolean {
+  if (rule.argsConds === undefined) return true;
+  return rule.argsConds.every((cond) => {
+    if (cond.key === undefined) return cond.res.some((re) => re.test(argsJson));
+    if (args === null || typeof args !== 'object' || Array.isArray(args)) return false;
+    const value = (args as Record<string, unknown>)[cond.key];
+    if (value === undefined) return false;
+    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    return cond.res.some((re) => re.test(text));
+  });
+}
 
 function matchesSegment(rule: CompiledRule, segment: string | undefined): boolean {
   const hasCommandCondition = rule.commandPrefixes !== undefined || rule.commandRes !== undefined;
@@ -146,7 +186,7 @@ export function evaluate(
   for (const segment of segments) {
     let winner: CompiledRule | undefined;
     for (const rule of candidates) {
-      if (!anyMatch(rule.argsRes, (re) => re.test(argsJson))) continue;
+      if (!argsMatch(rule, args, argsJson)) continue;
       if (!matchesSegment(rule, segment)) continue;
       winner = winner === undefined ? rule : prefer(winner, rule);
     }

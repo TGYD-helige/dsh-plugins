@@ -45,6 +45,41 @@ describe('evaluate', () => {
     expect(run(rules, 'write_file', { file_path: '/x/a.ts' })).toBeUndefined();
   });
 
+  it('matches the object form against the named argument value, not the whole JSON', () => {
+    const rules: PolicyRuleConfig[] = [
+      { tool: 'write_file', decision: 'deny', argsPattern: { file_path: '(^|/)etc/' } },
+    ];
+    expect(run(rules, 'write_file', { file_path: '/etc/hosts' })?.decision).toBe('deny');
+    // The same text in another field is not a match — key scoping needs no quote escapes.
+    expect(
+      run(rules, 'write_file', { file_path: '/tmp/x', note: 'see /etc/hosts' }),
+    ).toBeUndefined();
+  });
+
+  it('anchors value patterns at the value, not inside JSON syntax', () => {
+    const rules: PolicyRuleConfig[] = [
+      { tool: 'write_file', decision: 'deny', argsPattern: { file_path: '\\.md$' } },
+    ];
+    expect(run(rules, 'write_file', { file_path: '/x/README.md' })?.decision).toBe('deny');
+    expect(run(rules, 'write_file', { file_path: '/x/README.mdx' })).toBeUndefined();
+  });
+
+  it('ANDs object-form keys, any-ofs a list value, and stringifies non-strings', () => {
+    const rules: PolicyRuleConfig[] = [
+      {
+        tool: 'deploy',
+        decision: 'ask',
+        argsPattern: { env: ['prod', 'staging'], retries: '^3$' },
+      },
+    ];
+    expect(run(rules, 'deploy', { env: 'prod', retries: 3 })?.decision).toBe('ask');
+    expect(run(rules, 'deploy', { env: 'staging', retries: 3 })?.decision).toBe('ask');
+    expect(run(rules, 'deploy', { env: 'dev', retries: 3 })).toBeUndefined();
+    expect(run(rules, 'deploy', { env: 'prod', retries: 2 })).toBeUndefined();
+    // A missing key fails the condition.
+    expect(run(rules, 'deploy', { env: 'prod' })).toBeUndefined();
+  });
+
   it('matches commandPrefix per segment with a word boundary', () => {
     const rules: PolicyRuleConfig[] = [{ tool: 'bash', decision: 'deny', commandPrefix: 'npm' }];
     expect(run(rules, 'bash', bash('npm install'))?.decision).toBe('deny');
@@ -168,6 +203,15 @@ describe('describeRule', () => {
     ]);
     expect(describeRule(rule)).toBe(
       'tool "write_file" | "replace", commandPrefix "rm" | "shred" (priority 0)',
+    );
+  });
+
+  it('renders object-form argsPattern with its key', () => {
+    const [rule] = compileRules([
+      { tool: 'write_file', decision: 'deny', argsPattern: { file_path: '\\.md$' } },
+    ]);
+    expect(describeRule(rule)).toBe(
+      'tool "write_file", argsPattern file_path=/\\.md$/ (priority 0)',
     );
   });
 });
