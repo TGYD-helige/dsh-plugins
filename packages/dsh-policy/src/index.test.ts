@@ -200,6 +200,34 @@ describe('dsh-policy plugin', () => {
     expect(next).toHaveBeenCalledTimes(1);
   });
 
+  it('applies the object form of argsPattern through the gate', async () => {
+    apply(ctx, {
+      enabled: true,
+      rules: [
+        {
+          tool: 'write_file',
+          decision: 'ask',
+          argsPattern: { file_path: '(^|/)etc/' },
+          message: 'writes to a system path',
+        },
+      ],
+    });
+    await expect(
+      ctx.waterfall(
+        'tools/pre-execute',
+        execOf('write_file', { file_path: '/etc/hosts' }),
+        downstream,
+      ),
+    ).resolves.toEqual({ kind: 'ask', reason: 'writes to a system path' });
+    const next = vi.fn(downstream);
+    await ctx.waterfall(
+      'tools/pre-execute',
+      execOf('write_file', { file_path: '/tmp/x', note: 'mentions /etc/ inside another field' }),
+      next,
+    );
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
   it('swallows evaluation errors with the [dsh-policy] prefix and delegates', async () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     apply(ctx, geminiLike);

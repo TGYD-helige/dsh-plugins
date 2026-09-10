@@ -41,15 +41,18 @@ The plugin is **disabled by default**. Rules live in the profile's `cordis.patch
         priority: 300
       - tool: write_file
         decision: deny
-        argsPattern: '\.md"'
+        argsPattern:
+          file_path: '\.md$'           # matched against the file_path value directly
         priority: 200
       - tool: write_file               # …except the project contract file
         decision: allow
-        argsPattern: 'PRODUCT\.md'
+        argsPattern:
+          file_path: 'PRODUCT\.md$'
         priority: 300
       - tool: write_file
         decision: ask                  # resolved via ctx.approval (human/answerer chain)
-        argsPattern: '"file_path":"[^"]*/etc/'
+        argsPattern:
+          file_path: '(^|/)etc/'
         message: 'writes to a system path'
 ```
 
@@ -61,7 +64,7 @@ The plugin is **disabled by default**. Rules live in the profile's `cordis.patch
 | `decision` | yes | `allow` runs the call, `deny` blocks it (the `message` reaches the model as the tool error), `ask` defers to dsh's approval seam |
 | `priority` | no (0) | Higher priority wins among rules competing for the same command segment; ties break fail-closed (deny > ask > allow) |
 | `message` | no | Deny reason / ask explanation (a generated default names the matched rule) |
-| `argsPattern` | no | Regex (or list, any-of) matched against the JSON-stringified arguments |
+| `argsPattern` | no | Regex (or list, any-of) matched against the JSON-stringified arguments — or a map of argument name → regex (or list): each key's pattern is matched against that argument's **value** (non-string values are JSON-stringified first), all keys must hold. Prefer the map form for field-targeted rules — no quote escaping, no key-order or cross-field accidents |
 | `commandPrefix` | no | Anchored prefix match (or list, any-of) on each shell command segment, at a word boundary (`npm` matches `npm install`, never `npmx`) |
 | `commandRegex` | no | Regex (or list, any-of) anchored at each shell command segment's start — Gemini-compatible; use `.*` to match mid-segment |
 
@@ -86,7 +89,7 @@ Plugin-level fields: `enabled` (master switch) and `commandKeys` (argument keys 
 | `decision = "allow" / "deny" / "ask_user"` | `decision: allow / deny / ask` |
 | `priority = 300` | `priority: 300` (same direction) |
 | `denyMessage` | `message` |
-| `argsPattern` (regex on the serialized args) | `argsPattern` (JSON.stringify key order, not Gemini's sorted-key form — patterns that span multiple keys may need adjusting) |
+| `argsPattern` (regex on the serialized args) | `argsPattern` — plus a dsh-native object form `{ file_path: '…' }` matching per-argument values (the string form keeps JSON.stringify key order, not Gemini's sorted-key form — patterns spanning multiple keys may need adjusting; the object form has no such issue) |
 | `commandPrefix` / `commandRegex` (single or list) | same names, matched per command segment; `commandRegex` anchors at the segment start, like Gemini's at the command start |
 | `modes = [...]` | no counterpart — use separate dsh profile patch rows |
 | `allowRedirection` | not supported (dsh has no per-call redirection gate) |

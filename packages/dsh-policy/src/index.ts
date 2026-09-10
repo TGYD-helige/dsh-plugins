@@ -62,8 +62,8 @@ export const Config: Schema<PolicyPluginConfig> = Schema.object({
       message: Schema.string().description(
         'deny reason / ask explanation, surfaced to the model and the answerer',
       ),
-      argsPattern: stringOrList.description(
-        'regex(es) matched against the JSON-stringified arguments (any-of)',
+      argsPattern: Schema.union([stringOrList, Schema.dict(stringOrList)]).description(
+        'regex(es) matched against the JSON-stringified arguments (any-of) — or a map of argument name → regex(es) matched against that argument value',
       ),
       commandPrefix: stringOrList.description(
         'anchored word-boundary prefix match on each shell command segment (any-of)',
