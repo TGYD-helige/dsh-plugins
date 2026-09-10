@@ -11,6 +11,7 @@ Composable, config-driven plugins for [DeepSeek Harness (dsh)](https://github.co
 | [`@amaster.ai/dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) **1.0** (JSON-RPC + SSE, with a v0.3 compatibility layer): streaming turns, task cancel, task list, agent card; pluggable task-state stores (memory/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, own HTTP server |
 | [`@amaster.ai/dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
 | [`@amaster.ai/dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call (plus a nested `llm-request` span with the verbatim loop-built request), one span per tool call, one trace per turn; subagent child sessions nested under the parent's tree | `llm/stream` + `tools/execute` waterfalls, `session/event`, `session/created` + `subagent/start`/`subagent/end` |
+| [`@amaster.ai/dsh-policy`](packages/dsh-policy) | Declarative tool-call policy: config-driven `allow`/`deny`/`ask` rules (tool name, args pattern, per-segment shell command prefix/regex, priority) — Gemini CLI-style policy files as plain plugin config | `tools/pre-execute` waterfall (`ask` rides dsh's approval seam) |
 
 ## Plugin previews
 
@@ -58,7 +59,7 @@ dsh --profile my-agent --patch dev.patch.yml
 
 ## Configuration
 
-All three plugins are **disabled by default** and configured through the standard dsh plugin config layer (Schemastery-validated, hot-reloaded). Example profile `cordis.patch.yml` snippet:
+All plugins are **disabled by default** and configured through the standard dsh plugin config layer (Schemastery-validated, hot-reloaded). Example profile `cordis.patch.yml` snippet:
 
 ```yaml
 - insert:
@@ -89,6 +90,19 @@ All three plugins are **disabled by default** and configured through the standar
           url: redis://127.0.0.1:6379
         gcs:
           bucket: my-agent-archives
+    - id: policy
+      name: '@amaster.ai/dsh-policy'
+      config:
+        enabled: true
+        rules:
+          - tool: bash
+            decision: deny
+            commandPrefix: npm
+            priority: 200
+            message: 'npm is not allowed. Use bun instead.'
+          - tool: '*'
+            decision: allow
+            priority: 20
 ```
 
 ## Data model
@@ -119,7 +133,8 @@ dsh ships **no authentication or authorization**. `dsh-a2a` binds `127.0.0.1` by
 packages/
 ├── dsh-a2a/        # A2A protocol server plugin
 ├── dsh-storage/    # session storage mirror plugin (+ prisma schema)
-└── dsh-langfuse/   # Langfuse observability plugin
+├── dsh-langfuse/   # Langfuse observability plugin
+└── dsh-policy/     # declarative tool-call policy plugin
 ```
 
 ## Development
