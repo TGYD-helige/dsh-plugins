@@ -58,11 +58,12 @@ async function setup(config?: PolicyPluginConfig): Promise<Context> {
   const ctx = new Context();
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
-  await ctx.plugin(shellEnv as never);
-  await ctx.plugin(StubShell);
+  await ctx.plugin(shellEnv, undefined);
+  await ctx.plugin(StubShell, undefined);
   // The real model-facing bash tool; background is off so ctx.jobs is never
-  // touched.
-  await ctx.plugin(bashTool as never, { enableRunInBackground: false });
+  // touched. (Direct apply, like the wiring tests — the fiber machinery
+  // contributes nothing here.)
+  bashTool.apply(ctx, { enableRunInBackground: false });
   if (config) apply(ctx, config);
   return ctx;
 }
