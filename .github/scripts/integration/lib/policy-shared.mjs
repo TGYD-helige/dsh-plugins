@@ -24,16 +24,16 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { integrationModel, netEnv, requireEnv, run } from './ci-shared.mjs';
 
-export async function runPolicyScenario({ tag, name, rulesYaml, prompt, expectPresent, prepare }) {
+export async function runPolicyScenario({ tag, name, rulesYaml, prompt, expectPresent, prepare, verify }) {
   try {
-    await scenarioMain({ tag, name, rulesYaml, prompt, expectPresent, prepare });
+    await scenarioMain({ tag, name, rulesYaml, prompt, expectPresent, prepare, verify });
   } catch (error) {
     console.error(`::error::${error.message}`);
     process.exit(1);
   }
 }
 
-async function scenarioMain({ tag, name, rulesYaml, prompt, expectPresent, prepare }) {
+async function scenarioMain({ tag, name, rulesYaml, prompt, expectPresent, prepare, verify }) {
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-policy-${tag}-e2e`);
   mkdirSync(workDir, { recursive: true });
   const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
@@ -80,12 +80,13 @@ ${rulesYaml}
   );
   console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);
 
-  if (prepare) prepare(workDir);
-
   // 3. deepseek-v4-flash through the gateway stochastically garbles or skips
   //    tool calls (observed in CI), so attempts retry until every expected
-  //    signal lands in the answer.
+  //    signal lands. prepare() runs before EVERY attempt and must be
+  //    idempotent — it is also the retry cleanup (e.g. removing side-effect
+  //    files from a previous attempt).
   for (let attempt = 1; attempt <= 3; attempt++) {
+    if (prepare) prepare(workDir);
     console.log(`\n$ dsh --profile headless "${prompt}" (attempt ${attempt})`);
     const query = spawnSync(dsh, ['--profile', 'headless', prompt], {
       cwd: workDir,
@@ -109,11 +110,16 @@ ${rulesYaml}
     if (query.status !== 0) throw new Error(`dsh headless exited ${query.status}`);
     const out = query.stdout ?? '';
     const missing = expectPresent.filter((signal) => !out.includes(signal));
-    if (missing.length === 0) {
+    const problems = [
+      ...missing.map((signal) => `missing signal: ${signal}`),
+      // Ground-truth checks beyond the answer text (e.g. filesystem side effects).
+      ...(verify ? verify(workDir, out) : []),
+    ];
+    if (problems.length === 0) {
       console.log(`\nSCENARIO_OK (${tag}: ${name})`);
       return;
     }
-    console.log(`::warning::attempt ${attempt} missing signals: ${missing.join(' | ')}`);
+    console.log(`::warning::attempt ${attempt} failed: ${problems.join(' | ')}`);
   }
 
   throw new Error(`${tag}: attempts exhausted — the policy gate did not show up in the run`);
