@@ -1,6 +1,7 @@
 import { type Message, Role, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutionEvent } from '@a2a-js/sdk/server';
-import type { TokenUsage, ToolCallId } from '@deepseek-ai/dsh-llm';
+import type { AssistantStreamFrame } from '@deepseek-ai/dsh-agent';
+import type { StreamChunk, TokenUsage, ToolCallId } from '@deepseek-ai/dsh-llm';
 import type { SessionEvent, TurnEndReason } from '@deepseek-ai/dsh-session';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { SessionTranslator, terminalStatusUpdate } from './translator.js';
@@ -17,16 +18,13 @@ function event<T extends SessionEvent['type']>(
   return { type, seq: seq++, time: Date.now(), data } as SessionEvent;
 }
 
+/** One live `agent/assistant-stream` chunk frame (the V3 delta channel) — minimal shape; the translator reads only `type` and `chunk`. */
+const frame = (chunk: StreamChunk): AssistantStreamFrame => ({ type: 'chunk', chunk }) as never;
+
 const turnStart = (turn = 1) => event('turn/start', { turn });
 const turnEnd = (reason: TurnEndReason, turn = 1) => event('turn/end', { turn, reason });
-const textDelta = (text: string) =>
-  event('assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text } });
-const reasoningDelta = (text: string) =>
-  event('assistant/chunk', {
-    turn: 1,
-    step: 1,
-    chunk: { type: 'reasoning-delta', index: 1, text },
-  });
+const textDelta = (text: string) => frame({ type: 'text-delta', index: 0, text });
+const reasoningDelta = (text: string) => frame({ type: 'reasoning-delta', index: 1, text });
 const assistantMessage = (text: string, usage?: TokenUsage) =>
   event('assistant/message', {
     turn: 1,
@@ -62,8 +60,8 @@ describe('SessionTranslator (A2A 1.0 model)', () => {
   it('streams text deltas on one aggregating messageId per turn', () => {
     const t = new SessionTranslator('task1', 'ctx1');
     t.handle(turnStart());
-    const a = updates(t.handle(textDelta('hello ')));
-    const b = updates(t.handle(textDelta('world')));
+    const a = updates(t.handleStreamFrame(textDelta('hello ')));
+    const b = updates(t.handleStreamFrame(textDelta('world')));
     const ma = a[0].status?.message;
     const mb = b[0].status?.message;
     expect(ma?.role).toBe(Role.ROLE_AGENT);
@@ -75,31 +73,27 @@ describe('SessionTranslator (A2A 1.0 model)', () => {
     // next turn rotates the messageId
     t.handle(turnEnd({ kind: 'completed' }));
     t.handle(turnStart(2));
-    const c = updates(t.handle(textDelta('again')));
+    const c = updates(t.handleStreamFrame(textDelta('again')));
     expect(c[0].status?.message?.messageId).not.toBe(ma?.messageId);
   });
 
   it('routes reasoning deltas to a separate thought messageId', () => {
     const t = new SessionTranslator('task1', 'ctx1');
     t.handle(turnStart());
-    const text = updates(t.handle(textDelta('answer')));
-    const thought = updates(t.handle(reasoningDelta('thinking')));
+    const text = updates(t.handleStreamFrame(textDelta('answer')));
+    const thought = updates(t.handleStreamFrame(reasoningDelta('thinking')));
     expect(thought[0].metadata?.dshAgent).toEqual({ kind: 'thought' });
     expect(thought[0].status?.message?.messageId).not.toBe(text[0].status?.message?.messageId);
   });
 
-  it('ignores non-visible chunk types and log-only events', () => {
+  it('ignores non-visible chunk types, frame brackets, and log-only events', () => {
     const t = new SessionTranslator('task1', 'ctx1');
     t.handle(turnStart());
     expect(
-      t.handle(
-        event('assistant/chunk', {
-          turn: 1,
-          step: 1,
-          chunk: { type: 'block-start', index: 0, blockType: 'text' },
-        }),
-      ),
+      t.handleStreamFrame(frame({ type: 'block-start', index: 0, blockType: 'text' })),
     ).toEqual([]);
+    // start/end brackets share the same `type !== 'chunk'` guard — one covers both.
+    expect(t.handleStreamFrame({ type: 'start' } as never)).toEqual([]);
     expect(t.handle(event('step/start', { turn: 1, step: 1 }))).toEqual([]);
     expect(t.handle(event('session/end-seed', {}))).toEqual([]);
   });
@@ -190,7 +184,7 @@ describe('SessionTranslator (A2A 1.0 model)', () => {
   it('ends a completed turn input-required (continuable) with the assembled text and usage', () => {
     const t = new SessionTranslator('task1', 'ctx1');
     t.handle(turnStart());
-    t.handle(textDelta('partial '));
+    t.handleStreamFrame(textDelta('partial '));
     t.handle(assistantMessage('partial answer', { inputTokens: 10, outputTokens: 5 }));
     t.handle(
       assistantMessage(' and more', { inputTokens: 4, outputTokens: 2, reasoningTokens: 7 }),
@@ -212,8 +206,8 @@ describe('SessionTranslator (A2A 1.0 model)', () => {
   it('falls back to accumulated deltas when no assistant/message was recorded', () => {
     const t = new SessionTranslator('task1', 'ctx1');
     t.handle(turnStart());
-    t.handle(textDelta('streamed '));
-    t.handle(textDelta('only'));
+    t.handleStreamFrame(textDelta('streamed '));
+    t.handleStreamFrame(textDelta('only'));
     const final = updates(t.handle(turnEnd({ kind: 'completed' })));
     expect(textPartOf(final[0].status?.message)).toBe('streamed only');
   });

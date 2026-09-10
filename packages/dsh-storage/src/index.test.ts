@@ -62,6 +62,18 @@ const assistantEvent = (text: string, usage?: unknown, id = 'a1', time?: number)
     time,
   );
 
+/** V3 failed/cancelled attempt: the adapter's usage survives as a raw record in the embedded compact stream. */
+const attemptWithUsage = (turn: number, step: number, usage: unknown, time?: number) =>
+  ev(
+    'assistant/attempt',
+    {
+      turn,
+      step,
+      stream: [{ type: 'chunk', time: 1700000000000, chunk: { type: 'usage', usage } }],
+    },
+    time,
+  );
+
 describe('dsh-storage plugin', () => {
   let ctx: Context;
 
@@ -149,7 +161,7 @@ describe('dsh-storage plugin', () => {
     ctx.events.emit(
       'session/event',
       session,
-      ev('assistant/chunk', { turn: 0, step: 0, chunk: {} }),
+      ev('assistant/attempt', { turn: 0, step: 0, stream: [] }),
     );
     await flush();
     expect(backend.upsertMessage).not.toHaveBeenCalled();
@@ -359,31 +371,24 @@ describe('dsh-storage plugin', () => {
     errorSpy.mockRestore();
   });
 
-  it('accounts usage per step with replacement across chunks and messages', async () => {
+  it('accounts usage per step with replacement across attempts and messages', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
     const session = { id: 's1' };
 
-    // Failed step: usage arrives only as a chunk, no assistant/message.
+    // Failed step: usage arrives only in the committed attempt's embedded
+    // stream; no assistant/message exists for it.
     ctx.events.emit(
       'session/event',
       session,
-      ev('assistant/chunk', {
-        turn: 0,
-        step: 0,
-        chunk: { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
-      }),
+      attemptWithUsage(0, 0, { inputTokens: 10, outputTokens: 5 }),
     );
-    // Retry at the next step: a progressive chunk sample, then the final
-    // message of the SAME step — the message replaces the chunk's sample.
+    // Retry at the next step: a failed attempt's sample, then the settled
+    // message of the SAME step — the message replaces the attempt's sample.
     ctx.events.emit(
       'session/event',
       session,
-      ev('assistant/chunk', {
-        turn: 0,
-        step: 1,
-        chunk: { type: 'usage', usage: { inputTokens: 20, outputTokens: 0 } },
-      }),
+      attemptWithUsage(0, 1, { inputTokens: 20, outputTokens: 0 }),
     );
     ctx.events.emit(
       'session/event',
@@ -409,34 +414,27 @@ describe('dsh-storage plugin', () => {
     const lastSession = backend.upsertSession.mock.calls.at(-1)?.[0];
     expect(lastSession).toMatchObject({
       messageCount: 1,
-      // step 0: 10+5 (failed, chunk only); step 1: chunk 20+0 replaced by
+      // step 0: 10+5 (failed attempt only); step 1: attempt 20+0 replaced by
       // message 20+7 → 27. Total = 15 + 27 = 42.
       totalTokens: 42,
     });
   });
 
-  it('replaces progressive usage samples of one step instead of adding them', async () => {
+  it('replaces an earlier attempt’s usage sample within one step instead of adding', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
     const session = { id: 's1' };
 
+    // Two attempts at the same step (retry): the later sample wins.
     ctx.events.emit(
       'session/event',
       session,
-      ev('assistant/chunk', {
-        turn: 0,
-        step: 0,
-        chunk: { type: 'usage', usage: { inputTokens: 10, outputTokens: 0 } },
-      }),
+      attemptWithUsage(0, 0, { inputTokens: 10, outputTokens: 0 }),
     );
     ctx.events.emit(
       'session/event',
       session,
-      ev('assistant/chunk', {
-        turn: 0,
-        step: 0,
-        chunk: { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
-      }),
+      attemptWithUsage(0, 0, { inputTokens: 10, outputTokens: 5 }),
     );
     await flush();
 

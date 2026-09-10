@@ -14,7 +14,7 @@
  * no answerer is composed). A call no rule matches is delegated onward via
  * `next()` — the plugin only ever speaks for the calls its rules cover.
  *
- * Gate shape verified against @deepseek-ai/dsh-tools@0.1.2-rc.1
+ * Gate shape verified against @deepseek-ai/dsh-tools@0.1.5-rc.1
  * (lib/types/index.d.ts: tools/pre-execute + PreToolDecision).
  *
  * @module dsh-policy

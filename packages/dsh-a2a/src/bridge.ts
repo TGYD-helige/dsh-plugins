@@ -4,8 +4,10 @@
  * One A2A task maps to one dsh session/agent; the A2A `contextId` IS the dsh
  * sessionId. The bridge owns every agent it creates (the consumer-handle
  * pattern dsh's own ACP bridge uses) and routes the durable `session/event`
- * stream through a per-task {@link SessionTranslator} onto the executing
- * request's {@link ExecutionEventBus}.
+ * stream plus the live `agent/assistant-stream` frames (the V3 session log no
+ * longer carries incremental chunks) through a per-task
+ * {@link SessionTranslator} onto the executing request's
+ * {@link ExecutionEventBus}.
  *
  * Turn settlement: `agent.followup()` is fire-and-forget, so callers await a
  * FIFO waiter resolved by the session's next `turn/end` event (dsh's inbox
@@ -16,7 +18,12 @@
 
 import type { ExecutionEventBus } from '@a2a-js/sdk/server';
 import type { Context } from '@deepseek-ai/cordis';
-import type { AgentHandle, ModelSelection } from '@deepseek-ai/dsh-agent';
+import type {
+  Agent,
+  AgentHandle,
+  AssistantStreamFrame,
+  ModelSelection,
+} from '@deepseek-ai/dsh-agent';
 // installModelSelection is a root-module runtime import: the dsh-agent index
 // pulls workspace-internal packages (dsh-scope) that are absent from the
 // plugin's dev install, so unit tests vi.mock this module.
@@ -71,6 +78,7 @@ export class A2aBridge {
   ) {
     ctx.on('session/event', (session, event) => this.onSessionEvent(session, event));
     ctx.on('session/disposed', (session) => this.onSessionDisposed(session));
+    ctx.on('agent/assistant-stream', ({ agent, frame }) => this.onAssistantStream(agent, frame));
   }
 
   /**
@@ -127,7 +135,7 @@ export class A2aBridge {
       // the agent's installed model selection (dsh-agent-loop's variables read
       // agent.options; the scoped waterfalls wire provider/model into prompt
       // assembly and the request config). Verified against
-      // @deepseek-ai/dsh-headless@0.1.2-rc.1's run() — entry points are
+      // @deepseek-ai/dsh-headless@0.1.5-rc.1's run() — entry points are
       // expected to resolve the deployment default themselves.
       setup:
         selection || agentPreset
@@ -241,6 +249,20 @@ export class A2aBridge {
     if (event.type === 'turn/end') {
       entry.turnActive = false;
       entry.settled.shift()?.();
+    }
+  }
+
+  /**
+   * Live assistant deltas (V3: the durable log only commits settled
+   * `assistant/message` events). Same no-throw seam as the session feed.
+   */
+  private onAssistantStream(agent: Agent, frame: AssistantStreamFrame): void {
+    const entry = this.bySession.get(agent.session.id as string);
+    if (!entry) return;
+    try {
+      for (const out of entry.translator.handleStreamFrame(frame)) entry.bus?.publish(out);
+    } catch (error) {
+      console.error('[dsh-a2a] failed to translate assistant stream frame:', error);
     }
   }
 
