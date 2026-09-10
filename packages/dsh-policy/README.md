@@ -1,5 +1,7 @@
 # @amaster.ai/dsh-policy
 
+![dsh-policy preview](preview.png)
+
 Declarative tool-call policy for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness): config-driven `allow` / `deny` / `ask` rules on dsh's `tools/pre-execute` gate — the semantics of Gemini CLI's TOML policy files, expressed as plain plugin config (Schemastery-validated YAML, no code, no rule files).
 
 ## Install
