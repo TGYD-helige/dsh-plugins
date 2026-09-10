@@ -23,7 +23,10 @@ await runPolicyScenario({
         priority: 20
       - tool: bash
         decision: deny
-        commandPrefix: touch ci-blocked
+        # The prefix is word-boundary anchored, so it must name the full
+        # filename — 'touch ci-blocked' would NOT match 'touch ci-blocked.txt'
+        # ('.' is not a boundary).
+        commandPrefix: touch ci-blocked.txt
         priority: 200
         message: '${DENY_MESSAGE}'`,
   prompt:
