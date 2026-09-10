@@ -81,7 +81,7 @@ Plugin-level fields: `enabled` (master switch) and `commandKeys` (argument keys 
 
 Everything registered in `ctx.tools` passes `tools/pre-execute` — the gate is tool-agnostic and needs no per-tool support:
 
-- **Official tools** (verified against the 0.1.2-rc.1 sources): `bash`, `pwsh`, `read`, `write`, `edit`, `read_image`, `web_search`, `web_fetch`, `list_subagent_models` and the delegation tool, `run_code`, plus goal/skill/workflow/cordis tools. Match them by `tool` + `argsPattern` (the object form fits their argument shapes: `file_path` for `write`/`edit`, `url` for `web_fetch`, `query` for `web_search`, …).
+- **Official tools** (verified against the 0.1.5-rc.1 sources): `bash`, `pwsh`, `read`, `write`, `edit`, `read_image`, `web_search`, `web_fetch`, `list_subagent_models` and the delegation tool, `run_code`, plus goal/skill/workflow/cordis tools. Match them by `tool` + `argsPattern` (the object form fits their argument shapes: `file_path` for `write`/`edit`, `url` for `web_fetch`, `query` for `web_search`, …).
 - **`commandPrefix`/`commandRegex`** apply to tools whose arguments carry a shell command string — `bash` and `pwsh` both use `command` (covered by the default `commandKeys`).
 - **PTC mode**: `run_code` sub-dispatches re-enter the scheduler's `prepare` stage, which runs the same pre-execute gate — rules apply per sub-call, not just per `run_code`.
 - **MCP tools** bridged by `dsh-mcp-client` register into the same `ctx.tools` pipeline — match them by their registered names like any other tool.
