@@ -39,17 +39,17 @@ The plugin is **disabled by default**. Rules live in the profile's `cordis.patch
         decision: allow
         commandPrefix: grep
         priority: 300
-      - tool: write_file
+      - tool: write
         decision: deny
         argsPattern:
           file_path: '\.md$'           # matched against the file_path value directly
         priority: 200
-      - tool: write_file               # …except the project contract file
+      - tool: write                    # …except the project contract file
         decision: allow
         argsPattern:
           file_path: 'PRODUCT\.md$'
         priority: 300
-      - tool: write_file
+      - tool: write
         decision: ask                  # resolved via ctx.approval (human/answerer chain)
         argsPattern:
           file_path: '(^|/)etc/'
@@ -76,6 +76,15 @@ Plugin-level fields: `enabled` (master switch) and `commandKeys` (argument keys 
 - **Shell commands are checked segment by segment.** Compound commands (`a && b | c`, newlines, background `&`) are split, quote-aware, and `$( )` / backtick substitutions are extracted as their own segments — `cd /tmp && npm install` and `echo "$(npm install)"` both hit the `npm` rule.
 - **Priority resolves competition within one segment**; across segments the aggregation is conservative: any segment's `deny` denies the whole call, then any `ask` escalates, and `allow` requires every segment decided allow. A broad deny is still overridable by a specific allow because both compete on the same segment (`bun run lint` at 300 vs `bun run` at 200).
 - **No rule matches → the call passes through** to the rest of the `tools/pre-execute` chain (`next()`), so dsh's own gates and other plugins keep their say. Invalid regexes are config errors and fail the plugin load; a runtime evaluation failure is logged with the `[dsh-policy]` prefix and delegates onward — the gate never breaks the agent loop.
+
+### What the gate covers
+
+Everything registered in `ctx.tools` passes `tools/pre-execute` — the gate is tool-agnostic and needs no per-tool support:
+
+- **Official tools** (verified against the 0.1.2-rc.1 sources): `bash`, `pwsh`, `read`, `write`, `edit`, `read_image`, `web_search`, `web_fetch`, `list_subagent_models` and the delegation tool, `run_code`, plus goal/skill/workflow/cordis tools. Match them by `tool` + `argsPattern` (the object form fits their argument shapes: `file_path` for `write`/`edit`, `url` for `web_fetch`, `query` for `web_search`, …).
+- **`commandPrefix`/`commandRegex`** apply to tools whose arguments carry a shell command string — `bash` and `pwsh` both use `command` (covered by the default `commandKeys`).
+- **PTC mode**: `run_code` sub-dispatches re-enter the scheduler's `prepare` stage, which runs the same pre-execute gate — rules apply per sub-call, not just per `run_code`.
+- **MCP tools** bridged by `dsh-mcp-client` register into the same `ctx.tools` pipeline — match them by their registered names like any other tool.
 
 ### The `ask` decision
 
