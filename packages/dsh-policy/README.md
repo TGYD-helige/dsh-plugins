@@ -74,7 +74,7 @@ Plugin-level fields: `enabled` (master switch) and `commandKeys` (argument keys 
 
 ### The `ask` decision
 
-`ask` is resolved by dsh itself: through the composed answerers of `@deepseek-ai/dsh-user-approval` (a UI prompt, an auto-answerer, …), failing closed to deny when no approval service is composed, and short-circuiting to reject under a session's `approval/policy: never`. Gemini's `modes` (`default`/`autoEdit`/`yolo`/`plan`) have no dsh counterpart — dsh models that axis as the per-session approval policy (see `dsh-permission-presets` for the user-facing selector), and dsh profiles/`cordis.patch.yml` already scope config per deployment, so the plugin carries no mode axis of its own.
+`ask` is resolved by dsh itself: through the composed answerers of `@deepseek-ai/dsh-user-approval` (a UI prompt, an auto-answerer, …), failing closed to deny when no approval service is composed, and short-circuiting to reject under a session's `approval/policy: never`. The model-facing deny reason is the rule's `message` only when no approval service exists at all; a `rejected`/`cancelled`/`unavailable` outcome carries dsh-tools' own reason wording (verified against `dsh-tools@0.1.2-rc.1`). Gemini's `modes` (`default`/`autoEdit`/`yolo`/`plan`) have no dsh counterpart — dsh models that axis as the per-session approval policy (see `dsh-permission-presets` for the user-facing selector), and dsh profiles/`cordis.patch.yml` already scope config per deployment, so the plugin carries no mode axis of its own.
 
 ## Gemini CLI policy mapping
 
