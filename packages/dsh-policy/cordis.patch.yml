@@ -1,0 +1,5 @@
+# Inserts the dsh-policy plugin row; plugin config is the Config schema in
+# src/index.ts (overridable in the profile's own cordis.patch.yml).
+- insert:
+    - id: policy
+      name: '@amaster.ai/dsh-policy'
