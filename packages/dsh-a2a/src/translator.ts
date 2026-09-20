@@ -5,11 +5,11 @@
  * deliberately free of cordis/HTTP concerns so the mapping is unit-testable
  * without a harness. The mapping ports the source project's
  * `packages/a2a-server/src/agent/task.ts` event switch onto dsh's
- * `SessionEventMap` (verified against @deepseek-ai/dsh-session@0.1.5-rc.1),
+ * `SessionEventMap` (verified against @deepseek-ai/dsh-session@0.1.6-alpha.2),
  * emitting the A2A 1.0 data model (@a2a-js/sdk 1.1.0). As of the V3 session
  * format the durable log carries no incremental chunks — live text/reasoning
  * deltas arrive as `agent/assistant-stream` chunk frames
- * (@deepseek-ai/dsh-agent@0.1.5-rc.1) through {@link handleStreamFrame}:
+ * (@deepseek-ai/dsh-agent@0.1.6-alpha.2) through {@link handleStreamFrame}:
  *
  *   turn/start                         → statusUpdate(WORKING), ids rotate
  *   stream chunk (text-delta)          → statusUpdate(WORKING, text part),

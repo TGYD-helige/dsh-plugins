@@ -7,7 +7,7 @@
  * The asserted signal is dsh-tools' rejection wording rather than the rule's
  * `message`: the `rejected` outcome maps to a fixed reason and only the
  * no-approval-service-at-all path surfaces `ask.reason` (verified against
- * dsh-tools@0.1.5-rc.1 lib/index.js serviceAsk). Since this leg's only
+ * dsh-tools@0.1.6-alpha.2 lib/index.js serviceAsk). Since this leg's only
  * non-allow rule is the ask on npm, the rejection string can only come from
  * the policy gate. See lib/policy-shared.mjs for the machinery and env
  * contract.

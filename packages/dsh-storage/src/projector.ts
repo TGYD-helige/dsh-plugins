@@ -133,7 +133,7 @@ export interface UsageSample {
  * Extract the usage sample carried by one event, keyed by its step, or null
  * when the event carries none.
  *
- * V3 session log (dsh-session@0.1.5-rc.1):
+ * V3 session log (dsh-session@0.1.6-alpha.2):
  * - `assistant/message.data.usage` — the settled step's final accounting;
  * - `assistant/attempt` — a failed/retried/cancelled step commits no surface
  *   message; the adapter's usage chunk survives as a raw `chunk` record in the
