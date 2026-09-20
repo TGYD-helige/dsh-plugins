@@ -19,6 +19,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis';
+import type {} from '@deepseek-ai/dsh-session';
 import Schema from '@deepseek-ai/schemastery';
 import { DatabaseBackend, type DatabaseProvider } from './backends/database.js';
 import { projectEvent, usageSampleOf } from './projector.js';
@@ -84,11 +85,11 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   // Lifecycle: this cordis fork has no 'ready'/'dispose' events — startup
   // work goes in ctx.effect() (runs immediately at plugin load; the returned
   // disposer runs on fiber unload at shutdown). Event taps verified against
-  // @deepseek-ai/dsh-session@0.1.5-rc.1: session/event(session, event),
+  // @deepseek-ai/dsh-session@0.1.6-alpha.2: session/event(session, event),
   // session/disposed(session), and the awaited session/flush(session)
-  // durability checkpoint. The cast stays because the dsh-session types that
-  // declare these event names are not installed.
-  const on = ctx.on.bind(ctx) as (name: string, handler: (...args: any[]) => unknown) => void;
+  // durability checkpoint. The type-only import above registers the event
+  // names; handler params stay `any` because storage also mirrors
+  // plugin-owned event types (e.g. session/title) it does not depend on.
   if (!config.enabled || !config.database.enabled || !config.database.url) return;
 
   const backends: StorageBackend[] = [
@@ -188,7 +189,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   });
 
   /* eslint-disable @typescript-eslint/no-explicit-any */
-  on('session/event', (session: any, event: any) => {
+  ctx.on('session/event', (session: any, event: any) => {
     const sessionId: string = session?.id ?? 'unknown';
     enqueue(sessionId, async () => {
       let accum = sessions.get(sessionId);
@@ -225,7 +226,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
       }
 
       // Latest-wins title snapshot (log-only `session/title` event; payload
-      // { title, messageSeqs, source } verified against dsh-session-title@0.1.5-rc.1).
+      // { title, messageSeqs, source } verified against dsh-session-title@0.1.6-alpha.2).
       if (event?.type === 'session/title' && typeof event.data?.title === 'string') {
         accum.title = event.data.title;
       }
@@ -256,7 +257,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     });
   });
 
-  on('session/disposed', (session: any) => {
+  ctx.on('session/disposed', (session: any) => {
     const sessionId: string = session?.id ?? 'unknown';
     // The delete must run inside the session's chain — a synchronous delete
     // here races the queued event tasks (the map may not even have the entry
@@ -276,7 +277,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   });
 
   // Durability checkpoint: the store awaits every session/flush listener.
-  on('session/flush', async () => {
+  ctx.on('session/flush', async () => {
     await Promise.all([...pending]);
   });
 }

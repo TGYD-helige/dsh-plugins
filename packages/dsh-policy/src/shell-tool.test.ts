@@ -49,7 +49,7 @@ class StubShell extends ShellExecutor {
     };
   }
 
-  start(_spec: ShellExecSpec): ShellProcess {
+  async start(_spec: ShellExecSpec): Promise<ShellProcess> {
     throw new Error('background execution is not supported in tests');
   }
 }

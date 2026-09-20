@@ -23,7 +23,7 @@
  *   `subagent/descriptor` event).
  *
  * Event/waterfall shapes verified against the installed
- * @deepseek-ai/dsh-{llm,session,tools,agent,subagent}@0.1.5-rc.1 package sources
+ * @deepseek-ai/dsh-{llm,session,tools,agent,subagent}@0.1.6-alpha.2 package sources
  * (types for shapes; `lib/*.js` for the session/created ordering claim).
  *
  * @module dsh-langfuse
@@ -244,7 +244,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   // ------------------------------------------------------------------
   // Subagent child sessions: session/created precedes both subagent/start
   // and the child's first generation, and the durable header already links
-  // child → parent (verified against dsh-subagent@0.1.5-rc.1).
+  // child → parent (verified against dsh-subagent@0.1.6-alpha.2).
   // ------------------------------------------------------------------
   ctx.on('session/created', (session) => {
     const parentSessionId: string | undefined = session.header.parentSession;

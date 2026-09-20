@@ -32,9 +32,9 @@ This is an early dsh-preview ecosystem. The plugin shapes, config schemas, and s
 
 | @amaster.ai/dsh-* | dsh | cordis | @a2a-js/sdk (dsh-a2a) |
 | --- | --- | --- | --- |
-| 0.1.x | `0.1.5-rc.1` (source) / `0.1.5-rc.1` (npm) | `^4.0.1` | `^1.1.0` (A2A 1.0 + v0.3 compat) |
+| 0.1.x | `>=0.1.5-rc.1` (peer floor) / `0.1.6-alpha.2` (tested) | `^4.0.1` | `^1.1.0` (A2A 1.0 + v0.3 compat) |
 
-dsh is in developer preview and **will** break compatibility between releases. Every release of these plugins pins a tested dsh version in this matrix; upgrade deliberately.
+dsh is in developer preview and **will** break compatibility between releases. Plugins declare the oldest compatible dsh version as a fixed peer floor and every release records the tested dsh version in this matrix; the floor moves only when a plugin starts requiring a newer dsh API. Installs ride `dsh plugin add`, which is pnpm-only — pnpm's peer matching has no prerelease gate, so any newer dsh (alpha or stable) satisfies the floor without warnings.
 
 ## Install
 
