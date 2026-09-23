@@ -5,7 +5,7 @@
 //   - `type` values come from the dsh session event map
 //     ('user' | 'model' | 'tool' | ...) instead of gemini-cli message roles.
 //   - `agent_id` distinguishes the main agent from subagent writers.
-//   - create_by carries the request owner's platform user ID.
+//   - no user_id: tenancy is carried by session_id, not a column.
 //
 // The client is pre-generated at package build time (`pnpm generate`, output
 // src/generated/mysql, compiled into lib/generated) — consumers do NOT run
@@ -28,7 +28,6 @@ datasource db {
 model AiMessage {
   id            String    @id @default(cuid()) @db.Char(36)
   sessionId     String    @map("session_id") @db.VarChar(100)
-  createBy      String    @map("create_by") @db.VarChar(100)
   historyId     String?   @map("history_id") @db.Char(36)
   type          String    @db.VarChar(50)
   content       String    @db.LongText
@@ -58,7 +57,6 @@ model AiMessage {
 model AiChatHistory {
   id             String    @id @default(cuid()) @db.Char(36)
   sessionId      String    @map("session_id") @db.VarChar(100)
-  createBy       String    @map("create_by") @db.VarChar(100)
   title          String?   @db.VarChar(255)
   summary        String?   @db.Text
   messageCount   Int       @default(0) @map("message_count")

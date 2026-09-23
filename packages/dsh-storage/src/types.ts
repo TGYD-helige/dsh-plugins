@@ -10,7 +10,6 @@
 export interface MessageRow {
   id: string;
   sessionId: string;
-  createBy: string;
   historyId: string | null;
   /** 'user' | 'model' | 'tool' | 'utility_compressor' | plugin-defined */
   type: string;
@@ -27,7 +26,6 @@ export interface MessageRow {
 /** One row in `ai_chat_histories` — a per-session rollup. */
 export interface SessionRow {
   sessionId: string;
-  createBy: string;
   title?: string | null;
   messageCount: number;
   totalTokens: number;

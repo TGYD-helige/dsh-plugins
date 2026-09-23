@@ -66,8 +66,6 @@ describe('dsh-a2a plugin', () => {
   });
 
   it('clears a stored context after its live bridge binding is gone', async () => {
-    const setIdentity = vi.fn();
-    ctx.provide('storageIdentity', { set: setIdentity });
     let session: { id: string };
     ctx.provide('agents', {
       create: async ({ sessionId }: { sessionId: string }) => {
@@ -107,9 +105,6 @@ describe('dsh-a2a plugin', () => {
         headers: {
           'content-type': 'application/json',
           'A2A-Version': '1.0',
-          'x-platform-user-id': 'platform',
-          'x-app-user-id': 'app',
-          'x-app-user-uid': 'wrong',
         },
         body: JSON.stringify({
           jsonrpc: '2.0',
@@ -123,7 +118,6 @@ describe('dsh-a2a plugin', () => {
       })
     ).json()) as any;
     const task = sent.result.task;
-    expect(setIdentity).toHaveBeenCalledWith(task.contextId, 'platform');
     ctx.emit('session/disposed', session! as never);
     const service = ctx.get('a2aTasks') as { clearContext(id: string): Promise<string[]> };
     expect(await service.clearContext(task.contextId)).toEqual([task.id]);
@@ -140,27 +134,5 @@ describe('dsh-a2a plugin', () => {
       })
     ).json()) as any;
     expect(got.error).toBeDefined();
-
-    const fallback = (await (
-      await fetch(base, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'A2A-Version': '1.0',
-          'x-app-user-id': 'app',
-          'x-app-user-uid': 'wrong',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 3,
-          method: 'SendMessage',
-          params: {
-            tenant: '',
-            message: { messageId: 'm2', role: 'ROLE_USER', parts: [{ text: 'again' }] },
-          },
-        }),
-      })
-    ).json()) as any;
-    expect(setIdentity).toHaveBeenCalledWith(fallback.result.task.contextId, 'app');
   });
 });

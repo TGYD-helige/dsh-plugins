@@ -55,16 +55,10 @@ function toolPartsOf(message: any): unknown[] | undefined {
  * that should not be persisted as standalone rows (log-only events: chunks,
  * turn/step lifecycle, approvals, ...).
  */
-export function projectEvent(
-  _session: any,
-  event: any,
-  sessionId: string,
-  createBy = '0',
-): MessageRow | null {
+export function projectEvent(_session: any, event: any, sessionId: string): MessageRow | null {
   const data = event?.data ?? {};
   const base = {
     sessionId,
-    createBy,
     historyId: null,
     agentId: 'main',
     createdAt: new Date(event?.time ?? Date.now()),

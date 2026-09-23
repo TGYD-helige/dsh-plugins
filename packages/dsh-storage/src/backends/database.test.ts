@@ -44,7 +44,6 @@ const baseConfig = { provider: 'sqlite', url } as const;
 const messageRow: MessageRow = {
   id: 'm1',
   sessionId: 's1',
-  createBy: 'platform-user',
   historyId: null,
   type: 'user',
   content: 'hello',
@@ -54,7 +53,6 @@ const messageRow: MessageRow = {
 
 const sessionRow: SessionRow = {
   sessionId: 's1',
-  createBy: 'platform-user',
   messageCount: 3,
   totalTokens: 42,
   firstMessageAt: new Date(1700000000000),
@@ -255,7 +253,6 @@ describe('DatabaseBackend', () => {
     });
     expect(row).toEqual({
       sessionId: 's1',
-      createBy: '0',
       title: 'old',
       messageCount: 50,
       totalTokens: 1000,

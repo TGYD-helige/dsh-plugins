@@ -75,8 +75,6 @@ A2A **task state** (status + metadata) is separate from conversation history —
 
 dsh ships **no authentication or authorization**. The server binds `127.0.0.1` by default; if you expose it, put an authenticated reverse proxy in front and treat every agent as running with the host process's OS privileges. File parts carrying a `url` are fetched server-side (http/https only, bounded) — another reason to keep the endpoint off untrusted networks.
 
-`create_by` uses `x-platform-user-id`, falling back to `x-app-user-id`. These headers are not verified by dsh-a2a; a trusted gateway must remove client-supplied copies and set them from its authenticated identity before forwarding requests.
-
 ## Compatibility
 
 Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment}@0.1.6-alpha.2` — the attachment store is an optional peer) — check the `TODO(verify)` markers in `src/` before upgrading dsh.

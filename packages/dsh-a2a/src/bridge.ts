@@ -215,15 +215,6 @@ export class A2aBridge {
     return buildMessageContent(message.parts, attachments, uploadsDir(this.options.uploadsDir));
   }
 
-  /** Forward the upstream-supplied owner to the optional storage mirror. */
-  setIdentity(contextId: string, createBy: string | undefined): void {
-    if (!createBy) return;
-    (this.ctx.get('storageIdentity') as { set(id: string, user: string): void } | undefined)?.set(
-      contextId,
-      createBy,
-    );
-  }
-
   isClearing(contextId: string): boolean {
     return this.clearing.has(contextId);
   }

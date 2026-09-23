@@ -49,7 +49,6 @@ export interface StoragePluginConfig {
 
 /** Per-session live rollup used to maintain the session row. */
 interface SessionAccum {
-  createBy: string;
   messageCount: number;
   totalTokens: number;
   title?: string;
@@ -101,17 +100,6 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   ];
 
   const sessions = new Map<string, SessionAccum>();
-  const identities = new Map<string, string>();
-  // The gateway/A2A request path supplies the authenticated platform user ID
-  // before the first turn. Absent identity is the legacy local user '0'.
-  ctx.provide('storageIdentity', {
-    set(sessionId: string, createBy: string) {
-      if (!sessionId || !createBy) return;
-      identities.set(sessionId, createBy);
-      const accum = sessions.get(sessionId);
-      if (accum && accum.createBy === '0') accum.createBy = createBy;
-    },
-  });
 
   // Row writes are fire-and-forget during the run, but tracked so the
   // session/flush checkpoint and shutdown can drain them — a one-shot
@@ -172,7 +160,6 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
         const row = await backend.readSession?.(sessionId);
         if (row) {
           return {
-            createBy: row.createBy === '0' ? (identities.get(sessionId) ?? '0') : row.createBy,
             messageCount: row.messageCount,
             totalTokens: row.totalTokens,
             title: row.title ?? undefined,
@@ -189,20 +176,14 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
       }
     }
     if (readFailure) throw readFailure;
-    return {
-      createBy: identities.get(sessionId) ?? '0',
-      messageCount: 0,
-      totalTokens: 0,
-      metadata: {},
-    };
+    return { messageCount: 0, totalTokens: 0, metadata: {} };
   }
 
   ctx.effect(() => {
     started = track(guard(async (backend) => backend.init?.()));
     return async () => {
-      await Promise.all([...pending]);
       sessions.clear();
-      identities.clear();
+      await Promise.all([...pending]);
       await guard(async (backend) => backend.close?.());
     };
   });
@@ -217,7 +198,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
         sessions.set(sessionId, accum);
       }
 
-      const row: MessageRow | null = projectEvent(session, event, sessionId, accum.createBy);
+      const row: MessageRow | null = projectEvent(session, event, sessionId);
       if (row) {
         accum.messageCount += 1;
         accum.firstMessageAt ??= row.createdAt;
@@ -264,7 +245,6 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
         };
         const sessionRow: SessionRow = {
           sessionId,
-          createBy: accum.createBy,
           title: accum.title ?? null,
           messageCount: accum.messageCount,
           totalTokens: accum.totalTokens,
@@ -285,7 +265,6 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     // the dispose was meant to drop).
     enqueue(sessionId, async () => {
       sessions.delete(sessionId);
-      identities.delete(sessionId);
     });
     // Delete the chain entry only once it has settled AND is still the same
     // entry — deleting earlier would let a recreated session race the

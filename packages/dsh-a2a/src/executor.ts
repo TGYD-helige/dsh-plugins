@@ -22,7 +22,6 @@ import { type Message, type Task, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutor, ExecutionEventBus, RequestContext } from '@a2a-js/sdk/server';
 import { AgentEvent } from '@a2a-js/sdk/server';
 import type { A2aBridge } from './bridge.js';
-import { requestIdentity } from './request-identity.js';
 import { agentTextMessage, terminalStatusUpdate } from './translator.js';
 
 export class DshAgentExecutor implements AgentExecutor {
@@ -47,7 +46,6 @@ export class DshAgentExecutor implements AgentExecutor {
     const { userMessage, taskId, contextId } = requestContext;
     let anchored = false;
     try {
-      this.bridge.setIdentity(contextId, requestIdentity.getStore());
       const content = await this.bridge.buildContent(userMessage);
       const { entry, freshTask } = await this.bridge.ensureTask(taskId, contextId);
       eventBus.publish(

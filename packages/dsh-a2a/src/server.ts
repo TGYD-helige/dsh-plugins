@@ -30,7 +30,6 @@ import {
 } from '@a2a-js/sdk/server';
 import { agentCardHandler, jsonRpcHandler, UserBuilder } from '@a2a-js/sdk/server/express';
 import express, { type RequestHandler } from 'express';
-import { requestIdentity } from './request-identity.js';
 
 export interface A2aServerOptions {
   host: string;
@@ -93,10 +92,6 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
   const requestHandler = new DefaultRequestHandler(card, options.taskStore, options.executor);
 
   const app = express();
-  app.use((req, _res, next) => {
-    const createBy = req.get('x-platform-user-id') || req.get('x-app-user-id');
-    requestIdentity.run(createBy, next);
-  });
   // The SDK's jsonRpcHandler parses bodies with express.json()'s 100kb default;
   // raise the ceiling here — body-parser skips re-parsing an already-read body.
   app.use(express.json({ limit: '16mb' }));
