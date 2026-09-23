@@ -280,6 +280,8 @@ describe('SanitizedTaskStore', () => {
     finish();
     await Promise.all([writing, deleting]);
     await store.save(task(TaskState.TASK_STATE_INPUT_REQUIRED), ctx);
+    store.suppress('t2');
+    await store.save(task(TaskState.TASK_STATE_FAILED, { id: 't2' }), ctx);
     expect(inner.delete).toHaveBeenCalledWith('t1', ctx);
     expect(inner.save).toHaveBeenCalledTimes(1);
   });

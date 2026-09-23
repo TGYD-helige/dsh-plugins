@@ -25,7 +25,7 @@ import { DshAgentExecutor } from './executor.js';
 import { startA2aServer } from './server.js';
 import { GcsTaskStore } from './stores/gcs.js';
 import { RedisTaskStore } from './stores/redis.js';
-import { type ManagedTaskStore, MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
+import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
 
 export const name = 'dsh-a2a';
 
@@ -160,7 +160,7 @@ export function apply(
       },
     } satisfies A2aTasks);
 
-    const executor = new DshAgentExecutor(bridge);
+    const executor = new DshAgentExecutor(bridge, (taskId) => store.suppress(taskId));
     const server = await startA2aServer({
       host: config.host,
       port: config.port,
@@ -189,7 +189,7 @@ export function apply(
   }
 }
 
-function createTaskStore(config: A2aPluginConfig): ManagedTaskStore {
+function createTaskStore(config: A2aPluginConfig): SanitizedTaskStore {
   switch (config.taskStore) {
     case 'redis':
       return new SanitizedTaskStore(new RedisTaskStore(config.redis));

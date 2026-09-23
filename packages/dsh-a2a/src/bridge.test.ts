@@ -340,7 +340,8 @@ describe('A2aBridge + DshAgentExecutor', () => {
     });
     const order: string[] = [];
     const bus = new DefaultExecutionEventBus();
-    const executing = new DshAgentExecutor(bridge)
+    const suppress = vi.fn();
+    const executing = new DshAgentExecutor(bridge, suppress)
       .execute(requestContext(userMessage('hi'), 't1', 'ctx1'), bus)
       .then(() => {
         order.push('executed');
@@ -353,6 +354,32 @@ describe('A2aBridge + DshAgentExecutor', () => {
     await Promise.all([executing, clearing]);
     expect(order).toEqual(['executed', 'cleared']);
     expect(agents.created).toHaveLength(0);
+    expect(suppress).toHaveBeenCalledWith('t1');
+  });
+
+  it('suppresses a new task started during stored cleanup', async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const cleaning = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const cleared = bridge.clearContext('ctx1', async (ids) => {
+      started();
+      await gate;
+      return ids;
+    });
+    await cleaning;
+    const suppress = vi.fn();
+    await new DshAgentExecutor(bridge, suppress).execute(
+      requestContext(userMessage('hi'), 't1', 'ctx1'),
+      new DefaultExecutionEventBus(),
+    );
+    expect(suppress).toHaveBeenCalledWith('t1');
+    release();
+    await cleared;
   });
 
   it('cancels and drains a live turn before clearing its binding', async () => {

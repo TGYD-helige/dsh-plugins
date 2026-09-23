@@ -200,9 +200,9 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   ctx.effect(() => {
     started = track(guard(async (backend) => backend.init?.()));
     return async () => {
+      await Promise.all([...pending]);
       sessions.clear();
       identities.clear();
-      await Promise.all([...pending]);
       await guard(async (backend) => backend.close?.());
     };
   });
@@ -278,7 +278,6 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   });
 
   ctx.on('session/disposed', (session: any) => {
-    identities.delete(session?.id);
     const sessionId: string = session?.id ?? 'unknown';
     // The delete must run inside the session's chain — a synchronous delete
     // here races the queued event tasks (the map may not even have the entry
@@ -286,6 +285,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     // the dispose was meant to drop).
     enqueue(sessionId, async () => {
       sessions.delete(sessionId);
+      identities.delete(sessionId);
     });
     // Delete the chain entry only once it has settled AND is still the same
     // entry — deleting earlier would let a recreated session race the

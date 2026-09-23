@@ -88,8 +88,13 @@ export class SanitizedTaskStore implements ManagedTaskStore {
     await this.inner.close?.();
   }
 
-  async delete(taskId: string, context: ServerCallContext): Promise<void> {
+  /** Drop SDK saves that may arrive after a clear rejects an in-flight request. */
+  suppress(taskId: string): void {
     this.deleted.add(taskId);
+  }
+
+  async delete(taskId: string, context: ServerCallContext): Promise<void> {
+    this.suppress(taskId);
     await this.writes.get(taskId);
     await this.inner.delete(taskId, context);
     this.lastState.delete(taskId);

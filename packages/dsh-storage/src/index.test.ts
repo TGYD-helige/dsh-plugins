@@ -170,6 +170,32 @@ describe('dsh-storage plugin', () => {
     );
   });
 
+  it('keeps the request identity for events queued before immediate disposal', async () => {
+    apply(ctx, enabledConfig);
+    (ctx.get('storageIdentity') as { set(id: string, user: string): void }).set(
+      's1',
+      'platform-user',
+    );
+    const session = { id: 's1' };
+    ctx.events.emit('session/event', session, userEvent('hi'));
+    ctx.events.emit('session/disposed', session);
+    await ctx.events.parallel('session/flush', session as never);
+    const backend = backends.instances[0];
+    expect(backend.upsertMessage.mock.calls[0][0].createBy).toBe('platform-user');
+    expect(backend.upsertSession.mock.calls[0][0].createBy).toBe('platform-user');
+  });
+
+  it('drains identified messages before plugin unload', async () => {
+    apply(ctx, enabledConfig);
+    (ctx.get('storageIdentity') as { set(id: string, user: string): void }).set(
+      's1',
+      'platform-user',
+    );
+    ctx.events.emit('session/event', { id: 's1' }, userEvent('hi'));
+    await ctx.fiber.dispose();
+    expect(backends.instances[0].upsertMessage.mock.calls[0][0].createBy).toBe('platform-user');
+  });
+
   it('ignores log-only events; turn/end only checkpoints the rollup', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
