@@ -3,7 +3,7 @@
  * bridge. One `execute()` = one user-message turn:
  *
  *   1. map the message's parts onto dsh content blocks (file parts become
- *      attachments with a store composed, workspace files otherwise)
+ *      execution-world paths with a materializer, attachments or local files otherwise)
  *   2. ensure the task's session/agent exists (creating it on first contact)
  *   3. publish a `task` event first — A2A 1.0 stream ordering REQUIRES the
  *      first event of every execute to be a task or message, including
@@ -46,7 +46,7 @@ export class DshAgentExecutor implements AgentExecutor {
     const { userMessage, taskId, contextId } = requestContext;
     let anchored = false;
     try {
-      const content = await this.bridge.buildContent(userMessage);
+      const content = await this.bridge.buildContent(userMessage, contextId);
       const { entry, freshTask } = await this.bridge.ensureTask(taskId, contextId);
       eventBus.publish(
         freshTask

@@ -27,6 +27,8 @@ import { GcsTaskStore } from './stores/gcs.js';
 import { RedisTaskStore } from './stores/redis.js';
 import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
 
+export type { A2aFileMaterializer } from './content.js';
+
 export const name = 'dsh-a2a';
 
 /** The bridge creates and owns agents through the registry service. */

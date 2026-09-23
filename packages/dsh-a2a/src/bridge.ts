@@ -35,7 +35,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
 import type { ContentBlock } from '@deepseek-ai/dsh-llm/types';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
-import { buildMessageContent, uploadsDir } from './content.js';
+import { type A2aFileMaterializer, buildMessageContent, uploadsDir } from './content.js';
 import { SessionTranslator, terminalStatusUpdate } from './translator.js';
 
 export interface BridgeOptions {
@@ -210,9 +210,15 @@ export class A2aBridge {
   }
 
   /** A2A parts → dsh content blocks; throws only when no part is usable. */
-  async buildContent(message: Message): Promise<ContentBlock[]> {
+  async buildContent(message: Message, contextId: string): Promise<ContentBlock[]> {
     const attachments = this.ctx.get('attachments');
-    return buildMessageContent(message.parts, attachments, uploadsDir(this.options.uploadsDir));
+    const materializer = this.ctx.get('a2aFileMaterializer') as A2aFileMaterializer | undefined;
+    return buildMessageContent(
+      message.parts,
+      attachments,
+      uploadsDir(this.options.uploadsDir),
+      materializer ? { contextId, materializer } : undefined,
+    );
   }
 
   isClearing(contextId: string): boolean {
