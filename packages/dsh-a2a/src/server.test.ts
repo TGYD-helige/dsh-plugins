@@ -210,6 +210,29 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     expect(body.result.status.state).toBe('input-required');
   });
 
+  it('finds the latest legacy task by contextId at the root JSON-RPC path', async () => {
+    const first = await json(
+      await rpc('SendMessage', { tenant: '', ...v1Message('one', { contextId: 'recover' }) }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    const second = await json(
+      await rpc('SendMessage', { tenant: '', ...v1Message('two', { contextId: 'recover' }) }),
+    );
+    const lookup = (contextId: string, path = '/') =>
+      fetch(`${base}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'tasks/get', params: { contextId } }),
+      });
+    const found = await json(await lookup('recover'));
+    expect(found.error).toBeUndefined();
+    expect(found.result.kind).toBe('task');
+    expect(found.result.id).toBe(second.result.task.id);
+    expect(found.result.id).not.toBe(first.result.task.id);
+    expect((await json(await lookup('recover', '/a2a/'))).result.id).toBe(second.result.task.id);
+    expect((await json(await lookup('missing'))).result).toBeNull();
+  });
+
   it('rejects unknown methods and unknown tasks with JSON-RPC errors', async () => {
     const bad = await json(await rpc('Foo/Bar', {}, 6));
     expect(bad.error).toBeDefined();
