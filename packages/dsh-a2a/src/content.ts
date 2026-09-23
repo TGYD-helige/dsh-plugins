@@ -3,12 +3,11 @@
  * part kinds:
  *
  *   - `text` parts stay text;
- *   - file parts (inline `raw` bytes or a `url`) become durable image/file
- *     content blocks when the deployment composes an attachment store
- *     (`ctx.attachments`, e.g. @deepseek-ai/dsh-attachment-local); url parts
- *     are downloaded by the plugin (http/https only, size- and time-bounded);
+ *   - file parts (inline `raw` bytes or a `url`) use the composed attachment
+ *     store unless a non-image materializer is configured; url parts are
+ *     downloaded by the plugin (http/https only, size- and time-bounded);
  *   - an optional deployment materializer puts non-image files into the
- *     active execution world, including when the attachment store succeeds;
+ *     active execution world instead of saving a host attachment;
  *   - without a materializer, files with no store (or refused by a store)
  *     persist under the configured upload root (default `<OS temp>/
  *     dsh-a2a-uploads/<date>/`) and the prompt references them by path;
@@ -131,9 +130,14 @@ async function fileContent(
   } catch (error) {
     return failNote(part, mediaType, uri, 'failed to read a file part', error);
   }
-  const block = attachments && (await saveAttachment(attachments, bytes, mediaType, part.filename));
-  if (block?.type === 'image') return block;
-  if (materialization) {
+  const image = attachments?.imageLimits.mediaTypes.includes(
+    mediaType.toLowerCase() as ImageMediaType,
+  );
+  if (attachments && (!materialization || image)) {
+    const block = await saveAttachment(attachments, bytes, mediaType, part.filename);
+    if (block) return block;
+  }
+  if (materialization && !image) {
     try {
       const { readablePath } = await materialization.materializer.materializeFile({
         contextId: materialization.contextId,
@@ -148,7 +152,6 @@ async function fileContent(
       return note(part, mediaType, uri, 'file materialization failed');
     }
   }
-  if (block) return block;
   try {
     const name = sanitizeUploadFileName(part.filename);
     const filePath = await persistUpload(dir, name, bytes);

@@ -558,7 +558,7 @@ describe('A2aBridge + DshAgentExecutor', () => {
       expect(statusUpdates(seen).at(-1)!.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
     });
 
-    it('delivers a file into the context execution world even when attachment storage succeeds', async () => {
+    it('materializes non-image files without saving another host attachment', async () => {
       const store = fakeAttachments();
       const materializeFile = vi.fn(async () => ({ readablePath: '/sandbox/ctx1/doc.docx' }));
       ctx.provide('a2aFileMaterializer', { materializeFile });
@@ -569,7 +569,7 @@ describe('A2aBridge + DshAgentExecutor', () => {
 
       await executeMessage('t1', 'ctx1', message);
 
-      expect(store.saveFile).toHaveBeenCalledTimes(1);
+      expect(store.saveFile).not.toHaveBeenCalled();
       expect(materializeFile).toHaveBeenCalledWith({
         contextId: 'ctx1',
         bytes: docBytes,
@@ -599,7 +599,7 @@ describe('A2aBridge + DshAgentExecutor', () => {
 
       await executeMessage('t1', 'ctx1', message);
 
-      expect(store.saveFile).toHaveBeenCalledTimes(1);
+      expect(store.saveFile).not.toHaveBeenCalled();
       expect(agents.created[0].contents[0]).toHaveLength(1);
       expect(agents.created[0].contents[0][0]).toMatchObject({ type: 'text' });
       expect(agents.created[0].prompts[0]).toContain('not delivered');
@@ -637,6 +637,8 @@ describe('A2aBridge + DshAgentExecutor', () => {
     it('falls back to a file attachment when image admission rejects the bytes', async () => {
       const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
       const store = fakeAttachments();
+      const materializeFile = vi.fn();
+      ctx.provide('a2aFileMaterializer', { materializeFile });
       store.saveImage.mockRejectedValue(new Error('not a png'));
       const message: Message = {
         ...userMessage(''),
@@ -644,6 +646,7 @@ describe('A2aBridge + DshAgentExecutor', () => {
       };
       await executeMessage('t1', 'ctx1', message);
       expect(store.saveFile).toHaveBeenCalledTimes(1);
+      expect(materializeFile).not.toHaveBeenCalled();
       expect(agents.created[0].contents[0][0].type).toBe('file');
       expect(spy.mock.calls.some(([p]) => String(p).includes('[dsh-a2a]'))).toBe(true);
       spy.mockRestore();
