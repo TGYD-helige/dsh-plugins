@@ -261,6 +261,61 @@ describe('A2aBridge + DshAgentExecutor', () => {
     expect(final.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
   });
 
+  it('resumes a persisted context after restart instead of creating it again', async () => {
+    ctx.provide('sessionPersistence', { stat: vi.fn(async () => ({ id: 'ctx1' })) });
+    const originalCreate = agents.registry.create;
+    agents.registry.resume = vi.fn(async ({ resumeSessionId }: { resumeSessionId: SessionId }) =>
+      originalCreate({ sessionId: resumeSessionId }),
+    );
+    await execute('t1', 'ctx1');
+    expect(agents.registry.resume).toHaveBeenCalledWith(
+      expect.objectContaining({ resumeSessionId: 'ctx1' }),
+    );
+    expect(await bridge.clearContext('ctx1')).toEqual(['t1']);
+  });
+
+  it('clears an idle bound task and permits a fresh binding', async () => {
+    await execute('t1', 'ctx1');
+    expect(await bridge.clearContext('ctx1')).toEqual(['t1']);
+    expect(agents.created[0].handle.dispose).toHaveBeenCalledOnce();
+    await execute('t2', 'ctx1');
+    expect(agents.created).toHaveLength(2);
+  });
+
+  it('cancels and drains a live turn before clearing its binding', async () => {
+    let session: Session;
+    agents.registry.create = vi.fn(async ({ sessionId }: { sessionId: SessionId }) => {
+      session = { id: sessionId } as Session;
+      return {
+        agent: {
+          session,
+          followup: vi.fn(() =>
+            ctx.emit('session/event', session, event('turn/start', { turn: 1 })),
+          ),
+          cancel: vi.fn(() =>
+            ctx.emit(
+              'session/event',
+              session,
+              turnEnd({ kind: 'aborted', reason: { kind: 'user' } }),
+            ),
+          ),
+          whenIdle: vi.fn(async () => {}),
+        } as unknown as Agent,
+        dispose: vi.fn(async () => {}),
+      };
+    });
+    const bus = new DefaultExecutionEventBus();
+    const collector = collect(bus);
+    const running = new DshAgentExecutor(bridge).execute(
+      requestContext(userMessage('hi'), 't1', 'ctx1'),
+      bus,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(await bridge.clearContext('ctx1')).toEqual(['t1']);
+    await running;
+    expect(collector.isFinished()).toBe(true);
+  });
+
   it("keeps a previous binding's late turn/end out of a rebound task", async () => {
     // Turns never end on their own here; the test drives every event.
     let session: Session;

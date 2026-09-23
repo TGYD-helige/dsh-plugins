@@ -20,8 +20,7 @@ import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import type { ListTasksRequest, ListTasksResponse, Task } from '@a2a-js/sdk';
-import type { TaskStore } from '@a2a-js/sdk/server';
-import { listShells } from '../task-store.js';
+import { listShells, type ManagedTaskStore } from '../task-store.js';
 
 export interface GcsTaskStoreConfig {
   bucket: string;
@@ -31,7 +30,7 @@ export interface GcsTaskStoreConfig {
   keyFilename?: string;
 }
 
-export class GcsTaskStore implements TaskStore {
+export class GcsTaskStore implements ManagedTaskStore {
   private bucket: any = null;
   private prefix: string;
 
@@ -61,6 +60,18 @@ export class GcsTaskStore implements TaskStore {
     if (!exists) return undefined;
     const [buf] = await file.download();
     return JSON.parse(gunzipSync(buf).toString('utf8')) as Task;
+  }
+
+  async delete(taskId: string): Promise<void> {
+    if (!this.bucket) return;
+    await Promise.all([
+      this.bucket
+        .file(`${this.prefix}/${taskId}/metadata.json.gz`)
+        .delete({ ignoreNotFound: true }),
+      this.bucket
+        .file(`${this.prefix}/${taskId}/workspace.tar.gz`)
+        .delete({ ignoreNotFound: true }),
+    ]);
   }
 
   async list(params: ListTasksRequest): Promise<ListTasksResponse> {

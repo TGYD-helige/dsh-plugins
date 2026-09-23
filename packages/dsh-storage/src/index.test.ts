@@ -153,6 +153,23 @@ describe('dsh-storage plugin', () => {
     });
   });
 
+  it('writes the request identity to messages and the history rollup', async () => {
+    apply(ctx, enabledConfig);
+    (ctx.get('storageIdentity') as { set(id: string, user: string): void }).set(
+      's1',
+      'platform-user',
+    );
+    ctx.events.emit('session/event', { id: 's1' }, userEvent('hi'));
+    await ctx.events.parallel('session/flush', { id: 's1' } as never);
+    const backend = backends.instances[0];
+    expect(backend.upsertMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ createBy: 'platform-user' }),
+    );
+    expect(backend.upsertSession).toHaveBeenCalledWith(
+      expect.objectContaining({ createBy: 'platform-user' }),
+    );
+  });
+
   it('ignores log-only events; turn/end only checkpoints the rollup', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];

@@ -51,7 +51,9 @@ npx prisma db push --schema node_modules/@amaster.ai/dsh-storage/prisma/schema.m
 - **`ai_messages`** — one row per projected session event (user / model / tool), with `thoughts`, `tokens`, `tool_calls`, `agent_id`, `metadata` JSON columns and soft-delete.
 - **`ai_chat_histories`** — per-session rollup (message count, total tokens, first/last message timestamps).
 
-The logical message id rides in `metadata.id`; message rows use a deterministic hash of `(session_id, message id)` as their primary key, so re-projected events upsert in place rather than duplicate — on every connector. Session rows are matched by `session_id` and keep their cuid primary keys. One deviation from the source project: no `user_id` column — tenancy rides on `session_id`.
+The logical message id rides in `metadata.id`; message rows use a deterministic hash of `(session_id, message id)` as their primary key, so re-projected events upsert in place rather than duplicate — on every connector. Session rows are matched by `session_id` and keep their cuid primary keys. Both tables write `create_by`: the A2A request uses `x-platform-user-id`, falling back to `x-app-user-id` (never `x-app-user-uid`). Non-HTTP headless sessions use the legacy local user `0`. The gateway can also call the optional `ctx.storageIdentity.set(contextId, platformUserId)` service before a turn.
+
+Existing tables with required `user_id` need the [staged migration](MIGRATION.md) before this plugin writes to them. A plain `prisma db push` is not a safe substitute for that migration.
 
 SQL Server note: Prisma's sqlserver connector has no `Json` type, so its variant maps the JSON columns to text — the backend serializes them on write automatically (SQL Server's `ISJSON` / `JSON_VALUE` still query the text as JSON).
 

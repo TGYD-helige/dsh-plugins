@@ -170,7 +170,7 @@ for (let attempt = 1; attempt <= 3; attempt++) {
 console.log('\n--- ai_messages ---');
 const db = new DatabaseSync(dbPath, { readOnly: true });
 const messages = db
-  .prepare('SELECT session_id, type, content, model, metadata, tool_calls FROM ai_messages ORDER BY rowid')
+  .prepare('SELECT session_id, create_by, type, content, model, metadata, tool_calls FROM ai_messages ORDER BY rowid')
   .all();
 for (const m of messages) {
   console.log(
@@ -191,6 +191,7 @@ const user = messages.find((m) => m.type === 'user' && String(m.content).include
 // finish with no wrap-up prose), so don't require non-empty content here.
 const model = messages.find((m) => m.type === 'model');
 assert(user, 'user message row with the prompt missing');
+assert(messages.every((m) => m.create_by === '0'), 'headless messages must use local user 0');
 assert(model, 'assistant message row missing');
 assert(model.model === expectedModel, `expected model=${expectedModel}, got ${model.model}`);
 for (const m of messages) {
@@ -222,6 +223,7 @@ if (!messages.some((m) => m.type === 'model' && String(m.content).includes(marke
 assert(histories.length === 1, `expected 1 session row, got ${histories.length}`);
 const history = histories[0];
 assert(history.session_id === user.session_id, 'session row id mismatch');
+assert(history.create_by === '0', 'headless history must use local user 0');
 assert(Number(history.message_count) >= 4, `message_count=${history.message_count} < 4 (user + assistant/tool-call + tool + assistant)`);
 assert(Number(history.total_tokens) > 0, `total_tokens=${history.total_tokens} == 0`);
 assert(history.first_message_at != null && history.last_message_at != null, 'message timestamps missing');
@@ -259,6 +261,7 @@ async function backendOnlyLeg(dbProvider) {
   await backend.upsertMessage({
     id: 'm1',
     sessionId: 's1',
+    createBy: 'platform-user',
     historyId: null,
     type: 'user',
     content: `hello from ${dbProvider}`,
@@ -268,6 +271,7 @@ async function backendOnlyLeg(dbProvider) {
   await backend.upsertMessage({
     id: 'a1',
     sessionId: 's1',
+    createBy: 'platform-user',
     historyId: null,
     type: 'model',
     content: 'hi',
@@ -282,6 +286,7 @@ async function backendOnlyLeg(dbProvider) {
   await backend.upsertMessage({
     id: 'm1',
     sessionId: 's1',
+    createBy: 'platform-user',
     historyId: null,
     type: 'user',
     content: `hello from ${dbProvider} (edited)`,
@@ -290,6 +295,7 @@ async function backendOnlyLeg(dbProvider) {
   });
   await backend.upsertSession({
     sessionId: 's1',
+    createBy: 'platform-user',
     title: 'CI',
     messageCount: 2,
     totalTokens: 15,
@@ -309,10 +315,12 @@ async function backendOnlyLeg(dbProvider) {
 
   const parseJsonColumn = (value) => (typeof value === 'string' ? JSON.parse(value) : value);
   assert(messages.length === 2, `expected 2 messages, got ${messages.length}`);
+  assert(messages.every((m) => m.createBy === 'platform-user'), 'message owner did not round-trip');
   assert(messages[0].content === `hello from ${dbProvider} (edited)`, 'redelivery did not update in place');
   assert(parseJsonColumn(messages[1].metadata).id === 'a1', 'metadata did not round-trip');
   assert(parseJsonColumn(messages[1].tokens).inputTokens === 10, 'tokens did not round-trip');
   assert(sessions.length === 1 && Number(sessions[0].totalTokens) === 15, 'session rollup wrong');
+  assert(sessions[0].createBy === 'platform-user', 'history owner did not round-trip');
 
   console.log(`SCENARIO_OK ${dbProvider} (backend-only leg)`);
 }

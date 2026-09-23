@@ -141,6 +141,7 @@ export class DatabaseBackend implements StorageBackend {
     // JSON fields are serialized on write (derived from the provider — the
     // only valid combination, not a user knob).
     return {
+      createBy: row.createBy,
       type: row.type,
       content: row.content,
       thoughts: this.jsonField(row.thoughts),
@@ -173,6 +174,7 @@ export class DatabaseBackend implements StorageBackend {
     if (!row) return null;
     return {
       sessionId: row.sessionId,
+      createBy: row.createBy ?? '0',
       title: row.title,
       messageCount: row.messageCount,
       totalTokens: Number(row.totalTokens),
@@ -200,6 +202,7 @@ export class DatabaseBackend implements StorageBackend {
     });
     const data = {
       sessionId: row.sessionId,
+      createBy: row.createBy,
       title: row.title ?? undefined,
       messageCount: row.messageCount,
       totalTokens: BigInt(row.totalTokens),

@@ -15,8 +15,9 @@
 
 import { a2aClient, assert, bootA2a, STATES, stopA2a, textOf, THINKING_OFF } from './lib/a2a-shared.mjs';
 
-const { a2a, proc } = await bootA2a({ tag: 'turns', extraPatch: THINKING_OFF });
-const client = a2aClient(a2a);
+const boot = await bootA2a({ tag: 'turns', extraPatch: THINKING_OFF });
+let proc = boot.proc;
+let client = a2aClient(boot.a2a);
 
 const codeword = '424242';
 
@@ -110,9 +111,24 @@ try {
     `snapshot state ${snapshot.status?.state}`,
   );
 
+  // The contextId must reopen the persisted dsh session after a cold boot.
+  await stopA2a(proc);
+  proc = undefined;
+  const restarted = await bootA2a({ tag: 'turns', extraPatch: THINKING_OFF, reuse: true });
+  proc = restarted.proc;
+  client = a2aClient(restarted.a2a);
+  const resumed = await client.rpc('SendMessage', {
+    message: client.userMessage('重启前我让你记住的数字是什么？只回复数字', { contextId }),
+  });
+  assert(!resumed.body.error, `resumed rpc error: ${JSON.stringify(resumed.body.error)}`);
+  assert(
+    textOf(resumed.body.result?.task).includes(codeword),
+    `resumed context lost the codeword: ${JSON.stringify(resumed.body.result)}`,
+  );
+
   console.log(
     `\nSCENARIO_OK turns (task=${taskId}, rebound=${send3.body.result.task.id}, nonBlocking=${earlyTask.id})`,
   );
 } finally {
-  await stopA2a(proc);
+  if (proc) await stopA2a(proc);
 }

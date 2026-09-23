@@ -8,8 +8,7 @@
  */
 
 import type { ListTasksRequest, ListTasksResponse, Task } from '@a2a-js/sdk';
-import type { TaskStore } from '@a2a-js/sdk/server';
-import { listShells } from '../task-store.js';
+import { listShells, type ManagedTaskStore } from '../task-store.js';
 
 export interface RedisTaskStoreConfig {
   url: string;
@@ -17,7 +16,7 @@ export interface RedisTaskStoreConfig {
   ttlSeconds?: number;
 }
 
-export class RedisTaskStore implements TaskStore {
+export class RedisTaskStore implements ManagedTaskStore {
   private redis: any = null;
   private readonly prefix: string;
   private readonly ttl: number;
@@ -45,6 +44,10 @@ export class RedisTaskStore implements TaskStore {
     if (!this.redis) return undefined;
     const raw: string | null = await this.redis.get(this.taskKey(taskId));
     return raw ? (JSON.parse(raw) as Task) : undefined;
+  }
+
+  async delete(taskId: string): Promise<void> {
+    await this.redis?.del(this.taskKey(taskId));
   }
 
   async list(params: ListTasksRequest): Promise<ListTasksResponse> {

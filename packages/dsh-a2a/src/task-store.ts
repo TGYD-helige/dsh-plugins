@@ -18,7 +18,7 @@
  */
 
 import type { ListTasksRequest, ListTasksResponse, Task, TaskState } from '@a2a-js/sdk';
-import type { ServerCallContext, TaskStore } from '@a2a-js/sdk/server';
+import { resolveUserScope, type ServerCallContext, type TaskStore } from '@a2a-js/sdk/server';
 
 /** The persistent shape: a metadata shell with empty history/artifacts. */
 export function sanitizeTask(task: Task): Task {
@@ -35,12 +35,48 @@ export function sanitizeTask(task: Task): Task {
 /** TaskStore with the optional lifecycle our backends add. */
 export interface ManagedTaskStore extends TaskStore {
   init?(): Promise<void>;
+  delete(taskId: string, context: ServerCallContext): Promise<void>;
   close?(): Promise<void>;
+}
+
+/** The SDK memory store has no delete operation; keep the same shell contract. */
+export class MemoryTaskStore implements ManagedTaskStore {
+  private readonly scopes = new Map<string, Map<string, Task>>();
+
+  private bucket(context: ServerCallContext): Map<string, Task> {
+    const scope = JSON.stringify([context.tenant ?? '', resolveUserScope(context)]);
+    let tasks = this.scopes.get(scope);
+    if (!tasks) {
+      tasks = new Map();
+      this.scopes.set(scope, tasks);
+    }
+    return tasks;
+  }
+
+  async save(task: Task, context: ServerCallContext): Promise<void> {
+    this.bucket(context).set(task.id, structuredClone(task));
+  }
+
+  async load(taskId: string, context: ServerCallContext): Promise<Task | undefined> {
+    const task = this.bucket(context).get(taskId);
+    return task && structuredClone(task);
+  }
+
+  async list(params: ListTasksRequest, context: ServerCallContext): Promise<ListTasksResponse> {
+    return listShells([...this.bucket(context).values()], params);
+  }
+
+  async delete(taskId: string, context: ServerCallContext): Promise<void> {
+    this.bucket(context).delete(taskId);
+  }
 }
 
 /** Strips history/artifacts and saves only on task-state transitions. */
 export class SanitizedTaskStore implements ManagedTaskStore {
   private readonly lastState = new Map<string, TaskState>();
+  private readonly writes = new Map<string, Promise<void>>();
+  // ponytail: deleted ids stay tombstoned until plugin unload; use expiring ids if clear volume grows.
+  private readonly deleted = new Set<string>();
 
   constructor(private readonly inner: ManagedTaskStore) {}
 
@@ -52,11 +88,27 @@ export class SanitizedTaskStore implements ManagedTaskStore {
     await this.inner.close?.();
   }
 
+  async delete(taskId: string, context: ServerCallContext): Promise<void> {
+    this.deleted.add(taskId);
+    await this.writes.get(taskId);
+    await this.inner.delete(taskId, context);
+    this.lastState.delete(taskId);
+    this.writes.delete(taskId);
+  }
+
   async save(task: Task, context: ServerCallContext): Promise<void> {
+    if (this.deleted.has(task.id)) return;
     const state = task.status?.state;
     if (state !== undefined && this.lastState.get(task.id) === state) return;
     if (state !== undefined) this.lastState.set(task.id, state);
-    await this.inner.save(sanitizeTask(task), context);
+    const write = (this.writes.get(task.id) ?? Promise.resolve()).then(() =>
+      this.inner.save(sanitizeTask(task), context),
+    );
+    this.writes.set(
+      task.id,
+      write.catch(() => {}),
+    );
+    await write;
   }
 
   load(taskId: string, context: ServerCallContext): Promise<Task | undefined> {

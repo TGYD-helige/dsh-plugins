@@ -20,6 +20,7 @@ datasource db {
 model AiMessage {
   id            String    @id @default(cuid())
   sessionId     String    @map("session_id")
+  createBy      String    @map("create_by")
   historyId     String?   @map("history_id")
   type          String
   content       String
@@ -49,6 +50,7 @@ model AiMessage {
 model AiChatHistory {
   id             String    @id @default(cuid())
   sessionId      String    @map("session_id")
+  createBy       String    @map("create_by")
   title          String?
   summary        String?
   messageCount   Int       @default(0) @map("message_count")

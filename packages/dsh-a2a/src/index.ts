@@ -12,7 +12,8 @@
  * @module dsh-a2a
  */
 
-import { InMemoryTaskStore } from '@a2a-js/sdk/server';
+import { TaskState } from '@a2a-js/sdk';
+import { ServerCallContext } from '@a2a-js/sdk/server';
 import type { Context } from '@deepseek-ai/cordis';
 // Augmentation-only imports: pull ctx.agents and the session Events
 // declarations into the compilation (listeners are contextually typed).
@@ -24,7 +25,7 @@ import { DshAgentExecutor } from './executor.js';
 import { startA2aServer } from './server.js';
 import { GcsTaskStore } from './stores/gcs.js';
 import { RedisTaskStore } from './stores/redis.js';
-import { type ManagedTaskStore, SanitizedTaskStore } from './task-store.js';
+import { type ManagedTaskStore, MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
 
 export const name = 'dsh-a2a';
 
@@ -94,6 +95,11 @@ export interface A2aPluginConfig {
   gcs: { bucket: string; prefix: string; keyFilename: string };
 }
 
+/** Same-process gateway contract for messages/clear. */
+export interface A2aTasks {
+  clearContext(contextId: string, tenant?: string): Promise<string[]>;
+}
+
 export function apply(
   ctx: Context,
   config: A2aPluginConfig,
@@ -126,6 +132,32 @@ export function apply(
 
     const store = createTaskStore(config);
     await store.init?.();
+
+    ctx.provide('a2aTasks', {
+      async clearContext(contextId: string, tenant = ''): Promise<string[]> {
+        const call = new ServerCallContext({ tenant });
+        const ids = new Set<string>();
+        let pageToken = '';
+        do {
+          const page = await store.list(
+            {
+              tenant: '',
+              contextId,
+              pageSize: 100,
+              pageToken,
+              status: TaskState.TASK_STATE_UNSPECIFIED,
+              statusTimestampAfter: undefined,
+            },
+            call,
+          );
+          for (const task of page.tasks) ids.add(task.id);
+          pageToken = page.nextPageToken;
+        } while (pageToken);
+        for (const id of await bridge.clearContext(contextId)) ids.add(id);
+        for (const id of ids) await store.delete(id, call);
+        return [...ids];
+      },
+    } satisfies A2aTasks);
 
     const executor = new DshAgentExecutor(bridge);
     const server = await startA2aServer({
@@ -166,6 +198,6 @@ function createTaskStore(config: A2aPluginConfig): ManagedTaskStore {
       }
       return new SanitizedTaskStore(new GcsTaskStore(config.gcs));
     default:
-      return new SanitizedTaskStore(new InMemoryTaskStore());
+      return new SanitizedTaskStore(new MemoryTaskStore());
   }
 }

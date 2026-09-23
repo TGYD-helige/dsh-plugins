@@ -1,9 +1,9 @@
 import { Role, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutor, ExecutionEventBus } from '@a2a-js/sdk/server';
-import { AgentEvent, InMemoryTaskStore, type RequestContext } from '@a2a-js/sdk/server';
+import { AgentEvent, type RequestContext } from '@a2a-js/sdk/server';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { type A2aServer, startA2aServer } from './server.js';
-import { SanitizedTaskStore } from './task-store.js';
+import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
 
 // A stub executor with the same event contract the real one uses: a task
 // anchor first (A2A 1.0 stream ordering), then working, then input-required.
@@ -86,7 +86,7 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
       basePath: '/a2a',
       card: { name: 'test-agent', description: 'test', version: '0.0.1' },
       executor: stubExecutor,
-      taskStore: new SanitizedTaskStore(new InMemoryTaskStore()),
+      taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
     });
     base = `http://127.0.0.1:${server.port}`;
   });

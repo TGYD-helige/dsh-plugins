@@ -15,6 +15,7 @@
   "files": [
     "lib",
     "prisma",
+    "MIGRATION.md",
     "cordis.patch.yml",
     "preview.png"
   ],
