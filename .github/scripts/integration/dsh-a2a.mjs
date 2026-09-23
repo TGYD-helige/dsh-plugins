@@ -128,6 +128,29 @@ try {
   }
   assert(task, 'no stream contained the marker content — the model never read the marker file');
 
+  // A received FilePart must be readable through the agent's local tools,
+  // not merely present on the server's filesystem.
+  const uploadContent = 'ci-dsh-a2a-upload-9944';
+  let uploadRead = false;
+  for (let attempt = 1; attempt <= 3 && !uploadRead; attempt++) {
+    const message = client.userMessage('用工具读取随消息上传的文件，只回复文件中的内容');
+    message.parts.push({
+      raw: Buffer.from(uploadContent).toString('base64'),
+      mediaType: 'text/plain',
+      filename: 'ci-upload.txt',
+    });
+    const res = await client.stream('SendStreamingMessage', { message });
+    assert(res.ok, `FilePart stream http ${res.status}`);
+    const events = await readEvents(res);
+    uploadRead = events.some(
+      (e) =>
+        e.kind === 'statusUpdate' &&
+        e.value.metadata?.dshAgent?.kind === 'tool-result' &&
+        JSON.stringify(e.value.status.message?.parts).includes(uploadContent),
+    );
+  }
+  assert(uploadRead, 'agent tools could not read the received FilePart');
+
   // 3. Blocking follow-up on the SAME task: same-task continuation, and the
   //    blocking result shape — the answer rides result.task.status.message.
   console.log('\n$ POST SendMessage (follow-up, blocking)');

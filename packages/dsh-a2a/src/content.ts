@@ -7,11 +7,11 @@
  *     content blocks when the deployment composes an attachment store
  *     (`ctx.attachments`, e.g. @deepseek-ai/dsh-attachment-local); url parts
  *     are downloaded by the plugin (http/https only, size- and time-bounded);
- *   - without a store — or when a store refuses the bytes — file parts
+ *   - an optional deployment materializer puts non-image files into the
+ *     active execution world, including when the attachment store succeeds;
+ *   - without a materializer, files with no store (or refused by a store)
  *     persist under the configured upload root (default `<OS temp>/
- *     dsh-a2a-uploads/<date>/`) and the prompt references them by path, so
- *     the agent reads or converts them with its own tools (the same
- *     path-based model dsh-llm's file-block projection uses);
+ *     dsh-a2a-uploads/<date>/`) and the prompt references them by path;
  *   - `data` parts become JSON text.
  *
  * The SDK's admission helpers (admitEncodedFile/admitPromptContent) are not
@@ -30,6 +30,21 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm/types';
 const MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 30_000;
 
+/** Deployment-owned writer for files read by an agent's active tools. */
+export interface A2aFileMaterializer {
+  materializeFile(input: {
+    contextId: string;
+    bytes: Uint8Array;
+    filename: string;
+    mediaType: string;
+  }): Promise<{ readablePath: string }>;
+}
+
+interface Materialization {
+  contextId: string;
+  materializer: A2aFileMaterializer;
+}
+
 // TODO(verify): the confirmation data-part protocol ({callId, outcome}) maps
 // onto the optional dsh-user-approval service (0.1.2+, asks carry the exact
 // tool call) — bridge it once a deployment composes that service.
@@ -37,6 +52,7 @@ export async function buildMessageContent(
   parts: readonly Part[],
   attachments: AttachmentStore | undefined,
   dir: string,
+  materialization?: Materialization,
 ): Promise<ContentBlock[]> {
   const content: ContentBlock[] = [];
   for (const part of parts) {
@@ -51,7 +67,7 @@ export async function buildMessageContent(
         break;
       case 'raw':
       case 'url':
-        content.push(await fileContent(c, part, attachments, dir));
+        content.push(await fileContent(c, part, attachments, dir, materialization));
         break;
       default:
         // A part kind this SDK version predates: keep it visible, never drop.
@@ -98,6 +114,7 @@ async function fileContent(
   part: Part,
   attachments: AttachmentStore | undefined,
   dir: string,
+  materialization?: Materialization,
 ): Promise<ContentBlock> {
   let bytes: Uint8Array;
   let mediaType = part.mediaType;
@@ -114,10 +131,24 @@ async function fileContent(
   } catch (error) {
     return failNote(part, mediaType, uri, 'failed to read a file part', error);
   }
-  if (attachments) {
-    const block = await saveAttachment(attachments, bytes, mediaType, part.filename);
-    if (block) return block;
+  const block = attachments && (await saveAttachment(attachments, bytes, mediaType, part.filename));
+  if (block?.type === 'image') return block;
+  if (materialization) {
+    try {
+      const { readablePath } = await materialization.materializer.materializeFile({
+        contextId: materialization.contextId,
+        bytes,
+        filename: sanitizeUploadFileName(part.filename),
+        mediaType,
+      });
+      if (!readablePath) throw new Error('materializer returned no readable path');
+      return documentBlock(uri, mediaType, bytes.byteLength, readablePath);
+    } catch (error) {
+      console.error('[dsh-a2a] failed to materialize a file part:', error);
+      return note(part, mediaType, uri, 'file materialization failed');
+    }
   }
+  if (block) return block;
   try {
     const name = sanitizeUploadFileName(part.filename);
     const filePath = await persistUpload(dir, name, bytes);
@@ -193,7 +224,7 @@ function sanitizeUploadFileName(name: string): string {
   return !cleaned || WINDOWS_RESERVED_STEMS.has(stem) ? 'unnamed-file' : cleaned;
 }
 
-/** Workspace-file stand-in for a file part that did not become an attachment. */
+/** Tool-readable path stand-in for a file part. */
 function documentBlock(
   uri: string | undefined,
   mediaType: string,
@@ -203,7 +234,7 @@ function documentBlock(
   const attrs = [
     // The basename of the final path, so name= always matches the file on
     // disk — including collision suffixes.
-    `name="${attr(path.basename(filePath))}"`,
+    `name="${attr(path.win32.basename(filePath))}"`,
     uri && `uri="${attr(uri)}"`,
     mediaType && `type="${attr(mediaType)}"`,
     `size="${bytes}"`,
