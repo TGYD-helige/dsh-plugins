@@ -6,7 +6,7 @@
  * integration gateway) asserting the
  * tool-call/tool-result data parts, the text-delta messageId aggregation, and
  * the final event's usage metadata, a blocking SendMessage follow-up on the
- * same task, ListTasks, the text-only boundary, GetTask, CancelTask, the
+ * same task, ListTasks, the file-part degradation boundary, GetTask, CancelTask, the
  * SDK's terminal-state guard, and one legacy 0.3 `message/send` through the
  * compat layer.
  *
@@ -151,18 +151,18 @@ try {
     'persisted task must carry no history (conversation history is dsh-storage)',
   );
 
-  // 5. The text-only boundary: a file part is rejected with a failed task
-  //    (no LLM call is made — the executor rejects before session creation).
-  const rejected = await client.rpc('SendMessage', {
+  // 5. The parts boundary: a file part no longer fails the turn — the url
+  //    download 404s, degrades to an in-band metadata note, and the task
+  //    completes input-required.
+  const degraded = await client.rpc('SendMessage', {
     message: {
       ...client.userMessage('看这张图'),
       parts: [{ url: 'https://example.com/x.png', mediaType: 'image/png' }],
     },
   });
   assert(
-    rejected.body.result?.task?.status?.state === STATES.failed &&
-      JSON.stringify(rejected.body.result).includes('unsupported part kind'),
-    `non-text parts must fail the task: ${JSON.stringify(rejected.body)}`,
+    degraded.body.result?.task?.status?.state === STATES.inputRequired,
+    `file parts must degrade in band, not fail the task: ${JSON.stringify(degraded.body)}`,
   );
 
   // 6. Legacy 0.3 clients keep working through the compat layer.

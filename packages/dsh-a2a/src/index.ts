@@ -38,6 +38,11 @@ export const Config = Schema.object({
   basePath: Schema.string().default('/a2a'),
   /** Working directory for agents spawned by A2A tasks. Must be absolute. */
   cwd: Schema.string().default(process.cwd()),
+  /**
+   * Root directory file parts persist into when no attachment store is
+   * composed (date-layered below it). Empty = <OS temp>/dsh-a2a-uploads.
+   */
+  uploadsDir: Schema.string().default(''),
   agent: Schema.object({
     provider: Schema.string().default(''),
     model: Schema.string().default(''),
@@ -81,6 +86,7 @@ export interface A2aPluginConfig {
   port: number;
   basePath: string;
   cwd: string;
+  uploadsDir: string;
   agent: { provider: string; model: string; preset: string };
   card: { name: string; description: string; version: string; publicUrl: string };
   taskStore: 'memory' | 'redis' | 'gcs';
@@ -110,6 +116,7 @@ export function apply(
   async function start(): Promise<() => Promise<void>> {
     const bridge = new A2aBridge(ctx, {
       cwd: config.cwd,
+      uploadsDir: config.uploadsDir || undefined,
       agentOptions: {
         provider: config.agent.provider || undefined,
         model: config.agent.model || undefined,

@@ -2,7 +2,8 @@
  * The @a2a-js/sdk {@link AgentExecutor} that drives dsh agents through the
  * bridge. One `execute()` = one user-message turn:
  *
- *   1. extract the text prompt (v1 is text-only)
+ *   1. map the message's parts onto dsh content blocks (file parts become
+ *      attachments with a store composed, workspace files otherwise)
  *   2. ensure the task's session/agent exists (creating it on first contact)
  *   3. publish a `task` event first — A2A 1.0 stream ordering REQUIRES the
  *      first event of every execute to be a task or message, including
@@ -30,7 +31,7 @@ export class DshAgentExecutor implements AgentExecutor {
     const { userMessage, taskId, contextId } = requestContext;
     let anchored = false;
     try {
-      const text = extractText(userMessage);
+      const content = await this.bridge.buildContent(userMessage);
       const { entry, freshTask } = await this.bridge.ensureTask(taskId, contextId);
       eventBus.publish(
         freshTask
@@ -43,7 +44,7 @@ export class DshAgentExecutor implements AgentExecutor {
             taskEvent(taskId, contextId, TaskState.TASK_STATE_WORKING),
       );
       anchored = true;
-      await this.bridge.runTurn(entry, text, eventBus);
+      await this.bridge.runTurn(entry, content, eventBus);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!anchored) {
@@ -92,23 +93,4 @@ function taskEvent(
     metadata: undefined,
   };
   return AgentEvent.task(task);
-}
-
-// TODO(verify): non-text parts (file/raw/url/data) — dsh supports image
-// content blocks; map them when a client needs it. The confirmation data-part
-// protocol ({callId, outcome}) maps onto the optional dsh-user-approval
-// service (0.1.2+, asks carry the exact tool call) — bridge it once a
-// deployment composes that service.
-function extractText(message: Message): string {
-  const nonText = message.parts.filter((part) => part.content?.$case !== 'text');
-  if (nonText.length > 0) {
-    throw new Error(
-      `dsh-a2a: unsupported part kind(s): ${nonText.map((part) => part.content?.$case ?? 'unknown').join(', ')} (text-only)`,
-    );
-  }
-  const text = message.parts
-    .map((part) => (part.content?.$case === 'text' ? part.content.value : ''))
-    .join('');
-  if (!text.trim()) throw new Error('dsh-a2a: message must contain at least one text part');
-  return text;
 }

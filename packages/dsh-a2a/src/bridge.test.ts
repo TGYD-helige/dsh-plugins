@@ -1,4 +1,7 @@
-import { type Message, Role, TaskState } from '@a2a-js/sdk';
+import { mkdtemp, readFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { type Message, type Part, Role, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutionEvent, ExecutionEventBus } from '@a2a-js/sdk/server';
 import { DefaultExecutionEventBus, RequestContext, ServerCallContext } from '@a2a-js/sdk/server';
 import { Context } from '@deepseek-ai/cordis';
@@ -8,8 +11,9 @@ import type {
   AgentRegistry,
   AssistantStreamFrame,
 } from '@deepseek-ai/dsh-agent';
+import type { AttachmentStore } from '@deepseek-ai/dsh-attachment';
 import type { Session, SessionEvent, SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // The real dsh-agent root module imports workspace-internal packages
 // (dsh-scope) absent from this dev install — the bridge needs only
@@ -60,8 +64,10 @@ interface FakeAgent {
   agent: Agent;
   handle: AgentHandle;
   sessionId: SessionId;
-  /** Follow-up messages the loop received. */
+  /** Follow-up messages the loop received (text blocks joined). */
   prompts: string[];
+  /** Follow-up content blocks the loop received, verbatim per message. */
+  contents: Array<Array<{ type: string; text?: string; attachment?: unknown }>>;
   /** Emitted session events are scripted here per test. */
   emit: (events: SessionEvent[]) => void;
   /** Live assistant-stream frames are scripted here per test. */
@@ -82,6 +88,7 @@ function fakeAgents(ctx: Context) {
         const fake: FakeAgent = {
           sessionId: options.sessionId,
           prompts: [],
+          contents: [],
           emit: (events) => {
             for (const e of events) ctx.emit('session/event', session, e);
           },
@@ -97,13 +104,18 @@ function fakeAgents(ctx: Context) {
           session,
           options: options.agentOptions ?? {},
           status: 'idle',
-          followup: vi.fn((message: { content: Array<{ type: string; text?: string }> }) => {
-            if ((fake as FakeAgent & { failFollowup?: boolean }).failFollowup) {
-              throw new Error('inbox closed');
-            }
-            fake.prompts.push(message.content.map((b) => b.text ?? '').join(''));
-            scriptTurn(fake);
-          }),
+          followup: vi.fn(
+            (message: {
+              content: Array<{ type: string; text?: string; attachment?: unknown }>;
+            }) => {
+              if ((fake as FakeAgent & { failFollowup?: boolean }).failFollowup) {
+                throw new Error('inbox closed');
+              }
+              fake.contents.push(message.content);
+              fake.prompts.push(message.content.map((b) => b.text ?? '').join(''));
+              scriptTurn(fake);
+            },
+          ),
           cancel: vi.fn(() => {
             fake.emit([turnEnd({ kind: 'aborted', reason: { kind: 'user' } })]);
           }),
@@ -128,18 +140,15 @@ function userMessage(text: string): Message {
     contextId: '',
     taskId: '',
     role: Role.ROLE_USER,
-    parts: [
-      {
-        content: { $case: 'text', value: text },
-        metadata: undefined,
-        filename: '',
-        mediaType: 'text/plain',
-      },
-    ],
+    parts: [part({ $case: 'text', value: text }, 'text/plain')],
     metadata: undefined,
     extensions: [],
     referenceTaskIds: [],
   };
+}
+
+function part(content: Part['content'], mediaType = '', filename = ''): Part {
+  return { content, metadata: undefined, filename, mediaType };
 }
 
 function requestContext(message: Message, taskId: string, contextId: string): RequestContext {
@@ -190,12 +199,18 @@ describe('A2aBridge + DshAgentExecutor', () => {
     mocks.installModelSelection.mockClear();
   });
 
-  async function execute(taskId: string, contextId: string, text = 'hi') {
+  afterEach(vi.unstubAllGlobals);
+
+  async function executeMessage(taskId: string, contextId: string, message: Message) {
     const executor = new DshAgentExecutor(bridge);
     const bus = new DefaultExecutionEventBus();
     const collector = collect(bus);
-    await executor.execute(requestContext(userMessage(text), taskId, contextId), bus);
+    await executor.execute(requestContext(message, taskId, contextId), bus);
     return { bus, ...collector };
+  }
+
+  async function execute(taskId: string, contextId: string, text = 'hi') {
+    return executeMessage(taskId, contextId, userMessage(text));
   }
 
   it('runs a full turn: task anchor, working, deltas, final input-required', async () => {
@@ -246,6 +261,55 @@ describe('A2aBridge + DshAgentExecutor', () => {
     expect(final.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
   });
 
+  it("keeps a previous binding's late turn/end out of a rebound task", async () => {
+    // Turns never end on their own here; the test drives every event.
+    let session: Session;
+    agents.registry.create = vi.fn(
+      async (options: { sessionId: SessionId }): Promise<AgentHandle> => {
+        session = { id: options.sessionId } as Session;
+        const agent = {
+          id: options.sessionId,
+          session,
+          followup: vi.fn(() =>
+            ctx.emit('session/event', session, event('turn/start', { turn: 1 })),
+          ),
+          cancel: vi.fn(),
+          whenIdle: vi.fn(async () => {}),
+        } as unknown as Agent;
+        return { agent, dispose: vi.fn(async () => {}) };
+      },
+    );
+    const executor = new DshAgentExecutor(bridge);
+
+    const firstBus = new DefaultExecutionEventBus();
+    collect(firstBus);
+    const first = executor.execute(requestContext(userMessage('one'), 't1', 'ctx1'), firstBus);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Rebind the context to t2 while t1's turn is still open (its cancel is
+    // still propagating).
+    const secondBus = new DefaultExecutionEventBus();
+    const second = collect(secondBus);
+    const secondRun = executor.execute(requestContext(userMessage('two'), 't2', 'ctx1'), secondBus);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // t1's late aborted turn/end must settle its waiter but publish nothing
+    // under t2.
+    ctx.emit('session/event', session!, turnEnd({ kind: 'aborted', reason: { kind: 'user' } }));
+    expect(
+      statusUpdates(second.seen).some((u) => u.status?.state === TaskState.TASK_STATE_CANCELED),
+    ).toBe(false);
+
+    // t2's own turn then completes normally.
+    ctx.emit('session/event', session!, event('turn/start', { turn: 2 }));
+    ctx.emit('session/event', session!, assistantMessage('ok'));
+    ctx.emit('session/event', session!, turnEnd({ kind: 'completed' }));
+    await Promise.all([first, secondRun]);
+    const final = statusUpdates(second.seen).at(-1)!;
+    expect(final.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
+    expect(textOfStatus(final)).toBe('ok');
+  });
+
   it('fails the task when agent creation throws', async () => {
     agents.registry.create = vi.fn(async () => {
       throw new Error('no agent factory registered');
@@ -260,25 +324,238 @@ describe('A2aBridge + DshAgentExecutor', () => {
     expect(textOfStatus(final)).toBe('no agent factory registered');
   });
 
-  it('fails fast on messages without text parts', async () => {
-    const executor = new DshAgentExecutor(bridge);
-    const bus = new DefaultExecutionEventBus();
-    const { seen } = collect(bus);
-    const message: Message = {
-      ...userMessage(''),
-      parts: [
-        {
-          content: { $case: 'data', value: {} },
-          metadata: undefined,
-          filename: '',
-          mediaType: 'application/json',
-        },
-      ],
-    };
-    await executor.execute(requestContext(message, 't5', 'ctx5'), bus);
+  it('fails fast on a message with no usable parts', async () => {
+    const message: Message = { ...userMessage(''), parts: [part({ $case: 'text', value: '  ' })] };
+    const { seen } = await executeMessage('t5', 'ctx5', message);
     const final = statusUpdates(seen).at(-1)!;
     expect(final.status?.state).toBe(TaskState.TASK_STATE_FAILED);
     expect(agents.created).toHaveLength(0);
+  });
+
+  describe('message parts', () => {
+    const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    const docBytes = new TextEncoder().encode('hello doc');
+
+    let uploadsCwd: string;
+
+    beforeEach(async () => {
+      uploadsCwd = await mkdtemp(path.join(os.tmpdir(), 'dsh-a2a-uploads-'));
+      bridge = new A2aBridge(ctx, {
+        cwd: uploadsCwd,
+        agentOptions: { model: 'm' },
+        uploadsDir: uploadsCwd,
+      });
+    });
+
+    function fakeAttachments() {
+      const store = {
+        imageLimits: { mediaTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] },
+        saveImage: vi.fn(async (input: { data: Uint8Array; mediaType: string; name?: string }) => ({
+          attachmentId: `img-${input.name ?? 'image'}`,
+          mediaType: input.mediaType,
+          bytes: input.data.byteLength,
+          width: 8,
+          height: 8,
+          name: input.name,
+        })),
+        saveFile: vi.fn(async (input: { data: Uint8Array; name?: string }) => ({
+          attachmentId: `file-${input.name ?? 'upload'}`,
+          name: input.name ?? 'upload',
+          bytes: input.data.byteLength,
+        })),
+      };
+      ctx.provide('attachments', store as unknown as AttachmentStore);
+      return store;
+    }
+
+    const stubFetch = (body: ConstructorParameters<typeof Response>[0], contentType: string) =>
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(body, { headers: { 'content-type': contentType } })),
+      );
+
+    const promptPath = (prompt: string) => {
+      const filePath = /path="([^"]+)"/.exec(prompt)?.[1];
+      if (!filePath) throw new Error(`no path attribute in prompt: ${prompt}`);
+      return filePath;
+    };
+
+    it('stores a url file part as a file attachment when a store is composed', async () => {
+      const store = fakeAttachments();
+      stubFetch(docBytes, DOCX);
+      const message: Message = {
+        ...userMessage(''),
+        parts: [
+          part({ $case: 'text', value: '这个文档讲了啥' }, 'text/plain'),
+          part({ $case: 'url', value: 'https://cdn.example.com/doc.docx' }, DOCX, 'doc.docx'),
+        ],
+      };
+      const { seen } = await executeMessage('t1', 'ctx1', message);
+      expect(store.saveFile).toHaveBeenCalledTimes(1);
+      expect(store.saveFile.mock.calls[0][0].name).toBe('doc.docx');
+      expect(new Uint8Array(store.saveFile.mock.calls[0][0].data)).toEqual(docBytes);
+      const blocks = agents.created[0].contents[0];
+      expect(blocks[0]).toMatchObject({ type: 'text', text: '这个文档讲了啥' });
+      expect(blocks[1]).toMatchObject({
+        type: 'file',
+        attachment: { name: 'doc.docx', bytes: docBytes.byteLength },
+      });
+      expect(statusUpdates(seen).at(-1)!.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
+    });
+
+    it('stores an inline raw image part as an image attachment', async () => {
+      const store = fakeAttachments();
+      const message: Message = {
+        ...userMessage(''),
+        parts: [
+          part(
+            { $case: 'raw', value: Buffer.from([0x89, 0x50, 0x4e, 0x47]) },
+            'image/png',
+            's.png',
+          ),
+        ],
+      };
+      await executeMessage('t1', 'ctx1', message);
+      expect(store.saveImage).toHaveBeenCalledTimes(1);
+      expect(store.saveImage.mock.calls[0][0]).toMatchObject({
+        mediaType: 'image/png',
+        name: 's.png',
+      });
+      expect(agents.created[0].contents[0][0]).toMatchObject({
+        type: 'image',
+        attachment: { attachmentId: 'img-s.png' },
+      });
+    });
+
+    it('falls back to a file attachment when image admission rejects the bytes', async () => {
+      const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const store = fakeAttachments();
+      store.saveImage.mockRejectedValue(new Error('not a png'));
+      const message: Message = {
+        ...userMessage(''),
+        parts: [part({ $case: 'raw', value: Buffer.from('garbage') }, 'image/png', 's.png')],
+      };
+      await executeMessage('t1', 'ctx1', message);
+      expect(store.saveFile).toHaveBeenCalledTimes(1);
+      expect(agents.created[0].contents[0][0].type).toBe('file');
+      expect(spy.mock.calls.some(([p]) => String(p).includes('[dsh-a2a]'))).toBe(true);
+      spy.mockRestore();
+    });
+
+    it('persists a url file part into the workspace when no store is composed', async () => {
+      stubFetch(docBytes, DOCX);
+      const message: Message = {
+        ...userMessage(''),
+        parts: [
+          part({ $case: 'text', value: '这个文档讲了啥' }, 'text/plain'),
+          part({ $case: 'url', value: 'https://cdn.example.com/doc.docx' }, DOCX, 'doc.docx'),
+        ],
+      };
+      const { seen } = await executeMessage('t1', 'ctx1', message);
+      const prompt = agents.created[0].prompts[0];
+      expect(prompt).toContain('<document name="doc.docx" uri="https://cdn.example.com/doc.docx"');
+      expect(prompt).toContain(`type="${DOCX}"`);
+      expect(prompt).toContain(`size="${docBytes.byteLength}"`);
+      const filePath = promptPath(prompt);
+      expect(filePath.startsWith(uploadsCwd)).toBe(true);
+      expect(new Uint8Array(await readFile(filePath))).toEqual(docBytes);
+      expect(statusUpdates(seen).at(-1)!.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
+    });
+
+    it('defaults uploads to a dsh-a2a-uploads dir under the OS temp dir', async () => {
+      bridge = new A2aBridge(ctx, { cwd: uploadsCwd, agentOptions: { model: 'm' } });
+      const message: Message = {
+        ...userMessage(''),
+        parts: [part({ $case: 'raw', value: Buffer.from('x') }, 'text/plain', 'a.txt')],
+      };
+      await executeMessage('t1', 'ctx1', message);
+      const filePath = promptPath(agents.created[0].prompts[0]);
+      expect(filePath.startsWith(path.join(os.tmpdir(), 'dsh-a2a-uploads'))).toBe(true);
+    });
+
+    it('persists an anonymous raw part under a fallback name', async () => {
+      const message: Message = {
+        ...userMessage(''),
+        parts: [part({ $case: 'raw', value: Buffer.from('plain body') }, 'text/plain')],
+      };
+      await executeMessage('t1', 'ctx1', message);
+      const filePath = promptPath(agents.created[0].prompts[0]);
+      expect(path.basename(filePath)).toBe('unnamed-file');
+      expect(await readFile(filePath, 'utf8')).toBe('plain body');
+    });
+
+    it('sanitizes path separators out of upload filenames', async () => {
+      const message: Message = {
+        ...userMessage(''),
+        parts: [
+          part(
+            { $case: 'raw', value: Buffer.from('x') },
+            'application/octet-stream',
+            '../../evil.sh',
+          ),
+        ],
+      };
+      await executeMessage('t1', 'ctx1', message);
+      const prompt = agents.created[0].prompts[0];
+      const filePath = promptPath(prompt);
+      expect(prompt).toContain('name="evil.sh"');
+      expect(path.basename(filePath)).toBe('evil.sh');
+      expect(filePath.startsWith(uploadsCwd)).toBe(true);
+    });
+
+    it('keeps same-named uploads distinct', async () => {
+      const message: Message = {
+        ...userMessage(''),
+        parts: [
+          part({ $case: 'raw', value: Buffer.from('one') }, 'text/plain', 'a.txt'),
+          part({ $case: 'raw', value: Buffer.from('two') }, 'text/plain', 'a.txt'),
+        ],
+      };
+      await executeMessage('t1', 'ctx1', message);
+      const paths = agents.created[0].contents[0].map((b) => promptPath(b.text ?? ''));
+      expect(new Set(paths).size).toBe(2);
+      expect(await readFile(paths[0], 'utf8')).toBe('one');
+      expect(await readFile(paths[1], 'utf8')).toBe('two');
+    });
+
+    it('degrades a failed download to a note instead of failing the turn', async () => {
+      const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const store = fakeAttachments();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => {
+          throw new TypeError('fetch failed');
+        }),
+      );
+      const message: Message = {
+        ...userMessage('hi'),
+        parts: [
+          part({ $case: 'text', value: 'hi' }, 'text/plain'),
+          part({ $case: 'url', value: 'https://cdn.example.com/doc.docx' }, DOCX, 'doc.docx'),
+        ],
+      };
+      const { seen } = await executeMessage('t1', 'ctx1', message);
+      expect(store.saveFile).not.toHaveBeenCalled();
+      expect(agents.created[0].prompts[0]).toContain('not delivered');
+      expect(statusUpdates(seen).at(-1)!.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
+      expect(spy.mock.calls.some(([p]) => String(p).includes('[dsh-a2a]'))).toBe(true);
+      spy.mockRestore();
+    });
+
+    it('maps a data part onto JSON text instead of failing', async () => {
+      const message: Message = {
+        ...userMessage(''),
+        parts: [
+          part({ $case: 'text', value: 'fix this' }, 'text/plain'),
+          part({ $case: 'data', value: { type: 'error', line: 3 } }, 'application/json'),
+        ],
+      };
+      const { seen } = await executeMessage('t1', 'ctx1', message);
+      const prompt = agents.created[0].prompts[0];
+      expect(prompt).toContain('<data>');
+      expect(prompt).toContain('"type": "error"');
+      expect(statusUpdates(seen).at(-1)!.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
+    });
   });
 
   it('cancelTask aborts the agent and publishes a canceled final', async () => {
