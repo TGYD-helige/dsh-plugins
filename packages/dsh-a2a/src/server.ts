@@ -19,11 +19,17 @@ import {
   AGENT_CARD_PATH,
   type AgentCard,
   type AgentInterface,
+  TaskState,
 } from '@a2a-js/sdk';
 import { duplicateInterfacesForLegacy } from '@a2a-js/sdk/compat/v0_3';
-import { type AgentExecutor, DefaultRequestHandler, type TaskStore } from '@a2a-js/sdk/server';
+import {
+  type AgentExecutor,
+  DefaultRequestHandler,
+  ServerCallContext,
+  type TaskStore,
+} from '@a2a-js/sdk/server';
 import { agentCardHandler, jsonRpcHandler, UserBuilder } from '@a2a-js/sdk/server/express';
-import express from 'express';
+import express, { type RequestHandler } from 'express';
 
 export interface A2aServerOptions {
   host: string;
@@ -96,15 +102,73 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
   app.use(`/${AGENT_CARD_PATH}`, cardHandler);
   // Pre-1.0 discovery path, kept as a convenience alias.
   app.use('/.well-known/agent.json', cardHandler);
+  const contextLookup: RequestHandler = async (req, res, next) => {
+    const body = req.body as {
+      jsonrpc?: string;
+      id?: unknown;
+      method?: string;
+      params?: Record<string, unknown>;
+    };
+    const params = body?.params;
+    if (
+      body?.method !== 'tasks/get' ||
+      typeof params?.contextId !== 'string' ||
+      !params.contextId ||
+      params.id
+    ) {
+      next();
+      return;
+    }
+    try {
+      const contextId = params.contextId;
+      const tenant = typeof params.tenant === 'string' ? params.tenant : '';
+      const page = await options.taskStore.list(
+        {
+          tenant,
+          contextId,
+          pageSize: 1,
+          pageToken: '',
+          status: TaskState.TASK_STATE_UNSPECIFIED,
+          statusTimestampAfter: undefined,
+        },
+        new ServerCallContext({ tenant }),
+      );
+      const task = page.tasks[0];
+      if (!task) {
+        res.json({ jsonrpc: '2.0', id: body.id ?? null, result: null });
+        return;
+      }
+      const { contextId: _contextId, ...rest } = params;
+      req.body = { ...body, params: { ...rest, id: task.id } };
+      next(); // Let the SDK load and serialize the task on the v0.3 wire.
+    } catch (error) {
+      console.error('[dsh-a2a] context task lookup failed:', error);
+      res.status(500).json({
+        jsonrpc: '2.0',
+        id: body.id ?? null,
+        error: { code: -32603, message: 'Task lookup failed' },
+      });
+    }
+  };
+  const rpcHandler = jsonRpcHandler({
+    requestHandler,
+    userBuilder: UserBuilder.noAuthentication,
+    legacyCompat: { enabled: true },
+  });
   // dsh ships no authn/authz — the loopback default binding is the boundary.
-  app.use(
-    base,
-    jsonRpcHandler({
-      requestHandler,
-      userBuilder: UserBuilder.noAuthentication,
-      legacyCompat: { enabled: true },
-    }),
-  );
+  if (base) {
+    app.post(
+      '/',
+      (req, res, next) => {
+        const body = req.body as { method?: string; params?: Record<string, unknown> };
+        if (body?.method === 'tasks/get' && body.params?.contextId && !body.params.id) next();
+        else res.sendStatus(404);
+      },
+      contextLookup,
+      rpcHandler,
+    );
+  }
+  app.use(base, contextLookup, rpcHandler);
 
   const server: Server = createServer(app);
   await new Promise<void>((resolve, reject) => {

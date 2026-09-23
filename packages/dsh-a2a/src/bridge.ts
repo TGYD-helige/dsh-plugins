@@ -73,11 +73,16 @@ export interface TaskEntry {
   staleTurn: boolean;
   /** FIFO turn-end waiters, one per queued/running execute(). */
   settled: Array<() => void>;
+  /** Active execute() calls that must finish before task shells are deleted. */
+  running: Set<Promise<void>>;
 }
 
 export class A2aBridge {
   private readonly tasks = new Map<string, TaskEntry>(); // taskId → entry
   private readonly bySession = new Map<string, TaskEntry>(); // sessionId (== contextId) → entry
+  private readonly clearing = new Set<string>();
+  private readonly creating = new Map<string, Set<Promise<unknown>>>();
+  private readonly executing = new Map<string, Set<Promise<void>>>();
 
   constructor(
     private readonly ctx: Context,
@@ -99,6 +104,26 @@ export class A2aBridge {
     taskId: string,
     contextId: string,
   ): Promise<{ entry: TaskEntry; freshTask: boolean }> {
+    const creation = this.ensureTaskInner(taskId, contextId);
+    let pending = this.creating.get(contextId);
+    if (!pending) {
+      pending = new Set();
+      this.creating.set(contextId, pending);
+    }
+    pending.add(creation);
+    try {
+      return await creation;
+    } finally {
+      pending.delete(creation);
+      if (pending.size === 0) this.creating.delete(contextId);
+    }
+  }
+
+  private async ensureTaskInner(
+    taskId: string,
+    contextId: string,
+  ): Promise<{ entry: TaskEntry; freshTask: boolean }> {
+    if (this.clearing.has(contextId)) throw new Error('Context is being cleared.');
     const existing = this.tasks.get(taskId);
     if (existing) return { entry: existing, freshTask: false };
 
@@ -118,9 +143,6 @@ export class A2aBridge {
       return { entry: forContext, freshTask: true };
     }
 
-    // TODO(verify): resuming a persisted session (agents.resume) after a
-    // restart — needs dsh's sessionPersistence service composed. For now a
-    // client-supplied contextId simply names the fresh session.
     const sessionId = SessionId(contextId);
     const selection = this.resolveSelection();
 
@@ -135,32 +157,42 @@ export class A2aBridge {
       agentPreset = (await presets.resolve(this.options.preset || undefined)).id;
     }
 
-    const handle = await this.ctx.agents.create({
-      sessionId,
-      meta: { cwd: this.options.cwd, ...(agentPreset ? { agentPreset } : {}) },
-      agentOptions: selection
-        ? { provider: selection.provider, model: selection.model }
-        : undefined,
-      // The loop's `{{model}}` prompt variable and request routing resolve from
-      // the agent's installed model selection (dsh-agent-loop's variables read
-      // agent.options; the scoped waterfalls wire provider/model into prompt
-      // assembly and the request config). Verified against
-      // @deepseek-ai/dsh-headless@0.1.6-alpha.2's run() — entry points are
-      // expected to resolve the deployment default themselves.
-      setup:
-        selection || agentPreset
-          ? async (agentCtx) => {
-              if (selection) {
-                // Statement, deliberately not returned: a returned disposer would
-                // be invoked as the setup commit and immediately unwired. Likewise
-                // the mount result must not escape — setup's return value is
-                // commit()-shaped to the factory.
-                installModelSelection(agentCtx, { current: selection, assembled: undefined });
-              }
-              if (agentPreset) await presets!.mount(agentCtx, agentPreset);
+    const agentOptions = selection
+      ? { provider: selection.provider, model: selection.model }
+      : undefined;
+    // The loop's `{{model}}` prompt variable and request routing resolve from
+    // the agent's installed model selection (dsh-agent-loop's variables read
+    // agent.options; the scoped waterfalls wire provider/model into prompt
+    // assembly and the request config). Verified against
+    // @deepseek-ai/dsh-headless@0.1.6-alpha.2's run() — entry points are
+    // expected to resolve the deployment default themselves.
+    const setup =
+      selection || agentPreset
+        ? async (agentCtx: Context) => {
+            if (selection) {
+              // Statement, deliberately not returned: a returned disposer would
+              // be invoked as the setup commit and immediately unwired. Likewise
+              // the mount result must not escape — setup's return value is
+              // commit()-shaped to the factory.
+              installModelSelection(agentCtx, { current: selection, assembled: undefined });
             }
-          : undefined,
-    });
+            if (agentPreset) await presets!.mount(agentCtx, agentPreset);
+          }
+        : undefined;
+    // Persistence is optional in minimal compositions. A stat failure is not
+    // absence: let it fail instead of trying create() against an existing id.
+    const persistence = this.ctx.get('sessionPersistence') as
+      | { stat(id: SessionId): Promise<unknown> }
+      | undefined;
+    const persisted = await persistence?.stat(sessionId);
+    const handle = persisted
+      ? await this.ctx.agents.resume({ resumeSessionId: sessionId, agentOptions, setup })
+      : await this.ctx.agents.create({
+          sessionId,
+          meta: { cwd: this.options.cwd, ...(agentPreset ? { agentPreset } : {}) },
+          agentOptions,
+          setup,
+        });
     const entry: TaskEntry = {
       taskId,
       sessionId,
@@ -170,6 +202,7 @@ export class A2aBridge {
       turnActive: false,
       staleTurn: false,
       settled: [],
+      running: new Set(),
     };
     this.tasks.set(taskId, entry);
     this.bySession.set(contextId, entry);
@@ -182,8 +215,44 @@ export class A2aBridge {
     return buildMessageContent(message.parts, attachments, uploadsDir(this.options.uploadsDir));
   }
 
+  isClearing(contextId: string): boolean {
+    return this.clearing.has(contextId);
+  }
+
+  /** Include content preparation in the work a context clear must drain. */
+  async trackExecution(contextId: string, run: () => Promise<void>): Promise<void> {
+    const execution = run();
+    let pending = this.executing.get(contextId);
+    if (!pending) {
+      pending = new Set();
+      this.executing.set(contextId, pending);
+    }
+    pending.add(execution);
+    try {
+      await execution;
+    } finally {
+      pending.delete(execution);
+      if (pending.size === 0) this.executing.delete(contextId);
+    }
+  }
+
   /** Queue one user-message turn on the task's agent and await its `turn/end`. */
   async runTurn(entry: TaskEntry, content: ContentBlock[], bus: ExecutionEventBus): Promise<void> {
+    if (this.clearing.has(entry.sessionId as string)) throw new Error('Context is being cleared.');
+    const running = this.runTurnInner(entry, content, bus);
+    entry.running.add(running);
+    try {
+      await running;
+    } finally {
+      entry.running.delete(running);
+    }
+  }
+
+  private async runTurnInner(
+    entry: TaskEntry,
+    content: ContentBlock[],
+    bus: ExecutionEventBus,
+  ): Promise<void> {
     let resolveSettled!: () => void;
     const settled = new Promise<void>((resolve) => {
       resolveSettled = resolve;
@@ -221,6 +290,34 @@ export class A2aBridge {
       throw error;
     } finally {
       if (entry.bus === bus) entry.bus = null;
+    }
+  }
+
+  /** Cancel and release the live binding before the caller deletes stored shells. */
+  async clearContext(
+    contextId: string,
+    clearStored: (liveIds: string[]) => Promise<string[]> = async (ids) => ids,
+  ): Promise<string[]> {
+    if (this.clearing.has(contextId)) throw new Error('Context is already being cleared.');
+    this.clearing.add(contextId);
+    try {
+      await Promise.allSettled([...(this.creating.get(contextId) ?? [])]);
+      const entry = this.bySession.get(contextId);
+      if (entry) {
+        if (entry.turnActive || entry.running.size > 0) {
+          await entry.handle.agent.cancel({ kind: 'user' });
+        }
+        await entry.handle.agent.whenIdle();
+        this.settleEntry(entry, 'Context cleared.');
+        await Promise.allSettled([...entry.running]);
+        this.tasks.delete(entry.taskId);
+        this.bySession.delete(contextId);
+        await entry.handle.dispose();
+      }
+      await Promise.allSettled([...(this.executing.get(contextId) ?? [])]);
+      return await clearStored(entry ? [entry.taskId] : []);
+    } finally {
+      this.clearing.delete(contextId);
     }
   }
 

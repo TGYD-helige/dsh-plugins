@@ -1,9 +1,9 @@
 import { Role, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutor, ExecutionEventBus } from '@a2a-js/sdk/server';
-import { AgentEvent, InMemoryTaskStore, type RequestContext } from '@a2a-js/sdk/server';
+import { AgentEvent, type RequestContext } from '@a2a-js/sdk/server';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { type A2aServer, startA2aServer } from './server.js';
-import { SanitizedTaskStore } from './task-store.js';
+import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
 
 // A stub executor with the same event contract the real one uses: a task
 // anchor first (A2A 1.0 stream ordering), then working, then input-required.
@@ -86,7 +86,7 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
       basePath: '/a2a',
       card: { name: 'test-agent', description: 'test', version: '0.0.1' },
       executor: stubExecutor,
-      taskStore: new SanitizedTaskStore(new InMemoryTaskStore()),
+      taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
     });
     base = `http://127.0.0.1:${server.port}`;
   });
@@ -208,6 +208,29 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     expect(body.error).toBeUndefined();
     expect(body.result.kind).toBe('task');
     expect(body.result.status.state).toBe('input-required');
+  });
+
+  it('finds the latest legacy task by contextId at the root JSON-RPC path', async () => {
+    const first = await json(
+      await rpc('SendMessage', { tenant: '', ...v1Message('one', { contextId: 'recover' }) }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    const second = await json(
+      await rpc('SendMessage', { tenant: '', ...v1Message('two', { contextId: 'recover' }) }),
+    );
+    const lookup = (contextId: string, path = '/') =>
+      fetch(`${base}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'tasks/get', params: { contextId } }),
+      });
+    const found = await json(await lookup('recover'));
+    expect(found.error).toBeUndefined();
+    expect(found.result.kind).toBe('task');
+    expect(found.result.id).toBe(second.result.task.id);
+    expect(found.result.id).not.toBe(first.result.task.id);
+    expect((await json(await lookup('recover', '/a2a/'))).result.id).toBe(second.result.task.id);
+    expect((await json(await lookup('missing'))).result).toBeNull();
   });
 
   it('rejects unknown methods and unknown tasks with JSON-RPC errors', async () => {

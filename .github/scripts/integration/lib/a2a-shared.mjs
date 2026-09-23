@@ -46,7 +46,7 @@ export async function waitFor(url, timeoutMs) {
  * deepseek-v4-flash; legs pass extraPatch for e.g. the thinking rows), boot
  * `dsh web`, and wait for the agent card to answer.
  */
-export async function bootA2a({ tag, extraPatch = '' }) {
+export async function bootA2a({ tag, extraPatch = '', reuse = false }) {
   requireEnv(['DSH_INTEGRATION_BASE_URL', 'DSH_INTEGRATION_API_KEY', 'DSH_PKG_TARBALL']);
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-a2a-e2e-${tag}`);
   mkdirSync(workDir, { recursive: true });
@@ -54,10 +54,12 @@ export async function bootA2a({ tag, extraPatch = '' }) {
   const dsh = process.env.DSH_CLI ?? 'dsh';
   const a2aPort = await freePort();
 
-  run(dsh, ['plugin', '--profile', 'web', 'add', resolve(process.env.DSH_PKG_TARBALL)], {
-    cwd: workDir,
-    env: { DSH_HOME: dshHome },
-  });
+  if (!reuse) {
+    run(dsh, ['plugin', '--profile', 'web', 'add', resolve(process.env.DSH_PKG_TARBALL)], {
+      cwd: workDir,
+      env: { DSH_HOME: dshHome },
+    });
+  }
 
   // An id-targeted row replaces the bundle row's whole config; the template
   // file is one top-level YAML array, so rewrite it wholesale.

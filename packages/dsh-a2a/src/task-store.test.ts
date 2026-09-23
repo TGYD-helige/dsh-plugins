@@ -7,12 +7,12 @@ import {
 } from '@a2a-js/sdk';
 import { ServerCallContext } from '@a2a-js/sdk/server';
 import { beforeEach, describe, expect, it, type Mock, vi } from 'vitest';
-import { listShells, SanitizedTaskStore, sanitizeTask } from './task-store.js';
+import { listShells, MemoryTaskStore, SanitizedTaskStore, sanitizeTask } from './task-store.js';
 
 const mocks = vi.hoisted(() => {
   class MockRedis {
     static instances: MockRedis[] = [];
-    readonly calls = { set: [] as unknown[][], get: [] as string[], quit: 0 };
+    readonly calls = { set: [] as unknown[][], get: [] as string[], del: [] as string[], quit: 0 };
     private readonly data = new Map<string, string>();
     constructor(readonly url: string) {
       MockRedis.instances.push(this);
@@ -25,6 +25,10 @@ const mocks = vi.hoisted(() => {
     async get(key: string) {
       this.calls.get.push(key);
       return this.data.get(key) ?? null;
+    }
+    async del(key: string) {
+      this.calls.del.push(key);
+      return Number(this.data.delete(key));
     }
     async scan(_cursor: string, ...args: unknown[]) {
       const match = args[1] as string;
@@ -106,6 +110,17 @@ describe('sanitizeTask', () => {
     expect(clean.status?.state).toBe(TaskState.TASK_STATE_WORKING);
     expect(clean.metadata).toEqual({ dshAgent: { kind: 'state-change' } });
   });
+});
+
+it('keeps memory task shells scoped to their A2A tenant', async () => {
+  const store = new MemoryTaskStore();
+  const a = new ServerCallContext({ tenant: 'a' });
+  const b = new ServerCallContext({ tenant: 'b' });
+  await store.save(task(TaskState.TASK_STATE_WORKING), a);
+  expect(await store.load('t1', b)).toBeUndefined();
+  expect((await store.list(listParams(), a)).totalSize).toBe(1);
+  await store.delete('t1', a);
+  expect(await store.load('t1', a)).toBeUndefined();
 });
 
 describe('listShells', () => {
@@ -198,6 +213,7 @@ describe('SanitizedTaskStore', () => {
     save: Mock<(t: Task, c: ServerCallContext) => Promise<void>>;
     load: Mock<(id: string, c: ServerCallContext) => Promise<Task | undefined>>;
     list: Mock<(p: ListTasksRequest, c: ServerCallContext) => Promise<ListTasksResponse>>;
+    delete: Mock<(id: string, c: ServerCallContext) => Promise<void>>;
     init: Mock<() => Promise<void>>;
     close: Mock<() => Promise<void>>;
   };
@@ -210,6 +226,7 @@ describe('SanitizedTaskStore', () => {
       }),
       load: vi.fn(async () => undefined),
       list: vi.fn(async () => ({ tasks: [], nextPageToken: '', pageSize: 50, totalSize: 0 })),
+      delete: vi.fn(async () => {}),
       init: vi.fn(async () => {}),
       close: vi.fn(async () => {}),
     };
@@ -246,6 +263,28 @@ describe('SanitizedTaskStore', () => {
     expect(inner.load).toHaveBeenCalledWith('t1', ctx);
     expect(inner.close).toHaveBeenCalledTimes(1);
   });
+
+  it('waits for a pending save and prevents a cleared task from reappearing', async () => {
+    let finish!: () => void;
+    inner.save.mockImplementationOnce(
+      async () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const store = new SanitizedTaskStore(inner);
+    const writing = store.save(task(TaskState.TASK_STATE_WORKING), ctx);
+    const deleting = store.delete('t1', ctx);
+    await Promise.resolve();
+    expect(inner.delete).not.toHaveBeenCalled();
+    finish();
+    await Promise.all([writing, deleting]);
+    await store.save(task(TaskState.TASK_STATE_INPUT_REQUIRED), ctx);
+    store.suppress('t2');
+    await store.save(task(TaskState.TASK_STATE_FAILED, { id: 't2' }), ctx);
+    expect(inner.delete).toHaveBeenCalledWith('t1', ctx);
+    expect(inner.save).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('RedisTaskStore', () => {
@@ -268,6 +307,9 @@ describe('RedisTaskStore', () => {
     const loaded = await store.load('t1');
     expect(loaded).toEqual(value);
     expect(await store.load('missing')).toBeUndefined();
+    await store.delete('t1');
+    expect(redis.calls.del).toEqual(['a2a:tasks:t1']);
+    expect(await store.load('t1')).toBeUndefined();
 
     await store.close();
     expect(redis.calls.quit).toBe(1);

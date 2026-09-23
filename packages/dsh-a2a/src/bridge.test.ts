@@ -261,6 +261,161 @@ describe('A2aBridge + DshAgentExecutor', () => {
     expect(final.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
   });
 
+  it('resumes a persisted context after restart instead of creating it again', async () => {
+    ctx.provide('sessionPersistence', { stat: vi.fn(async () => ({ id: 'ctx1' })) });
+    const originalCreate = agents.registry.create;
+    agents.registry.resume = vi.fn(async ({ resumeSessionId }: { resumeSessionId: SessionId }) =>
+      originalCreate({ sessionId: resumeSessionId }),
+    );
+    await execute('t1', 'ctx1');
+    expect(agents.registry.resume).toHaveBeenCalledWith(
+      expect.objectContaining({ resumeSessionId: 'ctx1' }),
+    );
+    expect(await bridge.clearContext('ctx1')).toEqual(['t1']);
+  });
+
+  it('clears an idle bound task and permits a fresh binding', async () => {
+    await execute('t1', 'ctx1');
+    expect(await bridge.clearContext('ctx1')).toEqual(['t1']);
+    expect(agents.created[0].handle.dispose).toHaveBeenCalledOnce();
+    await execute('t2', 'ctx1');
+    expect(agents.created).toHaveLength(2);
+  });
+
+  it('waits for an in-flight creation and blocks rebinding through stored cleanup', async () => {
+    let creationStarted!: () => void;
+    let releaseCreation!: () => void;
+    const started = new Promise<void>((resolve) => {
+      creationStarted = resolve;
+    });
+    const creationGate = new Promise<void>((resolve) => {
+      releaseCreation = resolve;
+    });
+    ctx.provide('agentPresets', {
+      resolve: async () => {
+        creationStarted();
+        await creationGate;
+        return { id: 'code' };
+      },
+      mount: async () => {},
+    });
+    const creating = bridge.ensureTask('t1', 'ctx1');
+    await started;
+    let releaseCleanup!: () => void;
+    let cleanupStarted!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => {
+      releaseCleanup = resolve;
+    });
+    const cleaning = new Promise<void>((resolve) => {
+      cleanupStarted = resolve;
+    });
+    const cleared = bridge.clearContext('ctx1', async (ids) => {
+      expect(ids).toEqual(['t1']);
+      cleanupStarted();
+      await cleanupGate;
+      return ids;
+    });
+    releaseCreation();
+    await creating;
+    await cleaning;
+    await expect(bridge.ensureTask('t2', 'ctx1')).rejects.toThrow(/being cleared/);
+    releaseCleanup();
+    expect(await cleared).toEqual(['t1']);
+    expect(agents.created[0].handle.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('waits for an execute still building content before clearing', async () => {
+    let started!: () => void;
+    let release!: () => void;
+    const building = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.spyOn(bridge, 'buildContent').mockImplementation(async () => {
+      started();
+      await gate;
+      return [{ type: 'text', text: 'hi' }];
+    });
+    const order: string[] = [];
+    const bus = new DefaultExecutionEventBus();
+    const suppress = vi.fn();
+    const executing = new DshAgentExecutor(bridge, suppress)
+      .execute(requestContext(userMessage('hi'), 't1', 'ctx1'), bus)
+      .then(() => {
+        order.push('executed');
+      });
+    await building;
+    const clearing = bridge.clearContext('ctx1').then(() => {
+      order.push('cleared');
+    });
+    release();
+    await Promise.all([executing, clearing]);
+    expect(order).toEqual(['executed', 'cleared']);
+    expect(agents.created).toHaveLength(0);
+    expect(suppress).toHaveBeenCalledWith('t1');
+  });
+
+  it('suppresses a new task started during stored cleanup', async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const cleaning = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const cleared = bridge.clearContext('ctx1', async (ids) => {
+      started();
+      await gate;
+      return ids;
+    });
+    await cleaning;
+    const suppress = vi.fn();
+    await new DshAgentExecutor(bridge, suppress).execute(
+      requestContext(userMessage('hi'), 't1', 'ctx1'),
+      new DefaultExecutionEventBus(),
+    );
+    expect(suppress).toHaveBeenCalledWith('t1');
+    release();
+    await cleared;
+  });
+
+  it('cancels and drains a live turn before clearing its binding', async () => {
+    let session: Session;
+    agents.registry.create = vi.fn(async ({ sessionId }: { sessionId: SessionId }) => {
+      session = { id: sessionId } as Session;
+      return {
+        agent: {
+          session,
+          followup: vi.fn(() =>
+            ctx.emit('session/event', session, event('turn/start', { turn: 1 })),
+          ),
+          cancel: vi.fn(() =>
+            ctx.emit(
+              'session/event',
+              session,
+              turnEnd({ kind: 'aborted', reason: { kind: 'user' } }),
+            ),
+          ),
+          whenIdle: vi.fn(async () => {}),
+        } as unknown as Agent,
+        dispose: vi.fn(async () => {}),
+      };
+    });
+    const bus = new DefaultExecutionEventBus();
+    const collector = collect(bus);
+    const running = new DshAgentExecutor(bridge).execute(
+      requestContext(userMessage('hi'), 't1', 'ctx1'),
+      bus,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(await bridge.clearContext('ctx1')).toEqual(['t1']);
+    await running;
+    expect(collector.isFinished()).toBe(true);
+  });
+
   it("keeps a previous binding's late turn/end out of a rebound task", async () => {
     // Turns never end on their own here; the test drives every event.
     let session: Session;

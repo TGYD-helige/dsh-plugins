@@ -25,9 +25,24 @@ import type { A2aBridge } from './bridge.js';
 import { agentTextMessage, terminalStatusUpdate } from './translator.js';
 
 export class DshAgentExecutor implements AgentExecutor {
-  constructor(private readonly bridge: A2aBridge) {}
+  constructor(
+    private readonly bridge: A2aBridge,
+    private readonly suppressTask?: (taskId: string) => void,
+  ) {}
 
   async execute(requestContext: RequestContext, eventBus: ExecutionEventBus): Promise<void> {
+    if (this.bridge.isClearing(requestContext.contextId)) {
+      this.suppressTask?.(requestContext.taskId);
+    }
+    return this.bridge.trackExecution(requestContext.contextId, () =>
+      this.executeInner(requestContext, eventBus),
+    );
+  }
+
+  private async executeInner(
+    requestContext: RequestContext,
+    eventBus: ExecutionEventBus,
+  ): Promise<void> {
     const { userMessage, taskId, contextId } = requestContext;
     let anchored = false;
     try {
@@ -46,6 +61,7 @@ export class DshAgentExecutor implements AgentExecutor {
       anchored = true;
       await this.bridge.runTurn(entry, content, eventBus);
     } catch (error) {
+      if (this.bridge.isClearing(contextId)) this.suppressTask?.(taskId);
       const message = error instanceof Error ? error.message : String(error);
       if (!anchored) {
         eventBus.publish(
