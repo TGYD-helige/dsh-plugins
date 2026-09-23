@@ -26,6 +26,7 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
         port: 41241
         basePath: /a2a
         cwd: /srv/agent-workspaces
+        uploadsDir: ''         # file-part upload root; empty = <OS temp>/dsh-a2a-uploads/<date>
         agent:
           provider: ''       # dsh provider/model for A2A sessions; empty = profile default
           model: ''
@@ -56,7 +57,7 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
 - **One task = one dsh session.** The A2A `contextId` IS the dsh session id. A completed turn ends `input-required`, not `completed` — the task is a conversation and stays continuable; `CancelTask` and turn errors are terminal (`canceled` / `failed`), and the SDK rejects follow-ups addressed at a terminal `taskId` (send with only the `contextId` to continue the session under a fresh task id).
 - **Agents are full preset citizens.** Each task's agent is created with the deployment's default model selection (`agentDefaultModel`) and mounts its agent preset (the web profile keeps all tools inside presets — without one the agent would see an empty tool catalog). `agent.preset` pins a specific preset.
 - **Streaming aggregation.** Text deltas of a turn share one `messageId`, so clients accumulate them into a single message; reasoning deltas ride a separate `messageId` and are marked `metadata.dshAgent.kind: 'thought'`. The turn-final event's message carries the full assembled text, so blocking `SendMessage` clients read the answer from `result.task.status.message`. Tool calls/results are data parts marked `tool-call` / `tool-result`; token usage lands in `metadata.usage` of the final event. A2A 1.0 has no `final` flag — terminal and interrupted states close the stream.
-- **Text-only boundary** for now: `SendMessage` rejects messages with non-text parts (file/url/data) with a failed task.
+- **Message parts beyond text.** File parts (inline bytes or a `url` — the plugin downloads those over http/https, bounded to 64 MiB and 30 s) become durable image/file content blocks when the deployment composes an attachment store (`ctx.attachments`, e.g. `@deepseek-ai/dsh-attachment-local`): images reach vision-capable models natively, and every file projects to deterministic handle text naming the file and — on host-file-backed stores — its read-only saved path. Without a store, files persist under the configured `uploadsDir` (default `<OS temp>/dsh-a2a-uploads/<date>/`, names sanitized cross-platform, collisions suffixed) and the prompt references them by absolute path inside a `<document>` tag, so the agent reads or converts them with its own tools. `data` parts become `<data>` JSON text. A turn never fails because a part kind is unsupported.
 - **No approval bridge**: dsh ships the mid-turn approval seam only as the optional `dsh-user-approval` package, which headless profiles do not compose, so tools that would ask are governed by the profile's own approval setup; the A2A side never enters a mid-turn `input-required`.
 - **One in-flight message per task** is the supported flow (send the next message after the turn-final event). dsh serializes queued follow-ups into successive turns, but concurrent requests share one event bus — a second in-flight request may resolve with the first turn's final event.
 - **Restart**: persisted task shells survive in Redis/GCS, but live agents do not — continuing after a restart starts a fresh session (a client-supplied `contextId` names it).
@@ -71,11 +72,11 @@ A2A **task state** (status + metadata) is separate from conversation history —
 
 ## Security
 
-dsh ships **no authentication or authorization**. The server binds `127.0.0.1` by default; if you expose it, put an authenticated reverse proxy in front and treat every agent as running with the host process's OS privileges.
+dsh ships **no authentication or authorization**. The server binds `127.0.0.1` by default; if you expose it, put an authenticated reverse proxy in front and treat every agent as running with the host process's OS privileges. File parts carrying a `url` are fetched server-side (http/https only, bounded) — another reason to keep the endpoint off untrusted networks.
 
 ## Compatibility
 
-Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm}@0.1.6-alpha.2`) — check the `TODO(verify)` markers in `src/` before upgrading dsh.
+Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment}@0.1.6-alpha.2` — the attachment store is an optional peer) — check the `TODO(verify)` markers in `src/` before upgrading dsh.
 
 ## License
 

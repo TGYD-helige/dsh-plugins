@@ -16,6 +16,7 @@
  * resolves, so an execute() that returns always landed its events first.
  */
 
+import type { Message } from '@a2a-js/sdk';
 import type { ExecutionEventBus } from '@a2a-js/sdk/server';
 import type { Context } from '@deepseek-ai/cordis';
 import type {
@@ -31,13 +32,17 @@ import { installModelSelection } from '@deepseek-ai/dsh-agent';
 // Runtime helpers ride the clean subpaths: the dsh-llm/dsh-session index
 // modules import packages that are not on npm yet (dsh-timeout, dsh-scope).
 import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
+import type { ContentBlock } from '@deepseek-ai/dsh-llm/types';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
+import { buildMessageContent, uploadsDir } from './content.js';
 import { SessionTranslator, terminalStatusUpdate } from './translator.js';
 
 export interface BridgeOptions {
   /** Absolute working directory for spawned agents. */
   cwd: string;
+  /** Upload root for persisted file parts; absent = the OS temp dir. */
+  uploadsDir?: string;
   /** Optional provider/model overrides for created agents. */
   agentOptions?: { provider?: string; model?: string };
   /** Agent preset id; empty/absent = the deployment default (when a roster exists). */
@@ -165,8 +170,14 @@ export class A2aBridge {
     return { entry, freshTask: true };
   }
 
+  /** A2A parts → dsh content blocks; throws only when no part is usable. */
+  async buildContent(message: Message): Promise<ContentBlock[]> {
+    const attachments = this.ctx.get('attachments');
+    return buildMessageContent(message.parts, attachments, uploadsDir(this.options.uploadsDir));
+  }
+
   /** Queue one user-message turn on the task's agent and await its `turn/end`. */
-  async runTurn(entry: TaskEntry, text: string, bus: ExecutionEventBus): Promise<void> {
+  async runTurn(entry: TaskEntry, content: ContentBlock[], bus: ExecutionEventBus): Promise<void> {
     let resolveSettled!: () => void;
     const settled = new Promise<void>((resolve) => {
       resolveSettled = resolve;
@@ -176,7 +187,7 @@ export class A2aBridge {
     try {
       const result = entry.handle.agent.followup(
         createUserMessage({
-          content: [{ type: 'text', text }],
+          content,
           source: { kind: 'user' },
         }),
       ) as unknown;
