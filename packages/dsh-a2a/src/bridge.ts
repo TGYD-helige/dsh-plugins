@@ -69,6 +69,8 @@ export interface TaskEntry {
   bus: ExecutionEventBus | null;
   /** Between turn/start and turn/end. */
   turnActive: boolean;
+  /** A turn still open from a previous task binding; its turn/end is stale. */
+  staleTurn: boolean;
   /** FIFO turn-end waiters, one per queued/running execute(). */
   settled: Array<() => void>;
 }
@@ -109,6 +111,9 @@ export class A2aBridge {
         contextId,
         this.options.agentOptions?.model,
       );
+      // A turn still open from the previous binding (e.g. a cancel whose abort
+      // is still propagating) must not emit events under the new task id.
+      forContext.staleTurn = forContext.turnActive;
       this.tasks.set(taskId, forContext);
       return { entry: forContext, freshTask: true };
     }
@@ -163,6 +168,7 @@ export class A2aBridge {
       translator: new SessionTranslator(taskId, contextId, this.options.agentOptions?.model),
       bus: null,
       turnActive: false,
+      staleTurn: false,
       settled: [],
     };
     this.tasks.set(taskId, entry);
@@ -249,11 +255,17 @@ export class A2aBridge {
     const entry = this.bySession.get(session.id as string);
     if (!entry) return;
     if (event.type === 'turn/start') entry.turnActive = true;
+    // A turn carried over from a previous task binding (e.g. a canceled turn
+    // whose abort was still in flight when the context rebound): its turn/end
+    // belongs to the old task — settle waiters, but publish nothing under the
+    // new task id.
+    const stale = event.type === 'turn/end' && entry.staleTurn;
+    if (stale) entry.staleTurn = false;
     // No-throw seam: translation errors must never reach the agent loop. The
     // turn/end waiter still resolves below, so a poisoned event cannot hang
     // an in-flight execute() either.
     try {
-      for (const out of entry.translator.handle(event)) entry.bus?.publish(out);
+      if (!stale) for (const out of entry.translator.handle(event)) entry.bus?.publish(out);
     } catch (error) {
       console.error('[dsh-a2a] failed to translate session event:', error);
     }

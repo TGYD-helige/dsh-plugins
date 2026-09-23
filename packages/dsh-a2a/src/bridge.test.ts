@@ -261,6 +261,55 @@ describe('A2aBridge + DshAgentExecutor', () => {
     expect(final.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
   });
 
+  it("keeps a previous binding's late turn/end out of a rebound task", async () => {
+    // Turns never end on their own here; the test drives every event.
+    let session: Session;
+    agents.registry.create = vi.fn(
+      async (options: { sessionId: SessionId }): Promise<AgentHandle> => {
+        session = { id: options.sessionId } as Session;
+        const agent = {
+          id: options.sessionId,
+          session,
+          followup: vi.fn(() =>
+            ctx.emit('session/event', session, event('turn/start', { turn: 1 })),
+          ),
+          cancel: vi.fn(),
+          whenIdle: vi.fn(async () => {}),
+        } as unknown as Agent;
+        return { agent, dispose: vi.fn(async () => {}) };
+      },
+    );
+    const executor = new DshAgentExecutor(bridge);
+
+    const firstBus = new DefaultExecutionEventBus();
+    collect(firstBus);
+    const first = executor.execute(requestContext(userMessage('one'), 't1', 'ctx1'), firstBus);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Rebind the context to t2 while t1's turn is still open (its cancel is
+    // still propagating).
+    const secondBus = new DefaultExecutionEventBus();
+    const second = collect(secondBus);
+    const secondRun = executor.execute(requestContext(userMessage('two'), 't2', 'ctx1'), secondBus);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // t1's late aborted turn/end must settle its waiter but publish nothing
+    // under t2.
+    ctx.emit('session/event', session!, turnEnd({ kind: 'aborted', reason: { kind: 'user' } }));
+    expect(
+      statusUpdates(second.seen).some((u) => u.status?.state === TaskState.TASK_STATE_CANCELED),
+    ).toBe(false);
+
+    // t2's own turn then completes normally.
+    ctx.emit('session/event', session!, event('turn/start', { turn: 2 }));
+    ctx.emit('session/event', session!, assistantMessage('ok'));
+    ctx.emit('session/event', session!, turnEnd({ kind: 'completed' }));
+    await Promise.all([first, secondRun]);
+    const final = statusUpdates(second.seen).at(-1)!;
+    expect(final.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
+    expect(textOfStatus(final)).toBe('ok');
+  });
+
   it('fails the task when agent creation throws', async () => {
     agents.registry.create = vi.fn(async () => {
       throw new Error('no agent factory registered');
