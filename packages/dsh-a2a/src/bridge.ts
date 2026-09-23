@@ -224,6 +224,10 @@ export class A2aBridge {
     );
   }
 
+  isClearing(contextId: string): boolean {
+    return this.clearing.has(contextId);
+  }
+
   /** Include content preparation in the work a context clear must drain. */
   async trackExecution(contextId: string, run: () => Promise<void>): Promise<void> {
     const execution = run();
