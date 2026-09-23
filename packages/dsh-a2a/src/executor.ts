@@ -29,6 +29,15 @@ export class DshAgentExecutor implements AgentExecutor {
   constructor(private readonly bridge: A2aBridge) {}
 
   async execute(requestContext: RequestContext, eventBus: ExecutionEventBus): Promise<void> {
+    return this.bridge.trackExecution(requestContext.contextId, () =>
+      this.executeInner(requestContext, eventBus),
+    );
+  }
+
+  private async executeInner(
+    requestContext: RequestContext,
+    eventBus: ExecutionEventBus,
+  ): Promise<void> {
     const { userMessage, taskId, contextId } = requestContext;
     let anchored = false;
     try {

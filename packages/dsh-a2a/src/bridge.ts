@@ -81,6 +81,8 @@ export class A2aBridge {
   private readonly tasks = new Map<string, TaskEntry>(); // taskId → entry
   private readonly bySession = new Map<string, TaskEntry>(); // sessionId (== contextId) → entry
   private readonly clearing = new Set<string>();
+  private readonly creating = new Map<string, Set<Promise<unknown>>>();
+  private readonly executing = new Map<string, Set<Promise<void>>>();
 
   constructor(
     private readonly ctx: Context,
@@ -99,6 +101,25 @@ export class A2aBridge {
    * a new task id for `message/send` calls that omit `taskId`.
    */
   async ensureTask(
+    taskId: string,
+    contextId: string,
+  ): Promise<{ entry: TaskEntry; freshTask: boolean }> {
+    const creation = this.ensureTaskInner(taskId, contextId);
+    let pending = this.creating.get(contextId);
+    if (!pending) {
+      pending = new Set();
+      this.creating.set(contextId, pending);
+    }
+    pending.add(creation);
+    try {
+      return await creation;
+    } finally {
+      pending.delete(creation);
+      if (pending.size === 0) this.creating.delete(contextId);
+    }
+  }
+
+  private async ensureTaskInner(
     taskId: string,
     contextId: string,
   ): Promise<{ entry: TaskEntry; freshTask: boolean }> {
@@ -194,7 +215,7 @@ export class A2aBridge {
     return buildMessageContent(message.parts, attachments, uploadsDir(this.options.uploadsDir));
   }
 
-  /** Send the authenticated request owner to the optional storage mirror. */
+  /** Forward the upstream-supplied owner to the optional storage mirror. */
   setIdentity(contextId: string, createBy: string | undefined): void {
     if (!createBy) return;
     (this.ctx.get('storageIdentity') as { set(id: string, user: string): void } | undefined)?.set(
@@ -203,8 +224,26 @@ export class A2aBridge {
     );
   }
 
+  /** Include content preparation in the work a context clear must drain. */
+  async trackExecution(contextId: string, run: () => Promise<void>): Promise<void> {
+    const execution = run();
+    let pending = this.executing.get(contextId);
+    if (!pending) {
+      pending = new Set();
+      this.executing.set(contextId, pending);
+    }
+    pending.add(execution);
+    try {
+      await execution;
+    } finally {
+      pending.delete(execution);
+      if (pending.size === 0) this.executing.delete(contextId);
+    }
+  }
+
   /** Queue one user-message turn on the task's agent and await its `turn/end`. */
   async runTurn(entry: TaskEntry, content: ContentBlock[], bus: ExecutionEventBus): Promise<void> {
+    if (this.clearing.has(entry.sessionId as string)) throw new Error('Context is being cleared.');
     const running = this.runTurnInner(entry, content, bus);
     entry.running.add(running);
     try {
@@ -260,21 +299,28 @@ export class A2aBridge {
   }
 
   /** Cancel and release the live binding before the caller deletes stored shells. */
-  async clearContext(contextId: string): Promise<string[]> {
-    const entry = this.bySession.get(contextId);
-    if (!entry) return [];
+  async clearContext(
+    contextId: string,
+    clearStored: (liveIds: string[]) => Promise<string[]> = async (ids) => ids,
+  ): Promise<string[]> {
+    if (this.clearing.has(contextId)) throw new Error('Context is already being cleared.');
     this.clearing.add(contextId);
     try {
-      if (entry.turnActive || entry.running.size > 0) {
-        await entry.handle.agent.cancel({ kind: 'user' });
+      await Promise.allSettled([...(this.creating.get(contextId) ?? [])]);
+      const entry = this.bySession.get(contextId);
+      if (entry) {
+        if (entry.turnActive || entry.running.size > 0) {
+          await entry.handle.agent.cancel({ kind: 'user' });
+        }
+        await entry.handle.agent.whenIdle();
+        this.settleEntry(entry, 'Context cleared.');
+        await Promise.allSettled([...entry.running]);
+        this.tasks.delete(entry.taskId);
+        this.bySession.delete(contextId);
+        await entry.handle.dispose();
       }
-      await entry.handle.agent.whenIdle();
-      this.settleEntry(entry, 'Context cleared.');
-      await Promise.allSettled([...entry.running]);
-      this.tasks.delete(entry.taskId);
-      this.bySession.delete(contextId);
-      await entry.handle.dispose();
-      return [entry.taskId];
+      await Promise.allSettled([...(this.executing.get(contextId) ?? [])]);
+      return await clearStored(entry ? [entry.taskId] : []);
     } finally {
       this.clearing.delete(contextId);
     }

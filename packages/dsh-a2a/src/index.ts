@@ -136,26 +136,27 @@ export function apply(
     ctx.provide('a2aTasks', {
       async clearContext(contextId: string, tenant = ''): Promise<string[]> {
         const call = new ServerCallContext({ tenant });
-        const ids = new Set<string>();
-        let pageToken = '';
-        do {
-          const page = await store.list(
-            {
-              tenant: '',
-              contextId,
-              pageSize: 100,
-              pageToken,
-              status: TaskState.TASK_STATE_UNSPECIFIED,
-              statusTimestampAfter: undefined,
-            },
-            call,
-          );
-          for (const task of page.tasks) ids.add(task.id);
-          pageToken = page.nextPageToken;
-        } while (pageToken);
-        for (const id of await bridge.clearContext(contextId)) ids.add(id);
-        for (const id of ids) await store.delete(id, call);
-        return [...ids];
+        return bridge.clearContext(contextId, async (liveIds) => {
+          const ids = new Set(liveIds);
+          let pageToken = '';
+          do {
+            const page = await store.list(
+              {
+                tenant: '',
+                contextId,
+                pageSize: 100,
+                pageToken,
+                status: TaskState.TASK_STATE_UNSPECIFIED,
+                statusTimestampAfter: undefined,
+              },
+              call,
+            );
+            for (const task of page.tasks) ids.add(task.id);
+            pageToken = page.nextPageToken;
+          } while (pageToken);
+          for (const id of ids) await store.delete(id, call);
+          return [...ids];
+        });
       },
     } satisfies A2aTasks);
 

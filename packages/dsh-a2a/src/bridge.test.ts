@@ -282,6 +282,79 @@ describe('A2aBridge + DshAgentExecutor', () => {
     expect(agents.created).toHaveLength(2);
   });
 
+  it('waits for an in-flight creation and blocks rebinding through stored cleanup', async () => {
+    let creationStarted!: () => void;
+    let releaseCreation!: () => void;
+    const started = new Promise<void>((resolve) => {
+      creationStarted = resolve;
+    });
+    const creationGate = new Promise<void>((resolve) => {
+      releaseCreation = resolve;
+    });
+    ctx.provide('agentPresets', {
+      resolve: async () => {
+        creationStarted();
+        await creationGate;
+        return { id: 'code' };
+      },
+      mount: async () => {},
+    });
+    const creating = bridge.ensureTask('t1', 'ctx1');
+    await started;
+    let releaseCleanup!: () => void;
+    let cleanupStarted!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => {
+      releaseCleanup = resolve;
+    });
+    const cleaning = new Promise<void>((resolve) => {
+      cleanupStarted = resolve;
+    });
+    const cleared = bridge.clearContext('ctx1', async (ids) => {
+      expect(ids).toEqual(['t1']);
+      cleanupStarted();
+      await cleanupGate;
+      return ids;
+    });
+    releaseCreation();
+    await creating;
+    await cleaning;
+    await expect(bridge.ensureTask('t2', 'ctx1')).rejects.toThrow(/being cleared/);
+    releaseCleanup();
+    expect(await cleared).toEqual(['t1']);
+    expect(agents.created[0].handle.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('waits for an execute still building content before clearing', async () => {
+    let started!: () => void;
+    let release!: () => void;
+    const building = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.spyOn(bridge, 'buildContent').mockImplementation(async () => {
+      started();
+      await gate;
+      return [{ type: 'text', text: 'hi' }];
+    });
+    const order: string[] = [];
+    const bus = new DefaultExecutionEventBus();
+    const executing = new DshAgentExecutor(bridge)
+      .execute(requestContext(userMessage('hi'), 't1', 'ctx1'), bus)
+      .then(() => {
+        order.push('executed');
+      });
+    await building;
+    const clearing = bridge.clearContext('ctx1').then(() => {
+      order.push('cleared');
+    });
+    release();
+    await Promise.all([executing, clearing]);
+    expect(order).toEqual(['executed', 'cleared']);
+    expect(agents.created).toHaveLength(0);
+  });
+
   it('cancels and drains a live turn before clearing its binding', async () => {
     let session: Session;
     agents.registry.create = vi.fn(async ({ sessionId }: { sessionId: SessionId }) => {
