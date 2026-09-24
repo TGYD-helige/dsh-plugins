@@ -165,6 +165,54 @@ export class DatabaseBackend implements StorageBackend {
     });
   }
 
+  async readMessages(sessionId: string, messageId?: string): Promise<MessageRow[]> {
+    if (!this.prisma) return [];
+    // ponytail: tool-call lookup scans one session; add an indexed call lookup if that becomes slow.
+    const rows = await this.prisma.aiMessage.findMany({
+      where: {
+        sessionId,
+        deletedAt: null,
+        ...(messageId ? { id: pk(`message ${sessionId}\0${messageId}`) } : {}),
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    const json = (value: unknown) => (typeof value === 'string' ? JSON.parse(value) : value);
+    return rows.map((row: any) => {
+      const metadata = json(row.metadata) ?? {};
+      const storedThoughts = json(row.thoughts);
+      const thoughts = Array.isArray(storedThoughts)
+        ? storedThoughts.map((thought) => {
+            if (
+              thought &&
+              typeof thought === 'object' &&
+              !('content' in thought) &&
+              'description' in thought
+            ) {
+              const { description, ...rest } = thought;
+              return { ...rest, content: description };
+            }
+            return thought;
+          })
+        : typeof storedThoughts === 'string'
+          ? [{ content: storedThoughts }]
+          : storedThoughts;
+      return {
+        id: typeof metadata.id === 'string' ? metadata.id : row.id,
+        sessionId: row.sessionId,
+        historyId: row.historyId,
+        type: row.type,
+        content: row.content,
+        thoughts,
+        model: row.model,
+        tokens: json(row.tokens),
+        toolCalls: json(row.toolCalls),
+        agentId: row.agentId,
+        metadata,
+        createdAt: row.createdAt,
+      };
+    });
+  }
+
   async readSession(sessionId: string): Promise<SessionRow | null> {
     if (!this.prisma) return null;
     const row = await this.prisma.aiChatHistory.findFirst({

@@ -42,8 +42,8 @@ export const Config = Schema.object({
   /** Working directory for agents spawned by A2A tasks. Must be absolute. */
   cwd: Schema.string().default(process.cwd()),
   /**
-   * Root directory file parts persist into when no attachment store is
-   * composed (date-layered below it). Empty = <OS temp>/dsh-a2a-uploads.
+   * Root directory for fallback or opted-in local file parts (date-layered
+   * below it). Empty = <OS temp>/dsh-a2a-uploads.
    */
   uploadsDir: Schema.string().default(''),
   agent: Schema.object({

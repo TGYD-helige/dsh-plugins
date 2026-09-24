@@ -3,13 +3,12 @@
  * part kinds:
  *
  *   - `text` parts stay text;
- *   - file parts (inline `raw` bytes or a `url`) use the composed attachment
- *     store unless a non-image materializer is configured; url parts are
- *     downloaded by the plugin (http/https only, size- and time-bounded);
+ *   - file parts (inline `raw` bytes or a `url`) are downloaded by the plugin
+ *     (http/https only, size- and time-bounded) when they carry a URL;
  *   - an optional deployment materializer puts non-image files into the
  *     active execution world instead of saving a host attachment;
- *   - without a materializer, files with no store (or refused by a store)
- *     persist under the configured upload root (default `<OS temp>/
+ *   - without a materializer, non-image files persist under the configured
+ *     upload root even when an attachment store exists (default `<OS temp>/
  *     dsh-a2a-uploads/<date>/`) and the prompt references them by path;
  *   - `data` parts become JSON text.
  *
@@ -86,11 +85,11 @@ export async function buildMessageContent(
   return content;
 }
 
-/** The directory file parts persist into when they are not attachments. */
+/** The directory non-image file parts persist into without a materializer. */
 export function uploadsDir(root?: string): string {
   // 'sv-SE' renders YYYY-MM-DD; the bucket is local time.
   const segment = new Date().toLocaleDateString('sv-SE').replaceAll('-', '');
-  return path.join(root || path.join(os.tmpdir(), 'dsh-a2a-uploads'), segment);
+  return path.resolve(root || path.join(os.tmpdir(), 'dsh-a2a-uploads'), segment);
 }
 
 type FilePartContent = { $case: 'raw'; value: Uint8Array } | { $case: 'url'; value: string };
@@ -133,7 +132,7 @@ async function fileContent(
   const image = attachments?.imageLimits.mediaTypes.includes(
     mediaType.toLowerCase() as ImageMediaType,
   );
-  if (attachments && (!materialization || image)) {
+  if (attachments && image) {
     const block = await saveAttachment(attachments, bytes, mediaType, part.filename);
     if (block) return block;
   }
@@ -146,7 +145,7 @@ async function fileContent(
         mediaType,
       });
       if (!readablePath) throw new Error('materializer returned no readable path');
-      return documentBlock(uri, mediaType, bytes.byteLength, readablePath);
+      return documentBlock(uri, mediaType, bytes.byteLength, readablePath, part.filename);
     } catch (error) {
       console.error('[dsh-a2a] failed to materialize a file part:', error);
       return note(part, mediaType, uri, 'file materialization failed');
@@ -155,7 +154,7 @@ async function fileContent(
   try {
     const name = sanitizeUploadFileName(part.filename);
     const filePath = await persistUpload(dir, name, bytes);
-    return documentBlock(uri, mediaType, bytes.byteLength, filePath);
+    return documentBlock(uri, mediaType, bytes.byteLength, filePath, part.filename);
   } catch (error) {
     return failNote(part, mediaType, uri, 'failed to persist a file part', error);
   }
@@ -233,11 +232,15 @@ function documentBlock(
   mediaType: string,
   bytes: number,
   filePath: string,
+  originalName: string,
 ): ContentBlock {
   const attrs = [
     // The basename of the final path, so name= always matches the file on
     // disk — including collision suffixes.
     `name="${attr(path.win32.basename(filePath))}"`,
+    originalName &&
+      originalName !== path.win32.basename(filePath) &&
+      `originalName="${attr(originalName)}"`,
     uri && `uri="${attr(uri)}"`,
     mediaType && `type="${attr(mediaType)}"`,
     `size="${bytes}"`,

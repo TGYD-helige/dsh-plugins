@@ -5,7 +5,7 @@
  *   with the packed plugin, run one real LLM query ($DSH_INTEGRATION_MODEL,
  *   default deepseek-v4-flash, through the integration gateway), then assert
  *   the session mirror landed in SQLite.
- * - backend-only leg (DSH_PROVIDER = mysql | postgresql | sqlserver): no dsh
+ * - backend-only leg (DSH_DB_URL set; sqlite/mysql/postgresql/sqlserver): no dsh
  *   boot, no LLM, no secrets — db push the variant schema and drive
  *   DatabaseBackend against the service database in DSH_DB_URL.
  *
@@ -33,7 +33,7 @@ const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
 const dsh = process.env.DSH_CLI ?? 'dsh';
 
 const provider = process.env.DSH_PROVIDER || 'sqlite';
-if (provider !== 'sqlite') {
+if (process.env.DSH_DB_URL) {
   await backendOnlyLeg(provider);
   process.exit(0);
 }
@@ -117,12 +117,12 @@ const markerContent = 'ci-dsh-storage-marker-7788';
 writeFileSync(join(workDir, markerFile), `${markerContent}\n`);
 const prompt = `请用工具读取当前目录下的 ${markerFile}，并把它的内容原样复述给我`;
 
-function dbHasMarkerToolRow() {
+function dbHasMarkerResult() {
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
     return (
       db
-        .prepare("SELECT COUNT(*) c FROM ai_messages WHERE type = 'tool' AND content LIKE '%' || ? || '%'")
+        .prepare("SELECT COUNT(*) c FROM ai_messages WHERE type = 'model' AND tool_calls LIKE '%' || ? || '%'")
         .get(markerContent).c > 0
     );
   } finally {
@@ -161,7 +161,7 @@ for (let attempt = 1; attempt <= 3; attempt++) {
   if (query.error) throw query.error;
   if (query.status !== 0) throw new Error(`dsh headless exited ${query.status}`);
   if (!query.stdout?.trim()) console.log('::warning::empty answer from dsh headless');
-  if (dbHasMarkerToolRow()) break;
+  if (dbHasMarkerResult()) break;
   console.log('::warning::attempt produced no marker-bearing tool result');
 }
 
@@ -201,19 +201,17 @@ for (const m of messages) {
 // The tool round-trip, proven from the database: the marker content only
 // exists on disk, so it can only appear in the transcript via a tool result.
 const toolCallIds = new Set();
+let markerResult = false;
 for (const m of messages) {
   if (m.type !== 'model' || !m.tool_calls) continue;
-  for (const block of JSON.parse(m.tool_calls)) toolCallIds.add(block.id);
+  for (const block of JSON.parse(m.tool_calls)) {
+    toolCallIds.add(block.id);
+    if (JSON.stringify(block.result ?? '').includes(markerContent)) markerResult = true;
+  }
 }
-// The model may call more than one tool — assert on the marker-bearing row,
-// not whatever tool result happens to be first.
-const tool = messages.find((m) => m.type === 'tool' && String(m.content).includes(markerContent));
-assert(tool, 'no tool/result row contains the marker content — the model did not read the marker file');
+assert(!messages.some((m) => m.type === 'tool'), 'tool/result must not create a separate tool row');
+assert(markerResult, 'no model tool_calls result contains the marker content');
 assert(toolCallIds.size > 0, 'no tool-call block in any assistant row');
-assert(
-  toolCallIds.has(JSON.parse(tool.metadata).callId),
-  `tool result callId ${JSON.parse(tool.metadata).callId} not in assistant tool-call ids ${[...toolCallIds]}`,
-);
 // Repeating the marker in prose is the model's choice, not a correctness gate.
 if (!messages.some((m) => m.type === 'model' && String(m.content).includes(markerContent))) {
   console.log('::warning::no assistant row repeated the marker content (empty wrap-up prose)');
@@ -222,7 +220,7 @@ if (!messages.some((m) => m.type === 'model' && String(m.content).includes(marke
 assert(histories.length === 1, `expected 1 session row, got ${histories.length}`);
 const history = histories[0];
 assert(history.session_id === user.session_id, 'session row id mismatch');
-assert(Number(history.message_count) >= 4, `message_count=${history.message_count} < 4 (user + assistant/tool-call + tool + assistant)`);
+assert(Number(history.message_count) >= 3, `message_count=${history.message_count} < 3 (user + assistant/tool-call + assistant)`);
 assert(Number(history.total_tokens) > 0, `total_tokens=${history.total_tokens} == 0`);
 assert(history.first_message_at != null && history.last_message_at != null, 'message timestamps missing');
 
@@ -254,6 +252,7 @@ async function backendOnlyLeg(dbProvider) {
 
   // 2. Write through the real backend (same code path as production).
   const { DatabaseBackend, createAdapter } = await import(pkgUrl('lib/backends/database.js').href);
+  const { mergeToolResult } = await import(pkgUrl('lib/projector.js').href);
   const backend = new DatabaseBackend({ provider: dbProvider, url });
   await backend.init();
   await backend.upsertMessage({
@@ -265,19 +264,41 @@ async function backendOnlyLeg(dbProvider) {
     metadata: { event: 'user/message', seq: 1 },
     createdAt: new Date(1700000000000),
   });
+  const replayState = {
+    response: { kind: 'deepseek-messages', version: 1, model: 'deepseek-v4-flash', requestId: 'r1' },
+    blocks: [
+      { type: 'reasoning', signature: 'opaque-signature' },
+      { type: 'text' },
+      { type: 'tool-call' },
+    ],
+  };
   await backend.upsertMessage({
     id: 'a1',
     sessionId: 's1',
     historyId: null,
     type: 'model',
     content: 'hi',
-    thoughts: 'thinking…',
+    thoughts: [{ content: 'thinking…', thoughtSignature: 'opaque-signature' }],
     model: 'deepseek-v4-flash',
     tokens: { inputTokens: 10, outputTokens: 5 },
     toolCalls: [{ type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }],
-    metadata: { event: 'assistant/message', seq: 2 },
+    metadata: {
+      event: 'assistant/message', seq: 2,
+      source: { kind: 'model', provider: 'deepseek', model: 'deepseek-v4-flash', replayState },
+    },
     createdAt: new Date(1700000001000),
   });
+  const toolResult = {
+    type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'file contents' }],
+  };
+  const resultEvent = {
+    type: 'tool/result', data: { message: { source: { callId: 'c1' }, content: [toolResult] } },
+  };
+  for (let delivery = 0; delivery < 2; delivery++) {
+    const row = mergeToolResult(resultEvent, await backend.readMessages('s1'));
+    assert(row?.id === 'a1', 'tool result did not match the persisted model call');
+    await backend.upsertMessage(row);
+  }
   // Redelivery must update in place, not duplicate (deterministic PK).
   await backend.upsertMessage({
     id: 'm1',
@@ -312,6 +333,18 @@ async function backendOnlyLeg(dbProvider) {
   assert(messages[0].content === `hello from ${dbProvider} (edited)`, 'redelivery did not update in place');
   assert(parseJsonColumn(messages[1].metadata).id === 'a1', 'metadata did not round-trip');
   assert(parseJsonColumn(messages[1].tokens).inputTokens === 10, 'tokens did not round-trip');
+  assert(
+    JSON.stringify(parseJsonColumn(messages[1].metadata).source.replayState) === JSON.stringify(replayState),
+    'opaque replayState did not round-trip',
+  );
+  assert(
+    parseJsonColumn(messages[1].thoughts)[0].thoughtSignature === 'opaque-signature',
+    'thought signature did not round-trip',
+  );
+  assert(
+    parseJsonColumn(messages[1].toolCalls)[0].result.content[0].text === 'file contents',
+    'tool result did not round-trip inside the model row',
+  );
   assert(sessions.length === 1 && Number(sessions[0].totalTokens) === 15, 'session rollup wrong');
 
   console.log(`SCENARIO_OK ${dbProvider} (backend-only leg)`);

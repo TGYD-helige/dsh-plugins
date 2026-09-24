@@ -22,7 +22,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-session';
 import Schema from '@deepseek-ai/schemastery';
 import { DatabaseBackend, type DatabaseProvider } from './backends/database.js';
-import { projectEvent, usageSampleOf } from './projector.js';
+import { mergeToolResult, projectEvent, usageSampleOf } from './projector.js';
 import type { MessageRow, SessionRow, StorageBackend } from './types.js';
 
 export const name = 'dsh-storage';
@@ -198,11 +198,36 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
         sessions.set(sessionId, accum);
       }
 
-      const row: MessageRow | null = projectEvent(session, event, sessionId);
+      let row: MessageRow | null = projectEvent(session, event, sessionId);
+      const storedRows =
+        row || event?.type === 'tool/result'
+          ? await backends[0].readMessages(sessionId, row?.id)
+          : [];
+      if (event?.type === 'tool/result') row = mergeToolResult(event, storedRows);
+      const existing = row && storedRows.find((stored) => stored.id === row?.id);
+      if (event?.type === 'assistant/message' && row && existing && Array.isArray(row.toolCalls)) {
+        row.toolCalls = row.toolCalls.map((call: any) => {
+          const previous = Array.isArray(existing.toolCalls)
+            ? existing.toolCalls.find((stored: any) => stored?.id === call?.id)
+            : undefined;
+          return previous && 'result' in previous
+            ? {
+                ...call,
+                result: previous.result,
+                ...(previous.error ? { error: previous.error } : {}),
+              }
+            : call;
+        });
+      }
+      if (!row && event?.type === 'tool/result') {
+        console.error('[dsh-storage] no matching model tool call for result');
+      }
       if (row) {
-        accum.messageCount += 1;
-        accum.firstMessageAt ??= row.createdAt;
-        accum.lastMessageAt = row.createdAt;
+        if (!existing && event?.type !== 'tool/result') {
+          accum.messageCount += 1;
+          accum.firstMessageAt ??= row.createdAt;
+          accum.lastMessageAt = row.createdAt;
+        }
         await fanout((backend) => backend.upsertMessage(row));
       }
 

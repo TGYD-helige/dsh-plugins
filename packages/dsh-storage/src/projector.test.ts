@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { projectEvent, usageSampleOf } from './projector.js';
+import { mergeToolResult, projectEvent, usageSampleOf } from './projector.js';
 
 // Event envelopes follow the dsh persistence catalog: { type, seq, time, data }.
 const sessionId = 's1';
@@ -75,6 +75,14 @@ describe('projectEvent', () => {
 
   it('projects an assistant/message with model, usage and tool calls', () => {
     const toolCall = { type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' };
+    const replayState = {
+      response: { kind: 'deepseek-messages', version: 1, model: 'deepseek-chat' },
+      blocks: [
+        { type: 'reasoning', signature: 'opaque-signature' },
+        { type: 'text' },
+        { type: 'tool-call' },
+      ],
+    };
     const row = projectEvent(
       {},
       {
@@ -92,7 +100,7 @@ describe('projectEvent', () => {
               { type: 'text', text: 'answer' },
               toolCall,
             ],
-            source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' },
+            source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat', replayState },
           },
           usage: { inputTokens: 10, outputTokens: 5 },
         },
@@ -103,11 +111,15 @@ describe('projectEvent', () => {
       id: 'a1',
       type: 'model',
       content: 'answer',
-      thoughts: 'thinking',
+      thoughts: [{ content: 'thinking', thoughtSignature: 'opaque-signature' }],
       model: 'deepseek-chat',
       tokens: { inputTokens: 10, outputTokens: 5 },
       toolCalls: [toolCall],
-      metadata: { event: 'assistant/message', seq: 2 },
+      metadata: {
+        event: 'assistant/message',
+        seq: 2,
+        source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat', replayState },
+      },
     });
   });
 
@@ -137,7 +149,7 @@ describe('projectEvent', () => {
     expect(row?.toolCalls).toBeUndefined();
   });
 
-  it('projects a tool/result, unwrapping the ToolResultBlock', () => {
+  it('does not project a tool/result as a separate row', () => {
     const resultBlock = {
       type: 'tool-result',
       toolCallId: 'c9',
@@ -162,43 +174,28 @@ describe('projectEvent', () => {
       },
       sessionId,
     );
-    expect(row).toMatchObject({
-      id: 't1',
-      type: 'tool',
-      content: 'file contents',
-      toolCalls: [{ callId: 'c9', result: resultBlock }],
-      metadata: { event: 'tool/result', seq: 4, callId: 'c9' },
-    });
+    expect(row).toBeNull();
   });
 
-  it('attaches the structured error identity on failed tool results', () => {
-    const row = projectEvent(
-      {},
-      {
-        type: 'tool/result',
-        seq: 5,
-        time: 1,
-        data: {
-          turn: 0,
-          step: 0,
-          error: { name: 'ToolError', code: 'ENOENT' },
-          message: {
-            id: 't2',
-            role: 'user',
-            content: [{ type: 'tool-result', toolCallId: 'c2', content: [], isError: true }],
-            source: { kind: 'tool', callId: 'c2' },
-          },
-        },
-      },
-      sessionId,
-    );
-    expect(row?.toolCalls).toEqual([
-      {
-        callId: 'c2',
-        result: { type: 'tool-result', toolCallId: 'c2', content: [], isError: true },
+  it('merges a failed result into the matching model call without changing sibling calls', () => {
+    const first = { type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' };
+    const second = { type: 'tool-call', id: 'c2', name: 'write', arguments: '{}' };
+    const model = { id: 'a1', type: 'model', toolCalls: [first, second] } as any;
+    const result = { type: 'tool-result', toolCallId: 'c2', content: [], isError: true };
+    const event = {
+      type: 'tool/result',
+      data: {
         error: { name: 'ToolError', code: 'ENOENT' },
+        message: { source: { callId: 'c2' }, content: [result] },
       },
-    ]);
+    };
+    const merged = mergeToolResult(event, [model]);
+    expect(merged).toMatchObject({
+      id: 'a1',
+      type: 'model',
+      toolCalls: [first, { ...second, result, error: event.data.error }],
+    });
+    expect(mergeToolResult(event, [merged!])).toEqual(merged);
   });
 
   it.each([

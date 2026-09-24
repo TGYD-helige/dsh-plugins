@@ -12,6 +12,7 @@ vi.mock('./backends/database.js', () => ({
     readonly name = 'database';
     init = vi.fn(() => backends.initImpl?.() ?? Promise.resolve());
     readSession = vi.fn(async () => null);
+    readMessages = vi.fn(async () => [] as any[]);
     upsertMessage = vi.fn(async () => {});
     upsertSession = vi.fn(async () => {});
     close = vi.fn(async () => {});
@@ -151,6 +152,98 @@ describe('dsh-storage plugin', () => {
       firstMessageAt: new Date(1700000000000),
       lastMessageAt: new Date(1700000001000),
     });
+  });
+
+  it('preserves a merged result when tool results and the assistant message are redelivered', async () => {
+    const rows = new Map<string, any>();
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    backend.upsertMessage.mockImplementation(async (row: any) => {
+      rows.set(row.id, row);
+    });
+    backend.readMessages.mockImplementation(async () => [...rows.values()]);
+    const session = { id: 's1' };
+    const call = assistantEvent('', undefined, 'a1') as any;
+    call.data.message.content.push({
+      type: 'tool-call',
+      id: 'call-1',
+      name: 'read',
+      arguments: '{}',
+    });
+    ctx.events.emit('session/event', session, call);
+    const resultBlock = {
+      type: 'tool-result',
+      toolCallId: 'call-1',
+      content: [{ type: 'text', text: 'ok' }],
+    };
+    const result = ev('tool/result', {
+      message: { id: 'r1', source: { callId: 'call-1' }, content: [resultBlock] },
+    });
+    ctx.events.emit('session/event', session, result);
+    ctx.events.emit('session/event', session, result);
+    ctx.events.emit('session/event', session, call);
+    await ctx.events.parallel('session/flush', session);
+    expect([...rows.values()]).toMatchObject([
+      { id: 'a1', type: 'model', toolCalls: [{ id: 'call-1', result: resultBlock }] },
+    ]);
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(1);
+  });
+
+  it('matches a tool result against a model row persisted before resume', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    backend.readSession.mockResolvedValue({ sessionId: 's1', messageCount: 1, totalTokens: 0 });
+    backend.readMessages.mockResolvedValue([
+      {
+        id: 'a1',
+        sessionId: 's1',
+        historyId: null,
+        type: 'model',
+        content: '',
+        toolCalls: [{ type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }],
+        createdAt: new Date(1700000000000),
+      },
+    ]);
+    const resultBlock = {
+      type: 'tool-result',
+      toolCallId: 'c1',
+      content: [{ type: 'text', text: 'ok' }],
+    };
+    ctx.events.emit(
+      'session/event',
+      { id: 's1' },
+      ev('tool/result', {
+        message: { source: { callId: 'c1' }, content: [resultBlock] },
+      }),
+    );
+    await ctx.events.parallel('session/flush', { id: 's1' });
+    expect(backend.upsertMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'a1',
+        type: 'model',
+        toolCalls: [expect.objectContaining({ id: 'c1', result: resultBlock })],
+      }),
+    );
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(1);
+  });
+
+  it('logs a message lookup failure and keeps later session events flowing', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    backend.readMessages.mockRejectedValueOnce(new Error('db down'));
+    ctx.events.emit(
+      'session/event',
+      { id: 's1' },
+      ev('tool/result', {
+        message: { source: { callId: 'c1' }, content: [] },
+      }),
+    );
+    ctx.events.emit('session/event', { id: 's1' }, userEvent('second', 'm2'));
+    await ctx.events.parallel('session/flush', { id: 's1' });
+    expect(backend.upsertMessage.mock.calls.map((call: any) => call[0].id)).toEqual(['m2']);
+    expect(errorSpy).toHaveBeenCalledWith('[dsh-storage] mirror task error:', expect.any(Error));
+    errorSpy.mockRestore();
   });
 
   it('ignores log-only events; turn/end only checkpoints the rollup', async () => {

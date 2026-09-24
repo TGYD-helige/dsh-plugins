@@ -535,7 +535,7 @@ describe('A2aBridge + DshAgentExecutor', () => {
       return filePath;
     };
 
-    it('stores a url file part as a file attachment when a store is composed', async () => {
+    it('downloads a url file part locally when a store is composed', async () => {
       const store = fakeAttachments();
       stubFetch(docBytes, DOCX);
       const message: Message = {
@@ -546,15 +546,11 @@ describe('A2aBridge + DshAgentExecutor', () => {
         ],
       };
       const { seen } = await executeMessage('t1', 'ctx1', message);
-      expect(store.saveFile).toHaveBeenCalledTimes(1);
-      expect(store.saveFile.mock.calls[0][0].name).toBe('doc.docx');
-      expect(new Uint8Array(store.saveFile.mock.calls[0][0].data)).toEqual(docBytes);
+      expect(store.saveFile).not.toHaveBeenCalled();
       const blocks = agents.created[0].contents[0];
       expect(blocks[0]).toMatchObject({ type: 'text', text: '这个文档讲了啥' });
-      expect(blocks[1]).toMatchObject({
-        type: 'file',
-        attachment: { name: 'doc.docx', bytes: docBytes.byteLength },
-      });
+      expect(blocks[1]).toMatchObject({ type: 'text' });
+      expect(new Uint8Array(await readFile(promptPath(blocks[1].text ?? '')))).toEqual(docBytes);
       expect(statusUpdates(seen).at(-1)!.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
     });
 
