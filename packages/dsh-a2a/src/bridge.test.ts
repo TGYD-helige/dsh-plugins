@@ -3,7 +3,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { type Message, type Part, Role, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutionEvent, ExecutionEventBus } from '@a2a-js/sdk/server';
-import { DefaultExecutionEventBus, RequestContext, ServerCallContext } from '@a2a-js/sdk/server';
+import {
+  DefaultExecutionEventBus,
+  RequestContext,
+  ServerCallContext,
+  STATE_HEADERS_KEY,
+} from '@a2a-js/sdk/server';
 import { Context } from '@deepseek-ai/cordis';
 import type {
   Agent,
@@ -156,7 +161,7 @@ function requestContext(message: Message, taskId: string, contextId: string): Re
     { tenant: '', message, configuration: undefined, metadata: undefined },
     taskId,
     contextId,
-    new ServerCallContext(),
+    new ServerCallContext({ state: new Map([[STATE_HEADERS_KEY, { 'x-example': 'value' }]]) }),
   );
 }
 
@@ -227,6 +232,7 @@ describe('A2aBridge + DshAgentExecutor', () => {
       taskId: 't1',
       a2aMessageId: 'user-1',
       dshMessageId: expect.any(String),
+      requestHeaders: { 'x-example': 'value' },
     });
     expect(agents.created[0].agent.followup).toHaveBeenCalledWith(
       expect.objectContaining({ id: admitted.mock.calls[0][0].dshMessageId }),
