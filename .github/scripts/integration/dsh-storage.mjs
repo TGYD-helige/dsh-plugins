@@ -18,6 +18,7 @@
  *   exit   : non-zero on any failure
  */
 
+import { deepStrictEqual } from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -333,10 +334,7 @@ async function backendOnlyLeg(dbProvider) {
   assert(messages[0].content === `hello from ${dbProvider} (edited)`, 'redelivery did not update in place');
   assert(parseJsonColumn(messages[1].metadata).id === 'a1', 'metadata did not round-trip');
   assert(parseJsonColumn(messages[1].tokens).inputTokens === 10, 'tokens did not round-trip');
-  assert(
-    JSON.stringify(parseJsonColumn(messages[1].metadata).source.replayState) === JSON.stringify(replayState),
-    'opaque replayState did not round-trip',
-  );
+  deepStrictEqual(parseJsonColumn(messages[1].metadata).source.replayState, replayState);
   assert(
     parseJsonColumn(messages[1].thoughts)[0].thoughtSignature === 'opaque-signature',
     'thought signature did not round-trip',
