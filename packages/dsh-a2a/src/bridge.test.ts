@@ -214,12 +214,23 @@ describe('A2aBridge + DshAgentExecutor', () => {
   }
 
   it('runs a full turn: task anchor, working, deltas, final input-required', async () => {
+    const admitted = vi.fn();
+    ctx.on('a2a/message-admitted', admitted);
     const { seen, isFinished } = await execute('t1', 'ctx1', 'fix the bug');
 
     expect(isFinished()).toBe(true);
     expect(agents.created).toHaveLength(1);
     expect(agents.created[0].sessionId).toBe('ctx1');
     expect(agents.created[0].prompts).toEqual(['fix the bug']);
+    expect(admitted).toHaveBeenCalledWith({
+      contextId: 'ctx1',
+      taskId: 't1',
+      a2aMessageId: 'user-1',
+      dshMessageId: expect.any(String),
+    });
+    expect(agents.created[0].agent.followup).toHaveBeenCalledWith(
+      expect.objectContaining({ id: admitted.mock.calls[0][0].dshMessageId }),
+    );
 
     const task = seen[0];
     expect(task.kind).toBe('task');

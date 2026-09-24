@@ -243,9 +243,15 @@ export class A2aBridge {
   }
 
   /** Queue one user-message turn on the task's agent and await its `turn/end`. */
-  async runTurn(entry: TaskEntry, content: ContentBlock[], bus: ExecutionEventBus): Promise<void> {
+  async runTurn(
+    entry: TaskEntry,
+    content: ContentBlock[],
+    bus: ExecutionEventBus,
+    a2aMessageId: string,
+    requestHeaders: unknown,
+  ): Promise<void> {
     if (this.clearing.has(entry.sessionId as string)) throw new Error('Context is being cleared.');
-    const running = this.runTurnInner(entry, content, bus);
+    const running = this.runTurnInner(entry, content, bus, a2aMessageId, requestHeaders);
     entry.running.add(running);
     try {
       await running;
@@ -258,6 +264,8 @@ export class A2aBridge {
     entry: TaskEntry,
     content: ContentBlock[],
     bus: ExecutionEventBus,
+    a2aMessageId: string,
+    requestHeaders: unknown,
   ): Promise<void> {
     let resolveSettled!: () => void;
     const settled = new Promise<void>((resolve) => {
@@ -266,12 +274,15 @@ export class A2aBridge {
     entry.settled.push(resolveSettled);
     entry.bus = bus;
     try {
-      const result = entry.handle.agent.followup(
-        createUserMessage({
-          content,
-          source: { kind: 'user' },
-        }),
-      ) as unknown;
+      const message = createUserMessage({ content, source: { kind: 'user' } });
+      this.ctx.emit('a2a/message-admitted', {
+        contextId: entry.sessionId,
+        taskId: entry.taskId,
+        a2aMessageId,
+        dshMessageId: message.id,
+        requestHeaders,
+      });
+      const result = entry.handle.agent.followup(message) as unknown;
       // followup() is typed void; guard a mistyped async impl anyway — an
       // unhandled rejection would crash the host process, and no turn/end
       // would ever settle this waiter.
