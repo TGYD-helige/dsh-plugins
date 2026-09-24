@@ -111,11 +111,14 @@ function fakeAgents(ctx: Context) {
           status: 'idle',
           followup: vi.fn(
             (message: {
+              id: string;
               content: Array<{ type: string; text?: string; attachment?: unknown }>;
             }) => {
               if ((fake as FakeAgent & { failFollowup?: boolean }).failFollowup) {
                 throw new Error('inbox closed');
               }
+              ctx.emit('agent/inbox/inserted', { agent, message: message as never });
+              ctx.emit('agent/inbox/claimed', { agent, message: message as never, turn: 1 });
               fake.contents.push(message.content);
               fake.prompts.push(message.content.map((b) => b.text ?? '').join(''));
               scriptTurn(fake);
@@ -220,7 +223,10 @@ describe('A2aBridge + DshAgentExecutor', () => {
 
   it('runs a full turn: task anchor, working, deltas, final input-required', async () => {
     const admitted = vi.fn();
+    const order: string[] = [];
     ctx.on('a2a/message-admitted', admitted);
+    ctx.on('a2a/message-admitted', () => order.push('admitted'));
+    ctx.on('agent/inbox/claimed', () => order.push('claimed'));
     const { seen, isFinished } = await execute('t1', 'ctx1', 'fix the bug');
 
     expect(isFinished()).toBe(true);
@@ -237,6 +243,7 @@ describe('A2aBridge + DshAgentExecutor', () => {
     expect(agents.created[0].agent.followup).toHaveBeenCalledWith(
       expect.objectContaining({ id: admitted.mock.calls[0][0].dshMessageId }),
     );
+    expect(order).toEqual(['admitted', 'claimed']);
 
     const task = seen[0];
     expect(task.kind).toBe('task');
@@ -956,12 +963,15 @@ describe('A2aBridge + DshAgentExecutor', () => {
     await execute('t1', 'ctx1');
     const fake = agents.created[0] as FakeAgent & { failFollowup?: boolean };
     fake.failFollowup = true;
+    const admitted = vi.fn();
+    ctx.on('a2a/message-admitted', admitted);
 
     const failed = await execute('t1', 'ctx1', 'boom');
     const failedFinal = statusUpdates(failed.seen).at(-1)!;
     expect(failed.isFinished()).toBe(true);
     expect(failedFinal.status?.state).toBe(TaskState.TASK_STATE_FAILED);
     expect(textOfStatus(failedFinal)).toBe('inbox closed');
+    expect(admitted).not.toHaveBeenCalled();
 
     // The stale waiter was spliced out: the next turn settles on its own
     // turn/end instead of inheriting the poisoned FIFO slot.
@@ -970,5 +980,24 @@ describe('A2aBridge + DshAgentExecutor', () => {
     const final = statusUpdates(recovered.seen).at(-1)!;
     expect(final.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
     expect(agents.created[0].prompts).toEqual(['hi', 'again']);
+  });
+
+  it('isolates a failing admission listener from the agent turn and other listeners', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    ctx.on('a2a/message-admitted', () => {
+      throw new Error('observer failed');
+    });
+    const admitted = vi.fn();
+    ctx.on('a2a/message-admitted', admitted);
+
+    const { seen } = await execute('t1', 'ctx1');
+    expect(statusUpdates(seen).at(-1)?.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
+    expect(agents.created[0].prompts).toEqual(['hi']);
+    expect(admitted).toHaveBeenCalledOnce();
+    expect(error).toHaveBeenCalledWith(
+      '[dsh-a2a] message-admitted listener failed:',
+      expect.any(AggregateError),
+    );
+    error.mockRestore();
   });
 });
