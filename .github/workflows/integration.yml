@@ -196,12 +196,15 @@ jobs:
       - run: pnpm build
 
       # Backend-only provider legs: no dsh boot, no LLM, no secrets — just a
-      # real service database, db push, and backend writes/reads. They also
+      # real database, db push, and backend writes/reads. They also
       # run on fork PRs (forks receive no secrets and nothing is needed).
       - name: Start service database (${{ matrix.provider }})
         run: |
           set -euo pipefail
           case "${{ matrix.provider }}" in
+            sqlite)
+              echo "DSH_DB_URL=file:$RUNNER_TEMP/dsh-storage-projection.db" >> "$GITHUB_ENV"
+              ;;
             mysql)
               docker run -d --name ci-db -p 3306:3306 -e MYSQL_ROOT_PASSWORD='Dsh_ci_Passw0rd' -e MYSQL_DATABASE=dsh mysql:8.4
               echo 'DSH_DB_URL=mysql://root:Dsh_ci_Passw0rd@127.0.0.1:3306/dsh' >> "$GITHUB_ENV"

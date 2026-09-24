@@ -3,7 +3,7 @@
  * bridge. One `execute()` = one user-message turn:
  *
  *   1. map the message's parts onto dsh content blocks (file parts become
- *      execution-world paths with a materializer, attachments or local files otherwise)
+ *      execution-world paths with a materializer, local paths otherwise)
  *   2. ensure the task's session/agent exists (creating it on first contact)
  *   3. publish a `task` event first — A2A 1.0 stream ordering REQUIRES the
  *      first event of every execute to be a task or message, including

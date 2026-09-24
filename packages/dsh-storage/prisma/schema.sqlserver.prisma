@@ -21,8 +21,7 @@ datasource db {
   provider = "sqlserver"
 }
 
-/// One row per projected session event (user message, assistant message,
-/// tool call/result, compression snapshot, ...).
+/// User and assistant messages; tool results update the assistant row's tool_calls.
 model AiMessage {
   id            String    @id @default(cuid()) @db.Char(36)
   sessionId     String    @map("session_id") @db.VarChar(100)

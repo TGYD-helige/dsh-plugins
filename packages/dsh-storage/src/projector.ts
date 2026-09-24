@@ -5,8 +5,8 @@
  * (https://deepseek-harness.github.io/deepseek-harness/reference/persistence-catalog)
  * and the @deepseek-ai/dsh-llm message types:
  * - envelope: `{ type, seq, time, data }` — payload lives under `data`.
- * - surface events (the only ones producing LLM messages, and the only ones
- *   projected to rows): `user/message`, `assistant/message`, `tool/result`.
+ * - `user/message` and `assistant/message` produce rows; `tool/result` updates
+ *   the matching assistant row's toolCalls instead of producing a tool row.
  * - token usage (V3 log): `assistant/message.data.usage` is the settled
  *   step's accounting; a failed/cancelled attempt commits `assistant/attempt`
  *   instead, with the adapter's usage chunk preserved as a raw record in its
@@ -34,14 +34,25 @@ function textOf(message: any): string {
     .join('');
 }
 
-/** Reasoning text of an assistant message, if it carried reasoning blocks. */
-function reasoningOf(message: any): string | undefined {
+/** Reasoning blocks of an assistant message, in their original order. */
+function thoughtsOf(message: any): Array<{ content: string }> | undefined {
   const blocks = Array.isArray(message?.content) ? message.content : [];
-  const text = blocks
-    .filter((b: any) => b?.type === 'reasoning')
-    .map((b: any) => b.text)
-    .join('');
-  return text || undefined;
+  const replay = message?.source?.replayState?.blocks;
+  const thoughts = blocks
+    .map((b: any, index: number) => {
+      if (b?.type !== 'reasoning' || !b.text) return null;
+      const metadata = Array.isArray(replay) ? replay[index] : undefined;
+      const signature =
+        metadata?.type === 'reasoning'
+          ? (metadata.signature ?? metadata.thoughtSignature)
+          : undefined;
+      return {
+        content: b.text,
+        ...(typeof signature === 'string' ? { thoughtSignature: signature } : {}),
+      };
+    })
+    .filter((thought: any) => thought !== null);
+  return thoughts.length ? thoughts : undefined;
 }
 
 function toolPartsOf(message: any): unknown[] | undefined {
@@ -84,35 +95,16 @@ export function projectEvent(_session: any, event: any, sessionId: string): Mess
         id: message?.id ?? randomUUID(),
         type: 'model',
         content: textOf(message),
-        thoughts: reasoningOf(message),
+        thoughts: thoughtsOf(message),
         model: message?.source?.model ?? undefined,
         tokens: data.usage ?? undefined,
         toolCalls: toolPartsOf(message),
         metadata: {
           event: event.type,
           seq: event.seq,
+          ...(message?.source ? { source: message.source } : {}),
           ...(data.interrupted ? { interrupted: true } : {}),
         },
-      };
-    }
-
-    case 'tool/result': {
-      const message = data.message;
-      const callId = message?.source?.callId ?? undefined;
-      return {
-        ...base,
-        id: message?.id ?? randomUUID(),
-        type: 'tool',
-        content: textOf(message),
-        toolCalls: [
-          {
-            callId,
-            result: message?.content?.[0] ?? null,
-            // Internal failure identity, when the call failed.
-            ...(data.error ? { error: { name: data.error.name, code: data.error.code } } : {}),
-          },
-        ],
-        metadata: { event: event.type, seq: event.seq, callId },
       };
     }
 
@@ -122,6 +114,36 @@ export function projectEvent(_session: any, event: any, sessionId: string): Mess
       // SessionRow via usageSampleOf (assistant/message and assistant/attempt).
       return null;
   }
+}
+
+/** Update the persisted assistant call identified by a tool result. */
+export function mergeToolResult(event: any, rows: MessageRow[]): MessageRow | null {
+  const result = event?.data?.message?.content?.[0] ?? null;
+  const callId = event?.data?.message?.source?.callId ?? result?.toolCallId;
+  if (!callId) return null;
+  const model = [...rows]
+    .reverse()
+    .find(
+      (row) =>
+        row.type === 'model' &&
+        Array.isArray(row.toolCalls) &&
+        row.toolCalls.some((call: any) => call?.id === callId),
+    );
+  if (!model) return null;
+  return {
+    ...model,
+    toolCalls: (model.toolCalls as any[]).map((call) =>
+      call?.id === callId
+        ? {
+            ...call,
+            result,
+            error: event.data.error
+              ? { name: event.data.error.name, code: event.data.error.code }
+              : undefined,
+          }
+        : call,
+    ),
+  };
 }
 
 export interface UsageSample {

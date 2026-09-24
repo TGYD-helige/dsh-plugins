@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MessageRow, SessionRow } from '../types.js';
 import { DatabaseBackend } from './database.js';
@@ -5,7 +6,7 @@ import { DatabaseBackend } from './database.js';
 const prismaMock = vi.hoisted(() => {
   const instances: any[] = [];
   class PrismaClient {
-    aiMessage = { upsert: vi.fn() };
+    aiMessage = { upsert: vi.fn(), findMany: vi.fn() };
     aiChatHistory = { findFirst: vi.fn(), create: vi.fn(), update: vi.fn() };
     $connect = vi.fn(async () => {});
     $disconnect = vi.fn(async () => {});
@@ -77,6 +78,53 @@ describe('DatabaseBackend', () => {
     expect(prisma.options).toEqual({ adapter: expect.any(adapterMocks.PrismaLibSql) });
     expect(adapterMocks.calls.sqlite).toEqual([{ url }]);
     expect(prisma.$connect).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads persisted messages with logical ids and SQL Server JSON fields for a projector', async () => {
+    backend = new DatabaseBackend({
+      provider: 'sqlserver',
+      url: 'sqlserver://host;database=db;user=u;password=p',
+    });
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    prisma.aiMessage.findMany.mockResolvedValue([
+      {
+        id: 'hashed-id',
+        sessionId: 's1',
+        historyId: null,
+        type: 'model',
+        content: '',
+        thoughts: '[{"description":"older reasoning","timestamp":"2026-05-19T17:42:27Z"}]',
+        model: 'm',
+        tokens: null,
+        toolCalls: '[{"id":"call-1","result":null}]',
+        agentId: 'main',
+        metadata: '{"id":"a1"}',
+        createdAt: new Date(1700000000000),
+      },
+    ]);
+    const rows = await backend.readMessages('s1');
+    expect(prisma.aiMessage.findMany).toHaveBeenCalledWith({
+      where: { sessionId: 's1', deletedAt: null },
+      orderBy: { createdAt: 'asc' },
+    });
+    expect(rows).toMatchObject([
+      {
+        id: 'a1',
+        type: 'model',
+        toolCalls: [{ id: 'call-1', result: null }],
+        thoughts: [{ content: 'older reasoning', timestamp: '2026-05-19T17:42:27Z' }],
+      },
+    ]);
+    await backend.readMessages('s1', 'a1');
+    expect(prisma.aiMessage.findMany).toHaveBeenLastCalledWith({
+      where: {
+        sessionId: 's1',
+        deletedAt: null,
+        id: createHash('sha256').update('message s1\0a1').digest('hex').slice(0, 36),
+      },
+      orderBy: { createdAt: 'asc' },
+    });
   });
 
   it('builds the mysql adapter from a mariadb:// url', async () => {

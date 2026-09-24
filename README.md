@@ -117,7 +117,7 @@ npx prisma db push --schema node_modules/@amaster.ai/dsh-storage/prisma/schema.m
 
 SQL Server note: Prisma's sqlserver connector has no `Json` type, so its variant maps the JSON columns to text — the backend serializes them on write automatically (derived from `provider: sqlserver`; SQL Server's `ISJSON` / `JSON_VALUE` still query the text as JSON).
 
-- **`ai_messages`** — one row per projected session event (user / model / tool), with `thoughts`, `tokens`, `tool_calls`, `agent_id`, `metadata` JSON columns and soft-delete.
+- **`ai_messages`** — user/model rows with `thoughts`, `tokens`, `tool_calls`, `agent_id`, `metadata` JSON columns and soft-delete; tool results update the matching model row's `tool_calls`.
 - **`ai_chat_histories`** — per-session rollup (message count, total tokens, first/last message timestamps).
 
 The logical message id rides in `metadata.id`; message rows use a deterministic hash of `(session_id, message id)` as their primary key, so re-projected events upsert in place rather than duplicate — on every connector (the source project's `metadata.id` JSON-path lookup only works on PostgreSQL/MySQL). Session rows are matched by `session_id` and keep their cuid primary keys — the per-session serialization chain makes the find-then-write safe, and rows from the early scaffold (or the source project) are continued, never duplicated. Upgrade note: the early scaffold wrote messages with cuid keys; if you ran it, dedupe those by `metadata.id` before enabling this version.
