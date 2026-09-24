@@ -20,7 +20,7 @@
 
 import { type Message, type Task, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutor, ExecutionEventBus, RequestContext } from '@a2a-js/sdk/server';
-import { AgentEvent } from '@a2a-js/sdk/server';
+import { AgentEvent, STATE_HEADERS_KEY } from '@a2a-js/sdk/server';
 import type { A2aBridge } from './bridge.js';
 import { agentTextMessage, terminalStatusUpdate } from './translator.js';
 
@@ -59,7 +59,8 @@ export class DshAgentExecutor implements AgentExecutor {
             taskEvent(taskId, contextId, TaskState.TASK_STATE_WORKING),
       );
       anchored = true;
-      await this.bridge.runTurn(entry, content, eventBus);
+      const requestHeaders = requestContext.context.state.get(STATE_HEADERS_KEY);
+      await this.bridge.runTurn(entry, content, eventBus, userMessage.messageId, requestHeaders);
     } catch (error) {
       if (this.bridge.isClearing(contextId)) this.suppressTask?.(taskId);
       const message = error instanceof Error ? error.message : String(error);

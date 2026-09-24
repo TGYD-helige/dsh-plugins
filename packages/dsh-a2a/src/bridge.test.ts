@@ -3,7 +3,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { type Message, type Part, Role, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutionEvent, ExecutionEventBus } from '@a2a-js/sdk/server';
-import { DefaultExecutionEventBus, RequestContext, ServerCallContext } from '@a2a-js/sdk/server';
+import {
+  DefaultExecutionEventBus,
+  RequestContext,
+  ServerCallContext,
+  STATE_HEADERS_KEY,
+} from '@a2a-js/sdk/server';
 import { Context } from '@deepseek-ai/cordis';
 import type {
   Agent,
@@ -156,7 +161,7 @@ function requestContext(message: Message, taskId: string, contextId: string): Re
     { tenant: '', message, configuration: undefined, metadata: undefined },
     taskId,
     contextId,
-    new ServerCallContext(),
+    new ServerCallContext({ state: new Map([[STATE_HEADERS_KEY, { 'x-example': 'value' }]]) }),
   );
 }
 
@@ -214,12 +219,24 @@ describe('A2aBridge + DshAgentExecutor', () => {
   }
 
   it('runs a full turn: task anchor, working, deltas, final input-required', async () => {
+    const admitted = vi.fn();
+    ctx.on('a2a/message-admitted', admitted);
     const { seen, isFinished } = await execute('t1', 'ctx1', 'fix the bug');
 
     expect(isFinished()).toBe(true);
     expect(agents.created).toHaveLength(1);
     expect(agents.created[0].sessionId).toBe('ctx1');
     expect(agents.created[0].prompts).toEqual(['fix the bug']);
+    expect(admitted).toHaveBeenCalledWith({
+      contextId: 'ctx1',
+      taskId: 't1',
+      a2aMessageId: 'user-1',
+      dshMessageId: expect.any(String),
+      requestHeaders: { 'x-example': 'value' },
+    });
+    expect(agents.created[0].agent.followup).toHaveBeenCalledWith(
+      expect.objectContaining({ id: admitted.mock.calls[0][0].dshMessageId }),
+    );
 
     const task = seen[0];
     expect(task.kind).toBe('task');

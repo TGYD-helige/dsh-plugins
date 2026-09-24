@@ -29,6 +29,19 @@ import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
 
 export type { A2aFileMaterializer } from './content.js';
 
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /** Link a protocol message to the dsh inbox message created for its turn. */
+    'a2a/message-admitted'(detail: {
+      contextId: string;
+      taskId: string;
+      a2aMessageId: string;
+      dshMessageId: string;
+      requestHeaders: unknown;
+    }): void;
+  }
+}
+
 export const name = 'dsh-a2a';
 
 /** The bridge creates and owns agents through the registry service. */
