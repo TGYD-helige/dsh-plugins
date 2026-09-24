@@ -275,32 +275,44 @@ export class A2aBridge {
     entry.bus = bus;
     try {
       const message = createUserMessage({ content, source: { kind: 'user' } });
-      this.ctx.emit('a2a/message-admitted', {
-        contextId: entry.sessionId,
-        taskId: entry.taskId,
-        a2aMessageId,
-        dshMessageId: message.id,
-        requestHeaders,
+      // followup() inserts synchronously, then may claim the message before
+      // returning. Observe that insertion so the mapping is both real and early.
+      const stopListening = this.ctx.on('agent/inbox/inserted', ({ agent, message: inserted }) => {
+        if (agent !== entry.handle.agent || inserted.id !== message.id) return;
+        stopListening();
+        void this.ctx
+          .parallel('a2a/message-admitted', {
+            contextId: entry.sessionId,
+            taskId: entry.taskId,
+            a2aMessageId,
+            dshMessageId: message.id,
+            requestHeaders,
+          })
+          .catch((error: unknown) => {
+            console.error('[dsh-a2a] message-admitted listener failed:', error);
+          });
       });
-      const result = entry.handle.agent.followup(message) as unknown;
-      // followup() is typed void; guard a mistyped async impl anyway — an
-      // unhandled rejection would crash the host process, and no turn/end
-      // would ever settle this waiter.
-      void Promise.resolve(result).catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error('[dsh-a2a] followup failed:', error);
-        if (entry.bus === bus) {
-          entry.bus.publish(
-            terminalStatusUpdate(entry.taskId, entry.sessionId as string, 'failed', message),
-          );
-        }
-        resolveSettled();
-      });
-      // Never rejects: waiters only resolve. A synchronous followup() throw is
-      // the one failure path — it means no turn ever started, so pull this
-      // waiter back out of the FIFO before it can be settled by the NEXT
-      // turn's turn/end (which would resolve one execute() too early).
-      await settled;
+      try {
+        const result = entry.handle.agent.followup(message) as unknown;
+        // followup() is typed void; guard a mistyped async impl anyway — an
+        // unhandled rejection would crash the host process, and no turn/end
+        // would ever settle this waiter.
+        void Promise.resolve(result).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error('[dsh-a2a] followup failed:', error);
+          if (entry.bus === bus) {
+            entry.bus.publish(
+              terminalStatusUpdate(entry.taskId, entry.sessionId as string, 'failed', message),
+            );
+          }
+          resolveSettled();
+        });
+        // Never rejects: waiters only resolve. A synchronous followup() throw
+        // means no turn started, so pull its waiter from the FIFO below.
+        await settled;
+      } finally {
+        stopListening();
+      }
     } catch (error) {
       const index = entry.settled.indexOf(resolveSettled);
       if (index >= 0) entry.settled.splice(index, 1);

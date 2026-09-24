@@ -29,6 +29,9 @@ import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
 
 export type { A2aFileMaterializer } from './content.js';
 
+/** Event emitted when one A2A user message enters the dsh inbox. */
+export const A2A_MESSAGE_ADMITTED_EVENT = 'a2a/message-admitted' as const;
+
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /** Link a protocol message to the dsh inbox message created for its turn. */
