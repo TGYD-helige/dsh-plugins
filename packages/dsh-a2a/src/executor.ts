@@ -21,6 +21,7 @@
 import { type Message, type Task, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutor, ExecutionEventBus, RequestContext } from '@a2a-js/sdk/server';
 import { AgentEvent, STATE_HEADERS_KEY } from '@a2a-js/sdk/server';
+import { ApprovalReplyError } from './approval.js';
 import type { A2aBridge } from './bridge.js';
 import { agentTextMessage, terminalStatusUpdate } from './translator.js';
 
@@ -46,6 +47,17 @@ export class DshAgentExecutor implements AgentExecutor {
     const { userMessage, taskId, contextId } = requestContext;
     let anchored = false;
     try {
+      if (this.bridge.validateApprovalMessage(userMessage)) {
+        const approval = this.bridge.claimApproval(userMessage);
+        try {
+          eventBus.publish(taskEvent(taskId, contextId, TaskState.TASK_STATE_WORKING));
+          anchored = true;
+        } finally {
+          approval.resume();
+        }
+        await this.bridge.waitForTurn(approval.entry);
+        return;
+      }
       const content = await this.bridge.buildContent(userMessage, contextId);
       const { entry, freshTask } = await this.bridge.ensureTask(taskId, contextId);
       eventBus.publish(
@@ -62,6 +74,7 @@ export class DshAgentExecutor implements AgentExecutor {
       const requestHeaders = requestContext.context.state.get(STATE_HEADERS_KEY);
       await this.bridge.runTurn(entry, content, eventBus, userMessage.messageId, requestHeaders);
     } catch (error) {
+      if (error instanceof ApprovalReplyError) return;
       if (this.bridge.isClearing(contextId)) this.suppressTask?.(taskId);
       const message = error instanceof Error ? error.message : String(error);
       if (!anchored) {

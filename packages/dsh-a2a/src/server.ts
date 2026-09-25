@@ -19,9 +19,11 @@ import {
   AGENT_CARD_PATH,
   type AgentCard,
   type AgentInterface,
+  type Message,
   TaskState,
 } from '@a2a-js/sdk';
 import { duplicateInterfacesForLegacy } from '@a2a-js/sdk/compat/v0_3';
+import { RequestMalformedError } from '@a2a-js/sdk/errors';
 import {
   type AgentExecutor,
   DefaultRequestHandler,
@@ -44,6 +46,7 @@ export interface A2aServerOptions {
   };
   executor: AgentExecutor;
   taskStore: TaskStore;
+  approvalGuard?: (message: Message) => undefined | (() => void);
 }
 
 export interface A2aServer {
@@ -89,7 +92,35 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     signatures: [],
   };
 
-  const requestHandler = new DefaultRequestHandler(card, options.taskStore, options.executor);
+  const guardApproval = (message: Message | undefined) => {
+    if (!message) return;
+    try {
+      return options.approvalGuard?.(message);
+    } catch (error) {
+      throw new RequestMalformedError(error instanceof Error ? error.message : String(error));
+    }
+  };
+  const requestHandler = new (class extends DefaultRequestHandler {
+    override async sendMessage(...args: Parameters<DefaultRequestHandler['sendMessage']>) {
+      const release = guardApproval(args[0].message);
+      try {
+        return await super.sendMessage(...args);
+      } finally {
+        release?.();
+      }
+    }
+
+    override async *sendMessageStream(
+      ...args: Parameters<DefaultRequestHandler['sendMessageStream']>
+    ) {
+      const release = guardApproval(args[0].message);
+      try {
+        yield* super.sendMessageStream(...args);
+      } finally {
+        release?.();
+      }
+    }
+  })(card, options.taskStore, options.executor);
 
   const app = express();
   // The SDK's jsonRpcHandler parses bodies with express.json()'s 100kb default;

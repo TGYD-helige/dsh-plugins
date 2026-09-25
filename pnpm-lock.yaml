@@ -42,6 +42,9 @@ importers:
       '@deepseek-ai/dsh-session':
         specifier: 0.1.6-alpha.2
         version: 0.1.6-alpha.2(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-scope@0.1.6-alpha.2(@deepseek-ai/cordis@4.0.1)(@deepseek-ai/dsh-invariants@0.1.6-alpha.2(@deepseek-ai/cordis@4.0.1)))
+      '@deepseek-ai/dsh-user-approval':
+        specifier: 0.1.6-alpha.2
+        version: 0.1.6-alpha.2(xyiy4uw24shrlf2f7t4j7awxqq)
       '@google-cloud/storage':
         specifier: ^7.0.0
         version: 7.22.0
