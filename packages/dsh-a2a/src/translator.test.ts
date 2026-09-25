@@ -127,14 +127,9 @@ describe('SessionTranslator (A2A 1.0 model)', () => {
           step: 1,
           message: {
             id: 'm2',
-            role: 'user',
-            content: [
-              {
-                type: 'tool-result',
-                toolCallId: 'c1',
-                content: [{ type: 'text', text: 'file.txt' }],
-              },
-            ],
+            role: 'tool',
+            toolCallId: 'c1',
+            content: [{ type: 'text', text: 'file.txt' }],
             source: { kind: 'tool', callId: 'c1' },
           },
         } as never),
@@ -160,15 +155,10 @@ describe('SessionTranslator (A2A 1.0 model)', () => {
           step: 1,
           message: {
             id: 'm3',
-            role: 'user',
-            content: [
-              {
-                type: 'tool-result',
-                toolCallId: 'c9',
-                content: [{ type: 'text', text: 'boom' }],
-                isError: true,
-              },
-            ],
+            role: 'tool',
+            toolCallId: 'c9',
+            content: [{ type: 'text', text: 'boom' }],
+            isError: true,
             source: { kind: 'tool', callId: 'c9' },
           },
           error: { name: 'ToolError', code: 'EXEC_FAILED' },

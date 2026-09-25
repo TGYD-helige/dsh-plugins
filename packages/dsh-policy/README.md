@@ -111,7 +111,7 @@ A policy plugin is advisory gating, not containment: deny rules keep a well-beha
 
 | @amaster.ai/dsh-policy | dsh | cordis |
 | --- | --- | --- |
-| 0.1.x | `>=0.1.5-rc.1 || >=0.1.6-alpha.1` (tested `0.1.6-alpha.2`) | `^4.0.1` |
+| 0.1.x | `>=0.1.5-rc.1 || >=0.1.6-alpha.1 || >=0.1.7-alpha.1` (tested `0.1.7-rc.2`) | `^4.0.1` (tested `4.0.4`) |
 
 Peer dependency: `@deepseek-ai/dsh-tools` (the `tools/pre-execute` gate). The approval seam (`@deepseek-ai/dsh-user-approval`) is optional and only involved in `ask` decisions.
 

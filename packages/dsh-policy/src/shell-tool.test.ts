@@ -12,8 +12,7 @@ import type { ToolCallId } from '@deepseek-ai/dsh-llm';
 import ShellExecutor, {
   type ShellExecRequest,
   type ShellExecSpec,
-  type ShellProcess,
-  type ShellRunResult,
+  type ShellExecution,
 } from '@deepseek-ai/dsh-shell';
 import * as shellEnv from '@deepseek-ai/dsh-shell-env';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
@@ -31,14 +30,15 @@ class StubShell extends ShellExecutor {
       command: request.command,
       workdir: request.workdir ?? process.cwd(),
       timeoutMs: request.timeoutMs ?? 5_000,
+      onExpiry: request.onExpiry ?? 'kill',
       stdoutMaxBytes: 65_536,
       sandboxPolicy: undefined,
     };
   }
 
-  async run(spec: ShellExecSpec): Promise<ShellRunResult> {
+  async execute(spec: ShellExecSpec): Promise<ShellExecution> {
     this.executed.push(spec.command);
-    return {
+    const result = {
       exitCode: 0,
       signal: null,
       timedOut: false,
@@ -47,10 +47,7 @@ class StubShell extends ShellExecutor {
       stdout: { text: `stub-ran:${spec.command}\n`, truncated: false },
       stderr: { text: '', truncated: false },
     };
-  }
-
-  async start(_spec: ShellExecSpec): Promise<ShellProcess> {
-    throw new Error('background execution is not supported in tests');
+    return { result: async () => result } as ShellExecution;
   }
 }
 

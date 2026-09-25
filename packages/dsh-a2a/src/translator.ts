@@ -5,11 +5,11 @@
  * deliberately free of cordis/HTTP concerns so the mapping is unit-testable
  * without a harness. The mapping ports the source project's
  * `packages/a2a-server/src/agent/task.ts` event switch onto dsh's
- * `SessionEventMap` (verified against @deepseek-ai/dsh-session@0.1.6-alpha.2),
+ * `SessionEventMap` (verified against @deepseek-ai/dsh-session@0.1.7-rc.2),
  * emitting the A2A 1.0 data model (@a2a-js/sdk 1.1.0). As of the V3 session
  * format the durable log carries no incremental chunks — live text/reasoning
  * deltas arrive as `agent/assistant-stream` chunk frames
- * (@deepseek-ai/dsh-agent@0.1.6-alpha.2) through {@link handleStreamFrame}:
+ * (@deepseek-ai/dsh-agent@0.1.7-rc.2) through {@link handleStreamFrame}:
  *
  *   turn/start                         → statusUpdate(WORKING), ids rotate
  *   stream chunk (text-delta)          → statusUpdate(WORKING, text part),
@@ -170,22 +170,16 @@ export class SessionTranslator {
       }
       case 'tool/result': {
         const { message, error, meta } = event.data;
-        // ToolResultMessage.content is a single tool-result block.
-        const block = message.content[0];
-        const callId = block?.type === 'tool-result' ? block.toolCallId : undefined;
+        const callId = message.toolCallId;
         return [
           this.status(
             TaskState.TASK_STATE_WORKING,
             { kind: 'tool-result' },
             this.dataMessage({
               callId,
-              name: callId ? this.toolNames.get(callId) : undefined,
-              result:
-                block?.type === 'tool-result'
-                  ? flattenContent(block.content)
-                  : flattenContent(message.content),
-              isError:
-                (block?.type === 'tool-result' && block.isError === true) || error !== undefined,
+              name: this.toolNames.get(callId),
+              result: flattenContent(message.content),
+              isError: message.isError === true || error !== undefined,
               ...(error ? { error: `${error.name}: ${error.code}` } : {}),
               ...(meta !== undefined ? { meta } : {}),
             }),
@@ -315,7 +309,7 @@ function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
 }
 
 /** Flatten tool-result content blocks to display text; non-text blocks serialize as JSON. */
-function flattenContent(content: ContentBlock[]): string {
+function flattenContent(content: readonly ContentBlock[]): string {
   return content
     .map((block) => (block.type === 'text' ? block.text : JSON.stringify(block)))
     .join('');

@@ -23,7 +23,7 @@
  *   `subagent/descriptor` event).
  *
  * Event/waterfall shapes verified against the installed
- * @deepseek-ai/dsh-{llm,session,tools,agent,subagent}@0.1.6-alpha.2 package sources
+ * @deepseek-ai/dsh-{llm,session,tools,agent,subagent}@0.1.7-rc.2 package sources
  * (types for shapes; `lib/*.js` for the session/created ordering claim).
  *
  * @module dsh-langfuse
@@ -120,7 +120,7 @@ const isTokenDelta = (chunk: StreamChunk): boolean =>
   (chunk.type === 'tool-call-delta' && (chunk.argumentsDelta !== '' || chunk.name !== undefined));
 
 /** Trace input/output text: the message's text blocks, joined. */
-function messageText(message: { content: ContentBlock[] }): string | undefined {
+function messageText(message: { content: readonly ContentBlock[] }): string | undefined {
   const text = message.content.flatMap((block) => (block.type === 'text' ? [block.text] : []));
   return text.length > 0 ? text.join('\n') : undefined;
 }
