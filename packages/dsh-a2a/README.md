@@ -80,7 +80,7 @@ dsh ships **no authentication or authorization**. The server binds `127.0.0.1` b
 
 ## Compatibility
 
-Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment}@0.1.6-alpha.2` — the attachment store is an optional peer) — check the `TODO(verify)` markers in `src/` before upgrading dsh.
+Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment}@0.1.7-rc.2` — the attachment store is an optional peer) — check the `TODO(verify)` markers in `src/` before upgrading dsh.
 
 ## License
 

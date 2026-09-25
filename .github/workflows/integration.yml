@@ -31,7 +31,7 @@ permissions:
 
 env:
   # dsh is developer preview — pin the CLI under test (AGENTS.md compat stance).
-  DSH_CLI_VERSION: 0.1.6-alpha.2
+  DSH_CLI_VERSION: 0.1.7-rc.2
 
 jobs:
   detect:

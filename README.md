@@ -32,11 +32,11 @@ This is an early dsh-preview ecosystem. The plugin shapes, config schemas, and s
 
 | @amaster.ai/dsh-* | dsh | cordis | @a2a-js/sdk (dsh-a2a) |
 | --- | --- | --- | --- |
-| 0.1.x | `>=0.1.5-rc.1 || >=0.1.6-alpha.1` (peer floor) / `0.1.6-alpha.2` (tested) | `^4.0.1` | `^1.1.0` (A2A 1.0 + v0.3 compat) |
+| 0.1.x | `>=0.1.5-rc.1 || >=0.1.6-alpha.1 || >=0.1.7-alpha.1` (peer floor) / `0.1.7-rc.2` (tested) | `^4.0.1` (tested `4.0.4`) | `^1.1.0` (A2A 1.0 + v0.3 compat) |
 
-dsh is in developer preview and **will** break compatibility between releases. Plugins declare the oldest compatible dsh version as a fixed peer floor and every release records the tested dsh version in this matrix; the floor moves only when a plugin starts requiring a newer dsh API. Installs ride `dsh plugin add`, which is pnpm-only — pnpm's peer matching has no prerelease gate, so any newer dsh (alpha or stable) satisfies the floor without warnings. npm consumers are gated differently: npm never lets a prerelease satisfy a range unless the range names that release tuple with a prerelease comparator, so the floor carries the `|| >=0.1.6-alpha.1` union member — required only while 0.1.6 is pre-release; `0.1.6` final satisfies the plain floor again.
+dsh is in developer preview and **will** break compatibility between releases. Plugins declare the oldest compatible dsh version as a fixed peer floor and every release records the tested dsh version in this matrix; the floor moves only when a plugin starts requiring a newer dsh API. Installs ride `dsh plugin add`, which is pnpm-only — pnpm's peer matching has no prerelease gate, so any newer dsh (alpha or stable) satisfies the floor without warnings. npm consumers are gated differently: npm never lets a prerelease satisfy a range unless the range names that release tuple with a prerelease comparator, so the peer ranges also name the 0.1.6 and 0.1.7 prerelease tuples. Drop each union member once that line ships a final release.
 
-`dsh-a2a`'s approval bridge has an optional `@deepseek-ai/dsh-user-approval` peer floor of `>=0.1.6-alpha.2` (tested at `0.1.6-alpha.2`).
+`dsh-a2a`'s approval bridge has an optional `@deepseek-ai/dsh-user-approval` peer floor of `>=0.1.6-alpha.2 || >=0.1.7-alpha.1` (tested at `0.1.7-rc.2`).
 
 ## Install
 

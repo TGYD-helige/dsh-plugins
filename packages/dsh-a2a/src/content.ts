@@ -43,9 +43,6 @@ interface Materialization {
   materializer: A2aFileMaterializer;
 }
 
-// TODO(verify): the confirmation data-part protocol ({callId, outcome}) maps
-// onto the optional dsh-user-approval service (0.1.2+, asks carry the exact
-// tool call) — bridge it once a deployment composes that service.
 export async function buildMessageContent(
   parts: readonly Part[],
   attachments: AttachmentStore | undefined,
