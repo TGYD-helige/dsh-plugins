@@ -16,8 +16,8 @@
  * resolves, so an execute() that returns always landed its events first.
  */
 
-import type { Message } from '@a2a-js/sdk';
-import type { ExecutionEventBus } from '@a2a-js/sdk/server';
+import { type Message, TaskState } from '@a2a-js/sdk';
+import { AgentEvent, type ExecutionEventBus } from '@a2a-js/sdk/server';
 import type { Context } from '@deepseek-ai/cordis';
 import type {
   Agent,
@@ -35,8 +35,15 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
 import type { ContentBlock } from '@deepseek-ai/dsh-llm/types';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
+import type { ApprovalOutcome, ApprovalRequestEvent } from '@deepseek-ai/dsh-user-approval/types';
+import {
+  type A2aApproval,
+  type A2aApprovalCodec,
+  ApprovalReplyError,
+  defaultApprovalCodec,
+} from './approval.js';
 import { type A2aFileMaterializer, buildMessageContent, uploadsDir } from './content.js';
-import { SessionTranslator, terminalStatusUpdate } from './translator.js';
+import { agentTextMessage, SessionTranslator, terminalStatusUpdate } from './translator.js';
 
 export interface BridgeOptions {
   /** Absolute working directory for spawned agents. */
@@ -77,20 +84,38 @@ export interface TaskEntry {
   running: Set<Promise<void>>;
 }
 
+interface PendingApproval {
+  entry: TaskEntry;
+  request: A2aApproval;
+  reservedBy?: string;
+  prompted: boolean;
+  resolve: (outcome: ApprovalOutcome) => void;
+  removeAbort: () => void;
+}
+
 export class A2aBridge {
   private readonly tasks = new Map<string, TaskEntry>(); // taskId → entry
   private readonly bySession = new Map<string, TaskEntry>(); // sessionId (== contextId) → entry
   private readonly clearing = new Set<string>();
   private readonly creating = new Map<string, Set<Promise<unknown>>>();
   private readonly executing = new Map<string, Set<Promise<void>>>();
+  private readonly asked = new Map<
+    string,
+    Array<{ id: string; toolName: string; callId?: string }>
+  >();
+  private readonly approvals = new Map<string, PendingApproval>();
+  private readonly codec: A2aApprovalCodec;
 
   constructor(
     private readonly ctx: Context,
     private readonly options: BridgeOptions,
   ) {
+    this.codec =
+      (ctx.get('a2aApprovalCodec') as A2aApprovalCodec | undefined) ?? defaultApprovalCodec;
     ctx.on('session/event', (session, event) => this.onSessionEvent(session, event));
     ctx.on('session/disposed', (session) => this.onSessionDisposed(session));
     ctx.on('agent/assistant-stream', ({ agent, frame }) => this.onAssistantStream(agent, frame));
+    ctx.on('approval/request', (req, next) => this.onApprovalRequest(req, next));
   }
 
   /**
@@ -129,6 +154,7 @@ export class A2aBridge {
 
     const forContext = this.bySession.get(contextId);
     if (forContext) {
+      this.withdrawApprovals(forContext);
       this.tasks.delete(forContext.taskId);
       forContext.taskId = taskId;
       forContext.translator = new SessionTranslator(
@@ -223,6 +249,87 @@ export class A2aBridge {
 
   isClearing(contextId: string): boolean {
     return this.clearing.has(contextId);
+  }
+
+  /** Called before the SDK starts an executor, so a bad reply cannot fail the live task. */
+  validateApprovalMessage(message: Message): boolean {
+    const entry = message.contextId
+      ? this.bySession.get(message.contextId)
+      : this.tasks.get(message.taskId);
+    const pending = [...this.approvals].filter(([, value]) => value.entry === entry);
+    const reply = this.codec.decode(message);
+    if (!pending.length && !reply) return false;
+    if (!entry || !message.taskId || entry.taskId !== message.taskId || !reply) {
+      throw new ApprovalReplyError(
+        'Approval reply requires the current task and a supported outcome.',
+      );
+    }
+    const found = this.findApproval(entry, reply);
+    if (!found || (found[1].reservedBy && found[1].reservedBy !== message.messageId)) {
+      throw new ApprovalReplyError(
+        'Approval request ID or call ID does not match a pending request.',
+      );
+    }
+    return true;
+  }
+
+  /** Reserve one reply before the SDK asynchronously loads and saves the task. */
+  reserveApprovalMessage(message: Message): (() => void) | undefined {
+    if (!this.validateApprovalMessage(message)) return;
+    const entry = this.tasks.get(message.taskId)!;
+    const [id, approval] = this.findApproval(entry, this.codec.decode(message)!)!;
+    if (approval.reservedBy) throw new ApprovalReplyError('Approval reply is already in progress.');
+    approval.reservedBy = message.messageId;
+    return () => {
+      if (this.approvals.get(id) === approval) approval.reservedBy = undefined;
+    };
+  }
+
+  /** Claim the decision before publishing the reply's task anchor. */
+  claimApproval(message: Message): { entry: TaskEntry; resume: () => void } {
+    const reply = this.codec.decode(message);
+    if (!reply) throw new ApprovalReplyError('Unsupported approval reply.');
+    const entry = this.tasks.get(message.taskId);
+    const found = entry && this.findApproval(entry, reply);
+    if (
+      !found ||
+      entry.sessionId !== message.contextId ||
+      (found[1].reservedBy && found[1].reservedBy !== message.messageId)
+    ) {
+      throw new ApprovalReplyError('Approval is no longer pending.');
+    }
+    const [id, approval] = found;
+    this.approvals.delete(id);
+    approval.removeAbort();
+    return {
+      entry,
+      resume: () => {
+        approval.resolve(reply.outcome);
+        this.publishNextApproval(entry);
+      },
+    };
+  }
+
+  private findApproval(
+    entry: TaskEntry,
+    reply: { requestId?: string; callId?: string },
+  ): [string, PendingApproval] | undefined {
+    if (reply.requestId) {
+      const approval = this.approvals.get(reply.requestId);
+      return approval?.entry === entry &&
+        (reply.callId === undefined || approval.request.callId === reply.callId)
+        ? [reply.requestId, approval]
+        : undefined;
+    }
+    if (!reply.callId) return;
+    const matches = [...this.approvals].filter(
+      ([, approval]) => approval.entry === entry && approval.request.callId === reply.callId,
+    );
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
+  async waitForTurn(entry: TaskEntry): Promise<void> {
+    await Promise.allSettled([...entry.running]);
   }
 
   /** Include content preparation in the work a context clear must drain. */
@@ -333,6 +440,7 @@ export class A2aBridge {
       await Promise.allSettled([...(this.creating.get(contextId) ?? [])]);
       const entry = this.bySession.get(contextId);
       if (entry) {
+        this.withdrawApprovals(entry);
         if (entry.turnActive || entry.running.size > 0) {
           await entry.handle.agent.cancel({ kind: 'user' });
         }
@@ -354,6 +462,7 @@ export class A2aBridge {
   cancel(taskId: string): string | undefined {
     const entry = this.tasks.get(taskId);
     if (!entry) return undefined;
+    this.withdrawApprovals(entry);
     // cancel() is typed void; the guard keeps a mistyped async impl from
     // crashing the host (the caller already published its canceled final).
     void Promise.resolve(entry.handle.agent.cancel({ kind: 'user' }) as unknown).catch(
@@ -368,6 +477,7 @@ export class A2aBridge {
     this.tasks.clear();
     this.bySession.clear();
     for (const entry of entries) {
+      this.withdrawApprovals(entry);
       this.settleEntry(entry, 'Plugin unloaded.');
       try {
         await entry.handle.dispose();
@@ -380,6 +490,11 @@ export class A2aBridge {
   private onSessionEvent(session: Session, event: SessionEvent): void {
     const entry = this.bySession.get(session.id as string);
     if (!entry) return;
+    if (event.type === 'approval/asked') {
+      const queue = this.asked.get(session.id as string) ?? [];
+      queue.push({ id: event.data.id, toolName: event.data.toolName, callId: event.data.callId });
+      this.asked.set(session.id as string, queue);
+    }
     if (event.type === 'turn/start') entry.turnActive = true;
     // A turn carried over from a previous task binding (e.g. a canceled turn
     // whose abort was still in flight when the context rebound): its turn/end
@@ -396,6 +511,8 @@ export class A2aBridge {
       console.error('[dsh-a2a] failed to translate session event:', error);
     }
     if (event.type === 'turn/end') {
+      this.withdrawApprovals(entry);
+      this.asked.delete(session.id as string);
       entry.turnActive = false;
       entry.settled.shift()?.();
     }
@@ -418,6 +535,7 @@ export class A2aBridge {
   private onSessionDisposed(session: Session): void {
     const entry = this.bySession.get(session.id as string);
     if (!entry) return;
+    this.withdrawApprovals(entry);
     this.tasks.delete(entry.taskId);
     this.bySession.delete(session.id as string);
     // A mid-turn disposal never emits turn/end — settle instead of hanging
@@ -427,6 +545,7 @@ export class A2aBridge {
 
   /** Close an in-flight stream honestly and release every turn waiter. */
   private settleEntry(entry: TaskEntry, message: string): void {
+    this.withdrawApprovals(entry);
     if (entry.turnActive && entry.bus) {
       entry.bus.publish(
         terminalStatusUpdate(entry.taskId, entry.sessionId as string, 'canceled', message),
@@ -434,6 +553,98 @@ export class A2aBridge {
     }
     entry.turnActive = false;
     for (const resolve of entry.settled.splice(0)) resolve();
+  }
+
+  private onApprovalRequest(
+    req: ApprovalRequestEvent,
+    next: () => Promise<ApprovalOutcome>,
+  ): Promise<ApprovalOutcome> {
+    const entry = this.bySession.get(req.agent.session.id as string);
+    if (!entry || entry.handle.agent !== req.agent) return next();
+    const queue = this.asked.get(entry.sessionId as string) ?? [];
+    const matching = queue.filter(
+      (ask) => ask.toolName === req.toolName && ask.callId === req.callId,
+    );
+    // The answerer request has no request ID; duplicate unclaimed audit asks
+    // cannot be paired safely without a distinct call ID.
+    const asked =
+      matching.length === 1 ? queue.splice(queue.indexOf(matching[0]), 1)[0] : undefined;
+    if (!asked || !entry.bus || !entry.turnActive || req.signal?.aborted)
+      return Promise.resolve('unavailable');
+    return new Promise<ApprovalOutcome>((resolve) => {
+      const onAbort = () => {
+        this.approvals.delete(asked.id);
+        resolve('cancelled');
+        this.publishNextApproval(entry);
+      };
+      req.signal?.addEventListener('abort', onAbort, { once: true });
+      this.approvals.set(asked.id, {
+        entry,
+        request: {
+          requestId: asked.id,
+          toolName: req.toolName,
+          reason: req.reason,
+          callId: asked.callId,
+        },
+        prompted: false,
+        resolve,
+        removeAbort: () => req.signal?.removeEventListener('abort', onAbort),
+      });
+      this.publishNextApproval(entry);
+    });
+  }
+
+  private publishNextApproval(entry: TaskEntry): void {
+    const waiting = [...this.approvals].filter(([, approval]) => approval.entry === entry);
+    if (waiting.some(([, approval]) => approval.prompted)) return;
+    const next = waiting[0];
+    if (!next || !entry.bus) return;
+    const [id, approval] = next;
+    approval.prompted = true;
+    try {
+      const data = this.codec.encode(approval.request);
+      const message = agentTextMessage(
+        entry.taskId,
+        entry.sessionId as string,
+        'Tool approval required.',
+      );
+      message.parts = [
+        {
+          content: { $case: 'data', value: data },
+          metadata: undefined,
+          filename: '',
+          mediaType: 'application/json',
+        },
+      ];
+      entry.bus!.publish(
+        AgentEvent.statusUpdate({
+          taskId: entry.taskId,
+          contextId: entry.sessionId as string,
+          status: {
+            state: TaskState.TASK_STATE_INPUT_REQUIRED,
+            message,
+            timestamp: new Date().toISOString(),
+          },
+          metadata: { dshAgent: { kind: 'state-change', reason: 'approval' } },
+        }),
+      );
+    } catch (error) {
+      console.error('[dsh-a2a] failed to publish approval:', error);
+      this.approvals.delete(id);
+      approval.removeAbort();
+      approval.resolve('unavailable');
+      this.publishNextApproval(entry);
+    }
+  }
+
+  private withdrawApprovals(entry: TaskEntry): void {
+    for (const [id, approval] of this.approvals) {
+      if (approval.entry !== entry) continue;
+      this.approvals.delete(id);
+      approval.removeAbort();
+      approval.resolve('cancelled');
+    }
+    this.asked.delete(entry.sessionId as string);
   }
 
   /**

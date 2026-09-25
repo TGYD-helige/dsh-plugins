@@ -33,12 +33,8 @@
  * A2A 1.0 removed the `final` flag: the SDK's event queue stops on terminal
  * and interrupted (input-required) states, which is exactly the set above.
  *
- * dsh ships the approval seam as the optional
- * @deepseek-ai/dsh-user-approval package (the `ctx.approval` service), but
- * headless profiles do not compose it and `tools/pre-execute`'s `ask` fails
- * closed without one, so no approval bridge exists here. TODO(verify):
- * bridge approval asks to A2A input-required once a deployment composes the
- * service.
+ * Mid-turn approvals are mapped separately by A2aBridge: they interrupt the
+ * A2A task while this translator keeps the original dsh turn open.
  */
 
 import { randomUUID } from 'node:crypto';

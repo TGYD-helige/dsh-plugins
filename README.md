@@ -8,7 +8,7 @@ Composable, config-driven plugins for [DeepSeek Harness (dsh)](https://github.co
 
 | Package | What it does | Primary seams |
 | --- | --- | --- |
-| [`@amaster.ai/dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) **1.0** (JSON-RPC + SSE, with a v0.3 compatibility layer): streaming turns, task cancel, task list, agent card; pluggable task-state stores (memory/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, own HTTP server |
+| [`@amaster.ai/dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) **1.0** (JSON-RPC + SSE, with a v0.3 compatibility layer): streaming turns, task cancel, task list, tool approvals, agent card; pluggable task-state stores (memory/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, `approval/request`, own HTTP server |
 | [`@amaster.ai/dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
 | [`@amaster.ai/dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call (plus a nested `llm-request` span with the verbatim loop-built request), one span per tool call, one trace per turn; subagent child sessions nested under the parent's tree | `llm/stream` + `tools/execute` waterfalls, `session/event`, `session/created` + `subagent/start`/`subagent/end` |
 | [`@amaster.ai/dsh-policy`](packages/dsh-policy) | Declarative tool-call policy: config-driven `allow`/`deny`/`ask` rules (tool name, args pattern, per-segment shell command prefix/regex, priority) — Gemini CLI-style policy files as plain plugin config | `tools/pre-execute` waterfall (`ask` rides dsh's approval seam) |
@@ -35,6 +35,8 @@ This is an early dsh-preview ecosystem. The plugin shapes, config schemas, and s
 | 0.1.x | `>=0.1.5-rc.1 || >=0.1.6-alpha.1` (peer floor) / `0.1.6-alpha.2` (tested) | `^4.0.1` | `^1.1.0` (A2A 1.0 + v0.3 compat) |
 
 dsh is in developer preview and **will** break compatibility between releases. Plugins declare the oldest compatible dsh version as a fixed peer floor and every release records the tested dsh version in this matrix; the floor moves only when a plugin starts requiring a newer dsh API. Installs ride `dsh plugin add`, which is pnpm-only — pnpm's peer matching has no prerelease gate, so any newer dsh (alpha or stable) satisfies the floor without warnings. npm consumers are gated differently: npm never lets a prerelease satisfy a range unless the range names that release tuple with a prerelease comparator, so the floor carries the `|| >=0.1.6-alpha.1` union member — required only while 0.1.6 is pre-release; `0.1.6` final satisfies the plain floor again.
+
+`dsh-a2a`'s approval bridge has an optional `@deepseek-ai/dsh-user-approval` peer floor of `>=0.1.6-alpha.2` (tested at `0.1.6-alpha.2`).
 
 ## Install
 
@@ -151,7 +153,7 @@ pnpm test         # vitest (packages with a test script)
 
 - All plugins are disabled by default; enable and configure each explicitly in the profile.
 
-- `dsh-a2a` is text-only at the protocol boundary (non-text message parts are rejected), has no approval/`input-required` mid-turn bridge (dsh ships the approval seam only as the optional `dsh-user-approval` package, not composed by headless profiles), and does not resume live sessions across restarts — persisted task shells survive in Redis/GCS, but continuing a conversation starts a fresh session. No event replay is retained for subscriptions: `SubscribeToTask` opens with the current task snapshot and follows the live bus only.
+- `dsh-a2a` retains no event replay for subscriptions: `SubscribeToTask` opens with the current task snapshot and follows the live bus only. Resuming a dsh session after restart requires the optional `sessionPersistence` service.
 - `dsh-a2a` GCS store: workspace archiving (`archiveWorkspace`) shells out to `tar` and is not wired to the task lifecycle yet.
 
 ## License

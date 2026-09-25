@@ -26,8 +26,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({ installModelSelection: vi.fn() }));
 vi.mock('@deepseek-ai/dsh-agent', () => ({ installModelSelection: mocks.installModelSelection }));
 
+import type { A2aApprovalCodec } from './approval.js';
 import { A2aBridge, type TaskEntry } from './bridge.js';
 import { DshAgentExecutor } from './executor.js';
+import { startA2aServer } from './server.js';
+import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
 
 // ---------------------------------------------------------------------------
 // fake dsh runtime: a scripted Agent behind a registry-shaped fake
@@ -64,6 +67,7 @@ function scriptTurn(fake: FakeAgent): void {
   fake.stream([textDelta('hello '), textDelta('there')]);
   fake.emit([assistantMessage('hello there'), turnEnd({ kind: 'completed' })]);
 }
+let runScript = scriptTurn;
 
 interface FakeAgent {
   agent: Agent;
@@ -121,7 +125,7 @@ function fakeAgents(ctx: Context) {
               ctx.emit('agent/inbox/claimed', { agent, message: message as never, turn: 1 });
               fake.contents.push(message.content);
               fake.prompts.push(message.content.map((b) => b.text ?? '').join(''));
-              scriptTurn(fake);
+              runScript(fake);
             },
           ),
           cancel: vi.fn(() => {
@@ -201,6 +205,7 @@ describe('A2aBridge + DshAgentExecutor', () => {
 
   beforeEach(() => {
     seq = 0;
+    runScript = scriptTurn;
     ctx = new Context();
     agents = fakeAgents(ctx);
     bridge = new A2aBridge(ctx, { cwd: '/tmp', agentOptions: { model: 'm' } });
@@ -220,6 +225,567 @@ describe('A2aBridge + DshAgentExecutor', () => {
   async function execute(taskId: string, contextId: string, text = 'hi') {
     return executeMessage(taskId, contextId, userMessage(text));
   }
+
+  it.each([
+    ['allowed-once', true],
+    ['rejected', false],
+  ] as const)('continues the same turn after an %s approval reply', async (outcome, allowed) => {
+    const decisions: string[] = [];
+    let toolExecuted = false;
+    runScript = (fake) => {
+      fake.emit([event('turn/start', { turn: 1 })]);
+      fake.emit([
+        event('approval/asked', {
+          id: 'request-1',
+          toolName: 'shell',
+          callId: 'call-1',
+          reason: 'Run command?',
+        } as never),
+      ]);
+      void ctx
+        .waterfall(
+          'approval/request',
+          {
+            agent: fake.agent,
+            toolName: 'shell',
+            callId: 'call-1' as never,
+            reason: 'Run command?',
+          },
+          async () => 'unavailable',
+        )
+        .then((answer) => {
+          decisions.push(answer);
+          toolExecuted = answer === 'allowed-once';
+          fake.emit([assistantMessage('done'), turnEnd({ kind: 'completed' })]);
+        });
+    };
+    const executor = new DshAgentExecutor(bridge);
+    const bus = new DefaultExecutionEventBus();
+    const { seen } = collect(bus);
+    const original = executor.execute(requestContext(userMessage('work'), 't1', 'ctx1'), bus);
+    await vi.waitFor(() =>
+      expect(
+        statusUpdates(seen).some(
+          (status) => status.status?.state === TaskState.TASK_STATE_INPUT_REQUIRED,
+        ),
+      ).toBe(true),
+    );
+    const prompt = statusUpdates(seen).find(
+      (status) => status.metadata?.dshAgent?.reason === 'approval',
+    );
+    expect(prompt?.status?.message?.parts[0].content).toEqual({
+      $case: 'data',
+      value: {
+        requestId: 'request-1',
+        toolName: 'shell',
+        reason: 'Run command?',
+        callId: 'call-1',
+      },
+    });
+    const reply = userMessage('');
+    reply.taskId = 't1';
+    reply.contextId = 'ctx1';
+    reply.parts = [
+      part({ $case: 'data', value: { requestId: 'request-1', callId: 'call-1', outcome } }),
+    ];
+    expect(() => bridge.validateApprovalMessage({ ...reply, taskId: 'foreign' })).toThrow();
+    expect(() =>
+      bridge.validateApprovalMessage({
+        ...reply,
+        parts: [
+          part({ $case: 'data', value: { requestId: 'request-1', outcome: 'proceed_always' } }),
+        ],
+      }),
+    ).toThrow();
+    await executor.execute(requestContext(reply, 't1', 'ctx1'), bus);
+    await original;
+    expect(decisions).toEqual([outcome]);
+    expect(toolExecuted).toBe(allowed);
+    expect(agents.created[0].prompts).toEqual(['work']);
+    expect(() => bridge.validateApprovalMessage(reply)).toThrow();
+  });
+
+  it('accepts a deployment codec that correlates a legacy callId-only reply', async () => {
+    const codec: A2aApprovalCodec = {
+      encode: ({ callId, toolName }) => ({ callId, toolName }),
+      decode: (message) => {
+        const part = message.parts[0]?.content;
+        if (part?.$case !== 'data' || typeof part.value.callId !== 'string') return;
+        if (part.value.outcome !== 'allowed-once' && part.value.outcome !== 'rejected')
+          throw new Error('Unsupported outcome');
+        return { callId: part.value.callId, outcome: part.value.outcome };
+      },
+    };
+    ctx.provide('a2aApprovalCodec', codec);
+    bridge = new A2aBridge(ctx, { cwd: '/tmp' });
+    runScript = (fake) => {
+      fake.emit([
+        event('turn/start', { turn: 1 }),
+        event('approval/asked', { id: 'request-2', toolName: 'shell', callId: 'call-2' } as never),
+      ]);
+      void ctx
+        .waterfall(
+          'approval/request',
+          { agent: fake.agent, toolName: 'shell', callId: 'call-2' as never },
+          async () => 'unavailable',
+        )
+        .then(() => fake.emit([turnEnd({ kind: 'completed' })]));
+    };
+    const executor = new DshAgentExecutor(bridge);
+    const bus = new DefaultExecutionEventBus();
+    const { seen } = collect(bus);
+    const original = executor.execute(requestContext(userMessage('work'), 't2', 'ctx2'), bus);
+    await vi.waitFor(() =>
+      expect(
+        statusUpdates(seen).some((status) => status.metadata?.dshAgent?.reason === 'approval'),
+      ).toBe(true),
+    );
+    const reply = userMessage('');
+    reply.taskId = 't2';
+    reply.contextId = 'ctx2';
+    reply.parts = [part({ $case: 'data', value: { callId: 'call-2', outcome: 'allowed-once' } })];
+    await executor.execute(requestContext(reply, 't2', 'ctx2'), bus);
+    await original;
+    expect(agents.created[0].prompts).toEqual(['work']);
+  });
+
+  it('serializes concurrent asks and matches each confirmation by request ID', async () => {
+    const decisions: string[] = [];
+    runScript = (fake) => {
+      fake.emit([event('turn/start', { turn: 1 })]);
+      for (const number of [1, 2]) {
+        fake.emit([
+          event('approval/asked', {
+            id: `request-${number}`,
+            toolName: 'shell',
+            callId: `call-${number}`,
+          } as never),
+        ]);
+        void ctx
+          .waterfall(
+            'approval/request',
+            { agent: fake.agent, toolName: 'shell', callId: `call-${number}` as never },
+            async () => 'unavailable',
+          )
+          .then((outcome) => {
+            decisions.push(`${number}:${outcome}`);
+            if (decisions.length === 2) fake.emit([turnEnd({ kind: 'completed' })]);
+          });
+      }
+    };
+    const executor = new DshAgentExecutor(bridge);
+    const bus = new DefaultExecutionEventBus();
+    const { seen } = collect(bus);
+    const original = executor.execute(requestContext(userMessage('work'), 't1', 'ctx1'), bus);
+    await vi.waitFor(() =>
+      expect(
+        statusUpdates(seen).filter((s) => s.metadata?.dshAgent?.reason === 'approval'),
+      ).toHaveLength(1),
+    );
+    const reply = (requestId: string, callId: string) => {
+      const message = userMessage('');
+      message.taskId = 't1';
+      message.contextId = 'ctx1';
+      message.parts = [
+        part({ $case: 'data', value: { requestId, callId, outcome: 'allowed-once' } }),
+      ];
+      return message;
+    };
+    expect(() => bridge.validateApprovalMessage(reply('request-2', 'call-1'))).toThrow();
+    const first = executor.execute(requestContext(reply('request-1', 'call-1'), 't1', 'ctx1'), bus);
+    await vi.waitFor(() =>
+      expect(
+        statusUpdates(seen).filter((s) => s.metadata?.dshAgent?.reason === 'approval'),
+      ).toHaveLength(2),
+    );
+    expect(() => bridge.validateApprovalMessage(reply('request-1', 'call-1'))).toThrow();
+    await executor.execute(requestContext(reply('request-2', 'call-2'), 't1', 'ctx1'), bus);
+    await Promise.all([first, original]);
+    expect(decisions).toEqual(['1:allowed-once', '2:allowed-once']);
+    expect(agents.created[0].prompts).toEqual(['work']);
+  });
+
+  it('fails closed when two unclaimed asks have no distinguishing call ID', async () => {
+    const decisions: string[] = [];
+    runScript = (fake) => {
+      fake.emit([
+        event('turn/start', { turn: 1 }),
+        event('approval/asked', { id: 'request-1', toolName: 'shell' } as never),
+        event('approval/asked', { id: 'request-2', toolName: 'shell' } as never),
+      ]);
+      for (let i = 0; i < 2; i++) {
+        void ctx
+          .waterfall(
+            'approval/request',
+            { agent: fake.agent, toolName: 'shell' },
+            async () => 'unavailable',
+          )
+          .then((outcome) => {
+            decisions.push(outcome);
+            if (decisions.length === 2) fake.emit([turnEnd({ kind: 'completed' })]);
+          });
+      }
+    };
+    const { seen } = await execute('t1', 'ctx1');
+    expect(decisions).toEqual(['unavailable', 'unavailable']);
+    expect(
+      statusUpdates(seen).some((status) => status.metadata?.dshAgent?.reason === 'approval'),
+    ).toBe(false);
+  });
+
+  it('withdraws an approval when the task is canceled', async () => {
+    const decisions: string[] = [];
+    runScript = (fake) => {
+      fake.emit([
+        event('turn/start', { turn: 1 }),
+        event('approval/asked', { id: 'request-1', toolName: 'shell' } as never),
+      ]);
+      void ctx
+        .waterfall(
+          'approval/request',
+          { agent: fake.agent, toolName: 'shell' },
+          async () => 'unavailable',
+        )
+        .then((outcome) => decisions.push(outcome));
+    };
+    const executor = new DshAgentExecutor(bridge);
+    const bus = new DefaultExecutionEventBus();
+    const { seen } = collect(bus);
+    const original = executor.execute(requestContext(userMessage('work'), 't1', 'ctx1'), bus);
+    await vi.waitFor(() =>
+      expect(statusUpdates(seen).some((s) => s.metadata?.dshAgent?.reason === 'approval')).toBe(
+        true,
+      ),
+    );
+    await executor.cancelTask('t1', bus);
+    await original;
+    expect(decisions).toEqual(['cancelled']);
+    const late = userMessage('');
+    late.taskId = 't1';
+    late.contextId = 'ctx1';
+    late.parts = [
+      part({ $case: 'data', value: { requestId: 'request-1', outcome: 'allowed-once' } }),
+    ];
+    expect(() => bridge.validateApprovalMessage(late)).toThrow();
+  });
+
+  it('withdraws an approval on request abort', async () => {
+    const controller = new AbortController();
+    const decisions: string[] = [];
+    runScript = (fake) => {
+      fake.emit([
+        event('turn/start', { turn: 1 }),
+        event('approval/asked', { id: 'request-abort', toolName: 'shell' } as never),
+      ]);
+      void ctx
+        .waterfall(
+          'approval/request',
+          { agent: fake.agent, toolName: 'shell', signal: controller.signal },
+          async () => 'unavailable',
+        )
+        .then((outcome) => {
+          decisions.push(outcome);
+          fake.emit([turnEnd({ kind: 'completed' })]);
+        });
+    };
+    const executor = new DshAgentExecutor(bridge);
+    const bus = new DefaultExecutionEventBus();
+    const { seen } = collect(bus);
+    const original = executor.execute(requestContext(userMessage('work'), 't1', 'ctx1'), bus);
+    await vi.waitFor(() =>
+      expect(statusUpdates(seen).some((s) => s.metadata?.dshAgent?.reason === 'approval')).toBe(
+        true,
+      ),
+    );
+    controller.abort();
+    await original;
+    expect(decisions).toEqual(['cancelled']);
+    const late = userMessage('');
+    late.taskId = 't1';
+    late.contextId = 'ctx1';
+    late.parts = [
+      part({ $case: 'data', value: { requestId: 'request-abort', outcome: 'allowed-once' } }),
+    ];
+    expect(() => bridge.validateApprovalMessage(late)).toThrow();
+  });
+
+  it.each(['clear', 'dispose'] as const)('withdraws a pending approval on %s', async (action) => {
+    const decisions: string[] = [];
+    runScript = (fake) => {
+      fake.emit([
+        event('turn/start', { turn: 1 }),
+        event('approval/asked', { id: 'request-cleanup', toolName: 'shell' } as never),
+      ]);
+      void ctx
+        .waterfall(
+          'approval/request',
+          { agent: fake.agent, toolName: 'shell' },
+          async () => 'unavailable',
+        )
+        .then((outcome) => decisions.push(outcome));
+    };
+    const executor = new DshAgentExecutor(bridge);
+    const bus = new DefaultExecutionEventBus();
+    const { seen } = collect(bus);
+    const original = executor.execute(requestContext(userMessage('work'), 't1', 'ctx1'), bus);
+    await vi.waitFor(() =>
+      expect(statusUpdates(seen).some((s) => s.metadata?.dshAgent?.reason === 'approval')).toBe(
+        true,
+      ),
+    );
+    if (action === 'clear') await bridge.clearContext('ctx1');
+    else await bridge.dispose();
+    await original;
+    expect(decisions).toEqual(['cancelled']);
+    expect(agents.created[0].handle.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('resumes approvals through blocking send, SSE, and task resubscribe', async () => {
+    runScript = (fake) => {
+      fake.emit([
+        event('turn/start', { turn: 1 }),
+        event('approval/asked', {
+          id: 'request-http',
+          toolName: 'shell',
+          callId: 'call-http',
+        } as never),
+      ]);
+      void ctx
+        .waterfall(
+          'approval/request',
+          { agent: fake.agent, toolName: 'shell', callId: 'call-http' as never },
+          async () => 'unavailable',
+        )
+        .then(() => fake.emit([assistantMessage('done'), turnEnd({ kind: 'completed' })]));
+    };
+    const server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      card: { name: 'test', description: 'test', version: '0.1' },
+      executor: new DshAgentExecutor(bridge),
+      taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+      approvalGuard: (message) => bridge.reserveApprovalMessage(message),
+    });
+    const rpc = async (method: string, params: unknown) =>
+      (
+        await fetch(`http://127.0.0.1:${server.port}/a2a/`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+        })
+      ).json() as Promise<any>;
+    try {
+      const first = await rpc('SendMessage', {
+        tenant: '',
+        message: { messageId: 'user-http', role: 'user', parts: [{ text: 'work' }] },
+      });
+      expect(first.result.task.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+      const { id: taskId, contextId } = first.result.task;
+      const data = first.result.task.status.message.parts[0].data;
+      expect(data).toMatchObject({ requestId: 'request-http', callId: 'call-http' });
+      const stored = await rpc('GetTask', { tenant: '', id: taskId });
+      expect(stored.result.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+      const subscription = await fetch(`http://127.0.0.1:${server.port}/a2a/`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'SubscribeToTask',
+          params: { tenant: '', id: taskId },
+        }),
+      });
+      const reader = subscription.body!.getReader();
+      const initial = await reader.read();
+      expect(new TextDecoder().decode(initial.value)).toContain('TASK_STATE_INPUT_REQUIRED');
+      const bad = await rpc('SendMessage', {
+        tenant: '',
+        message: {
+          messageId: 'bad',
+          taskId,
+          contextId,
+          role: 'user',
+          parts: [{ data: { requestId: 'request-http', outcome: 'proceed_always' } }],
+        },
+      });
+      expect(bad.error).toBeDefined();
+      const reply = await rpc('SendMessage', {
+        tenant: '',
+        message: {
+          messageId: 'reply',
+          taskId,
+          contextId,
+          role: 'user',
+          parts: [
+            { data: { requestId: 'request-http', callId: 'call-http', outcome: 'allowed-once' } },
+          ],
+        },
+      });
+      expect(reply.result.task.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+      expect(reply.result.task.status.message.parts[0].text).toBe('done');
+      expect(agents.created[0].prompts).toEqual(['work']);
+      let continuation = '';
+      while (!continuation.includes('done')) {
+        const next = await reader.read();
+        expect(next.done).toBe(false);
+        continuation += new TextDecoder().decode(next.value);
+      }
+      expect(continuation).toContain('TASK_STATE_WORKING');
+      expect(continuation).toContain('done');
+      await reader.cancel();
+
+      const streamed = await fetch(`http://127.0.0.1:${server.port}/a2a/`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 3,
+          method: 'SendStreamingMessage',
+          params: {
+            tenant: '',
+            message: { messageId: 'user-stream', role: 'user', parts: [{ text: 'stream' }] },
+          },
+        }),
+      });
+      const frames = (await streamed.text())
+        .split('\n\n')
+        .filter((frame) => frame.startsWith('data: '))
+        .map((frame) => JSON.parse(frame.slice(6)));
+      expect(frames.at(-1).result.statusUpdate.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+      const streamTaskId = frames[0].result.task.id;
+      const streamReply = await fetch(`http://127.0.0.1:${server.port}/a2a/`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 4,
+          method: 'SendStreamingMessage',
+          params: {
+            tenant: '',
+            message: {
+              messageId: 'reply-stream',
+              taskId: streamTaskId,
+              contextId: frames[0].result.task.contextId,
+              role: 'user',
+              parts: [{ data: { requestId: 'request-http', outcome: 'allowed-once' } }],
+            },
+          },
+        }),
+      });
+      const replyFrames = (await streamReply.text())
+        .split('\n\n')
+        .filter((frame) => frame.startsWith('data: '))
+        .map((frame) => JSON.parse(frame.slice(6)));
+      expect(
+        replyFrames.some((frame) => frame.result?.task?.status?.state === 'TASK_STATE_WORKING'),
+      ).toBe(true);
+      expect(replyFrames.at(-1).result.statusUpdate.status.message.parts[0].text).toBe('done');
+      expect(agents.created.at(-1)?.prompts).toEqual(['stream']);
+      const canceled = await rpc('CancelTask', { tenant: '', id: streamTaskId });
+      expect(canceled.result.status.state).toBe('TASK_STATE_CANCELED');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('rejects a simultaneous duplicate reply before it can finish the live task bus', async () => {
+    let releaseTool!: () => void;
+    const toolGate = new Promise<void>((resolve) => {
+      releaseTool = resolve;
+    });
+    let releaseLoad!: () => void;
+    const loadGate = new Promise<void>((resolve) => {
+      releaseLoad = resolve;
+    });
+    const decisions: string[] = [];
+    runScript = (fake) => {
+      fake.emit([
+        event('turn/start', { turn: 1 }),
+        event('approval/asked', {
+          id: 'request-race',
+          toolName: 'shell',
+          callId: 'call-race',
+        } as never),
+      ]);
+      void ctx
+        .waterfall(
+          'approval/request',
+          { agent: fake.agent, toolName: 'shell', callId: 'call-race' as never },
+          async () => 'unavailable',
+        )
+        .then(async (outcome) => {
+          decisions.push(outcome);
+          await toolGate;
+          fake.emit([assistantMessage('done'), turnEnd({ kind: 'completed' })]);
+        });
+    };
+    const store = new SanitizedTaskStore(new MemoryTaskStore());
+    const load = store.load.bind(store);
+    let taskId = '';
+    vi.spyOn(store, 'load').mockImplementation(async (id, context) => {
+      if (id === taskId) await loadGate;
+      return load(id, context);
+    });
+    let guards = 0;
+    const server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      card: { name: 'test', description: 'test', version: '0.1' },
+      executor: new DshAgentExecutor(bridge),
+      taskStore: store,
+      approvalGuard: (message) => {
+        if (message.messageId.startsWith('reply-') && ++guards === 2) releaseLoad();
+        return bridge.reserveApprovalMessage(message);
+      },
+    });
+    const rpc = async (message: Record<string, unknown>) =>
+      (
+        await fetch(`http://127.0.0.1:${server.port}/a2a/`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: message.messageId,
+            method: 'SendMessage',
+            params: { tenant: '', message },
+          }),
+        })
+      ).json() as Promise<any>;
+    try {
+      const initial = await rpc({ messageId: 'original', role: 'user', parts: [{ text: 'work' }] });
+      taskId = initial.result.task.id;
+      const contextId = initial.result.task.contextId;
+      const reply = (messageId: string) =>
+        rpc({
+          messageId,
+          taskId,
+          contextId,
+          role: 'user',
+          parts: [
+            { data: { requestId: 'request-race', callId: 'call-race', outcome: 'allowed-once' } },
+          ],
+        });
+      const first = reply('reply-1');
+      const duplicate = reply('reply-2');
+      await vi.waitFor(() => expect(guards).toBe(2));
+      await vi.waitFor(() => expect(decisions).toEqual(['allowed-once']));
+      releaseTool();
+      const results = await Promise.all([first, duplicate]);
+      expect(results.filter((result) => result.error)).toHaveLength(1);
+      expect(
+        results.filter(
+          (result) => result.result?.task?.status?.message?.parts?.[0]?.text === 'done',
+        ),
+      ).toHaveLength(1);
+      expect(agents.created[0].prompts).toEqual(['work']);
+    } finally {
+      releaseLoad();
+      releaseTool();
+      await server.close();
+    }
+  });
 
   it('runs a full turn: task anchor, working, deltas, final input-required', async () => {
     const admitted = vi.fn();

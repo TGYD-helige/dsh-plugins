@@ -19,6 +19,7 @@ import type { Context } from '@deepseek-ai/cordis';
 // declarations into the compilation (listeners are contextually typed).
 import type {} from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-session';
+import type {} from '@deepseek-ai/dsh-user-approval/types';
 import Schema from '@deepseek-ai/schemastery';
 import { A2aBridge } from './bridge.js';
 import { DshAgentExecutor } from './executor.js';
@@ -27,6 +28,8 @@ import { GcsTaskStore } from './stores/gcs.js';
 import { RedisTaskStore } from './stores/redis.js';
 import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
 
+export type { A2aApproval, A2aApprovalCodec, A2aApprovalReply } from './approval.js';
+export { defaultApprovalCodec } from './approval.js';
 export type { A2aFileMaterializer } from './content.js';
 
 /** Event emitted when one A2A user message enters the dsh inbox. */
@@ -191,6 +194,7 @@ export function apply(
       },
       executor,
       taskStore: store,
+      approvalGuard: (message) => bridge.reserveApprovalMessage(message),
     });
     serverPort = server.port;
 
