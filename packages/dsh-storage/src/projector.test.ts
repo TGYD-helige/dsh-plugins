@@ -26,7 +26,7 @@ describe('projectEvent', () => {
       agentId: 'main',
       type: 'user',
       content: 'hello',
-      metadata: { event: 'user/message', seq: 1 },
+      metadata: { event: 'user/message', seq: 1, message: userMessage('hello') },
     });
     expect(row?.createdAt).toEqual(new Date(1700000000000));
   });
@@ -50,6 +50,35 @@ describe('projectEvent', () => {
       sessionId,
     );
     expect(row?.content).toBe('foobar');
+  });
+
+  it('preserves each user message as received, including provenance and image blocks', () => {
+    const messages = [
+      {
+        id: 'm-image',
+        role: 'user',
+        source: { kind: 'user' },
+        content: [
+          { type: 'text', text: 'Look at this image' },
+          {
+            type: 'image',
+            attachment: { attachmentId: 'local-image', mediaType: 'image/png', bytes: 4 },
+          },
+          { type: 'text', text: '<uploaded-image uri="https://example.com/image.png"/>' },
+        ],
+      },
+      {
+        id: 'm-hook',
+        role: 'user',
+        source: { kind: 'hook', name: 'runtime-context' },
+        content: [{ type: 'text', text: 'Injected context' }],
+      },
+    ];
+
+    for (const [index, message] of messages.entries()) {
+      const event = { type: 'user/message', seq: index + 1, time: 1, data: message };
+      expect(projectEvent({}, event, sessionId)?.metadata?.message).toEqual(message);
+    }
   });
 
   it('generates a uuid when the message has no id', () => {
