@@ -12,6 +12,7 @@
  * the server and builds the card.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
@@ -26,8 +27,10 @@ import { duplicateInterfacesForLegacy } from '@a2a-js/sdk/compat/v0_3';
 import { RequestMalformedError } from '@a2a-js/sdk/errors';
 import {
   type AgentExecutor,
+  DefaultExecutionEventBus,
   DefaultRequestHandler,
   ServerCallContext,
+  STATE_HEADERS_KEY,
   type TaskStore,
 } from '@a2a-js/sdk/server';
 import { agentCardHandler, jsonRpcHandler, UserBuilder } from '@a2a-js/sdk/server/express';
@@ -47,6 +50,7 @@ export interface A2aServerOptions {
   executor: AgentExecutor;
   taskStore: TaskStore;
   approvalGuard?: (message: Message) => undefined | (() => void);
+  beforeWorkingTaskMessage?: (message: Message, requestHeaders: unknown) => Promise<void>;
 }
 
 export interface A2aServer {
@@ -100,11 +104,77 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       throw new RequestMalformedError(error instanceof Error ? error.message : String(error));
     }
   };
+  // SDK's default manager gives concurrent sends one bus. Give each send its
+  // own bus while forwarding events to a stable task bus for resubscribe/cancel.
+  const approvalReply = new AsyncLocalStorage<boolean>();
+  const taskBuses = new Map<
+    string,
+    { broadcast: DefaultExecutionEventBus; requests: Set<DefaultExecutionEventBus> }
+  >();
+  const busManager = {
+    createOrGetByTaskId(taskId: string) {
+      let task = taskBuses.get(taskId);
+      if (!task) {
+        const broadcast = new DefaultExecutionEventBus();
+        task = { broadcast, requests: new Set() };
+        taskBuses.set(taskId, task);
+        broadcast.on('event', (event) => {
+          const state = event.kind === 'statusUpdate' ? event.data.status?.state : undefined;
+          if (
+            state !== undefined &&
+            [
+              TaskState.TASK_STATE_COMPLETED,
+              TaskState.TASK_STATE_FAILED,
+              TaskState.TASK_STATE_CANCELED,
+              TaskState.TASK_STATE_REJECTED,
+            ].includes(state)
+          )
+            queueMicrotask(() => broadcast.finished());
+        });
+      }
+      if (approvalReply.getStore()) {
+        const active = task.requests.values().next().value;
+        if (active) return active;
+      }
+      const requestBus = new DefaultExecutionEventBus();
+      task.requests.add(requestBus);
+      requestBus.on('event', (event) => task.broadcast.publish(event));
+      requestBus.on('finished', () => task.requests.delete(requestBus));
+      return requestBus;
+    },
+    getByTaskId: (taskId: string) => taskBuses.get(taskId)?.broadcast,
+    cleanupByTaskId(taskId: string) {
+      const task = taskBuses.get(taskId);
+      task?.broadcast.finished();
+      task?.broadcast.removeAllListeners();
+      taskBuses.delete(taskId);
+    },
+  };
+  const beforeWorkingTaskMessage = async (
+    message: Message | undefined,
+    context: ServerCallContext,
+  ) => {
+    if (!message?.taskId) return;
+    // Validate through the scoped store before a host hook can affect a live task.
+    const task = await options.taskStore.load(message.taskId, context);
+    if (
+      !task ||
+      task.status?.state !== TaskState.TASK_STATE_WORKING ||
+      (message.contextId && message.contextId !== task.contextId)
+    )
+      return;
+    try {
+      await options.beforeWorkingTaskMessage?.(message, context.state.get(STATE_HEADERS_KEY));
+    } catch (error) {
+      throw new RequestMalformedError(error instanceof Error ? error.message : String(error));
+    }
+  };
   const requestHandler = new (class extends DefaultRequestHandler {
     override async sendMessage(...args: Parameters<DefaultRequestHandler['sendMessage']>) {
       const release = guardApproval(args[0].message);
       try {
-        return await super.sendMessage(...args);
+        if (!release) await beforeWorkingTaskMessage(args[0].message, args[1]);
+        return await approvalReply.run(Boolean(release), () => super.sendMessage(...args));
       } finally {
         release?.();
       }
@@ -115,12 +185,22 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     ) {
       const release = guardApproval(args[0].message);
       try {
-        yield* super.sendMessageStream(...args);
+        if (!release) await beforeWorkingTaskMessage(args[0].message, args[1]);
+        const stream = super.sendMessageStream(...args);
+        try {
+          if (release) {
+            const first = await approvalReply.run(true, () => stream.next());
+            if (!first.done) yield first.value;
+          }
+          yield* stream;
+        } finally {
+          if (release) await stream.return(undefined);
+        }
       } finally {
         release?.();
       }
     }
-  })(card, options.taskStore, options.executor);
+  })(card, options.taskStore, options.executor, busManager);
 
   const app = express();
   // The SDK's jsonRpcHandler parses bodies with express.json()'s 100kb default;

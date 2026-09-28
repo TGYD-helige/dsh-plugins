@@ -49,7 +49,6 @@ export interface A2aWorkingTaskMessageContext {
   agent: Agent;
   contextId: string;
   taskId: string;
-  a2aMessageId: string;
   a2aMessage: Message;
   requestHeaders: unknown;
   signal: AbortSignal;
@@ -230,6 +229,8 @@ export function apply(
       executor,
       taskStore: store,
       approvalGuard: (message) => bridge.reserveApprovalMessage(message),
+      beforeWorkingTaskMessage: (message, headers) =>
+        bridge.beforeWorkingTaskMessage(message, headers),
     });
     serverPort = server.port;
 

@@ -1091,95 +1091,187 @@ describe('A2aBridge + DshAgentExecutor', () => {
     expect(statusUpdates(seen).at(-1)?.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
   });
 
-  it('exposes a same-task message while the previous settlement is pending', async () => {
+  it.each([
+    ['SendMessage', false],
+    ['SendStreamingMessage', false],
+    ['SendMessage', true],
+  ] as const)(
+    'keeps overlapping HTTP requests on one task in their own response streams (%s, immediate=%s)',
+    async (method, immediately) => {
+      let finish!: () => void;
+      const hostWork = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      runScript = (fake) => {
+        fake.emit([
+          event('turn/start', { turn: fake.prompts.length }),
+          assistantMessage(fake.prompts.at(-1)!),
+          turnEnd({ kind: 'completed' }),
+        ]);
+      };
+      const settling = vi.fn(async (_detail: unknown, next: () => Promise<void>) => {
+        if (agents.created[0].prompts.at(-1) === 'work') await hostWork;
+        return next();
+      });
+      ctx.on('a2a/task-settlement', settling);
+      const early = vi.fn(async () => finish());
+      ctx.on('a2a/working-task-message', early);
+      const server = await startA2aServer({
+        host: '127.0.0.1',
+        port: 0,
+        basePath: '/a2a',
+        card: { name: 'test', description: 'test', version: '0.1' },
+        executor: new DshAgentExecutor(bridge),
+        taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+        beforeWorkingTaskMessage: (message, headers) =>
+          bridge.beforeWorkingTaskMessage(message, headers),
+      });
+      const rpc = async (
+        method: string,
+        message: Record<string, unknown>,
+        configuration?: Record<string, unknown>,
+      ) => {
+        const response = await fetch(`http://127.0.0.1:${server.port}/a2a/`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method,
+            params: { tenant: '', message, configuration },
+          }),
+        });
+        if (method === 'SendStreamingMessage')
+          return (await response.text())
+            .split('\n\n')
+            .filter((frame) => frame.startsWith('data: '))
+            .map((frame) => JSON.parse(frame.slice(6)));
+        return response.json() as Promise<any>;
+      };
+      try {
+        const initial = await rpc('SendMessage', {
+          messageId: 'setup',
+          role: 'user',
+          parts: [{ text: 'setup' }],
+        });
+        const { id: taskId, contextId } = initial.result.task;
+        const first = rpc(
+          method,
+          {
+            messageId: 'work',
+            taskId,
+            contextId,
+            role: 'user',
+            parts: [{ text: 'work' }],
+          },
+          immediately ? { returnImmediately: true } : undefined,
+        );
+        await vi.waitFor(() => expect(settling).toHaveBeenCalledTimes(2));
+        const second = rpc('SendMessage', {
+          messageId: 'pause',
+          taskId,
+          contextId,
+          role: 'user',
+          parts: [{ text: 'pause' }],
+        });
+        await vi.waitFor(() => expect(early).toHaveBeenCalledOnce());
+        const [firstResult, secondResult] = await Promise.all([first, second]);
+        if (immediately) expect(firstResult.result.task.status.state).toBe('TASK_STATE_WORKING');
+        else if (method === 'SendStreamingMessage')
+          expect(firstResult.at(-1).result.statusUpdate.status.message.parts[0].text).toBe('work');
+        else expect(firstResult.result.task.status.message.parts[0].text).toBe('work');
+        expect(secondResult.result.task.status.message.parts[0].text).toBe('pause');
+        expect(agents.created[0].prompts).toEqual(['setup', 'work', 'pause']);
+      } finally {
+        await server.close();
+      }
+    },
+  );
+
+  it('rejects an early hook failure without failing the running task', async () => {
     let finish!: () => void;
     const hostWork = new Promise<void>((resolve) => {
       finish = resolve;
     });
+    runScript = (fake) => {
+      fake.emit([
+        event('turn/start', { turn: fake.prompts.length }),
+        assistantMessage(fake.prompts.at(-1)!),
+        turnEnd({ kind: 'completed' }),
+      ]);
+    };
     const settling = vi.fn(async (_detail: unknown, next: () => Promise<void>) => {
-      if (settling.mock.calls.length === 1) await hostWork;
+      if (agents.created[0].prompts.at(-1) === 'work') await hostWork;
       return next();
     });
     ctx.on('a2a/task-settlement', settling);
-    const incoming = userMessage('pause');
-    incoming.messageId = 'user-2';
-    incoming.taskId = 't1';
-    incoming.contextId = 'ctx1';
-    const early = vi.fn(async ({ agent, a2aMessage, requestHeaders, signal }) => {
-      expect(agent).toBe(agents.created[0].agent);
-      expect(a2aMessage).toMatchObject({ messageId: 'user-2', taskId: 't1', contextId: 'ctx1' });
-      expect(requestHeaders).toEqual({ 'x-example': 'value' });
-      expect(signal.aborted).toBe(false);
-      finish();
-    });
-    ctx.on('a2a/working-task-message', early);
-    const executor = new DshAgentExecutor(bridge);
-    const firstBus = new DefaultExecutionEventBus();
-    const first = collect(firstBus);
-    const firstRun = executor.execute(requestContext(userMessage('work'), 't1', 'ctx1'), firstBus);
-    await vi.waitFor(() => expect(settling).toHaveBeenCalledOnce());
-    const secondBus = new DefaultExecutionEventBus();
-    const second = collect(secondBus);
-    const secondRun = executor.execute(requestContext(incoming, 't1', 'ctx1'), secondBus);
-    await vi.waitFor(() => expect(early).toHaveBeenCalledOnce());
-    await vi.waitFor(() => expect(agents.created[0].prompts).toEqual(['work', 'pause']));
-    await Promise.all([firstRun, secondRun]);
-    expect(agents.created[0].prompts).toEqual(['work', 'pause']);
-    expect(first.isFinished()).toBe(true);
-    expect(second.isFinished()).toBe(true);
-    expect(statusUpdates(second.seen).at(-1)?.status?.state).toBe(
-      TaskState.TASK_STATE_INPUT_REQUIRED,
-    );
-  });
-
-  it('does not enqueue a same-task message when its early hook fails', async () => {
-    let finish!: () => void;
-    const hostWork = new Promise<void>((resolve) => {
-      finish = resolve;
-    });
-    ctx.on('a2a/task-settlement', async (_detail, next) => {
-      await hostWork;
-      return next();
-    });
     ctx.on('a2a/working-task-message', async () => {
       throw new Error('host rejected message');
     });
-    const executor = new DshAgentExecutor(bridge);
-    const firstBus = new DefaultExecutionEventBus();
-    const first = collect(firstBus);
-    const firstRun = executor.execute(requestContext(userMessage('work'), 't1', 'ctx1'), firstBus);
-    await vi.waitFor(() => expect(agents.created[0]?.prompts).toEqual(['work']));
-    const secondBus = new DefaultExecutionEventBus();
-    const second = collect(secondBus);
-    await executor.execute(requestContext(userMessage('reject'), 't1', 'ctx1'), secondBus);
-    expect(second.isFinished()).toBe(true);
-    expect(textOfStatus(statusUpdates(second.seen).at(-1))).toBe('host rejected message');
-    expect(agents.created[0].prompts).toEqual(['work']);
-    expect(first.isFinished()).toBe(false);
-    finish();
-    await firstRun;
-    expect(textOfStatus(statusUpdates(first.seen).at(-1))).toBe('hello there');
+    const server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      card: { name: 'test', description: 'test', version: '0.1' },
+      executor: new DshAgentExecutor(bridge),
+      taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+      beforeWorkingTaskMessage: (message, headers) =>
+        bridge.beforeWorkingTaskMessage(message, headers),
+    });
+    const rpc = async (method: string, params: unknown) =>
+      (
+        await fetch(`http://127.0.0.1:${server.port}/a2a/`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+        })
+      ).json() as Promise<any>;
+    const message = (text: string, taskId?: string, contextId?: string) => ({
+      tenant: '',
+      message: { messageId: text, taskId, contextId, role: 'user', parts: [{ text }] },
+    });
+    try {
+      const initial = await rpc('SendMessage', message('setup'));
+      const { id: taskId, contextId } = initial.result.task;
+      const first = rpc('SendMessage', message('work', taskId, contextId));
+      await vi.waitFor(() => expect(settling).toHaveBeenCalledTimes(2));
+      const wrongContext = await rpc('SendMessage', message('wrong', taskId, 'other-context'));
+      expect(wrongContext.error?.message).toContain('contextId mismatch');
+      const wrongTenant = await rpc('SendMessage', {
+        ...message('wrong-tenant', taskId, contextId),
+        tenant: 'other',
+      });
+      expect(wrongTenant.error?.message).toContain('Task not found');
+      const rejected = await rpc('SendMessage', message('reject', taskId, contextId));
+      expect(rejected.error?.message).toContain('host rejected message');
+      const during = await rpc('GetTask', { tenant: '', id: taskId });
+      expect(during.result.status.state).toBe('TASK_STATE_WORKING');
+      finish();
+      const firstResult = await first;
+      expect(firstResult.result.task.status.message.parts[0].text).toBe('work');
+      const after = await rpc('GetTask', { tenant: '', id: taskId });
+      expect(after.result.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+      expect(agents.created[0].prompts).toEqual(['setup', 'work']);
+    } finally {
+      finish();
+      await server.close();
+    }
   });
 
-  it('cancels a pending same-task message hook without enqueueing it', async () => {
+  it('aborts a pending working-task hook when the task is canceled', async () => {
     ctx.on('a2a/task-settlement', async () => new Promise<void>(() => {}));
     const early = vi.fn(() => new Promise<void>(() => {}));
     ctx.on('a2a/working-task-message', early);
     const executor = new DshAgentExecutor(bridge);
-    const firstBus = new DefaultExecutionEventBus();
-    const firstRun = executor.execute(requestContext(userMessage('work'), 't1', 'ctx1'), firstBus);
+    const bus = new DefaultExecutionEventBus();
+    const first = executor.execute(requestContext(userMessage('work'), 't1', 'ctx1'), bus);
     await vi.waitFor(() => expect(agents.created[0]?.prompts).toEqual(['work']));
-    const secondBus = new DefaultExecutionEventBus();
-    const second = collect(secondBus);
-    const secondRun = executor.execute(
-      requestContext(userMessage('stop'), 't1', 'ctx1'),
-      secondBus,
-    );
+    const incoming = { ...userMessage('stop'), taskId: 't1', contextId: 'ctx1' };
+    const pending = bridge.beforeWorkingTaskMessage(incoming, {});
     await vi.waitFor(() => expect(early).toHaveBeenCalledOnce());
-    await executor.cancelTask('t1', firstBus);
-    await Promise.all([firstRun, secondRun]);
-    expect(second.isFinished()).toBe(true);
-    expect(statusUpdates(second.seen).at(-1)?.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
+    bridge.cancel('t1');
+    await expect(pending).rejects.toThrow(/interrupted/);
+    await first;
     expect(agents.created[0].prompts).toEqual(['work']);
   });
 
@@ -1225,6 +1317,47 @@ describe('A2aBridge + DshAgentExecutor', () => {
     error.mockRestore();
   });
 
+  it('does not run a queued message after the preceding turn fails', async () => {
+    let fail!: () => void;
+    const settlement = new Promise<void>((_, reject) => {
+      fail = () => reject(new Error('policy failed'));
+    });
+    ctx.on('a2a/task-settlement', () => settlement);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const executor = new DshAgentExecutor(bridge);
+    const firstBus = new DefaultExecutionEventBus();
+    const secondBus = new DefaultExecutionEventBus();
+    const { seen: secondSeen } = collect(secondBus);
+    const first = executor.execute(requestContext(userMessage('first'), 't1', 'ctx1'), firstBus);
+    await vi.waitFor(() => expect(agents.created[0]?.prompts).toEqual(['first']));
+    const second = executor.execute(requestContext(userMessage('second'), 't1', 'ctx1'), secondBus);
+    fail();
+    await Promise.all([first, second]);
+    expect(agents.created[0].prompts).toEqual(['first']);
+    expect(statusUpdates(secondSeen).at(-1)?.status?.state).toBe(TaskState.TASK_STATE_FAILED);
+    error.mockRestore();
+  });
+
+  it('does not run a queued message after the preceding turn aborts', async () => {
+    let abort!: () => void;
+    runScript = (fake) => {
+      fake.emit([event('turn/start', { turn: 1 })]);
+      abort = () => fake.emit([turnEnd({ kind: 'aborted', reason: { kind: 'user' } })]);
+    };
+    const executor = new DshAgentExecutor(bridge);
+    const firstBus = new DefaultExecutionEventBus();
+    const secondBus = new DefaultExecutionEventBus();
+    const { seen: secondSeen } = collect(secondBus);
+    const first = executor.execute(requestContext(userMessage('first'), 't1', 'ctx1'), firstBus);
+    await vi.waitFor(() => expect(agents.created[0]?.prompts).toEqual(['first']));
+    const second = executor.execute(requestContext(userMessage('second'), 't1', 'ctx1'), secondBus);
+    await vi.waitFor(() => expect(secondSeen[0]?.kind).toBe('task'));
+    abort();
+    await Promise.all([first, second]);
+    expect(agents.created[0].prompts).toEqual(['first']);
+    expect(statusUpdates(secondSeen).at(-1)?.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
+  });
+
   it('continues an existing task by taskId with a working anchor', async () => {
     await execute('t1', 'ctx1');
     const { seen } = await execute('t1', 'ctx1', 'again');
@@ -1237,8 +1370,6 @@ describe('A2aBridge + DshAgentExecutor', () => {
   });
 
   it('keeps overlapping requests for one task on separate event buses', async () => {
-    const early = vi.fn();
-    ctx.on('a2a/working-task-message', early);
     runScript = (fake) => {
       fake.emit([event('turn/start', { turn: fake.prompts.length })]);
       if (fake.prompts.length === 2)
@@ -1253,7 +1384,7 @@ describe('A2aBridge + DshAgentExecutor', () => {
     const secondBus = new DefaultExecutionEventBus();
     const second = collect(secondBus);
     const secondRun = executor.execute(requestContext(userMessage('two'), 't1', 'ctx1'), secondBus);
-    await vi.waitFor(() => expect(early).toHaveBeenCalledOnce());
+    await new Promise((resolve) => setImmediate(resolve));
     expect(agents.created[0].prompts).toEqual(['one']);
     agents.created[0].emit([assistantMessage('first'), turnEnd({ kind: 'completed' })]);
     await Promise.all([firstRun, secondRun]);

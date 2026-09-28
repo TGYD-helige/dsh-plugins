@@ -87,6 +87,7 @@ export interface TaskEntry {
   settling: boolean;
   lastFinal?: AgentExecutionEvent;
   interrupted: boolean;
+  terminalState?: 'failed' | 'canceled';
 }
 
 interface PendingApproval {
@@ -179,6 +180,7 @@ export class A2aBridge {
       // A turn still open from the previous binding (e.g. a cancel whose abort
       // is still propagating) must not emit events under the new task id.
       forContext.interrupted = false;
+      forContext.terminalState = undefined;
       this.tasks.set(taskId, forContext);
       return { entry: forContext, freshTask: true };
     }
@@ -350,6 +352,39 @@ export class A2aBridge {
     await Promise.allSettled([...entry.running]);
   }
 
+  /** Inspect a message for a live task before the SDK starts its next request. */
+  async beforeWorkingTaskMessage(a2aMessage: Message, requestHeaders: unknown): Promise<void> {
+    const entry = this.tasks.get(a2aMessage.taskId);
+    if (
+      !entry ||
+      (a2aMessage.contextId && entry.sessionId !== a2aMessage.contextId) ||
+      entry.running.size === 0
+    )
+      return;
+    const pending = new AbortController();
+    entry.pendingMessageAborts.add(pending);
+    try {
+      await Promise.race([
+        this.ctx.serial('a2a/working-task-message', {
+          agent: entry.handle.agent,
+          contextId: entry.sessionId,
+          taskId: entry.taskId,
+          a2aMessage,
+          requestHeaders,
+          signal: pending.signal,
+        } satisfies A2aWorkingTaskMessageContext),
+        new Promise<never>((_, reject) => {
+          const abort = () =>
+            reject(new Error('A2A task was interrupted before message admission.'));
+          if (pending.signal.aborted) abort();
+          else pending.signal.addEventListener('abort', abort, { once: true });
+        }),
+      ]);
+    } finally {
+      entry.pendingMessageAborts.delete(pending);
+    }
+  }
+
   /** Include content preparation in the work a context clear must drain. */
   async trackExecution(contextId: string, run: () => Promise<void>): Promise<void> {
     const execution = run();
@@ -384,45 +419,20 @@ export class A2aBridge {
         );
         return;
       }
-      if (previous.length) {
-        const pending = new AbortController();
-        entry.pendingMessageAborts.add(pending);
-        try {
-          await Promise.race([
-            this.ctx.serial('a2a/working-task-message', {
-              agent: entry.handle.agent,
-              contextId: entry.sessionId,
-              taskId,
-              a2aMessageId: a2aMessage.messageId,
-              a2aMessage,
-              requestHeaders,
-              signal: pending.signal,
-            } satisfies A2aWorkingTaskMessageContext),
-            new Promise<never>((_, reject) => {
-              const abort = () =>
-                reject(new Error('A2A task was interrupted before message wait.'));
-              if (pending.signal.aborted) abort();
-              else pending.signal.addEventListener('abort', abort, { once: true });
-            }),
-          ]);
-        } catch (error) {
-          if (!pending.signal.aborted) throw error;
-          bus.publish(
-            terminalStatusUpdate(
-              taskId,
-              entry.sessionId as string,
-              'canceled',
-              'Task interrupted.',
-            ),
-          );
-          return;
-        } finally {
-          entry.pendingMessageAborts.delete(pending);
-        }
-      }
       await Promise.allSettled(previous);
       if (this.clearing.has(entry.sessionId as string))
         throw new Error('Context is being cleared.');
+      if (entry.terminalState) {
+        bus.publish(
+          terminalStatusUpdate(
+            taskId,
+            entry.sessionId as string,
+            entry.terminalState,
+            'Task ended.',
+          ),
+        );
+        return;
+      }
       if (entry.interrupted || entry.taskId !== taskId || this.tasks.get(taskId) !== entry) {
         bus.publish(
           terminalStatusUpdate(taskId, entry.sessionId as string, 'canceled', 'Task interrupted.'),
@@ -434,8 +444,12 @@ export class A2aBridge {
     entry.running.add(running);
     try {
       await running;
+    } catch (error) {
+      entry.terminalState = 'failed';
+      throw error;
     } finally {
       entry.running.delete(running);
+      if (entry.running.size === 0) entry.terminalState = undefined;
     }
   }
 
@@ -512,6 +526,7 @@ export class A2aBridge {
         // unhandled rejection would crash the host process, and no turn/end
         // would ever settle this waiter.
         void Promise.resolve(result).catch((error: unknown) => {
+          entry.terminalState = 'failed';
           const message = error instanceof Error ? error.message : String(error);
           console.error('[dsh-a2a] followup failed:', error);
           const index = entry.settled.indexOf(resolveSettled);
@@ -669,6 +684,7 @@ export class A2aBridge {
               .then(complete)
               .catch((error: unknown) => {
                 if (entry.bus !== bus || entry.taskId !== taskId) return;
+                entry.terminalState = 'failed';
                 const message = error instanceof Error ? error.message : String(error);
                 console.error('[dsh-a2a] task settlement failed:', error);
                 bus.publish(
@@ -688,6 +704,7 @@ export class A2aBridge {
         event.type === 'turn/end' &&
         (event.data.reason.kind === 'completed' || event.data.reason.kind === 'max-tokens')
       ) {
+        entry.terminalState = 'failed';
         entry.bus?.publish(
           terminalStatusUpdate(
             entry.taskId,
@@ -702,6 +719,9 @@ export class A2aBridge {
       }
     }
     if (event.type === 'turn/end') {
+      if (event.data.reason.kind === 'blocked' || event.data.reason.kind === 'error')
+        entry.terminalState = 'failed';
+      if (event.data.reason.kind === 'aborted') entry.terminalState = 'canceled';
       this.withdrawApprovals(entry);
       this.asked.delete(session.id as string);
       entry.turnActive = false;
