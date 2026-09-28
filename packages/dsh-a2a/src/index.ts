@@ -45,8 +45,19 @@ export interface A2aTurnContext {
   signal: AbortSignal;
 }
 
+export interface A2aWorkingTaskMessageContext {
+  agent: Agent;
+  contextId: string;
+  taskId: string;
+  a2aMessage: Message;
+  requestHeaders: unknown;
+  signal: AbortSignal;
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Events {
+    /** Awaited for a message targeting a running task, before waiting for its prior execution. */
+    'a2a/working-task-message'(detail: A2aWorkingTaskMessageContext): void;
     /** Awaited before inbox insertion; failure rejects the A2A request. */
     'a2a/before-followup'(detail: A2aTurnContext): void;
     /** Await host-owned continuation work before closing this task. */
@@ -218,6 +229,8 @@ export function apply(
       executor,
       taskStore: store,
       approvalGuard: (message) => bridge.reserveApprovalMessage(message),
+      beforeWorkingTaskMessage: (message, headers) =>
+        bridge.beforeWorkingTaskMessage(message, headers),
     });
     serverPort = server.port;
 
