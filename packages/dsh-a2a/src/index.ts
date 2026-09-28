@@ -12,13 +12,13 @@
  * @module dsh-a2a
  */
 
-import { TaskState } from '@a2a-js/sdk';
+import { type Message, TaskState } from '@a2a-js/sdk';
 import { ServerCallContext } from '@a2a-js/sdk/server';
 import type { Context } from '@deepseek-ai/cordis';
 // Augmentation-only imports: pull ctx.agents and the session Events
 // declarations into the compilation (listeners are contextually typed).
-import type {} from '@deepseek-ai/dsh-agent';
-import type {} from '@deepseek-ai/dsh-session';
+import type { Agent } from '@deepseek-ai/dsh-agent';
+import type { TurnEndReason } from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-user-approval/types';
 import Schema from '@deepseek-ai/schemastery';
 import { A2aBridge } from './bridge.js';
@@ -35,8 +35,31 @@ export type { A2aFileMaterializer } from './content.js';
 /** Event emitted when one A2A user message enters the dsh inbox. */
 export const A2A_MESSAGE_ADMITTED_EVENT = 'a2a/message-admitted' as const;
 
+export interface A2aTurnContext {
+  agent: Agent;
+  contextId: string;
+  taskId: string;
+  a2aMessage: Message;
+  dshMessageId: string;
+  requestHeaders: unknown;
+  signal: AbortSignal;
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Events {
+    /** Awaited before inbox insertion; failure rejects the A2A request. */
+    'a2a/before-followup'(detail: A2aTurnContext): void;
+    /** Await host-owned continuation work before closing this task. */
+    'a2a/task-settlement'(
+      detail: {
+        agent: Agent;
+        contextId: string;
+        taskId: string;
+        reason: TurnEndReason;
+        signal: AbortSignal;
+      },
+      next: () => void | Promise<void>,
+    ): Promise<void> | void;
     /** Link a protocol message to the dsh inbox message created for its turn. */
     'a2a/message-admitted'(detail: {
       contextId: string;
