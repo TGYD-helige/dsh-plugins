@@ -320,6 +320,121 @@ describe('dsh-langfuse plugin', () => {
   });
 
   describe('trace lifecycle', () => {
+    it('reports a hook invocation and result as one span inside the turn trace', async () => {
+      await setup();
+      const session = sessionOf('s1');
+      ctx.emit('session/event', session, turnStart(0));
+
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/invoked', {
+          turn: 0,
+          point: 'PreToolUse',
+          dialect: 'codex',
+          matcher: 'write_file',
+          handlerId: 'handler-1',
+        }),
+      );
+      const hook = fakeObs(mocks.roots[0].spans[0]);
+      expect(hook.name).toBe('hook:PreToolUse');
+      expect(hook.body.metadata).toEqual({
+        turn: 0,
+        point: 'PreToolUse',
+        dialect: 'codex',
+        matcher: 'write_file',
+        handlerId: 'handler-1',
+      });
+      expect(hook.ended).toBe(0);
+
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/result', {
+          turn: 0,
+          point: 'PreToolUse',
+          handlerId: 'handler-1',
+          decision: 'block',
+          exitCode: 2,
+          stderrSummary: 'blocked by policy',
+          durationMs: 37,
+        }),
+      );
+      expect(lastUpdate(hook)).toMatchObject({
+        output: { decision: 'block', exitCode: 2, stderrSummary: 'blocked by policy' },
+        level: 'WARNING',
+        metadata: { durationMs: 37 },
+      });
+      expect(hook.ended).toBe(1);
+      ctx.emit('session/event', session, turnEnd(0));
+      expect(mocks.roots[0].ended).toBe(1);
+    });
+
+    it('marks a failed hook script as an error', async () => {
+      await setup();
+      const session = sessionOf('s1');
+      ctx.emit('session/event', session, turnStart(0));
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/invoked', {
+          turn: 0,
+          point: 'UserPromptSubmit',
+          dialect: 'codex',
+          handlerId: 'h',
+        }),
+      );
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/result', {
+          turn: 0,
+          point: 'UserPromptSubmit',
+          handlerId: 'h',
+          decision: 'pass',
+          exitCode: 1,
+          stderrSummary: 'script failed',
+          durationMs: 5,
+        }),
+      );
+      expect(lastUpdate(fakeObs(mocks.roots[0].spans[0]))).toMatchObject({
+        level: 'ERROR',
+        output: { decision: 'pass', exitCode: 1, stderrSummary: 'script failed' },
+      });
+    });
+
+    it('redacts hook stderr when content capture is disabled', async () => {
+      await setup({ ...enabledConfig, captureContent: false });
+      const session = sessionOf('s1');
+      ctx.emit('session/event', session, turnStart(0));
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/invoked', {
+          turn: 0,
+          point: 'Stop',
+          dialect: 'claude-code',
+          handlerId: 'handler-2',
+        }),
+      );
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/result', {
+          turn: 0,
+          point: 'Stop',
+          handlerId: 'handler-2',
+          decision: 'stop',
+          exitCode: 0,
+          stderrSummary: 'secret output',
+          durationMs: 8,
+        }),
+      );
+      const hook = fakeObs(mocks.roots[0].spans[0]);
+      expect(lastUpdate(hook).output).toEqual({ decision: 'stop', exitCode: 0 });
+      expect(JSON.stringify(hook)).not.toContain('secret output');
+    });
+
     it('opens a root span per turn, feeds it the first user message, ends it on turn/end', async () => {
       await setup();
 
@@ -401,7 +516,20 @@ describe('dsh-langfuse plugin', () => {
       await setup();
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
       const stale = fakeObs(mocks.roots[0]);
+      ctx.emit(
+        'session/event',
+        sessionOf('s1'),
+        ev('hook/invoked', {
+          turn: 0,
+          point: 'PreToolUse',
+          dialect: 'codex',
+          handlerId: 'unfinished',
+        }),
+      );
+      const hook = stale.spans[0];
       ctx.emit('session/event', sessionOf('s1'), turnStart(1));
+      expect(hook.ended).toBe(1);
+      expect(lastUpdate(hook)).toMatchObject({ level: 'WARNING' });
       expect(stale.ended).toBe(1);
       expect(mocks.roots).toHaveLength(2);
     });
@@ -1040,12 +1168,25 @@ describe('dsh-langfuse plugin', () => {
       await setup();
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
       ctx.emit('session/created', childSessionOf('c1', 's1'));
+      ctx.emit(
+        'session/event',
+        sessionOf('s1'),
+        ev('hook/invoked', {
+          turn: 0,
+          point: 'PreToolUse',
+          dialect: 'codex',
+          handlerId: 'handler-3',
+        }),
+      );
       const root = fakeObs(mocks.roots[0]);
       const subSpan = root.spans[0];
+      const hookSpan = root.spans[1];
 
       await ctx.fiber.dispose();
       expect(root.ended).toBe(1);
       expect(subSpan.ended).toBe(1);
+      expect(hookSpan.ended).toBe(1);
+      expect(lastUpdate(hookSpan)).toMatchObject({ level: 'WARNING' });
       expect(mocks.providers[0].shutdown).toHaveBeenCalledTimes(1);
     });
   });

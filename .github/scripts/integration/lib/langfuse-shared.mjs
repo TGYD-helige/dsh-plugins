@@ -13,7 +13,11 @@
  *   plugin wiring without a Langfuse instance. Note fork PRs never reach
  *   these scripts at all — Stage B is gated on the DSH_INTEGRATION_* secrets,
  *   which forks don't receive; fake mode covers LANGFUSE-keyless same-repo
- *   runs and local development.
+ *   runs and local development for the base/subagent legs. The hook leg
+ *   requires real Langfuse keys so a green result proves API read-back.
+ * - hook leg: mount dsh-hooks-codex, run a script that reads the hook payload
+ *   and a workspace file, then verify stdout reaches the LLM request and the
+ *   result recorded through stderr reaches the completed Langfuse span.
  *
  * The query runs via async spawn: in fake mode the endpoint lives in THIS
  * process, so the event loop must stay responsive while dsh runs.
@@ -28,7 +32,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -51,6 +55,8 @@ const POLL_INTERVAL_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_PAGES = 20;
 const EXPECTED_MODEL = integrationModel();
+const HOOK_CONTEXT = 'ci-hook-context-verification';
+const HOOK_RESULT = 'hook-script-result: marker-verified';
 
 // Non-empty trimmed value or fallback — GitHub injects unset secrets as '',
 // which `??` would happily keep.
@@ -141,6 +147,58 @@ export function evaluateReasoning(observations) {
   return has
     ? []
     : ['no llm-request span output has a reasoning-delta chunk (thinking should be enabled at max)'];
+}
+
+// A real UserPromptSubmit command hook must inject context into the LLM
+// request and produce a completed observation in that same turn.
+export function evaluateHookTrace(observations, codeword) {
+  const problems = [];
+  const generation = observations.find(
+    (o) =>
+      o.type === 'GENERATION' &&
+      o.metadata?.purpose == null &&
+      JSON.stringify(o.input ?? '').includes(codeword),
+  );
+  const root = observations.find(
+    (o) =>
+      o.type === 'SPAN' &&
+      o.name === 'dsh-turn' &&
+      o.parentObservationId == null &&
+      o.id === generation?.parentObservationId,
+  );
+  const hook = observations.find(
+    (o) =>
+      o.type === 'SPAN' &&
+      o.name === 'hook:UserPromptSubmit' &&
+      o.parentObservationId === root?.id,
+  );
+  if (!root?.endTime) problems.push('missing completed turn trace');
+  if (!generation?.endTime) problems.push('missing completed codeworded LLM generation');
+  if (generation && !JSON.stringify(generation.input ?? '').includes(HOOK_CONTEXT)) {
+    problems.push('hook context did not reach the LLM request');
+  }
+  if (!hook) problems.push('missing hook:UserPromptSubmit span');
+  else {
+    if (!hook.endTime) problems.push('hook span has no endTime');
+    if (hook.metadata?.dialect !== 'codex' || hook.metadata?.point !== 'UserPromptSubmit') {
+      problems.push('hook span has incorrect dialect or hook point');
+    }
+    if (
+      hook.output?.decision !== 'pass' ||
+      hook.output?.exitCode !== 0 ||
+      hook.output?.stderrSummary !== HOOK_RESULT
+    ) {
+      problems.push('hook span did not report the successful script result');
+    }
+    if (
+      hook.metadata?.durationMs == null ||
+      !Number.isFinite(Number(hook.metadata.durationMs)) ||
+      Number(hook.metadata.durationMs) < 0
+    ) {
+      problems.push('hook span has no durationMs');
+    }
+  }
+  return problems;
 }
 
 // The subagent shape: the delegation tool call, the subagent span parented
@@ -402,7 +460,7 @@ async function startFakeIngestion(captured) {
 }
 
 /**
- * Run one leg to green: { tag, name, prompt, evaluate }. The marker file
+ * Run one leg to green: { tag, name, prompt, evaluate, hook? }. The marker file
  * `${codeword}.txt` is written into the workspace and its name is the
  * codeword the leg verifies on. Failures log `::error::` and exit non-zero.
  */
@@ -415,7 +473,7 @@ export async function runScenario(opts) {
   }
 }
 
-async function scenarioMain({ tag, name, prompt, evaluate }) {
+async function scenarioMain({ tag, name, prompt, evaluate, hook = false }) {
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-langfuse-${tag}-e2e`);
   mkdirSync(workDir, { recursive: true });
   const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
@@ -426,6 +484,9 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
 
   const publicKey = envOr(process.env.LANGFUSE_PUBLIC_KEY, '');
   const secretKey = envOr(process.env.LANGFUSE_SECRET_KEY, '');
+  if (hook && (!publicKey || !secretKey)) {
+    throw new Error('hook E2E requires LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY');
+  }
   // A half-configured pair is a misconfiguration — never silently fake it.
   if (Boolean(publicKey) !== Boolean(secretKey)) {
     console.log(
@@ -471,6 +532,31 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
     '@opentelemetry/exporter-trace-otlp-http@0.221.0',
   ], { cwd: workDir, env: dshHomeEnv });
 
+  let hookPatch = '';
+  if (hook) {
+    const version = envOr(process.env.DSH_CLI_VERSION, '0.1.7-rc.2');
+    run(dsh, [
+      'plugin', '--profile', 'headless', 'add',
+      `@deepseek-ai/dsh-hooks-codex@${version}`,
+      `@deepseek-ai/dsh-hook-protocol@${version}`,
+      `@deepseek-ai/dsh-shell@${version}`,
+      `@deepseek-ai/dsh-invariants@${version}`,
+    ], { cwd: workDir, env: dshHomeEnv });
+    copyFileSync(new URL('./hook-script.mjs', import.meta.url), join(workDir, 'hook-script.mjs'));
+    const hookConfigPath = join(workDir, 'hooks.json');
+    writeFileSync(hookConfigPath, JSON.stringify({
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'node hook-script.mjs' }] }] },
+    }));
+    hookPatch = `
+- insert:
+    - id: langfuse-hook-e2e
+      name: '@deepseek-ai/dsh-hooks-codex'
+      config:
+        configPath: ${JSON.stringify(hookConfigPath)}
+        model: ${JSON.stringify(EXPECTED_MODEL)}
+`;
+  }
+
   // Enable the plugin through the profile's user patch layer (an id-targeted
   // row replaces the bundle row's whole config). The agent-default-model row
   // pins the integration model; the llm-deepseek row turns thinking ON at max
@@ -501,6 +587,7 @@ async function scenarioMain({ tag, name, prompt, evaluate }) {
     # Scenarios need only short answers; dsh's 256000 default is rejected by
     # smaller-cap models (glm-5.3-flash caps max_tokens at 131072).
     maxTokens: 16384
+${hookPatch}
 `,
   );
   if (!realMode) console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);
