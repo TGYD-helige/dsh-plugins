@@ -84,7 +84,7 @@ export function projectEvent(_session: any, event: any, sessionId: string): Mess
         id: message.id ?? randomUUID(),
         type: 'user',
         content: textOf(message),
-        metadata: { event: event.type, seq: event.seq },
+        metadata: { event: event.type, seq: event.seq, message },
       };
     }
 

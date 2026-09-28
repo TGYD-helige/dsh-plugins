@@ -186,8 +186,12 @@ describe('DatabaseBackend', () => {
   it('upserts a message row by a deterministic PK, logical id in metadata', async () => {
     await backend.init();
     const prisma = prismaMock.instances[0];
+    const message = {
+      source: { kind: 'user' },
+      content: [{ type: 'image', attachment: { attachmentId: 'image-1' } }],
+    };
 
-    await backend.upsertMessage(messageRow);
+    await backend.upsertMessage({ ...messageRow, metadata: { ...messageRow.metadata, message } });
 
     expect(prisma.aiMessage.upsert).toHaveBeenCalledTimes(1);
     const call = prisma.aiMessage.upsert.mock.calls[0][0];
@@ -198,12 +202,13 @@ describe('DatabaseBackend', () => {
       historyId: null,
       type: 'user',
       content: 'hello',
-      metadata: { id: 'm1', event: 'user/message' },
+      metadata: { id: 'm1', event: 'user/message', message },
       createdAt: new Date(1700000000000),
     });
     expect(call.update).toMatchObject({ content: 'hello' });
     expect(call.update.id).toBeUndefined();
     expect(call.update.sessionId).toBeUndefined();
+    expect(call.update.metadata).toEqual(call.create.metadata);
   });
 
   it('derives a stable PK per (sessionId, messageId)', async () => {
