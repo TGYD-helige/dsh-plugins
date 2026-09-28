@@ -50,5 +50,7 @@ export interface StorageBackend {
   readMessages(sessionId: string, messageId?: string): Promise<MessageRow[]>;
   upsertMessage(row: MessageRow): Promise<void>;
   upsertSession(row: SessionRow): Promise<void>;
+  /** Move active messages into a queryable history row; null when already empty. */
+  archiveSession(sessionId: string): Promise<string | null>;
   close?(): Promise<void>;
 }

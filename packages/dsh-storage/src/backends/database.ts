@@ -168,11 +168,13 @@ export class DatabaseBackend implements StorageBackend {
   async readMessages(sessionId: string, messageId?: string): Promise<MessageRow[]> {
     if (!this.prisma) return [];
     // ponytail: tool-call lookup scans one session; add an indexed call lookup if that becomes slow.
+    // Scan only the active segment for tool results; exact-ID reads still find
+    // archived rows so redelivery does not count the same message twice.
     const rows = await this.prisma.aiMessage.findMany({
       where: {
         sessionId,
         deletedAt: null,
-        ...(messageId ? { id: pk(`message ${sessionId}\0${messageId}`) } : {}),
+        ...(messageId ? { id: pk(`message ${sessionId}\0${messageId}`) } : { historyId: null }),
       },
       orderBy: { createdAt: 'asc' },
     });
@@ -216,7 +218,7 @@ export class DatabaseBackend implements StorageBackend {
   async readSession(sessionId: string): Promise<SessionRow | null> {
     if (!this.prisma) return null;
     const row = await this.prisma.aiChatHistory.findFirst({
-      where: { sessionId, deletedAt: null },
+      where: { sessionId, deletedAt: null, messages: { none: {} } },
     });
     if (!row) return null;
     return {
@@ -243,7 +245,7 @@ export class DatabaseBackend implements StorageBackend {
     // cuid primary key matches the source project and early-scaffold rows,
     // so existing data is continued, never duplicated.
     const existing = await this.prisma.aiChatHistory.findFirst({
-      where: { sessionId: row.sessionId, deletedAt: null },
+      where: { sessionId: row.sessionId, deletedAt: null, messages: { none: {} } },
       select: { id: true },
     });
     const data = {
@@ -260,6 +262,42 @@ export class DatabaseBackend implements StorageBackend {
     } else {
       await this.prisma.aiChatHistory.create({ data });
     }
+  }
+
+  async archiveSession(sessionId: string): Promise<string | null> {
+    if (!this.prisma) throw new Error('dsh-storage database is not initialized');
+    return this.prisma.$transaction(async (tx: any) => {
+      const where = { sessionId, historyId: null, deletedAt: null };
+      const stats = await tx.aiMessage.aggregate({
+        where,
+        _count: { _all: true },
+        _min: { createdAt: true },
+        _max: { createdAt: true },
+      });
+      if (stats._count._all === 0) return null;
+
+      // Active rollups have no attached messages; an archive gains them below.
+      const active = await tx.aiChatHistory.findFirst({
+        where: { sessionId, deletedAt: null, messages: { none: {} } },
+        select: { id: true },
+      });
+      const rollup = {
+        messageCount: stats._count._all,
+        firstMessageAt: stats._min.createdAt,
+        lastMessageAt: stats._max.createdAt,
+      };
+      const history = active
+        ? await tx.aiChatHistory.update({ where: { id: active.id }, data: rollup })
+        : await tx.aiChatHistory.create({
+            data: { sessionId, ...rollup, totalTokens: 0n },
+            select: { id: true },
+          });
+      const updated = await tx.aiMessage.updateMany({ where, data: { historyId: history.id } });
+      if (updated.count !== stats._count._all) {
+        throw new Error('active messages changed during archive');
+      }
+      return history.id;
+    });
   }
 
   async close(): Promise<void> {

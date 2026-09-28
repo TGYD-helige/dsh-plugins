@@ -6,8 +6,9 @@ import { DatabaseBackend } from './database.js';
 const prismaMock = vi.hoisted(() => {
   const instances: any[] = [];
   class PrismaClient {
-    aiMessage = { upsert: vi.fn(), findMany: vi.fn() };
+    aiMessage = { upsert: vi.fn(), findMany: vi.fn(), aggregate: vi.fn(), updateMany: vi.fn() };
     aiChatHistory = { findFirst: vi.fn(), create: vi.fn(), update: vi.fn() };
+    $transaction = vi.fn(async (run: (client: PrismaClient) => Promise<unknown>) => run(this));
     $connect = vi.fn(async () => {});
     $disconnect = vi.fn(async () => {});
     constructor(public options: unknown) {
@@ -105,7 +106,7 @@ describe('DatabaseBackend', () => {
     ]);
     const rows = await backend.readMessages('s1');
     expect(prisma.aiMessage.findMany).toHaveBeenCalledWith({
-      where: { sessionId: 's1', deletedAt: null },
+      where: { sessionId: 's1', deletedAt: null, historyId: null },
       orderBy: { createdAt: 'asc' },
     });
     expect(rows).toMatchObject([
@@ -235,7 +236,7 @@ describe('DatabaseBackend', () => {
     await backend.upsertSession(sessionRow);
 
     expect(prisma.aiChatHistory.findFirst).toHaveBeenCalledWith({
-      where: { sessionId: 's1', deletedAt: null },
+      where: { sessionId: 's1', deletedAt: null, messages: { none: {} } },
       select: { id: true },
     });
     expect(prisma.aiChatHistory.create).toHaveBeenCalledWith({
@@ -262,6 +263,92 @@ describe('DatabaseBackend', () => {
       data: expect.objectContaining({ messageCount: 3 }),
     });
     expect(prisma.aiChatHistory.create).not.toHaveBeenCalled();
+  });
+
+  it('archives active messages with their rollup in one transaction', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const first = new Date(1700000000000);
+    const last = new Date(1700000001000);
+    prisma.aiMessage.aggregate.mockResolvedValue({
+      _count: { _all: 2 },
+      _min: { createdAt: first },
+      _max: { createdAt: last },
+    });
+    prisma.aiChatHistory.findFirst.mockResolvedValue({ id: 'history-1' });
+    prisma.aiChatHistory.update.mockResolvedValue({ id: 'history-1' });
+    prisma.aiMessage.updateMany.mockResolvedValue({ count: 2 });
+
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-1');
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.aiMessage.aggregate).toHaveBeenCalledWith({
+      where: { sessionId: 's1', historyId: null, deletedAt: null },
+      _count: { _all: true },
+      _min: { createdAt: true },
+      _max: { createdAt: true },
+    });
+    expect(prisma.aiChatHistory.findFirst).toHaveBeenCalledWith({
+      where: { sessionId: 's1', deletedAt: null, messages: { none: {} } },
+      select: { id: true },
+    });
+    expect(prisma.aiMessage.updateMany).toHaveBeenCalledWith({
+      where: { sessionId: 's1', historyId: null, deletedAt: null },
+      data: { historyId: 'history-1' },
+    });
+    expect(prisma.aiChatHistory.update).toHaveBeenCalledWith({
+      where: { id: 'history-1' },
+      data: { messageCount: 2, firstMessageAt: first, lastMessageAt: last },
+    });
+  });
+
+  it('does not create an archive when there are no active messages', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    prisma.aiMessage.aggregate.mockResolvedValue({ _count: { _all: 0 } });
+
+    await expect(backend.archiveSession('s1')).resolves.toBeNull();
+    expect(prisma.aiChatHistory.create).not.toHaveBeenCalled();
+    expect(prisma.aiMessage.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('creates an archive rollup when active messages lack one', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    prisma.aiMessage.aggregate.mockResolvedValue({
+      _count: { _all: 1 },
+      _min: { createdAt: new Date(1700000000000) },
+      _max: { createdAt: new Date(1700000000000) },
+    });
+    prisma.aiChatHistory.findFirst.mockResolvedValue(null);
+    prisma.aiChatHistory.create.mockResolvedValue({ id: 'history-2' });
+    prisma.aiMessage.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-2');
+    expect(prisma.aiChatHistory.create).toHaveBeenCalledWith({
+      data: {
+        sessionId: 's1',
+        messageCount: 1,
+        totalTokens: 0n,
+        firstMessageAt: new Date(1700000000000),
+        lastMessageAt: new Date(1700000000000),
+      },
+      select: { id: true },
+    });
+  });
+
+  it('rejects an archive if the active message set changes inside the transaction', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    prisma.aiMessage.aggregate.mockResolvedValue({
+      _count: { _all: 1 },
+      _min: { createdAt: new Date(1700000000000) },
+      _max: { createdAt: new Date(1700000000000) },
+    });
+    prisma.aiChatHistory.findFirst.mockResolvedValue({ id: 'history-1' });
+    prisma.aiChatHistory.update.mockResolvedValue({ id: 'history-1' });
+    prisma.aiMessage.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(backend.archiveSession('s1')).rejects.toThrow('active messages changed');
   });
 
   it('serializes JSON columns as text on sqlserver (derived from provider)', async () => {
@@ -302,7 +389,7 @@ describe('DatabaseBackend', () => {
     const row = await backend.readSession('s1');
 
     expect(prisma.aiChatHistory.findFirst).toHaveBeenCalledWith({
-      where: { sessionId: 's1', deletedAt: null },
+      where: { sessionId: 's1', deletedAt: null, messages: { none: {} } },
     });
     expect(row).toEqual({
       sessionId: 's1',
