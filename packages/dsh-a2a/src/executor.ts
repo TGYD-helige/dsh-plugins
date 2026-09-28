@@ -1,6 +1,6 @@
 /**
  * The @a2a-js/sdk {@link AgentExecutor} that drives dsh agents through the
- * bridge. One `execute()` = one user-message turn:
+ * bridge. One `execute()` starts one user message and may include host-owned follow-up turns:
  *
  *   1. map the message's parts onto dsh content blocks (file parts become
  *      execution-world paths with a materializer, local paths otherwise)
@@ -72,7 +72,7 @@ export class DshAgentExecutor implements AgentExecutor {
       );
       anchored = true;
       const requestHeaders = requestContext.context.state.get(STATE_HEADERS_KEY);
-      await this.bridge.runTurn(entry, content, eventBus, userMessage.messageId, requestHeaders);
+      await this.bridge.runTurn(entry, content, eventBus, taskId, userMessage, requestHeaders);
     } catch (error) {
       if (error instanceof ApprovalReplyError) return;
       if (this.bridge.isClearing(contextId)) this.suppressTask?.(taskId);

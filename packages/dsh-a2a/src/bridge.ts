@@ -9,15 +9,13 @@
  * {@link SessionTranslator} onto the executing request's
  * {@link ExecutionEventBus}.
  *
- * Turn settlement: `agent.followup()` is fire-and-forget, so callers await a
- * FIFO waiter resolved by the session's next `turn/end` event (dsh's inbox
- * serializes queued follow-ups into successive turns, so waiter order matches
- * turn order). The final status-update is published before the waiter
- * resolves, so an execute() that returns always landed its events first.
+ * Turn settlement: `agent.followup()` is fire-and-forget. The default policy
+ * settles at the next `turn/end`; a host may keep the same task open for
+ * autonomous turns through `a2a/task-settlement`.
  */
 
 import { type Message, TaskState } from '@a2a-js/sdk';
-import { AgentEvent, type ExecutionEventBus } from '@a2a-js/sdk/server';
+import { AgentEvent, type AgentExecutionEvent, type ExecutionEventBus } from '@a2a-js/sdk/server';
 import type { Context } from '@deepseek-ai/cordis';
 import type {
   Agent,
@@ -43,6 +41,7 @@ import {
   defaultApprovalCodec,
 } from './approval.js';
 import { type A2aFileMaterializer, buildMessageContent, uploadsDir } from './content.js';
+import type { A2aTurnContext } from './index.js';
 import { agentTextMessage, SessionTranslator, terminalStatusUpdate } from './translator.js';
 
 export interface BridgeOptions {
@@ -78,10 +77,15 @@ export interface TaskEntry {
   turnActive: boolean;
   /** A turn still open from a previous task binding; its turn/end is stale. */
   staleTurn: boolean;
-  /** FIFO turn-end waiters, one per queued/running execute(). */
+  /** FIFO settlement waiters, one per queued/running execute(). */
   settled: Array<() => void>;
   /** Active execute() calls that must finish before task shells are deleted. */
   running: Set<Promise<void>>;
+  admissionAbort?: AbortController;
+  settlementAbort: AbortController;
+  settling: boolean;
+  lastFinal?: AgentExecutionEvent;
+  interrupted: boolean;
 }
 
 interface PendingApproval {
@@ -154,7 +158,16 @@ export class A2aBridge {
 
     const forContext = this.bySession.get(contextId);
     if (forContext) {
-      this.withdrawApprovals(forContext);
+      const staleTurn = forContext.staleTurn || forContext.turnActive;
+      this.settleEntry(forContext, 'Task superseded by a new request.');
+      forContext.staleTurn = staleTurn;
+      // The previous task may have queued autonomous work that has not started
+      // a turn yet. dsh-agent cancel clears that inbox work synchronously.
+      try {
+        forContext.handle.agent.cancel({ kind: 'user' });
+      } catch (error) {
+        console.error('[dsh-a2a] rebind cancel failed:', error);
+      }
       this.tasks.delete(forContext.taskId);
       forContext.taskId = taskId;
       forContext.translator = new SessionTranslator(
@@ -164,7 +177,7 @@ export class A2aBridge {
       );
       // A turn still open from the previous binding (e.g. a cancel whose abort
       // is still propagating) must not emit events under the new task id.
-      forContext.staleTurn = forContext.turnActive;
+      forContext.interrupted = false;
       this.tasks.set(taskId, forContext);
       return { entry: forContext, freshTask: true };
     }
@@ -229,6 +242,9 @@ export class A2aBridge {
       staleTurn: false,
       settled: [],
       running: new Set(),
+      settlementAbort: new AbortController(),
+      settling: false,
+      interrupted: false,
     };
     this.tasks.set(taskId, entry);
     this.bySession.set(contextId, entry);
@@ -354,11 +370,23 @@ export class A2aBridge {
     entry: TaskEntry,
     content: ContentBlock[],
     bus: ExecutionEventBus,
-    a2aMessageId: string,
+    taskId: string,
+    a2aMessage: Message,
     requestHeaders: unknown,
   ): Promise<void> {
-    if (this.clearing.has(entry.sessionId as string)) throw new Error('Context is being cleared.');
-    const running = this.runTurnInner(entry, content, bus, a2aMessageId, requestHeaders);
+    const previous = [...entry.running];
+    const running = (async () => {
+      await Promise.allSettled(previous);
+      if (this.clearing.has(entry.sessionId as string))
+        throw new Error('Context is being cleared.');
+      if (entry.interrupted || entry.taskId !== taskId) {
+        bus.publish(
+          terminalStatusUpdate(taskId, entry.sessionId as string, 'canceled', 'Task interrupted.'),
+        );
+        return;
+      }
+      await this.runTurnInner(entry, content, bus, taskId, a2aMessage, requestHeaders);
+    })();
     entry.running.add(running);
     try {
       await running;
@@ -371,7 +399,8 @@ export class A2aBridge {
     entry: TaskEntry,
     content: ContentBlock[],
     bus: ExecutionEventBus,
-    a2aMessageId: string,
+    taskId: string,
+    a2aMessage: Message,
     requestHeaders: unknown,
   ): Promise<void> {
     let resolveSettled!: () => void;
@@ -380,8 +409,42 @@ export class A2aBridge {
     });
     entry.settled.push(resolveSettled);
     entry.bus = bus;
+    entry.settlementAbort = new AbortController();
+    entry.settling = false;
+    entry.lastFinal = undefined;
     try {
       const message = createUserMessage({ content, source: { kind: 'user' } });
+      const admission = new AbortController();
+      entry.admissionAbort = admission;
+      try {
+        await Promise.race([
+          this.ctx.serial('a2a/before-followup', {
+            agent: entry.handle.agent,
+            contextId: entry.sessionId,
+            taskId,
+            a2aMessage,
+            dshMessageId: message.id,
+            requestHeaders,
+            signal: admission.signal,
+          } satisfies A2aTurnContext),
+          new Promise<never>((_, reject) => {
+            const abort = () =>
+              reject(new Error('A2A task was interrupted before message admission.'));
+            if (admission.signal.aborted) abort();
+            else admission.signal.addEventListener('abort', abort, { once: true });
+          }),
+        ]);
+      } finally {
+        if (entry.admissionAbort === admission) entry.admissionAbort = undefined;
+      }
+      if (
+        !entry.settled.includes(resolveSettled) ||
+        entry.interrupted ||
+        entry.taskId !== taskId ||
+        this.tasks.get(taskId) !== entry
+      ) {
+        return;
+      }
       // followup() inserts synchronously, then may claim the message before
       // returning. Observe that insertion so the mapping is both real and early.
       const stopListening = this.ctx.on('agent/inbox/inserted', ({ agent, message: inserted }) => {
@@ -390,8 +453,8 @@ export class A2aBridge {
         void this.ctx
           .parallel('a2a/message-admitted', {
             contextId: entry.sessionId,
-            taskId: entry.taskId,
-            a2aMessageId,
+            taskId,
+            a2aMessageId: a2aMessage.messageId,
             dshMessageId: message.id,
             requestHeaders,
           })
@@ -407,9 +470,11 @@ export class A2aBridge {
         void Promise.resolve(result).catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error);
           console.error('[dsh-a2a] followup failed:', error);
+          const index = entry.settled.indexOf(resolveSettled);
+          if (index >= 0) entry.settled.splice(index, 1);
           if (entry.bus === bus) {
             entry.bus.publish(
-              terminalStatusUpdate(entry.taskId, entry.sessionId as string, 'failed', message),
+              terminalStatusUpdate(taskId, entry.sessionId as string, 'failed', message),
             );
           }
           resolveSettled();
@@ -423,9 +488,13 @@ export class A2aBridge {
     } catch (error) {
       const index = entry.settled.indexOf(resolveSettled);
       if (index >= 0) entry.settled.splice(index, 1);
+      else return; // cancellation/clear already published the terminal state
       throw error;
     } finally {
-      if (entry.bus === bus) entry.bus = null;
+      if (entry.bus === bus) {
+        entry.settlementAbort.abort();
+        entry.bus = null;
+      }
     }
   }
 
@@ -440,12 +509,16 @@ export class A2aBridge {
       await Promise.allSettled([...(this.creating.get(contextId) ?? [])]);
       const entry = this.bySession.get(contextId);
       if (entry) {
-        this.withdrawApprovals(entry);
-        if (entry.turnActive || entry.running.size > 0) {
-          await entry.handle.agent.cancel({ kind: 'user' });
+        const active = entry.turnActive || entry.running.size > 0;
+        this.settleEntry(entry, 'Context cleared.');
+        if (active) {
+          try {
+            await entry.handle.agent.cancel({ kind: 'user' });
+          } catch (error) {
+            console.error('[dsh-a2a] clear cancel failed:', error);
+          }
         }
         await entry.handle.agent.whenIdle();
-        this.settleEntry(entry, 'Context cleared.');
         await Promise.allSettled([...entry.running]);
         this.tasks.delete(entry.taskId);
         this.bySession.delete(contextId);
@@ -462,12 +535,18 @@ export class A2aBridge {
   cancel(taskId: string): string | undefined {
     const entry = this.tasks.get(taskId);
     if (!entry) return undefined;
-    this.withdrawApprovals(entry);
+    const staleTurn = entry.turnActive;
+    this.settleEntry(entry, 'Task canceled by request.');
+    entry.staleTurn ||= staleTurn;
     // cancel() is typed void; the guard keeps a mistyped async impl from
     // crashing the host (the caller already published its canceled final).
-    void Promise.resolve(entry.handle.agent.cancel({ kind: 'user' }) as unknown).catch(
-      (error: unknown) => console.error('[dsh-a2a] cancel failed:', error),
-    );
+    try {
+      void Promise.resolve(entry.handle.agent.cancel({ kind: 'user' }) as unknown).catch(
+        (error: unknown) => console.error('[dsh-a2a] cancel failed:', error),
+      );
+    } catch (error) {
+      console.error('[dsh-a2a] cancel failed:', error);
+    }
     return entry.sessionId as string;
   }
 
@@ -490,31 +569,103 @@ export class A2aBridge {
   private onSessionEvent(session: Session, event: SessionEvent): void {
     const entry = this.bySession.get(session.id as string);
     if (!entry) return;
+    if (entry.staleTurn) {
+      if (event.type === 'turn/end') entry.staleTurn = false;
+      return;
+    }
     if (event.type === 'approval/asked') {
       const queue = this.asked.get(session.id as string) ?? [];
       queue.push({ id: event.data.id, toolName: event.data.toolName, callId: event.data.callId });
       this.asked.set(session.id as string, queue);
     }
     if (event.type === 'turn/start') entry.turnActive = true;
-    // A turn carried over from a previous task binding (e.g. a canceled turn
-    // whose abort was still in flight when the context rebound): its turn/end
-    // belongs to the old task — settle waiters, but publish nothing under the
-    // new task id.
-    const stale = event.type === 'turn/end' && entry.staleTurn;
-    if (stale) entry.staleTurn = false;
     // No-throw seam: translation errors must never reach the agent loop. The
     // turn/end waiter still resolves below, so a poisoned event cannot hang
     // an in-flight execute() either.
     try {
-      if (!stale) for (const out of entry.translator.handle(event)) entry.bus?.publish(out);
+      const outputs = entry.translator.handle(event);
+      if (
+        event.type === 'turn/end' &&
+        (event.data.reason.kind === 'completed' || event.data.reason.kind === 'max-tokens') &&
+        entry.bus
+      ) {
+        const bus = entry.bus;
+        const taskId = entry.taskId;
+        entry.lastFinal = outputs[0];
+        if (!entry.settling) {
+          entry.settling = true;
+          const signal = entry.settlementAbort.signal;
+          const complete = () => {
+            if (signal.aborted || entry.bus !== bus || entry.taskId !== taskId) return;
+            if (entry.lastFinal) bus.publish(entry.lastFinal);
+            entry.bus = null;
+            entry.settlementAbort.abort();
+            entry.settled.shift()?.();
+          };
+          const wait = this.ctx.waterfall(
+            'a2a/task-settlement',
+            {
+              agent: entry.handle.agent,
+              contextId: entry.sessionId,
+              taskId,
+              reason: event.data.reason,
+              signal,
+            },
+            () => {},
+          );
+          if (!wait) complete();
+          else
+            void Promise.race([
+              wait,
+              new Promise<void>((resolve) => {
+                if (signal.aborted) resolve();
+                else signal.addEventListener('abort', () => resolve(), { once: true });
+              }),
+            ])
+              .then(complete)
+              .catch((error: unknown) => {
+                if (entry.bus !== bus || entry.taskId !== taskId) return;
+                const message = error instanceof Error ? error.message : String(error);
+                console.error('[dsh-a2a] task settlement failed:', error);
+                bus.publish(
+                  terminalStatusUpdate(taskId, entry.sessionId as string, 'failed', message),
+                );
+                entry.bus = null;
+                entry.settlementAbort.abort();
+                entry.settled.shift()?.();
+              });
+        }
+      } else {
+        for (const out of outputs) entry.bus?.publish(out);
+      }
     } catch (error) {
       console.error('[dsh-a2a] failed to translate session event:', error);
+      if (
+        event.type === 'turn/end' &&
+        (event.data.reason.kind === 'completed' || event.data.reason.kind === 'max-tokens')
+      ) {
+        entry.bus?.publish(
+          terminalStatusUpdate(
+            entry.taskId,
+            entry.sessionId as string,
+            'failed',
+            'Failed to translate agent turn.',
+          ),
+        );
+        entry.bus = null;
+        entry.settlementAbort.abort();
+        entry.settled.shift()?.();
+      }
     }
     if (event.type === 'turn/end') {
       this.withdrawApprovals(entry);
       this.asked.delete(session.id as string);
       entry.turnActive = false;
-      entry.settled.shift()?.();
+      if (event.data.reason.kind !== 'completed' && event.data.reason.kind !== 'max-tokens') {
+        entry.settlementAbort.abort();
+        entry.bus = null;
+        entry.settled.shift()?.();
+      }
     }
   }
 
@@ -524,7 +675,7 @@ export class A2aBridge {
    */
   private onAssistantStream(agent: Agent, frame: AssistantStreamFrame): void {
     const entry = this.bySession.get(agent.session.id as string);
-    if (!entry) return;
+    if (!entry || entry.staleTurn) return;
     try {
       for (const out of entry.translator.handleStreamFrame(frame)) entry.bus?.publish(out);
     } catch (error) {
@@ -545,12 +696,16 @@ export class A2aBridge {
 
   /** Close an in-flight stream honestly and release every turn waiter. */
   private settleEntry(entry: TaskEntry, message: string): void {
+    entry.interrupted = true;
+    entry.admissionAbort?.abort();
+    entry.settlementAbort.abort();
     this.withdrawApprovals(entry);
-    if (entry.turnActive && entry.bus) {
+    if (entry.bus && (entry.turnActive || entry.settled.length > 0)) {
       entry.bus.publish(
         terminalStatusUpdate(entry.taskId, entry.sessionId as string, 'canceled', message),
       );
     }
+    entry.bus = null;
     entry.turnActive = false;
     for (const resolve of entry.settled.splice(0)) resolve();
   }
