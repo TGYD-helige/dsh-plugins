@@ -6,6 +6,7 @@ Langfuse observability for [DeepSeek Harness (dsh)](https://github.com/deepseek-
 
 - one **generation** per LLM call (`llm/stream` waterfall), plus a nested `llm-request` span carrying the verbatim loop-built request
 - one **span** per tool call (`tools/execute` waterfall)
+- one **span** per `hook/invoked` / `hook/result` pair, with hook point, decision, exit code, and duration (stderr summary follows `captureContent`)
 - one **trace** per session turn (`session/event`) — in the v5 SDK the trace IS its root span, ended (and thereby exported) at `turn/end`
 - subagent child sessions nested under the parent's tree (`session/created` header link + `subagent/start` / `subagent/end`)
 
@@ -37,6 +38,8 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
 ```
 
 Buffered spans drain on `session/flush(session)`; the exporter shuts down with the plugin fiber.
+
+Hook spans appear when a dsh hook bridge emits the paired session records. The current `hook/result` record does not contain stdout; successful script output can appear in the LLM request when the bridge injects it as context, while the hook span reports decision, exit code, duration, and bounded stderr. `SessionStart` runs before the first turn and does not emit these records, so it has no hook span.
 
 Observability is a no-throw seam: backend errors are logged with a `[dsh-langfuse]` prefix and never escape into the agent loop.
 
