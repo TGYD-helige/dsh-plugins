@@ -47,6 +47,11 @@ export interface StoragePluginConfig {
   database: { enabled: boolean; provider: DatabaseProvider; url: string };
 }
 
+/** Explicit write API for a consumer's session-clear flow. */
+export interface DshStorageService {
+  archiveSession(sessionId: string): Promise<string | null>;
+}
+
 /** Per-session live rollup used to maintain the session row. */
 interface SessionAccum {
   messageCount: number;
@@ -187,6 +192,25 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
       await guard(async (backend) => backend.close?.());
     };
   });
+
+  ctx.provide('dshStorage', {
+    archiveSession(sessionId: string): Promise<string | null> {
+      // Join the same per-session chain as event writes, then discard the old
+      // in-memory rollup only after the database transaction commits.
+      const archived = (chains.get(sessionId) ?? started).then(async () => {
+        const id = await backends[0].archiveSession(sessionId);
+        sessions.delete(sessionId);
+        return id;
+      });
+      const settled = archived.then(
+        () => {},
+        () => {},
+      );
+      chains.set(sessionId, settled);
+      track(settled);
+      return archived;
+    },
+  } satisfies DshStorageService);
 
   /* eslint-disable @typescript-eslint/no-explicit-any */
   ctx.on('session/event', (session: any, event: any) => {

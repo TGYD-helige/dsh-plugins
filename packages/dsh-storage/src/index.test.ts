@@ -15,6 +15,7 @@ vi.mock('./backends/database.js', () => ({
     readMessages = vi.fn(async () => [] as any[]);
     upsertMessage = vi.fn(async () => {});
     upsertSession = vi.fn(async () => {});
+    archiveSession = vi.fn(async (): Promise<string | null> => 'history-1');
     close = vi.fn(async () => {});
     constructor(public config: unknown) {
       backends.instances.push(this);
@@ -152,6 +153,36 @@ describe('dsh-storage plugin', () => {
       firstMessageAt: new Date(1700000000000),
       lastMessageAt: new Date(1700000001000),
     });
+  });
+
+  it('archives after queued writes and starts a fresh session rollup', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const session = { id: 's1' };
+    ctx.events.emit('session/event', session, userEvent('before', 'm1'));
+
+    const service = ctx.get('dshStorage') as { archiveSession(id: string): Promise<string | null> };
+    await expect(service.archiveSession('s1')).resolves.toBe('history-1');
+    expect(backend.archiveSession).toHaveBeenCalledWith('s1');
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(1);
+
+    ctx.events.emit('session/event', session, userEvent('after', 'm2'));
+    await ctx.events.parallel('session/flush', session);
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(1);
+  });
+
+  it('keeps the current rollup when archive fails', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const service = ctx.get('dshStorage') as { archiveSession(id: string): Promise<string | null> };
+    backend.archiveSession.mockRejectedValueOnce(new Error('db down'));
+    const session = { id: 's1' };
+    ctx.events.emit('session/event', session, userEvent('before', 'm1'));
+
+    await expect(service.archiveSession('s1')).rejects.toThrow('db down');
+    ctx.events.emit('session/event', session, userEvent('after', 'm2'));
+    await ctx.events.parallel('session/flush', session);
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(2);
   });
 
   it('preserves a merged result when tool results and the assistant message are redelivered', async () => {

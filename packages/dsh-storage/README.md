@@ -63,6 +63,12 @@ SQL Server note: Prisma's sqlserver connector has no `Json` type, so its variant
 
 Mirroring is a no-throw seam: backend errors are logged with a `[dsh-storage]` prefix and never escape into the agent loop.
 
+## Archive a session
+
+When handling a session-clear request, call `await ctx.get('dshStorage').archiveSession(sessionId)` after stopping the live turn. It waits for queued mirror writes, then transactionally assigns all current, non-deleted `ai_messages` rows (`history_id IS NULL`) to a non-deleted `ai_chat_histories` row. The returned history ID can be used to query those rows directly from the database; a second call with no active messages returns `null`. A database failure rejects this explicit operation instead of reporting a successful clear.
+
+Archived rollups stay queryable. The plugin recognizes an active rollup as a history row with no associated messages, so the next projected event creates a fresh rollup instead of overwriting the archived one. The caller owns stopping/replacing the dsh session surface and any A2A task state; this operation only archives the database mirror.
+
 ## Compatibility
 
 Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs — check the `TODO(verify)` markers in `src/` before upgrading dsh.

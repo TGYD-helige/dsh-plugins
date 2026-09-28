@@ -326,8 +326,6 @@ async function backendOnlyLeg(dbProvider) {
   const sessions = await prisma.aiChatHistory.findMany();
   for (const m of messages) console.log(` [${m.type}] ${JSON.stringify(m.content)} tokens=${JSON.stringify(m.tokens)}`);
   for (const h of sessions) console.log(` history title=${JSON.stringify(h.title)} count=${h.messageCount} tokens=${h.totalTokens}`);
-  await prisma.$disconnect();
-  await backend.close();
 
   const parseJsonColumn = (value) => (typeof value === 'string' ? JSON.parse(value) : value);
   assert(messages.length === 2, `expected 2 messages, got ${messages.length}`);
@@ -344,6 +342,25 @@ async function backendOnlyLeg(dbProvider) {
     'tool result did not round-trip inside the model row',
   );
   assert(sessions.length === 1 && Number(sessions[0].totalTokens) === 15, 'session rollup wrong');
+
+  const archiveId = await backend.archiveSession('s1');
+  assert(archiveId === sessions[0].id, 'archive did not retain the active rollup');
+  assert(await backend.archiveSession('s1') === null, 'empty archive was not idempotent');
+  assert(await backend.readSession('s1') === null, 'archived rollup was selected as active');
+  await backend.upsertMessage({
+    id: 'm2', sessionId: 's1', historyId: null, type: 'user', content: 'after clear',
+    createdAt: new Date(1700000002000),
+  });
+  await backend.upsertSession({ sessionId: 's1', messageCount: 1, totalTokens: 0 });
+  const archivedRows = await prisma.aiMessage.findMany({ where: { historyId: archiveId } });
+  const activeRows = await backend.readMessages('s1');
+  const activeRollup = await backend.readSession('s1');
+  assert(archivedRows.length === 2, 'archived messages are not queryable by history ID');
+  assert(activeRows.length === 1 && activeRows[0].id === 'm2', 'active message query includes history');
+  assert(activeRollup?.messageCount === 1, 'new active rollup reused archived counts');
+
+  await prisma.$disconnect();
+  await backend.close();
 
   console.log(`SCENARIO_OK ${dbProvider} (backend-only leg)`);
 }
