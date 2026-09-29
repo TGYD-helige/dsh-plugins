@@ -164,14 +164,16 @@ try {
   );
   assert(textOf(follow.body.result.task).length > 0, 'blocking result carries no answer text');
 
-  // 4. ListTasks finds the task with history stripped.
+  // 4. ListTasks finds the task with its settled A2A history.
   const { body: listed } = await client.rpc('ListTasks', {});
   assert(!listed.error, `ListTasks error: ${JSON.stringify(listed.error)}`);
   const listedTask = (listed.result?.tasks ?? []).find((t) => t.id === task.id);
   assert(listedTask, `task ${task.id} missing from ListTasks`);
   assert(
-    (listedTask.history ?? []).length === 0,
-    'persisted task must carry no history (conversation history is dsh-storage)',
+    listedTask.history?.some((message) =>
+      message.parts?.some((part) => part.text?.includes(markerContent)),
+    ),
+    'persisted task must carry the first settled reply',
   );
 
   // 5. The parts boundary: a file part no longer fails the turn — the url
@@ -230,7 +232,7 @@ try {
 /**
  * Backend-only Redis leg: drive the production store path
  * (SanitizedTaskStore → RedisTaskStore) against the service Redis and check
- * the key layout, TTL, list(), and history stripping. (Save deduping is
+ * the key layout, TTL, list(), and history retention. (Save deduping is
  * covered by the unit tests — it is not observable through key contents.)
  */
 async function redisLeg() {
@@ -274,7 +276,6 @@ async function redisLeg() {
   const shell = (state, timestamp) => ({
     ...base,
     status: { state, message: undefined, timestamp },
-    history: [],
   });
   // State changes persist; repeated same-state saves collapse.
   await store.save(shell(2, '2026-01-01T00:00:00Z'), undefined);
@@ -298,8 +299,8 @@ async function redisLeg() {
   assert(ttl > 0 && ttl <= 60, `ttl ${ttl} outside (0, 60]`);
   assert(loaded?.status?.state === 6, `loaded state ${loaded?.status?.state}`);
   assert(
-    Array.isArray(loaded.history) && loaded.history.length === 0,
-    'persisted task must carry no history',
+    loaded.history?.[0]?.messageId === 'm1',
+    'persisted task must retain A2A history',
   );
   assert(listed.totalSize === 1 && listed.tasks[0]?.id === 'ci-task-1', 'list must find the task');
   console.log('SCENARIO_OK redis (backend-only leg)');
