@@ -282,7 +282,7 @@ async function redisLeg() {
   await store.save(shell(6, '2026-01-01T00:00:02Z'), undefined);
 
   const keys = await raw.keys('ci:tasks:*');
-  const ttl = await raw.ttl('ci:tasks:ci-task-1');
+  const ttl = await raw.ttl(keys[0]);
   const loaded = await store.load('ci-task-1', undefined);
   const listed = await store.list(
     { tenant: '', contextId: '', status: 0, pageToken: '', statusTimestampAfter: undefined },
@@ -294,7 +294,7 @@ async function redisLeg() {
   await store.close();
   await raw.quit();
 
-  assert(keys.length === 1 && keys[0] === 'ci:tasks:ci-task-1', `unexpected keys ${keys}`);
+  assert(keys.length === 1 && /^ci:tasks:[a-f0-9]{64}:ci-task-1$/.test(keys[0]), `unexpected keys ${keys}`);
   assert(ttl > 0 && ttl <= 60, `ttl ${ttl} outside (0, 60]`);
   assert(loaded?.status?.state === 6, `loaded state ${loaded?.status?.state}`);
   assert(

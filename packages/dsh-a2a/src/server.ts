@@ -130,9 +130,52 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
         task = created;
         taskBuses.set(taskId, created);
         broadcast.on('event', (event) => {
-          if (event.kind === 'task') created.replay = [];
-          else created.replay.push(event);
+          if (event.kind === 'task') {
+            created.replay = [event];
+          } else if (event.kind === 'statusUpdate') {
+            const previous = created.replay.at(-1);
+            const priorMessage = previous?.kind === 'statusUpdate' && previous.data.status?.message;
+            const message = event.data.status?.message;
+            const before = priorMessage ? priorMessage.parts[0]?.content : undefined;
+            const delta = message?.parts[0]?.content;
+            if (
+              previous?.kind === 'statusUpdate' &&
+              previous.data.status?.state === TaskState.TASK_STATE_WORKING &&
+              event.data.status?.state === TaskState.TASK_STATE_WORKING &&
+              priorMessage &&
+              message &&
+              priorMessage.messageId === message.messageId &&
+              before?.$case === 'text' &&
+              delta?.$case === 'text'
+            ) {
+              created.replay[created.replay.length - 1] = {
+                ...event,
+                data: {
+                  ...event.data,
+                  status: {
+                    ...event.data.status,
+                    message: {
+                      ...message,
+                      parts: [
+                        {
+                          ...message.parts[0],
+                          content: { $case: 'text', value: before.value + delta.value },
+                        },
+                      ],
+                    },
+                  },
+                },
+              };
+            } else created.replay.push(event);
+          } else created.replay.push(event);
           const state = event.kind === 'statusUpdate' ? event.data.status?.state : undefined;
+          // Keep the settling event until the persisted snapshot catches up.
+          if (
+            state !== undefined &&
+            state !== TaskState.TASK_STATE_WORKING &&
+            state !== TaskState.TASK_STATE_SUBMITTED
+          )
+            created.replay = [event];
           if (
             state !== undefined &&
             [
@@ -224,35 +267,63 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       }
       const stream = super.resubscribe(...args);
       try {
-        // Starting the iterator attaches the live queue; take the replay snapshot
-        // before the next await so no event can fall between replay and live data.
-        const firstPromise = stream.next();
         const replay = task.replay.slice();
-        const first = await firstPromise;
+        const last = replay.at(-1);
+        const settledAtAttach =
+          replay.length === 1 &&
+          last?.kind === 'statusUpdate' &&
+          last.data.status?.state !== TaskState.TASK_STATE_WORKING &&
+          last.data.status?.state !== TaskState.TASK_STATE_SUBMITTED;
+        const during: AgentExecutionEvent[] = [];
+        const record = (event: AgentExecutionEvent) => during.push(event);
+        task.broadcast.on('event', record);
+        let first: IteratorResult<StreamResponse>;
+        try {
+          // The SDK attaches its live queue before awaiting the TaskStore load.
+          first = await stream.next();
+        } finally {
+          task.broadcast.off('event', record);
+        }
         if (first.done) return;
+        const payload = first.value.payload;
+        const queuedAnchor = during.find((event) => event.kind === 'task');
+        const anchor = queuedAnchor ?? replay.find((event) => event.kind === 'task');
+        const replayNeeded =
+          (!settledAtAttach && !during.some((event) => event.kind === 'task')) ||
+          (payload?.$case === 'task' &&
+            payload.value.status?.state === TaskState.TASK_STATE_WORKING &&
+            !during.some((event) => event.kind === 'task'));
         const replayedIds = new Set(
-          replay.flatMap((event) =>
+          (replayNeeded ? [...replay, ...during] : during).flatMap((event) =>
             event.kind === 'statusUpdate' && event.data.status?.message
               ? [event.data.status.message.messageId]
               : [],
           ),
         );
-        const payload = first.value.payload;
         if (payload?.$case === 'task') {
           const initial = payload.value;
-          const running = initial.status?.state === TaskState.TASK_STATE_WORKING;
+          const useAnchor =
+            anchor?.kind === 'task' &&
+            (initial.status?.state === TaskState.TASK_STATE_INPUT_REQUIRED ||
+              (anchor.data.status?.timestamp &&
+                initial.status?.timestamp &&
+                Date.parse(anchor.data.status.timestamp) > Date.parse(initial.status.timestamp)));
+          const history =
+            initial.history?.filter((message) => !replayedIds.has(message.messageId)) ?? [];
+          if (useAnchor && anchor.kind === 'task') {
+            const ids = new Set(history.map((message) => message.messageId));
+            for (const message of anchor.data.history ?? [])
+              if (!ids.has(message.messageId)) history.push(message);
+          }
           yield {
             payload: {
               $case: 'task',
               value: {
                 ...initial,
-                history: running
-                  ? initial.history?.filter((message) => !replayedIds.has(message.messageId))
-                  : initial.history,
-                status:
-                  running &&
-                  initial.status?.message &&
-                  replayedIds.has(initial.status.message.messageId)
+                history,
+                status: useAnchor
+                  ? anchor.data.status
+                  : initial.status?.message && replayedIds.has(initial.status.message.messageId)
                     ? { ...initial.status, message: undefined }
                     : initial.status,
               },
@@ -261,13 +332,26 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
         } else {
           yield first.value;
         }
-        for (const event of replay) {
+        for (const event of replayNeeded ? replay : []) {
+          if (event.kind === 'task') continue;
           if (event.kind === 'statusUpdate')
             yield { payload: { $case: 'statusUpdate', value: event.data } };
           else if (event.kind === 'artifactUpdate')
             yield { payload: { $case: 'artifactUpdate', value: event.data } };
         }
-        yield* stream;
+        let skipQueuedAnchor = Boolean(queuedAnchor);
+        for await (const value of stream) {
+          if (
+            skipQueuedAnchor &&
+            queuedAnchor?.kind === 'task' &&
+            value.payload?.$case === 'task' &&
+            value.payload.value.status?.timestamp === queuedAnchor.data.status?.timestamp
+          ) {
+            skipQueuedAnchor = false;
+            continue;
+          }
+          yield value;
+        }
       } finally {
         await stream.return(undefined);
       }

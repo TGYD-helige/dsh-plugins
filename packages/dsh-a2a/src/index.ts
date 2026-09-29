@@ -116,8 +116,8 @@ export const Config = Schema.object({
     publicUrl: Schema.string().default(''),
   }),
   /**
-   * A2A task state store (task metadata only — conversation history is
-   * dsh-storage's ai_messages, not this). 'memory' loses tasks on restart.
+   * A2A task snapshots, including protocol history. dsh-storage separately
+   * owns the full conversation log. 'memory' loses tasks on restart.
    */
   taskStore: Schema.union([
     Schema.const('memory'),

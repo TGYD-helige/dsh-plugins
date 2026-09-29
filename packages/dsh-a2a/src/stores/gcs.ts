@@ -2,9 +2,9 @@
  * GCS TaskStore for @a2a-js/sdk. `@google-cloud/storage` is an optional peer.
  *
  * Ported from the source project's packages/a2a-server/src/persistence/gcs.ts:
- *   tasks/{taskId}/metadata.json.gz  — gzipped task state (pre-sanitized by
- *                                      SanitizedTaskStore: no history)
- *   tasks/{taskId}/workspace.tar.gz  — tar of the task's workspace directory
+ *   tasks/{scope}/{taskId}/metadata.json.gz  — gzipped task snapshot (written on
+ *                                      state transitions)
+ *   tasks/{scope}/{taskId}/workspace.tar.gz  — tar of the task's workspace directory
  *
  * The workspace archive is written explicitly via `archiveWorkspace()` (not
  * wired to any lifecycle event yet — A2A tasks share one configured cwd, so a
@@ -20,11 +20,12 @@ import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import type { ListTasksRequest, ListTasksResponse, Task } from '@a2a-js/sdk';
-import { listShells, type ManagedTaskStore } from '../task-store.js';
+import type { ServerCallContext } from '@a2a-js/sdk/server';
+import { listShells, type ManagedTaskStore, taskScopeKey } from '../task-store.js';
 
 export interface GcsTaskStoreConfig {
   bucket: string;
-  /** Object key prefix, default 'tasks' (matches the source layout). */
+  /** Object key prefix, default 'tasks'. */
   prefix?: string;
   /** Path to a service-account key file; omit to use ADC. */
   keyFilename?: string;
@@ -46,37 +47,41 @@ export class GcsTaskStore implements ManagedTaskStore {
     this.bucket = storage.bucket(this.config.bucket);
   }
 
-  async save(task: Task): Promise<void> {
+  async save(task: Task, context: ServerCallContext): Promise<void> {
     if (!this.bucket) return;
     await this.bucket
-      .file(`${this.prefix}/${task.id}/metadata.json.gz`)
+      .file(`${this.prefix}/${taskScopeKey(context)}/${task.id}/metadata.json.gz`)
       .save(gzipSync(JSON.stringify(task)), { contentType: 'application/gzip', resumable: false });
   }
 
-  async load(taskId: string): Promise<Task | undefined> {
+  async load(taskId: string, context: ServerCallContext): Promise<Task | undefined> {
     if (!this.bucket) return undefined;
-    const file = this.bucket.file(`${this.prefix}/${taskId}/metadata.json.gz`);
+    const file = this.bucket.file(
+      `${this.prefix}/${taskScopeKey(context)}/${taskId}/metadata.json.gz`,
+    );
     const [exists] = await file.exists();
     if (!exists) return undefined;
     const [buf] = await file.download();
     return JSON.parse(gunzipSync(buf).toString('utf8')) as Task;
   }
 
-  async delete(taskId: string): Promise<void> {
+  async delete(taskId: string, context: ServerCallContext): Promise<void> {
     if (!this.bucket) return;
     await Promise.all([
       this.bucket
-        .file(`${this.prefix}/${taskId}/metadata.json.gz`)
+        .file(`${this.prefix}/${taskScopeKey(context)}/${taskId}/metadata.json.gz`)
         .delete({ ignoreNotFound: true }),
       this.bucket
-        .file(`${this.prefix}/${taskId}/workspace.tar.gz`)
+        .file(`${this.prefix}/${taskScopeKey(context)}/${taskId}/workspace.tar.gz`)
         .delete({ ignoreNotFound: true }),
     ]);
   }
 
-  async list(params: ListTasksRequest): Promise<ListTasksResponse> {
+  async list(params: ListTasksRequest, context: ServerCallContext): Promise<ListTasksResponse> {
     if (!this.bucket) return { tasks: [], nextPageToken: '', pageSize: 0, totalSize: 0 };
-    const [files] = await this.bucket.getFiles({ prefix: `${this.prefix}/` });
+    const [files] = await this.bucket.getFiles({
+      prefix: `${this.prefix}/${taskScopeKey(context)}/`,
+    });
     const shells: Task[] = [];
     for (const file of files) {
       if (!file.name.endsWith('/metadata.json.gz')) continue;
@@ -87,17 +92,19 @@ export class GcsTaskStore implements ManagedTaskStore {
   }
 
   /**
-   * Tar + gzip the workspace directory to `tasks/{taskId}/workspace.tar.gz`.
+   * Tar + gzip the workspace directory to `tasks/{scope}/{taskId}/workspace.tar.gz`.
    * TODO: replace the tar subprocess with a streaming tar library (e.g. `tar`)
    * to control inclusion and avoid shelling out.
    */
-  async archiveWorkspace(taskId: string, cwd: string): Promise<void> {
+  async archiveWorkspace(taskId: string, cwd: string, context: ServerCallContext): Promise<void> {
     if (!this.bucket) return;
     const dir = await mkdtemp(join(tmpdir(), 'dsh-a2a-archive-'));
     const tarball = join(dir, 'workspace.tar.gz');
     try {
       await promisify(execFile)('tar', ['-czf', tarball, '-C', cwd, '.']);
-      const dest = this.bucket.file(`${this.prefix}/${taskId}/workspace.tar.gz`);
+      const dest = this.bucket.file(
+        `${this.prefix}/${taskScopeKey(context)}/${taskId}/workspace.tar.gz`,
+      );
       await pipeline(createReadStream(tarball), dest.createWriteStream());
     } finally {
       await rm(dir, { recursive: true, force: true });
