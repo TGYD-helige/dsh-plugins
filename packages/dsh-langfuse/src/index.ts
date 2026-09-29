@@ -24,7 +24,7 @@
  *   `subagent/descriptor` event).
  *
  * Event/waterfall shapes verified against the installed
- * @deepseek-ai/dsh-{llm,session,tools,agent,subagent}@0.1.7-rc.2 package sources
+ * @deepseek-ai/dsh-{llm,session,tools,agent,subagent}@0.2.0-rc.1 package sources
  * (types for shapes; `lib/*.js` for the session/created ordering claim).
  *
  * @module dsh-langfuse
