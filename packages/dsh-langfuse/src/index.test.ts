@@ -561,7 +561,7 @@ describe('dsh-langfuse plugin', () => {
       expect(generation.name).toBe('llm-call [hello]'); // renamed to the reply's first line at close
       expect(generation.body).toMatchObject({
         model: 'deepseek-chat',
-        input: { messages: [], system: undefined, tools: undefined },
+        input: { provider: 'test', model: 'deepseek-chat', messages: [] },
       });
       expect(lastUpdate(generation)).toMatchObject({
         output: 'hello',
@@ -608,13 +608,31 @@ describe('dsh-langfuse plugin', () => {
       await drain(
         ctx.waterfall(
           'llm/stream',
-          optionsOf({ stop: ['END-OF-SECRET'], temperature: 0.5, maxTokens: 100 }),
+          optionsOf({
+            stop: ['END-OF-SECRET'],
+            temperature: 0.5,
+            maxTokens: 100,
+            reasoningEffort: 'high' as GenerateOptions['reasoningEffort'],
+          }),
           () => streamOf(finishStop()),
         ),
       );
       expect(fakeObs(mocks.roots[0]).generations[0].body).toMatchObject({
         // v5 modelParameters values are string|number — the stop list serializes.
-        modelParameters: { stop: '["END-OF-SECRET"]', temperature: 0.5, maxTokens: 100 },
+        modelParameters: {
+          stop: '["END-OF-SECRET"]',
+          temperature: 0.5,
+          maxTokens: 100,
+          reasoningEffort: 'high',
+        },
+        input: {
+          modelParameters: {
+            stop: '["END-OF-SECRET"]',
+            temperature: 0.5,
+            maxTokens: 100,
+            reasoningEffort: 'high',
+          },
+        },
       });
     });
 
@@ -640,6 +658,27 @@ describe('dsh-langfuse plugin', () => {
       });
       expect(requestSpan.ended).toBe(1);
       expect(requestSpan.attributes['session.id']).toBe('s1');
+    });
+
+    it('passes new request fields through both inputs', async () => {
+      await setup();
+      const options = optionsOf({
+        temperature: 0.5,
+        maxTokens: 100,
+        signal: new AbortController().signal,
+        futureControl: { enabled: true },
+      } as Partial<GenerateOptions>);
+      await drain(ctx.waterfall('llm/stream', options, () => streamOf(finishStop())));
+
+      const generation = fakeObs(mocks.roots[0]).generations[0];
+      const request = generation.spans[0];
+      const expectedInput = {
+        ...options,
+        signal: undefined,
+        modelParameters: { temperature: 0.5, maxTokens: 100 },
+      };
+      expect(generation.body.input).toEqual(expectedInput);
+      expect(request.body.input).toEqual(expectedInput);
     });
 
     it('sets completionStartTime at the first token delta, not at block boundaries', async () => {
@@ -818,8 +857,10 @@ describe('dsh-langfuse plugin', () => {
       );
       const body = fakeObs(mocks.roots[0]).generations[0].body as {
         modelParameters?: Record<string, unknown>;
+        input?: { modelParameters?: Record<string, unknown> };
       };
       expect(body.modelParameters).toEqual({ temperature: 0.5, stopCount: 2 });
+      expect(body.input?.modelParameters).toEqual(body.modelParameters);
     });
 
     it('redacts the nested request span body to counts', async () => {

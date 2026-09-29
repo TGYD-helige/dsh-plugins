@@ -39,6 +39,8 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
 
 Buffered spans drain on `session/flush(session)`; the exporter shuts down with the plugin fiber.
 
+With `captureContent: true`, both `llm-call` and `llm-request` inputs contain every `llm/stream` request option except the non-serializable `AbortSignal`, plus `modelParameters`. New request fields pass through without a plugin update. These are dsh-side values, not exact provider HTTP payloads: adapters may add defaults, project messages/tools, or rename fields after this seam. With `captureContent: false`, inputs keep counts and safe model parameters.
+
 Hook spans appear when a dsh hook bridge emits the paired session records. The current `hook/result` record does not contain stdout; successful script output can appear in the LLM request when the bridge injects it as context, while the hook span reports decision, exit code, duration, and bounded stderr. `SessionStart` runs before the first turn and does not emit these records, so it has no hook span.
 
 Observability is a no-throw seam: backend errors are logged with a `[dsh-langfuse]` prefix and never escape into the agent loop.
