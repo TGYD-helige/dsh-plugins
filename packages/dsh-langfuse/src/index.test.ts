@@ -626,14 +626,15 @@ describe('dsh-langfuse plugin', () => {
           reasoningEffort: 'high',
         },
         input: {
-          modelParameters: {
-            stop: '["END-OF-SECRET"]',
-            temperature: 0.5,
-            maxTokens: 100,
-            reasoningEffort: 'high',
-          },
+          stop: ['END-OF-SECRET'],
+          temperature: 0.5,
+          maxTokens: 100,
+          reasoningEffort: 'high',
         },
       });
+      expect(fakeObs(mocks.roots[0]).generations[0].body.input).not.toHaveProperty(
+        'modelParameters',
+      );
     });
 
     it('records the loop-built request as a nested llm-request span', async () => {
@@ -672,11 +673,7 @@ describe('dsh-langfuse plugin', () => {
 
       const generation = fakeObs(mocks.roots[0]).generations[0];
       const request = generation.spans[0];
-      const expectedInput = {
-        ...options,
-        signal: undefined,
-        modelParameters: { temperature: 0.5, maxTokens: 100 },
-      };
+      const { signal: _, ...expectedInput } = options;
       expect(generation.body.input).toEqual(expectedInput);
       expect(request.body.input).toEqual(expectedInput);
     });
@@ -857,10 +854,10 @@ describe('dsh-langfuse plugin', () => {
       );
       const body = fakeObs(mocks.roots[0]).generations[0].body as {
         modelParameters?: Record<string, unknown>;
-        input?: { modelParameters?: Record<string, unknown> };
+        input?: Record<string, unknown>;
       };
       expect(body.modelParameters).toEqual({ temperature: 0.5, stopCount: 2 });
-      expect(body.input?.modelParameters).toEqual(body.modelParameters);
+      expect(body.input).not.toHaveProperty('modelParameters');
     });
 
     it('redacts the nested request span body to counts', async () => {

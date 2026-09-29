@@ -475,7 +475,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     const oneOffRoot = options.sessionId ? null : parent;
     const generationName = options.purpose ? `llm-call [${options.purpose}]` : 'llm-call';
     const modelParameters = modelParametersOf(options, config.captureContent);
-    const input = { ...requestBodyOf(options, config.captureContent), modelParameters };
+    const input = requestBodyOf(options, config.captureContent);
     const generation = reporter.startGeneration(parent, {
       name: generationName,
       model: options.model,
