@@ -39,6 +39,10 @@ export interface ManagedTaskStore extends TaskStore {
   close?(): Promise<void>;
 }
 
+function scopeOf(context: ServerCallContext | undefined): string {
+  return JSON.stringify([context?.tenant ?? '', context ? resolveUserScope(context) : '']);
+}
+
 /** The SDK memory store has no delete operation; keep the same shell contract. */
 export class MemoryTaskStore implements ManagedTaskStore {
   private readonly scopes = new Map<string, Map<string, Task>>();
@@ -114,7 +118,7 @@ export class SanitizedTaskStore implements ManagedTaskStore {
       else history.push(final);
     }
     this.liveHistory.set(task.id, {
-      scope: JSON.stringify([context.tenant ?? '', resolveUserScope(context)]),
+      scope: scopeOf(context),
       history,
     });
     const state = task.status?.state;
@@ -133,7 +137,7 @@ export class SanitizedTaskStore implements ManagedTaskStore {
   async load(taskId: string, context: ServerCallContext): Promise<Task | undefined> {
     const task = await this.inner.load(taskId, context);
     const live = this.liveHistory.get(taskId);
-    return task && live?.scope === JSON.stringify([context.tenant ?? '', resolveUserScope(context)])
+    return task && live?.scope === scopeOf(context)
       ? { ...task, history: structuredClone(live.history) }
       : task;
   }

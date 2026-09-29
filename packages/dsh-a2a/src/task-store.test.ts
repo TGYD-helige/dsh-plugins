@@ -263,6 +263,16 @@ describe('SanitizedTaskStore', () => {
     expect((await store.list(listParams(), ctx)).tasks[0].history).toEqual([]);
   });
 
+  it('accepts an omitted context from direct backend callers', async () => {
+    const store = new SanitizedTaskStore(inner);
+    const missing = undefined as unknown as ServerCallContext;
+    await store.save(task(TaskState.TASK_STATE_WORKING), missing);
+    inner.load.mockResolvedValue(inner.saved[0]);
+    expect((await store.load('t1', missing))?.history?.map((message) => message.messageId)).toEqual(
+      ['m1'],
+    );
+  });
+
   it('passes init/close/load through to the inner store', async () => {
     const store = new SanitizedTaskStore(inner);
     await store.init();
