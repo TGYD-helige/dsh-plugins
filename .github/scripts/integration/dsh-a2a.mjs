@@ -164,14 +164,16 @@ try {
   );
   assert(textOf(follow.body.result.task).length > 0, 'blocking result carries no answer text');
 
-  // 4. ListTasks finds the task with history stripped.
+  // 4. ListTasks finds the task with its settled A2A history.
   const { body: listed } = await client.rpc('ListTasks', {});
   assert(!listed.error, `ListTasks error: ${JSON.stringify(listed.error)}`);
   const listedTask = (listed.result?.tasks ?? []).find((t) => t.id === task.id);
   assert(listedTask, `task ${task.id} missing from ListTasks`);
   assert(
-    (listedTask.history ?? []).length === 0,
-    'persisted task must carry no history (conversation history is dsh-storage)',
+    listedTask.history?.some((message) =>
+      message.parts?.some((part) => part.text?.includes(markerContent)),
+    ),
+    'persisted task must carry the first settled reply',
   );
 
   // 5. The parts boundary: a file part no longer fails the turn — the url
@@ -230,7 +232,7 @@ try {
 /**
  * Backend-only Redis leg: drive the production store path
  * (SanitizedTaskStore → RedisTaskStore) against the service Redis and check
- * the key layout, TTL, list(), and history stripping. (Save deduping is
+ * the key layout, TTL, list(), and history retention. (Save deduping is
  * covered by the unit tests — it is not observable through key contents.)
  */
 async function redisLeg() {
@@ -274,7 +276,6 @@ async function redisLeg() {
   const shell = (state, timestamp) => ({
     ...base,
     status: { state, message: undefined, timestamp },
-    history: [],
   });
   // State changes persist; repeated same-state saves collapse.
   await store.save(shell(2, '2026-01-01T00:00:00Z'), undefined);
@@ -282,7 +283,7 @@ async function redisLeg() {
   await store.save(shell(6, '2026-01-01T00:00:02Z'), undefined);
 
   const keys = await raw.keys('ci:tasks:*');
-  const ttl = await raw.ttl('ci:tasks:ci-task-1');
+  const ttl = await raw.ttl(keys[0]);
   const loaded = await store.load('ci-task-1', undefined);
   const listed = await store.list(
     { tenant: '', contextId: '', status: 0, pageToken: '', statusTimestampAfter: undefined },
@@ -294,12 +295,12 @@ async function redisLeg() {
   await store.close();
   await raw.quit();
 
-  assert(keys.length === 1 && keys[0] === 'ci:tasks:ci-task-1', `unexpected keys ${keys}`);
+  assert(keys.length === 1 && /^ci:tasks:[a-f0-9]{64}:ci-task-1$/.test(keys[0]), `unexpected keys ${keys}`);
   assert(ttl > 0 && ttl <= 60, `ttl ${ttl} outside (0, 60]`);
   assert(loaded?.status?.state === 6, `loaded state ${loaded?.status?.state}`);
   assert(
-    Array.isArray(loaded.history) && loaded.history.length === 0,
-    'persisted task must carry no history',
+    loaded.history?.[0]?.messageId === 'm1',
+    'persisted task must retain A2A history',
   );
   assert(listed.totalSize === 1 && listed.tasks[0]?.id === 'ci-task-1', 'list must find the task');
   console.log('SCENARIO_OK redis (backend-only leg)');

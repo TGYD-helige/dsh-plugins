@@ -5,31 +5,28 @@
  * event — including each streamed text delta — and folds status messages into
  * `task.history`. Two constraints follow from this plugin's design:
  *
- * 1. A2A stores carry task STATE only (task metadata ≠ conversation history —
- *    history is dsh-storage's `ai_messages`). {@link sanitizeTask} strips
- *    `history`/`artifacts` before anything reaches a backend.
+ * 1. A2A task history is a protocol snapshot, separate from dsh-storage's
+ *    conversation log. Persist it at state changes so tasks survive restart.
  * 2. Token-rate saves would hammer Redis and put a GCS upload in the hot path
  *    of the SSE stream (ResultManager awaits every save). {@link
  *    SanitizedTaskStore} collapses saves to task-state CHANGES, which are the
- *    only transitions a `tasks/get` reader can act on anyway.
+ *    durable checkpoints; active deltas remain available from this process.
  *
  * A2A 1.0 added `list()` to the TaskStore contract; {@link listShells} holds
  * the shared filter/sort/paginate logic so the backends only enumerate shells.
  */
 
-import type { ListTasksRequest, ListTasksResponse, Task, TaskState } from '@a2a-js/sdk';
+import { createHash } from 'node:crypto';
+import { type ListTasksRequest, type ListTasksResponse, type Task, TaskState } from '@a2a-js/sdk';
 import { resolveUserScope, type ServerCallContext, type TaskStore } from '@a2a-js/sdk/server';
 
-/** The persistent shape: a metadata shell with empty history/artifacts. */
+/** Omit an unfinished current message from a WORKING snapshot. */
 export function sanitizeTask(task: Task): Task {
-  return {
-    id: task.id,
-    contextId: task.contextId,
-    status: task.status,
-    metadata: task.metadata,
-    history: [],
-    artifacts: [],
-  };
+  const current =
+    task.status?.state === TaskState.TASK_STATE_WORKING && task.status.message?.messageId;
+  return current
+    ? { ...task, history: task.history.filter((message) => message.messageId !== current) }
+    : task;
 }
 
 /** TaskStore with the optional lifecycle our backends add. */
@@ -37,6 +34,15 @@ export interface ManagedTaskStore extends TaskStore {
   init?(): Promise<void>;
   delete(taskId: string, context: ServerCallContext): Promise<void>;
   close?(): Promise<void>;
+}
+
+function scopeOf(context: ServerCallContext | undefined): string {
+  return JSON.stringify([context?.tenant ?? '', context ? resolveUserScope(context) : 'unknown']);
+}
+
+/** A safe path/key segment for the SDK's tenant and owner scope. */
+export function taskScopeKey(context: ServerCallContext): string {
+  return createHash('sha256').update(scopeOf(context)).digest('hex');
 }
 
 /** The SDK memory store has no delete operation; keep the same shell contract. */
@@ -71,10 +77,11 @@ export class MemoryTaskStore implements ManagedTaskStore {
   }
 }
 
-/** Strips history/artifacts and saves only on task-state transitions. */
+/** Saves task snapshots on state transitions while keeping active deltas in process. */
 export class SanitizedTaskStore implements ManagedTaskStore {
   private readonly lastState = new Map<string, TaskState>();
   private readonly writes = new Map<string, Promise<void>>();
+  private readonly liveHistory = new Map<string, { scope: string; history: Task['history'] }>();
   // ponytail: deleted ids stay tombstoned until plugin unload; use expiring ids if clear volume grows.
   private readonly deleted = new Set<string>();
 
@@ -85,12 +92,14 @@ export class SanitizedTaskStore implements ManagedTaskStore {
   }
 
   async close(): Promise<void> {
+    this.liveHistory.clear();
     await this.inner.close?.();
   }
 
   /** Drop SDK saves that may arrive after a clear rejects an in-flight request. */
   suppress(taskId: string): void {
     this.deleted.add(taskId);
+    this.liveHistory.delete(taskId);
   }
 
   async delete(taskId: string, context: ServerCallContext): Promise<void> {
@@ -103,21 +112,68 @@ export class SanitizedTaskStore implements ManagedTaskStore {
 
   async save(task: Task, context: ServerCallContext): Promise<void> {
     if (this.deleted.has(task.id)) return;
+    const history = structuredClone(task.history ?? []);
+    const current = task.status?.message;
+    if (task.status?.state === TaskState.TASK_STATE_WORKING && current) {
+      const previous = this.liveHistory
+        .get(task.id)
+        ?.history.find((message) => message.messageId === current.messageId);
+      const index = history.findIndex((message) => message.messageId === current.messageId);
+      const before = previous?.parts[0]?.content;
+      const delta = current.parts[0]?.content;
+      if (index >= 0 && before?.$case === 'text' && delta?.$case === 'text') {
+        history[index] = {
+          ...history[index],
+          parts: [
+            {
+              ...history[index].parts[0],
+              content: { $case: 'text', value: before.value + delta.value },
+            },
+          ],
+        };
+      }
+    }
+    if (task.status?.state === TaskState.TASK_STATE_INPUT_REQUIRED && task.status.message) {
+      const final = structuredClone(task.status.message);
+      const index = history.findIndex((message) => message.messageId === final.messageId);
+      if (index >= 0) history[index] = final;
+      else history.push(final);
+    }
+    this.liveHistory.set(task.id, {
+      scope: scopeOf(context),
+      history,
+    });
     const state = task.status?.state;
     if (state !== undefined && this.lastState.get(task.id) === state) return;
-    if (state !== undefined) this.lastState.set(task.id, state);
     const write = (this.writes.get(task.id) ?? Promise.resolve()).then(() =>
-      this.inner.save(sanitizeTask(task), context),
+      this.inner.save(sanitizeTask({ ...task, history }), context),
     );
     this.writes.set(
       task.id,
       write.catch(() => {}),
     );
     await write;
+    if (state === TaskState.TASK_STATE_WORKING || state === TaskState.TASK_STATE_SUBMITTED) {
+      this.lastState.set(task.id, state);
+    } else {
+      this.lastState.delete(task.id);
+      this.writes.delete(task.id);
+      this.liveHistory.delete(task.id);
+    }
   }
 
-  load(taskId: string, context: ServerCallContext): Promise<Task | undefined> {
-    return this.inner.load(taskId, context);
+  async load(taskId: string, context: ServerCallContext): Promise<Task | undefined> {
+    const task = await this.inner.load(taskId, context);
+    const live = this.liveHistory.get(taskId);
+    if (!task || live?.scope !== scopeOf(context)) return task;
+    const history = structuredClone(live.history);
+    const current = task.status?.message;
+    const message = current && history.find((entry) => entry.messageId === current.messageId);
+    return {
+      ...task,
+      history,
+      status: message && task.status ? { ...task.status, message } : task.status,
+    };
   }
 
   list(params: ListTasksRequest, context: ServerCallContext): Promise<ListTasksResponse> {

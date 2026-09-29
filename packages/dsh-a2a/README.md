@@ -70,11 +70,13 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
 
 ## Task stores
 
-A2A **task state** (status + metadata) is separate from conversation history — use [dsh-storage](../dsh-storage) for the latter. Every backend persists a sanitized metadata shell (history/artifacts stripped) and saves only on task-state transitions, so token-rate stream events never reach the backend.
+A2A task snapshots retain protocol history and artifacts; [dsh-storage](../dsh-storage) separately records the full conversation. Backends save on task-state transitions, including the complete reply at `input-required`, so token-rate stream events never reach Redis or GCS. While a task is working, in-process history accumulates text deltas for `GetTask` and resubscription; a restart before the next state change can lose those transient deltas.
 
 - `memory` (default) — in-process, lost on restart
-- `redis` — task JSON under `<keyPrefix>:tasks:<taskId>` with a TTL; requires the `ioredis` peer
-- `gcs` — gzipped task JSON at `<prefix>/<taskId>/metadata.json.gz` (same layout as the source project's `GCSTaskStore`); requires the `@google-cloud/storage` peer. `archiveWorkspace()` (tar of the workspace) exists but is not wired to the lifecycle yet.
+- `redis` — task JSON under `<keyPrefix>:tasks:<scope>:<taskId>` with a TTL; requires the `ioredis` peer
+- `gcs` — gzipped task JSON at `<prefix>/<scope>/<taskId>/metadata.json.gz`; requires the `@google-cloud/storage` peer. `archiveWorkspace()` (tar of the workspace) exists but is not wired to the lifecycle yet.
+
+`<scope>` is a hash of the A2A tenant and user. Older unscoped Redis/GCS task records are not read after this upgrade; migrate known records into their scope or let them expire before rollout.
 
 ## Security
 

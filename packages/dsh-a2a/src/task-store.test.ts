@@ -45,6 +45,34 @@ const mocks = vi.hoisted(() => {
 
 vi.mock('ioredis', () => ({ Redis: mocks.MockRedis, default: mocks.MockRedis }));
 
+const gcs = vi.hoisted(() => {
+  const files = new Map<string, Buffer>();
+  const file = (name: string) => ({
+    name,
+    save: async (value: Buffer) => {
+      files.set(name, value);
+    },
+    exists: async () => [files.has(name)],
+    download: async () => [files.get(name)],
+    delete: async () => {
+      files.delete(name);
+    },
+  });
+  class Storage {
+    bucket() {
+      return {
+        file,
+        getFiles: async ({ prefix }: { prefix: string }) => [
+          [...files.keys()].filter((name) => name.startsWith(prefix)).map(file),
+        ],
+      };
+    }
+  }
+  return { files, Storage };
+});
+vi.mock('@google-cloud/storage', () => ({ Storage: gcs.Storage }));
+
+import { GcsTaskStore } from './stores/gcs.js';
 import { RedisTaskStore } from './stores/redis.js';
 
 const ctx = new ServerCallContext();
@@ -103,10 +131,10 @@ const listParams = (extra: Partial<ListTasksRequest> = {}): ListTasksRequest => 
 });
 
 describe('sanitizeTask', () => {
-  it('keeps state and metadata, strips history and artifacts', () => {
+  it('keeps task history and artifacts at state changes', () => {
     const clean = sanitizeTask(task(TaskState.TASK_STATE_WORKING));
-    expect(clean.history).toEqual([]);
-    expect(clean.artifacts).toEqual([]);
+    expect(clean.history.map((message) => message.messageId)).toEqual(['m1']);
+    expect(clean.artifacts).toHaveLength(1);
     expect(clean.status?.state).toBe(TaskState.TASK_STATE_WORKING);
     expect(clean.metadata).toEqual({ dshAgent: { kind: 'state-change' } });
   });
@@ -246,12 +274,80 @@ describe('SanitizedTaskStore', () => {
     ]);
   });
 
-  it('persists the sanitized shell, not the live task', async () => {
+  it('persists task history at a state change', async () => {
     const store = new SanitizedTaskStore(inner);
     await store.save(task(TaskState.TASK_STATE_WORKING), ctx);
     const saved = inner.save.mock.calls[0][0];
-    expect(saved.history).toEqual([]);
-    expect(saved.artifacts).toEqual([]);
+    expect(saved.history.map((message) => message.messageId)).toEqual(['m1']);
+    expect(saved.artifacts).toHaveLength(1);
+  });
+
+  it('returns running history to a resubscriber', async () => {
+    const store = new SanitizedTaskStore(new MemoryTaskStore());
+    await store.save(task(TaskState.TASK_STATE_SUBMITTED), ctx);
+    await store.save(task(TaskState.TASK_STATE_WORKING), ctx);
+    const resumed = await store.load('t1', ctx);
+    expect(resumed?.history?.map((message) => message.messageId)).toEqual(['m1']);
+    expect(
+      (await store.list(listParams(), ctx)).tasks[0].history.map((message) => message.messageId),
+    ).toEqual(['m1']);
+  });
+
+  it('shows the complete text so far when polling a working task', async () => {
+    const store = new SanitizedTaskStore(new MemoryTaskStore());
+    const running = task(TaskState.TASK_STATE_WORKING);
+    const first = {
+      ...running.history[0],
+      messageId: 'answer',
+      role: Role.ROLE_AGENT,
+      parts: [{ ...running.history[0].parts[0], content: { $case: 'text' as const, value: 'A' } }],
+    };
+    running.history.push(first);
+    running.status!.message = first;
+    await store.save(running, ctx);
+    const second = (await store.load('t1', ctx))!;
+    second.status!.message = {
+      ...first,
+      parts: [{ ...first.parts[0], content: { $case: 'text', value: 'B' } }],
+    };
+    await store.save(second, ctx);
+    const polled = await store.load('t1', ctx);
+    expect(
+      polled?.history.find((message) => message.messageId === 'answer')?.parts[0].content,
+    ).toEqual({ $case: 'text', value: 'AB' });
+  });
+
+  it('recovers a settled reply through a fresh store wrapper', async () => {
+    const inner = new MemoryTaskStore();
+    const first = new SanitizedTaskStore(inner);
+    const settled = task(TaskState.TASK_STATE_INPUT_REQUIRED);
+    settled.status!.message = {
+      ...settled.history[0],
+      messageId: 'answer',
+      role: Role.ROLE_AGENT,
+      parts: [
+        {
+          ...settled.history[0].parts[0],
+          content: { $case: 'text', value: 'complete answer' },
+        },
+      ],
+    };
+    await first.save(settled, ctx);
+    const second = new SanitizedTaskStore(inner);
+    expect((await second.load('t1', ctx))?.history?.map((message) => message.messageId)).toEqual([
+      'm1',
+      'answer',
+    ]);
+  });
+
+  it('accepts an omitted context from direct backend callers', async () => {
+    const store = new SanitizedTaskStore(inner);
+    const missing = undefined as unknown as ServerCallContext;
+    await store.save(task(TaskState.TASK_STATE_WORKING), missing);
+    inner.load.mockResolvedValue(inner.saved[0]);
+    expect((await store.load('t1', missing))?.history?.map((message) => message.messageId)).toEqual(
+      ['m1'],
+    );
   });
 
   it('passes init/close/load through to the inner store', async () => {
@@ -292,24 +388,26 @@ describe('RedisTaskStore', () => {
     mocks.MockRedis.instances = [];
   });
 
-  it('writes the task JSON under a2a:tasks:{id} with a TTL and reads it back', async () => {
+  it('writes scoped task JSON with a TTL and reads it back', async () => {
     const store = new RedisTaskStore({ url: 'redis://example:6379', ttlSeconds: 60 });
     await store.init();
     const redis = mocks.MockRedis.instances[0];
     expect(redis.url).toBe('redis://example:6379');
 
     const value = task(TaskState.TASK_STATE_WORKING);
-    await store.save(value);
+    await store.save(value, ctx);
     // RedisTaskStore persists exactly what it is given — sanitizing is the
     // SanitizedTaskStore wrapper's job.
-    expect(redis.calls.set[0]).toEqual(['a2a:tasks:t1', JSON.stringify(value), 'EX', 60]);
+    const key = redis.calls.set[0][0] as string;
+    expect(key).toMatch(/^a2a:tasks:[a-f0-9]{64}:t1$/);
+    expect(redis.calls.set[0]).toEqual([key, JSON.stringify(value), 'EX', 60]);
 
-    const loaded = await store.load('t1');
+    const loaded = await store.load('t1', ctx);
     expect(loaded).toEqual(value);
-    expect(await store.load('missing')).toBeUndefined();
-    await store.delete('t1');
-    expect(redis.calls.del).toEqual(['a2a:tasks:t1']);
-    expect(await store.load('t1')).toBeUndefined();
+    expect(await store.load('missing', ctx)).toBeUndefined();
+    await store.delete('t1', ctx);
+    expect(redis.calls.del).toEqual([key]);
+    expect(await store.load('t1', ctx)).toBeUndefined();
 
     await store.close();
     expect(redis.calls.quit).toBe(1);
@@ -318,25 +416,48 @@ describe('RedisTaskStore', () => {
   it('honors a custom key prefix', async () => {
     const store = new RedisTaskStore({ url: 'redis://example:6379', keyPrefix: 'x' });
     await store.init();
-    await store.save(task(TaskState.TASK_STATE_WORKING));
-    expect(mocks.MockRedis.instances[0].calls.set[0][0]).toBe('x:tasks:t1');
+    await store.save(task(TaskState.TASK_STATE_WORKING), ctx);
+    expect(mocks.MockRedis.instances[0].calls.set[0][0]).toMatch(/^x:tasks:[a-f0-9]{64}:t1$/);
   });
 
   it('lists shells through the shared filter/sort/paginate path', async () => {
     const store = new RedisTaskStore({ url: 'redis://example:6379' });
     await store.init();
-    await store.save(task(TaskState.TASK_STATE_WORKING, { id: 't1' }));
-    await store.save(task(TaskState.TASK_STATE_CANCELED, { id: 't2', contextId: 'c2' }));
-    const all = await store.list(listParams());
+    await store.save(task(TaskState.TASK_STATE_WORKING, { id: 't1' }), ctx);
+    await store.save(task(TaskState.TASK_STATE_CANCELED, { id: 't2', contextId: 'c2' }), ctx);
+    const all = await store.list(listParams(), ctx);
     expect(all.totalSize).toBe(2);
-    const filtered = await store.list(listParams({ contextId: 'c2' }));
+    const filtered = await store.list(listParams({ contextId: 'c2' }), ctx);
     expect(filtered.tasks.map((t) => t.id)).toEqual(['t2']);
+  });
+
+  it('does not expose stored history across tenants', async () => {
+    const store = new RedisTaskStore({ url: 'redis://example:6379' });
+    await store.init();
+    const other = new ServerCallContext({ tenant: 'other' });
+    await store.save(task(TaskState.TASK_STATE_INPUT_REQUIRED), ctx);
+    expect(await store.load('t1', other)).toBeUndefined();
+    expect((await store.list(listParams(), other)).tasks).toEqual([]);
+    expect((await store.list(listParams(), ctx)).tasks).toHaveLength(1);
   });
 
   it('no-ops before init()', async () => {
     const store = new RedisTaskStore({ url: 'redis://example:6379' });
-    await store.save(task(TaskState.TASK_STATE_WORKING));
-    expect(await store.load('t1')).toBeUndefined();
-    expect((await store.list(listParams())).tasks).toEqual([]);
+    await store.save(task(TaskState.TASK_STATE_WORKING), ctx);
+    expect(await store.load('t1', ctx)).toBeUndefined();
+    expect((await store.list(listParams(), ctx)).tasks).toEqual([]);
+  });
+});
+
+describe('GcsTaskStore', () => {
+  it('keeps stored task history in the caller scope', async () => {
+    gcs.files.clear();
+    const store = new GcsTaskStore({ bucket: 'test' });
+    await store.init();
+    const other = new ServerCallContext({ tenant: 'other' });
+    await store.save(task(TaskState.TASK_STATE_INPUT_REQUIRED), ctx);
+    expect(await store.load('t1', other)).toBeUndefined();
+    expect((await store.list(listParams(), other)).tasks).toEqual([]);
+    expect((await store.load('t1', ctx))?.history[0].messageId).toBe('m1');
   });
 });
