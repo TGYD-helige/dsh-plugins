@@ -254,6 +254,15 @@ describe('SanitizedTaskStore', () => {
     expect(saved.artifacts).toEqual([]);
   });
 
+  it('returns running history to a resubscriber without persisting it', async () => {
+    const store = new SanitizedTaskStore(new MemoryTaskStore());
+    await store.save(task(TaskState.TASK_STATE_SUBMITTED), ctx);
+    await store.save(task(TaskState.TASK_STATE_WORKING), ctx);
+    const resumed = await store.load('t1', ctx);
+    expect(resumed?.history?.map((message) => message.messageId)).toEqual(['m1']);
+    expect((await store.list(listParams(), ctx)).tasks[0].history).toEqual([]);
+  });
+
   it('passes init/close/load through to the inner store', async () => {
     const store = new SanitizedTaskStore(inner);
     await store.init();

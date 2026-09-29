@@ -17,7 +17,7 @@
  * the shared filter/sort/paginate logic so the backends only enumerate shells.
  */
 
-import type { ListTasksRequest, ListTasksResponse, Task, TaskState } from '@a2a-js/sdk';
+import { type ListTasksRequest, type ListTasksResponse, type Task, TaskState } from '@a2a-js/sdk';
 import { resolveUserScope, type ServerCallContext, type TaskStore } from '@a2a-js/sdk/server';
 
 /** The persistent shape: a metadata shell with empty history/artifacts. */
@@ -75,6 +75,7 @@ export class MemoryTaskStore implements ManagedTaskStore {
 export class SanitizedTaskStore implements ManagedTaskStore {
   private readonly lastState = new Map<string, TaskState>();
   private readonly writes = new Map<string, Promise<void>>();
+  private readonly liveHistory = new Map<string, { scope: string; history: Task['history'] }>();
   // ponytail: deleted ids stay tombstoned until plugin unload; use expiring ids if clear volume grows.
   private readonly deleted = new Set<string>();
 
@@ -85,12 +86,14 @@ export class SanitizedTaskStore implements ManagedTaskStore {
   }
 
   async close(): Promise<void> {
+    this.liveHistory.clear();
     await this.inner.close?.();
   }
 
   /** Drop SDK saves that may arrive after a clear rejects an in-flight request. */
   suppress(taskId: string): void {
     this.deleted.add(taskId);
+    this.liveHistory.delete(taskId);
   }
 
   async delete(taskId: string, context: ServerCallContext): Promise<void> {
@@ -103,6 +106,17 @@ export class SanitizedTaskStore implements ManagedTaskStore {
 
   async save(task: Task, context: ServerCallContext): Promise<void> {
     if (this.deleted.has(task.id)) return;
+    const history = structuredClone(task.history ?? []);
+    if (task.status?.state === TaskState.TASK_STATE_INPUT_REQUIRED && task.status.message) {
+      const final = structuredClone(task.status.message);
+      const index = history.findIndex((message) => message.messageId === final.messageId);
+      if (index >= 0) history[index] = final;
+      else history.push(final);
+    }
+    this.liveHistory.set(task.id, {
+      scope: JSON.stringify([context.tenant ?? '', resolveUserScope(context)]),
+      history,
+    });
     const state = task.status?.state;
     if (state !== undefined && this.lastState.get(task.id) === state) return;
     if (state !== undefined) this.lastState.set(task.id, state);
@@ -116,8 +130,12 @@ export class SanitizedTaskStore implements ManagedTaskStore {
     await write;
   }
 
-  load(taskId: string, context: ServerCallContext): Promise<Task | undefined> {
-    return this.inner.load(taskId, context);
+  async load(taskId: string, context: ServerCallContext): Promise<Task | undefined> {
+    const task = await this.inner.load(taskId, context);
+    const live = this.liveHistory.get(taskId);
+    return task && live?.scope === JSON.stringify([context.tenant ?? '', resolveUserScope(context)])
+      ? { ...task, history: structuredClone(live.history) }
+      : task;
   }
 
   list(params: ListTasksRequest, context: ServerCallContext): Promise<ListTasksResponse> {

@@ -160,6 +160,172 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     expect(last.result.statusUpdate.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
   });
 
+  it('returns live history in the first legacy resubscribe frame', async () => {
+    const send = await fetch(`${base}/a2a/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/send',
+        params: {
+          message: {
+            kind: 'message',
+            messageId: 'user-1',
+            role: 'user',
+            parts: [{ kind: 'text', text: 'hello' }],
+          },
+        },
+      }),
+    });
+    const sent = await json(send);
+    const subscribed = await fetch(`${base}/a2a/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/resubscribe',
+        params: { id: sent.result.id },
+      }),
+    });
+    const reader = subscribed.body!.getReader();
+    let wire = '';
+    while (!wire.includes('\n\n')) {
+      const chunk = await reader.read();
+      expect(chunk.done).toBe(false);
+      wire += new TextDecoder().decode(chunk.value);
+    }
+    const first = JSON.parse(wire.split('\n\n')[0].slice(6));
+    expect(first.result.history).toMatchObject([
+      { role: 'user', parts: [{ kind: 'text', text: 'hello' }] },
+      { role: 'agent', parts: [{ kind: 'text', text: 'done' }] },
+    ]);
+    await reader.cancel();
+  });
+
+  it('replays prior deltas and continues live after resubscribe', async () => {
+    await server.close();
+    let resume!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const executor: AgentExecutor = {
+      async execute({ userMessage, taskId, contextId }, bus) {
+        const status = (text: string, state = TaskState.TASK_STATE_WORKING) =>
+          AgentEvent.statusUpdate({
+            taskId,
+            contextId,
+            status: {
+              state,
+              message: {
+                messageId: 'answer',
+                contextId,
+                taskId,
+                role: Role.ROLE_AGENT,
+                parts: [
+                  {
+                    content: { $case: 'text', value: text },
+                    metadata: undefined,
+                    filename: '',
+                    mediaType: 'text/plain',
+                  },
+                ],
+                metadata: undefined,
+                extensions: [],
+                referenceTaskIds: [],
+              },
+              timestamp: new Date().toISOString(),
+            },
+            metadata: undefined,
+          });
+        bus.publish(
+          AgentEvent.task({
+            id: taskId,
+            contextId,
+            status: {
+              state: TaskState.TASK_STATE_SUBMITTED,
+              message: undefined,
+              timestamp: new Date().toISOString(),
+            },
+            history: [userMessage],
+            artifacts: [],
+            metadata: undefined,
+          }),
+        );
+        bus.publish(status('A'));
+        await paused;
+        bus.publish(status('B'));
+        bus.publish(status('AB', TaskState.TASK_STATE_INPUT_REQUIRED));
+        bus.finished();
+      },
+      cancelTask: async () => {},
+    };
+    server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      card: { name: 'test-agent', description: 'test', version: '0.0.1' },
+      executor,
+      taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+    });
+    base = `http://127.0.0.1:${server.port}`;
+    const send = await fetch(`${base}/a2a/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'message/stream',
+        params: {
+          message: {
+            kind: 'message',
+            messageId: 'user-1',
+            role: 'user',
+            parts: [{ kind: 'text', text: 'hello' }],
+          },
+        },
+      }),
+    });
+    const sendReader = send.body!.getReader();
+    const initial = new TextDecoder().decode((await sendReader.read()).value);
+    const taskId = JSON.parse(initial.split('\n\n')[0].slice(6)).result.id;
+    const subscribed = await fetch(`${base}/a2a/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tasks/resubscribe',
+        params: { id: taskId },
+      }),
+    });
+    const reader = subscribed.body!.getReader();
+    let wire = '';
+    while (!wire.includes('"text":"A"'))
+      wire += new TextDecoder().decode((await reader.read()).value);
+    const first = JSON.parse(wire.split('\n\n')[0].slice(6));
+    expect(first.result.history).toMatchObject([
+      { role: 'user', parts: [{ kind: 'text', text: 'hello' }] },
+    ]);
+    expect(first.result.history).toHaveLength(1);
+    expect(first.result.status.message).toBeUndefined();
+    resume();
+    while (!wire.includes('"text":"B"'))
+      wire += new TextDecoder().decode((await reader.read()).value);
+    const events = wire
+      .split('\n\n')
+      .filter((frame) => frame.startsWith('data: '))
+      .map((frame) => JSON.parse(frame.slice(6)).result);
+    const texts = events
+      .filter((event) => event.kind === 'status-update')
+      .map((event) => event.status.message?.parts?.[0]?.text);
+    expect(texts.filter((text) => text === 'A')).toHaveLength(1);
+    expect(texts.filter((text) => text === 'B')).toHaveLength(1);
+    await reader.cancel();
+    await sendReader.cancel();
+  });
+
   it('lists tasks via ListTasks with history stripped', async () => {
     await rpc('SendMessage', { tenant: '', ...v1Message('hello') });
     const body = await json(await rpc('ListTasks', { tenant: '' }, 2));

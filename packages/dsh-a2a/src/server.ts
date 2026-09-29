@@ -21,11 +21,13 @@ import {
   type AgentCard,
   type AgentInterface,
   type Message,
+  type StreamResponse,
   TaskState,
 } from '@a2a-js/sdk';
 import { duplicateInterfacesForLegacy } from '@a2a-js/sdk/compat/v0_3';
 import { RequestMalformedError } from '@a2a-js/sdk/errors';
 import {
+  type AgentExecutionEvent,
   type AgentExecutor,
   DefaultExecutionEventBus,
   DefaultRequestHandler,
@@ -109,16 +111,27 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
   const approvalReply = new AsyncLocalStorage<boolean>();
   const taskBuses = new Map<
     string,
-    { broadcast: DefaultExecutionEventBus; requests: Set<DefaultExecutionEventBus> }
+    {
+      broadcast: DefaultExecutionEventBus;
+      requests: Set<DefaultExecutionEventBus>;
+      replay: AgentExecutionEvent[];
+    }
   >();
   const busManager = {
     createOrGetByTaskId(taskId: string) {
       let task = taskBuses.get(taskId);
       if (!task) {
         const broadcast = new DefaultExecutionEventBus();
-        task = { broadcast, requests: new Set() };
-        taskBuses.set(taskId, task);
+        const created = {
+          broadcast,
+          requests: new Set<DefaultExecutionEventBus>(),
+          replay: [] as AgentExecutionEvent[],
+        };
+        task = created;
+        taskBuses.set(taskId, created);
         broadcast.on('event', (event) => {
+          if (event.kind === 'task') created.replay = [];
+          else created.replay.push(event);
           const state = event.kind === 'statusUpdate' ? event.data.status?.state : undefined;
           if (
             state !== undefined &&
@@ -198,6 +211,65 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
         }
       } finally {
         release?.();
+      }
+    }
+
+    override async *resubscribe(
+      ...args: Parameters<DefaultRequestHandler['resubscribe']>
+    ): AsyncGenerator<StreamResponse, void, undefined> {
+      const task = taskBuses.get(args[0].id);
+      if (!task) {
+        yield* super.resubscribe(...args);
+        return;
+      }
+      const stream = super.resubscribe(...args);
+      try {
+        // Starting the iterator attaches the live queue; take the replay snapshot
+        // before the next await so no event can fall between replay and live data.
+        const firstPromise = stream.next();
+        const replay = task.replay.slice();
+        const first = await firstPromise;
+        if (first.done) return;
+        const replayedIds = new Set(
+          replay.flatMap((event) =>
+            event.kind === 'statusUpdate' && event.data.status?.message
+              ? [event.data.status.message.messageId]
+              : [],
+          ),
+        );
+        const payload = first.value.payload;
+        if (payload?.$case === 'task') {
+          const initial = payload.value;
+          const running = initial.status?.state === TaskState.TASK_STATE_WORKING;
+          yield {
+            payload: {
+              $case: 'task',
+              value: {
+                ...initial,
+                history: running
+                  ? initial.history?.filter((message) => !replayedIds.has(message.messageId))
+                  : initial.history,
+                status:
+                  running &&
+                  initial.status?.message &&
+                  replayedIds.has(initial.status.message.messageId)
+                    ? { ...initial.status, message: undefined }
+                    : initial.status,
+              },
+            },
+          };
+        } else {
+          yield first.value;
+        }
+        for (const event of replay) {
+          if (event.kind === 'statusUpdate')
+            yield { payload: { $case: 'statusUpdate', value: event.data } };
+          else if (event.kind === 'artifactUpdate')
+            yield { payload: { $case: 'artifactUpdate', value: event.data } };
+        }
+        yield* stream;
+      } finally {
+        await stream.return(undefined);
       }
     }
   })(card, options.taskStore, options.executor, busManager);
