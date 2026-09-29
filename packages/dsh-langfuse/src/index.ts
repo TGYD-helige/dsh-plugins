@@ -4,11 +4,10 @@
  * Instruments the documented seams, with zero core patches:
  *
  * - `llm/stream` waterfall  → one Langfuse **generation** per LLM call
- *   (input = full request; output, token usage and finish reason collected
+ *   (input = loop-built options; output, token usage and finish reason collected
  *   from the chunk stream), plus a nested `llm-request` **span** holding the
- *   verbatim loop-built request and the collected chunk stream (the rawest
- *   request/response a plugin can observe — the provider HTTP body is
- *   assembled inside the adapter).
+ *   same options and collected chunk stream (the rawest request/response a
+ *   plugin can observe — the provider HTTP body is assembled inside the adapter).
  * - `tools/execute` waterfall → one Langfuse **span** per tool dispatch
  *   (routed to the session's trace via `exec.agent.id` — the agent/session
  *   shared identity).
@@ -173,8 +172,8 @@ function modelParametersOf(
 }
 
 /**
- * The loop-built request as Langfuse input: verbatim (minus the AbortSignal,
- * which is not JSON-safe) when content capture is on, counts-only otherwise.
+ * The loop-built request as Langfuse input: every current/future option except
+ * the non-JSON-safe AbortSignal when content capture is on, counts otherwise.
  */
 function requestBodyOf(options: GenerateOptions, captureContent: boolean): Record<string, unknown> {
   if (!captureContent) {
@@ -475,13 +474,13 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     // spans never export in v5 — end it when the call settles.
     const oneOffRoot = options.sessionId ? null : parent;
     const generationName = options.purpose ? `llm-call [${options.purpose}]` : 'llm-call';
+    const modelParameters = modelParametersOf(options, config.captureContent);
+    const input = requestBodyOf(options, config.captureContent);
     const generation = reporter.startGeneration(parent, {
       name: generationName,
       model: options.model,
-      input: config.captureContent
-        ? { messages: options.messages, system: options.system, tools: options.tools }
-        : { messageCount: options.messages.length },
-      modelParameters: modelParametersOf(options, config.captureContent),
+      input,
+      modelParameters,
       metadata: { purpose: options.purpose },
     });
 
@@ -492,7 +491,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     // chunk stream (the raw response at this seam).
     const requestSpan = reporter.startSpan(generation, {
       name: 'llm-request',
-      input: requestBodyOf(options, config.captureContent),
+      input,
       metadata: { provider: options.provider },
     });
     const rawChunks: StreamChunk[] = [];
