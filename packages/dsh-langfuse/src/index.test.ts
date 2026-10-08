@@ -42,6 +42,7 @@ const mocks = vi.hoisted(() => {
     parentContext: unknown;
     readonly updates: Array<Record<string, unknown>> = [];
     ended = 0;
+    endedAt?: Date;
     readonly spans: MockObservation[] = [];
     readonly generations: MockObservation[] = [];
     /** Raw OTEL attributes stamped on the span (e.g. the session.id key). */
@@ -73,7 +74,8 @@ const mocks = vi.hoisted(() => {
       if (io.output !== undefined) this.attributes['langfuse.trace.output'] = io.output;
     }
 
-    end() {
+    end(endedAt?: Date) {
+      this.endedAt = endedAt;
       this.ended += 1;
     }
 
@@ -506,12 +508,10 @@ describe('dsh-langfuse plugin', () => {
 
     it('does not delay streaming for image reads and drains their closed observations before flush', async () => {
       let release!: (value: { ref: typeof image.attachment; data: Uint8Array }) => void;
-      const readImage = vi.fn(
-        () =>
-          new Promise<{ ref: typeof image.attachment; data: Uint8Array }>((resolve) => {
-            release = resolve;
-          }),
-      );
+      const pending = new Promise<{ ref: typeof image.attachment; data: Uint8Array }>((resolve) => {
+        release = resolve;
+      });
+      const readImage = vi.fn(() => pending);
       ctx.provide('attachments', { readImage } as unknown as AttachmentStore);
       await setup({ ...enabledConfig, captureMedia: true });
       const session = sessionOf('s1');
@@ -528,12 +528,24 @@ describe('dsh-langfuse plugin', () => {
       ).toEqual(chunks);
       const generation = mocks.roots[0].generations[0];
       expect(generation.ended).toBe(0);
+      const completedAt = new Date();
+      const result = { ...okResult(), content: [image] };
+      expect(await ctx.waterfall('tools/execute', execOf(), async () => result)).toBe(result);
+      const toolCompletedAt = new Date();
+      ctx.emit('session/event', session, ev('user/message', { content: [image] }));
       ctx.emit('session/event', session, turnEnd(0));
+      const turnCompletedAt = new Date();
       const flushing = ctx.parallel('session/flush', session);
       expect(mocks.providers[0].forceFlush).not.toHaveBeenCalled();
+      await new Promise((resolve) => setTimeout(resolve, 20));
       release({ ref: image.attachment, data: Uint8Array.of(1, 2, 3) });
       await flushing;
       expect(generation.ended).toBe(1);
+      expect(generation.endedAt?.getTime()).toBeLessThanOrEqual(completedAt.getTime());
+      expect(mocks.roots[0].spans[0].endedAt?.getTime()).toBeLessThanOrEqual(
+        toolCompletedAt.getTime(),
+      );
+      expect(mocks.roots[0].endedAt?.getTime()).toBeLessThanOrEqual(turnCompletedAt.getTime());
       expect(mocks.providers[0].forceFlush).toHaveBeenCalledTimes(1);
     });
 
@@ -1280,20 +1292,28 @@ describe('dsh-langfuse plugin', () => {
 
     it('logs metadata only when captureContent is off', async () => {
       await setup({ ...enabledConfig, captureContent: false });
-      await drain(
+      const received = await drain(
         ctx.waterfall('llm/stream', optionsOf(), () =>
           streamOf(
             textDelta('secret'),
+            toolCallEnd('read_file', '{"secret":"private"}'),
             usageChunk({ inputTokens: 1, outputTokens: 1 }),
             finishStop(),
           ),
         ),
       );
+      expect(received[0]).toEqual(textDelta('secret'));
+      expect(received[1]).toEqual(toolCallEnd('read_file', '{"secret":"private"}'));
       const generation = fakeObs(mocks.roots[0]).generations[0];
       expect(generation.body).toMatchObject({ input: { messageCount: 0 } });
       expect(lastUpdate(generation)).toMatchObject({
         output: undefined,
         usageDetails: { input: 1, output: 1, total: 2 },
+        metadata: { toolCallCount: 1 },
+      });
+      expect(lastUpdate(generation.spans[0])).toMatchObject({
+        output: undefined,
+        metadata: { chunkCount: 4 },
       });
     });
 

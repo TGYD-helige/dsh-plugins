@@ -155,20 +155,26 @@ try {
   await reporter.shutdown();
   const { Context } = await import(require.resolve('@deepseek-ai/cordis'));
   ctx = new Context();
+  let releaseImage;
+  let imageReads = 0;
+  const imageRead = new Promise((resolve) => { releaseImage = resolve; });
+  const imageRef = { id: 'fixture-image', mediaType: 'image/png', bytes: 3 };
   ctx.provide('attachments', {
-    readImage: () => {
-      throw new Error('late image read after unload');
-    },
+    readImage: () => { imageReads += 1; return imageRead; },
   });
   await apply(ctx, {
     ...connection,
     enabled: true,
     traceName: 'sdk-one-off',
+    // The loopback fixture tests read latency; masked URLs avoid real media uploads.
+    redactFields: ['url'],
     captureContent: true,
     captureMedia: true,
   });
   const stream = await ctx.waterfall('llm/stream', {
-    provider: 'fixture', model: 'fixture', messages: [], signal: new AbortController().signal,
+    provider: 'fixture', model: 'fixture',
+    messages: [{ role: 'user', content: [{ type: 'image', attachment: imageRef }] }],
+    signal: new AbortController().signal,
   }, async function* () {
     yield { type: 'reasoning-delta', index: 0, text: 'Consider the file.' };
     yield { type: 'block-end', index: 1, block: {
@@ -178,7 +184,16 @@ try {
     yield { type: 'finish', reason: { kind: 'stop' } };
   });
   for await (const _ of stream) { /* drain */ }
-  await ctx.parallel('session/flush', { id: 'fixture' });
+  const completedAt = Date.now();
+  const flushing = ctx.parallel('session/flush', { id: 'fixture' });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  releaseImage({ ref: imageRef, data: Uint8Array.of(1, 2, 3) });
+  await flushing;
+  const timedSpan = captured.find((span) =>
+    span.attributes.some((a) => a.key === 'langfuse.observation.model.name' && a.value.stringValue === 'fixture'),
+  );
+  assert.ok(Number(BigInt(timedSpan.endTimeUnixNano) / 1000000n) <= completedAt,
+    'image projection must not extend the exported model completion time');
   const projected = capturedToObservations(captured).find((o) => o.model === 'fixture');
   assert.deepEqual(projected.output, {
     role: 'assistant', thinking: [{ type: 'thinking', content: 'Consider the file.' }],
@@ -202,6 +217,7 @@ try {
   release(result);
   assert.equal(await operation, result);
   assert.equal(captured.length, 10, 'late completion must not export the same tool again');
+  assert.equal(imageReads, 1, 'late completion must not start another image read');
   console.log('real Langfuse SDK / OTLP checks passed');
 } finally {
   await ctx?.fiber.dispose();

@@ -368,6 +368,7 @@ export class LangfuseReporter {
       statusMessage?: string;
       metadata?: Record<string, unknown>;
     },
+    endedAt?: Date,
   ): void {
     if (!generation) return;
     try {
@@ -382,7 +383,7 @@ export class LangfuseReporter {
       });
       // v5 observation attributes have no `name` — renames ride the OTEL span.
       if (update.name) generation.otelSpan.updateName(update.name);
-      generation.end();
+      generation.end(endedAt);
     } catch (error) {
       console.error('[dsh-langfuse] generation end failed:', error);
     }
@@ -453,6 +454,7 @@ export class LangfuseReporter {
       statusMessage?: string;
       metadata?: Record<string, unknown>;
     } = {},
+    endedAt?: Date,
   ): void {
     if (!span) return;
     try {
@@ -461,7 +463,7 @@ export class LangfuseReporter {
       if (update.output !== undefined && this.roots.has(span)) {
         span.setTraceIO({ output: update.output });
       }
-      span.end();
+      span.end(endedAt);
     } catch (error) {
       console.error('[dsh-langfuse] span end failed:', error);
     }
