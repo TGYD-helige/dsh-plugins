@@ -768,9 +768,12 @@ describe('dsh-langfuse plugin', () => {
       expect(received).toEqual(chunks);
       const generation = mocks.roots[0].generations[0];
       expect(lastUpdate(generation).output).toEqual({
-        text: 'Checking now',
-        reasoning: 'Compare the options. Read the file.',
-        toolCalls: [{ name: 'read_file', arguments: '{}' }],
+        role: 'assistant',
+        content: 'Checking now',
+        thinking: [{ type: 'thinking', content: 'Compare the options. Read the file.' }],
+        tool_calls: [
+          { id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{}' } },
+        ],
       });
       expect(lastUpdate(generation.spans[0]).output).toEqual(chunks);
       await ctx.waterfall('tools/execute', execOf(), async () => okResult());
@@ -1157,7 +1160,16 @@ describe('dsh-langfuse plugin', () => {
       );
       const generation = fakeObs(mocks.roots[0]).generations[0];
       expect(lastUpdate(generation)).toMatchObject({
-        output: { text: '', toolCalls: [{ name: 'write_file', arguments: '{"path":"a.ts"}' }] },
+        output: {
+          role: 'assistant',
+          tool_calls: [
+            {
+              id: 'c1',
+              type: 'function',
+              function: { name: 'write_file', arguments: '{"path":"a.ts"}' },
+            },
+          ],
+        },
         metadata: { finishReason: 'stop', toolCallCount: 1 },
       });
     });
@@ -1804,8 +1816,8 @@ describe('usageOf', () => {
       input: 10,
       output: 5,
       total: 20,
-      input_cache_read: 2,
-      input_cache_creation: 3,
+      cache_read_input_tokens: 2,
+      cache_creation_input_tokens: 3,
     });
   });
 
@@ -1814,7 +1826,7 @@ describe('usageOf', () => {
       input: 10,
       output: 1,
       total: 15,
-      output_reasoning: 4,
+      output_reasoning_tokens: 4,
     });
   });
 
@@ -1910,7 +1922,7 @@ describe('LangfuseReporter', () => {
     });
     expect(lastUpdate(generation)).toMatchObject({
       output: 'hi',
-      usageDetails: { input: 10, output: 5, total: 17, input_cache_read: 2 },
+      usageDetails: { input: 10, output: 5, total: 17, cache_read_input_tokens: 2 },
       level: 'DEFAULT',
     });
     expect(generation.name).toBe('llm-call [hi]');

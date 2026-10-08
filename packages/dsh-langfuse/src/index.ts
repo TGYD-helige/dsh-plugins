@@ -693,7 +693,11 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
 
     let text = '';
     let reasoning = '';
-    const toolCalls: Array<{ name: string; arguments: string }> = [];
+    const toolCalls: Array<{
+      id: string;
+      type: 'function';
+      function: { name: string; arguments: string };
+    }> = [];
     let usage: TokenUsage | undefined;
     let finish: FinishReason | undefined;
     let completionStartTime: Date | undefined;
@@ -702,9 +706,10 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       config.captureContent
         ? toolCalls.length > 0 || reasoning
           ? {
-              text,
-              ...(reasoning ? { reasoning } : {}),
-              ...(toolCalls.length ? { toolCalls } : {}),
+              role: 'assistant',
+              ...(text ? { content: text } : {}),
+              ...(reasoning ? { thinking: [{ type: 'thinking', content: reasoning }] } : {}),
+              ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
             }
           : text || undefined
         : undefined;
@@ -794,7 +799,11 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
               break;
             case 'block-end':
               if (chunk.block.type === 'tool-call') {
-                toolCalls.push({ name: chunk.block.name, arguments: chunk.block.arguments });
+                toolCalls.push({
+                  id: chunk.block.id,
+                  type: 'function',
+                  function: { name: chunk.block.name, arguments: chunk.block.arguments },
+                });
               }
               break;
             case 'usage':

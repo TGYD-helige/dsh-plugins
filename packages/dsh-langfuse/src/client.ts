@@ -103,7 +103,7 @@ function parentContext(traceparent: string | undefined) {
  * INCLUDES reasoning (verified in dsh-llm-deepseek@0.1.6-alpha.2:
  * `outputTokens: usage.completion_tokens`, with reasoning split out of
  * `completion_tokens_details`), so the `output` bucket subtracts
- * `reasoningTokens` into `output_reasoning`. Only `usageDetails` is sent.
+ * `reasoningTokens` into `output_reasoning_tokens`. Only `usageDetails` is sent.
  */
 export function usageOf(usage: TokenUsage): Record<string, number> {
   // The dsh type marks the two primary fields required, but a non-conformant
@@ -122,9 +122,9 @@ export function usageOf(usage: TokenUsage): Record<string, number> {
     output: output - reasoning,
     total,
   };
-  if (usage.cacheReadTokens) usageDetails.input_cache_read = usage.cacheReadTokens;
-  if (usage.cacheWriteTokens) usageDetails.input_cache_creation = usage.cacheWriteTokens;
-  if (reasoning) usageDetails.output_reasoning = reasoning;
+  if (usage.cacheReadTokens) usageDetails.cache_read_input_tokens = usage.cacheReadTokens;
+  if (usage.cacheWriteTokens) usageDetails.cache_creation_input_tokens = usage.cacheWriteTokens;
+  if (reasoning) usageDetails.output_reasoning_tokens = reasoning;
   return usageDetails;
 }
 

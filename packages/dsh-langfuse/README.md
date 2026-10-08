@@ -57,7 +57,7 @@ Configured Langfuse credentials and `pk-lf-*` / `sk-lf-*` values are redacted ac
 
 ## Reasoning, images, and turn results
 
-Text-only generation output remains a string. When reasoning or tool calls are present, output contains `text`, optional `reasoning`, and optional `toolCalls`. The original reasoning deltas remain in the nested `llm-request` output; no extra generation is created.
+Text-only generation output remains a string. When reasoning or tool calls are present, output uses the Langfuse chat format: `role: "assistant"`, optional `content`, `thinking` blocks, and `tool_calls` with the original call ID and function arguments. This renders thinking and invoked tools in the formatted preview. The original reasoning deltas remain in the nested `llm-request` output; no extra generation is created.
 
 `captureMedia: true` requires content capture and an available `ctx.attachments` service (`@deepseek-ai/dsh-attachment >=0.2.0-rc.1`). Prompt, generation-input, and tool-output image references are read through that service and converted to data URIs for the SDK's media uploader. Install the attachment bundle appropriate to the deployment; the plugin does not instantiate a storage backend. Missing/failed reads, offloaded images, unsupported MIME types, oversized images, and disabled media fall back to MIME/size/dimension metadata. A generation's byte budget covers all messages in that request. `LANGFUSE_MEDIA_UPLOAD_ENABLED=false` (or `0`) overrides media capture. Verbatim file references remain metadata; their bytes are not uploaded.
 
@@ -81,9 +81,9 @@ Only explicit W3C version-00 parents with non-zero trace/span IDs are joined. In
 
 ## Token usage and cost
 
-Generation `usageDetails` has disjoint `input`, `input_cache_read`, `input_cache_creation`, `output`, and `output_reasoning` buckets plus `total`. Reasoning is subtracted from provider output before becoming its own bucket; cached input is counted separately. This avoids double-counting both usage and inferred cost.
+Generation `usageDetails` has disjoint `input`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `output`, and `output_reasoning_tokens` buckets plus `total`. Reasoning is subtracted from provider output before becoming its own bucket; cached input is counted separately. These keys match the official Pi integration. Custom definitions using the previous `input_cache_read`, `input_cache_creation`, or `output_reasoning` names must update their price keys. This avoids double-counting both usage and inferred cost.
 
-[Langfuse infers USD cost](https://langfuse.com/docs/observability/features/token-and-cost-tracking) when the generation model matches a model definition with prices for the **exact usage keys**. In Project Settings → Models, configure these buckets for private routes, model aliases, or custom prices; reasoning output generally uses the model's output rate. A token total does not prove that a matching price definition exists. dsh's current `TokenUsage` does not carry billed cost, so the plugin does not claim provider-invoiced costs or maintain its own price table.
+[Langfuse infers USD cost](https://langfuse.com/docs/observability/features/token-and-cost-tracking) when the generation model matches a model definition with prices for the **exact usage keys**. In Project Settings → Models, configure these buckets for private routes, model aliases, or custom prices; reasoning output generally uses the model's output rate. A token total does not prove that a matching price definition exists. If a generation shows “Create model definition”, its model has no matching definition. For gateway aliases, use the actual routed model and your gateway’s rates when defining prices; the plugin keeps the requested model name rather than guessing the upstream model. Definition changes apply to new generations only. dsh's current `TokenUsage` does not carry billed cost, so the plugin does not claim provider-invoiced costs or maintain its own price table.
 
 Compaction and session-title calls passing through `llm/stream` already receive their own generation and `purpose` metadata, including out-of-turn calls. Tools using the same LLM service are observed there too; adding a second generation from tool-result usage would duplicate accounting.
 
@@ -100,3 +100,5 @@ Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#comp
 ## License
 
 MIT
+
+The Langfuse integration scenarios label observations with environment `ci`, release `GITHUB_SHA`, and tags for scenario, run ID, and workflow run attempt. Select environment `ci` in Langfuse to find new E2E traces. Read-back uses a bounded time window for each model run and queries a discovered trace directly while ingestion settles.

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { LangfuseReporter } from '../../../../packages/dsh-langfuse/lib/client.js';
 import { apply } from '../../../../packages/dsh-langfuse/lib/index.js';
@@ -7,6 +8,7 @@ import {
   evaluateReasoning,
   evaluateTrace,
   startFakeIngestion,
+  runVerification,
 } from './langfuse-shared.mjs';
 import { integrationModel } from './ci-shared.mjs';
 
@@ -66,13 +68,13 @@ try {
     reporter.startGeneration(root, {
       name: 'llm-call',
       model: integrationModel(),
-      input: { messages: [] },
+      input: { messages: [{ role: 'user', content: 'sdk-marker' }] },
     }),
   );
   const request = reporter.startSpan(generation, { name: 'llm-request', input: { messages: [] } });
   reporter.endSpan(request, { output: [{ type: 'reasoning-delta', index: 0, text: 'check' }] });
   reporter.endGeneration(generation, {
-    output: { text: 'answer', reasoning: 'check' },
+    output: { role: 'assistant', content: 'answer', thinking: [{ type: 'thinking', content: 'check' }] },
     usage: { inputTokens: 10, outputTokens: 4, reasoningTokens: 1 },
   });
   reporter.endSpan(root);
@@ -111,6 +113,39 @@ try {
   const observations = capturedToObservations(captured);
   assert.deepEqual(evaluateTrace(observations, 'sdk-marker'), []);
   assert.deepEqual(evaluateReasoning(observations), []);
+  const fromStartTime = new Date(Date.now() - 60_000).toISOString();
+  const toStartTime = new Date().toISOString();
+  const queries = [];
+  const readback = createServer((request, response) => {
+    const params = new URL(request.url, 'http://localhost').searchParams;
+    queries.push(params);
+    if (params.get('fromStartTime') !== fromStartTime || params.get('toStartTime') !== toStartTime) {
+      response.writeHead(422).end('{"message":"bounded time range required"}');
+      return;
+    }
+    response.setHeader('content-type', 'application/json');
+    const rows = observations.map((o) => ({ ...o, traceId: 'sdk-trace' }));
+    if (params.get('type') === 'GENERATION') rows.unshift({
+      name: 'llm-call [session-title]', input: 'sdk-marker', traceId: 'purpose-trace',
+      metadata: { purpose: 'session-title' },
+    });
+    response.end(JSON.stringify({ data: rows }));
+  });
+  await new Promise((resolve) => readback.listen(0, '127.0.0.1', resolve));
+  try {
+    const result = await runVerification({
+      baseUrl: `http://127.0.0.1:${readback.address().port}`,
+      publicKey: 'fixture', secretKey: 'fixture', fromStartTime, toStartTime,
+      codeword: 'sdk-marker', evaluate: evaluateTrace,
+    });
+    assert.equal(result.ok, true, result.state);
+    assert.equal(queries.length, 2, 'discover once, then query that trace');
+    assert.equal(queries[0].get('model'), integrationModel());
+    assert.equal(queries[1].get('traceId'), 'sdk-trace');
+  } finally {
+    await new Promise((resolve) => readback.close(resolve));
+  }
+
   const legacyTools = observations.map((observation) =>
     observation.type === 'TOOL' ? { ...observation, type: 'SPAN' } : observation,
   );
@@ -132,6 +167,26 @@ try {
     captureContent: true,
     captureMedia: true,
   });
+  const stream = await ctx.waterfall('llm/stream', {
+    provider: 'fixture', model: 'fixture', messages: [], signal: new AbortController().signal,
+  }, async function* () {
+    yield { type: 'reasoning-delta', index: 0, text: 'Consider the file.' };
+    yield { type: 'block-end', index: 1, block: {
+      type: 'tool-call', id: 'sdk-call', name: 'read', arguments: '{"path":"marker"}',
+    } };
+    yield { type: 'usage', usage: { inputTokens: 10, cacheReadTokens: 2, outputTokens: 5, reasoningTokens: 3 } };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  });
+  for await (const _ of stream) { /* drain */ }
+  await ctx.parallel('session/flush', { id: 'fixture' });
+  const projected = capturedToObservations(captured).find((o) => o.model === 'fixture');
+  assert.deepEqual(projected.output, {
+    role: 'assistant', thinking: [{ type: 'thinking', content: 'Consider the file.' }],
+    tool_calls: [{ id: 'sdk-call', type: 'function', function: { name: 'read', arguments: '{"path":"marker"}' } }],
+  });
+  assert.deepEqual(projected.usageDetails, {
+    input: 10, cache_read_input_tokens: 2, output: 2, output_reasoning_tokens: 3, total: 17,
+  });
   let release;
   const pending = new Promise((resolve) => {
     release = resolve;
@@ -142,11 +197,11 @@ try {
     () => pending,
   );
   await ctx.fiber.dispose();
-  assert.equal(captured.length, 7, 'unload must export an agent-less tool and its root');
+  assert.equal(captured.length, 10, 'unload must export an agent-less tool and its root');
   const result = { isError: false, content: [{ type: 'image', attachment: {} }] };
   release(result);
   assert.equal(await operation, result);
-  assert.equal(captured.length, 7, 'late completion must not export the same tool again');
+  assert.equal(captured.length, 10, 'late completion must not export the same tool again');
   console.log('real Langfuse SDK / OTLP checks passed');
 } finally {
   await ctx?.fiber.dispose();
