@@ -51,7 +51,7 @@ export interface A2aServerOptions {
   };
   executor: AgentExecutor;
   taskStore: TaskStore;
-  heartbeat?: { enabled: boolean; intervalMs: number; mode?: 'comment' | 'artifact' };
+  heartbeat?: { enabled: boolean; intervalMs: number };
   approvalGuard?: (message: Message) => undefined | (() => void);
   beforeWorkingTaskMessage?: (message: Message, requestHeaders: unknown) => Promise<void>;
 }
@@ -395,25 +395,23 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
           // A slow client gets no additional heartbeat backlog; retry next tick.
           if (res.writableNeedDrain) return;
           try {
-            if (options.heartbeat?.mode === 'artifact') {
-              if (!task.taskId || !task.contextId) return;
-              const update = {
-                taskId: task.taskId,
-                contextId: task.contextId,
-                artifact: { artifactId: 'heartbeat', name: 'heartbeat', parts: [] },
-                append: false,
-                lastChunk: false,
-              };
-              res.write(
-                `data: ${JSON.stringify({
-                  jsonrpc: '2.0',
-                  id: req.body.id ?? null,
-                  result: legacy
-                    ? { kind: 'artifact-update', ...update }
-                    : { artifactUpdate: update },
-                })}\n\n`,
-              );
-            } else res.write(': heartbeat\n\n');
+            if (!task.taskId || !task.contextId) return;
+            const update = {
+              taskId: task.taskId,
+              contextId: task.contextId,
+              artifact: { artifactId: 'heartbeat', name: 'heartbeat', parts: [] },
+              append: false,
+              lastChunk: false,
+            };
+            res.write(
+              `data: ${JSON.stringify({
+                jsonrpc: '2.0',
+                id: req.body.id ?? null,
+                result: legacy
+                  ? { kind: 'artifact-update', ...update }
+                  : { artifactUpdate: update },
+              })}\n\n`,
+            );
           } catch (error) {
             stop();
             console.error('[dsh-a2a] heartbeat write failed:', error);
