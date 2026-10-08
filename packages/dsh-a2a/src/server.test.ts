@@ -1,3 +1,4 @@
+import { ServerResponse } from 'node:http';
 import { Role, type Task, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutor, ExecutionEventBus } from '@a2a-js/sdk/server';
 import { AgentEvent, type RequestContext } from '@a2a-js/sdk/server';
@@ -158,6 +159,224 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     expect(frames[0].result.task.status.state).toBe('TASK_STATE_SUBMITTED');
     const last = frames.at(-1);
     expect(last.result.statusUpdate.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity, 2_147_483_648])(
+    'rejects invalid heartbeat intervals: %s',
+    async (intervalMs) => {
+      await expect(
+        startA2aServer({
+          host: '127.0.0.1',
+          port: 0,
+          basePath: '/a2a',
+          card: { name: 'test-agent', description: 'test', version: '0.0.1' },
+          executor: stubExecutor,
+          taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+          heartbeat: { enabled: false, intervalMs },
+        }),
+      ).rejects.toThrow('heartbeat.intervalMs');
+    },
+  );
+
+  it.each([
+    'legacy send',
+    'v1 send',
+    'legacy subscribe',
+    'v1 subscribe',
+    'disabled',
+    'default',
+    'disconnect',
+    'disposal',
+    'stream error',
+    'response error',
+    'write failure',
+    'backpressure',
+  ])('configurable idle SSE heartbeat: %s', async (mode) => {
+    await server.close();
+    let resume!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const intervals = vi.spyOn(globalThis, 'setInterval');
+    const cleared = vi.spyOn(globalThis, 'clearInterval');
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let blocked = mode === 'backpressure';
+    let response!: ServerResponse;
+    const flush = ServerResponse.prototype.flushHeaders;
+    const flushing = vi
+      .spyOn(ServerResponse.prototype, 'flushHeaders')
+      .mockImplementation(function (this: ServerResponse) {
+        response = this;
+        if (mode === 'write failure') {
+          const write = this.write;
+          Object.defineProperty(this, 'write', {
+            value: (chunk: unknown, ...args: unknown[]) => {
+              if (chunk === ': heartbeat\n\n') throw new Error('heartbeat failed');
+              return Reflect.apply(write, this, [chunk, ...args]);
+            },
+          });
+        }
+        if (mode === 'backpressure')
+          Object.defineProperty(this, 'writableNeedDrain', { get: () => blocked });
+        flush.call(this);
+      });
+    server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      card: { name: 'test-agent', description: 'test', version: '0.0.1' },
+      taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+      heartbeat: mode === 'default' ? undefined : { enabled: mode !== 'disabled', intervalMs: 15 },
+      executor: {
+        async execute(request, bus) {
+          bus.publish(
+            AgentEvent.task({
+              id: request.taskId,
+              contextId: request.contextId,
+              status: {
+                state: TaskState.TASK_STATE_WORKING,
+                message: undefined,
+                timestamp: new Date().toISOString(),
+              },
+              history: [request.userMessage],
+              artifacts: [],
+              metadata: undefined,
+            }),
+          );
+          await paused;
+          if (mode === 'stream error') throw new Error('executor failed');
+          await stubExecutor.execute(request, {
+            ...bus,
+            publish: (event) => {
+              if (event.kind !== 'task') bus.publish(event);
+            },
+            finished: () => bus.finished(),
+          });
+        },
+        cancelTask: async () => {},
+      },
+    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2000);
+    try {
+      const legacy = mode.startsWith('legacy');
+      const call = (method: string, params: unknown) =>
+        fetch(`http://127.0.0.1:${server.port}/a2a/`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            ...(!legacy ? { 'A2A-Version': '1.0' } : {}),
+          },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+          signal: controller.signal,
+        });
+      const invalid = await call('UnknownMethod', {});
+      expect(invalid.headers.get('content-type')).toContain('application/json');
+      expect(await invalid.json()).toHaveProperty('error');
+      expect(intervals.mock.calls.filter(([, ms]) => ms === 15)).toHaveLength(0);
+      const sent = await call(legacy ? 'message/stream' : 'SendStreamingMessage', {
+        message: {
+          messageId: 'heartbeat-user',
+          role: 'user',
+          parts: legacy ? [{ kind: 'text', text: 'hello' }] : [{ text: 'hello' }],
+          ...(legacy ? { kind: 'message' } : {}),
+        },
+      });
+      let res = sent;
+      if (mode.endsWith('subscribe')) {
+        const sendReader = sent.body!.getReader();
+        const initial = JSON.parse(
+          new TextDecoder()
+            .decode((await sendReader.read()).value)
+            .split('\n\n')[0]
+            .slice(6),
+        ).result;
+        res = await call(legacy ? 'tasks/resubscribe' : 'SubscribeToTask', {
+          id: legacy ? initial.id : initial.task.id,
+        });
+        await sendReader.cancel();
+      }
+      const reader = res.body!.getReader();
+      let wire = '';
+      if (mode === 'disabled' || mode === 'default' || blocked) {
+        // Keep the executor paused beyond several ticks, then collect the complete wire.
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        expect(intervals.mock.calls.filter(([, ms]) => ms === 15)).toHaveLength(blocked ? 1 : 0);
+        if (!blocked) resume();
+        else {
+          const first = await reader.read();
+          wire += new TextDecoder().decode(first.value);
+          expect(wire).not.toContain(': heartbeat');
+          blocked = false;
+        }
+      }
+      while (
+        mode !== 'disabled' &&
+        mode !== 'default' &&
+        mode !== 'write failure' &&
+        wire.split(': heartbeat\n\n').length < 3
+      ) {
+        const chunk = await reader.read();
+        expect(chunk.done).toBe(false);
+        wire += new TextDecoder().decode(chunk.value);
+      }
+      if (mode === 'write failure') {
+        await vi.waitFor(() =>
+          expect(errors).toHaveBeenCalledWith(
+            '[dsh-a2a] heartbeat write failed:',
+            expect.objectContaining({ message: 'heartbeat failed' }),
+          ),
+        );
+      }
+      const timers = intervals.mock.results
+        .filter((_, i) => intervals.mock.calls[i][1] === 15)
+        .map((result) => result.value);
+      if (mode === 'disconnect' || mode === 'disposal' || mode === 'response error') {
+        if (mode === 'disconnect') await reader.cancel();
+        else if (mode === 'response error') response.emit('error', new Error('response failed'));
+        else await server.close();
+        await vi.waitFor(() => {
+          for (const timer of timers) expect(cleared).toHaveBeenCalledWith(timer);
+        });
+        return;
+      }
+      if (mode === 'write failure') {
+        for (const timer of timers) expect(cleared).toHaveBeenCalledWith(timer);
+      }
+      resume();
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        wire += new TextDecoder().decode(chunk.value);
+      }
+      const events = wire
+        .split('\n\n')
+        .filter((frame) => frame.startsWith('data: '))
+        .map((frame) => JSON.parse(frame.slice(6)));
+      if (mode === 'stream error') {
+        expect(events.at(-1).result.statusUpdate.status.state).toBe('TASK_STATE_FAILED');
+        expect(errors).toHaveBeenCalled();
+      } else {
+        const last = events.at(-1).result;
+        const status = legacy ? last.status : last.statusUpdate.status;
+        expect(status.state).toBe(legacy ? 'input-required' : 'TASK_STATE_INPUT_REQUIRED');
+        expect(status.message.parts[0].text).toBe('done');
+      }
+      if (mode === 'disabled' || mode === 'default') expect(wire).not.toContain(': heartbeat');
+      else
+        await vi.waitFor(() => {
+          for (const timer of timers) expect(cleared).toHaveBeenCalledWith(timer);
+        });
+    } finally {
+      clearTimeout(timeout);
+      resume();
+      controller.abort();
+      await server.close();
+      intervals.mockRestore();
+      cleared.mockRestore();
+      errors.mockRestore();
+      flushing.mockRestore();
+    }
   });
 
   it('returns live history in the first legacy resubscribe frame', async () => {

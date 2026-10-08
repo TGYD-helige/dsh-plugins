@@ -9,7 +9,7 @@
  *   through the SDK's opt-in legacyCompat layer
  *
  * The SSE framing and error envelopes are the SDK's; this layer only binds
- * the server and builds the card.
+ * the server, builds the card, and optionally adds transport heartbeats.
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -51,6 +51,7 @@ export interface A2aServerOptions {
   };
   executor: AgentExecutor;
   taskStore: TaskStore;
+  heartbeat?: { enabled: boolean; intervalMs: number };
   approvalGuard?: (message: Message) => undefined | (() => void);
   beforeWorkingTaskMessage?: (message: Message, requestHeaders: unknown) => Promise<void>;
 }
@@ -62,6 +63,11 @@ export interface A2aServer {
 }
 
 export async function startA2aServer(options: A2aServerOptions): Promise<A2aServer> {
+  const intervalMs = options.heartbeat?.intervalMs ?? 15_000;
+  if (!Number.isInteger(intervalMs) || intervalMs < 1 || intervalMs > 2_147_483_647) {
+    throw new Error('[dsh-a2a] heartbeat.intervalMs must be an integer from 1 to 2147483647');
+  }
+  const stopHeartbeats = new Set<() => void>();
   const base = options.basePath.replace(/\/$/, '');
   const publicUrl = (options.card.publicUrl ?? `http://${options.host}:${options.port}`).replace(
     /\/$/,
@@ -362,6 +368,41 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
   // The SDK's jsonRpcHandler parses bodies with express.json()'s 100kb default;
   // raise the ceiling here — body-parser skips re-parsing an already-read body.
   app.use(express.json({ limit: '16mb' }));
+  if (options.heartbeat?.enabled) {
+    app.use((_req, res, next) => {
+      const flushHeaders = res.flushHeaders;
+      // Wait for the SDK to commit SSE headers: validation errors stay JSON.
+      res.flushHeaders = function () {
+        flushHeaders.call(this);
+        if (!String(res.getHeader('content-type')).startsWith('text/event-stream') || timer) return;
+        timer = setInterval(() => {
+          if (res.destroyed || res.writableEnded) return stop();
+          // A slow client gets no additional heartbeat backlog; retry next tick.
+          if (res.writableNeedDrain) return;
+          try {
+            res.write(': heartbeat\n\n');
+          } catch (error) {
+            stop();
+            console.error('[dsh-a2a] heartbeat write failed:', error);
+          }
+        }, intervalMs);
+        timer.unref();
+        stopHeartbeats.add(stop);
+        res.once('finish', stop);
+        res.once('close', stop);
+        res.once('error', stop);
+      };
+      let timer: ReturnType<typeof setInterval> | undefined;
+      const stop = () => {
+        clearInterval(timer);
+        stopHeartbeats.delete(stop);
+        res.off('finish', stop);
+        res.off('close', stop);
+        res.off('error', stop);
+      };
+      next();
+    });
+  }
   const cardHandler = agentCardHandler({
     agentCardProvider: requestHandler,
     legacyCompat: { enabled: true },
@@ -447,6 +488,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     port: (server.address() as AddressInfo).port,
     close: () =>
       new Promise<void>((resolve) => {
+        for (const stop of stopHeartbeats) stop();
         server.closeAllConnections?.();
         server.close(() => resolve());
       }),

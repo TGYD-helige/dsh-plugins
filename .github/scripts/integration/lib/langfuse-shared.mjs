@@ -550,7 +550,7 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false }) {
 
   let hookPatch = '';
   if (hook) {
-    const version = envOr(process.env.DSH_CLI_VERSION, '0.2.0-rc.1');
+    const version = envOr(process.env.DSH_CLI_VERSION, '0.2.0-rc.2');
     run(dsh, [
       'plugin', '--profile', 'headless', 'add',
       `@deepseek-ai/dsh-hooks-codex@${version}`,

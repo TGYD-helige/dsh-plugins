@@ -67,7 +67,7 @@ jobs:
 
       - name: Install DSH (pinned)
         run: |
-          npm install --global @deepseek-ai/dsh@0.1.7-rc.2
+          npm install --global @deepseek-ai/dsh@0.2.0-rc.2
           dsh --version
 
       - name: Prepare untrusted PR data for review

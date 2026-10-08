@@ -25,6 +25,9 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
         host: 127.0.0.1        # no auth built in — keep loopback or front with a proxy
         port: 41241
         basePath: /a2a
+        heartbeat:
+          enabled: false     # opt in to transport keepalive comments
+          intervalMs: 15000  # positive integer, at most 2147483647
         cwd: /srv/agent-workspaces
         uploadsDir: ''         # file-part upload root; empty = <OS temp>/dsh-a2a-uploads/<date>
         agent:
@@ -68,6 +71,28 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
 - **Restart**: persisted task shells survive in Redis/GCS. With `sessionPersistence` composed, a `contextId` already present on disk resumes its dsh session after restart; a new id creates a new session.
 - **Clear**: the same-process gateway can call `ctx.get('a2aTasks').clearContext(contextId)` before reporting `messages/clear` success. It cancels and drains the live turn, removes the binding and every TaskStore shell for that context, and returns the removed task IDs. The gateway owns the separate session-surface replacement and client-visible history-ID update.
 
+## SSE heartbeats
+
+Set `heartbeat.enabled: true` to send the SSE comment `: heartbeat\n\n` every
+`heartbeat.intervalMs` (default 15000 ms). The default is disabled. Intervals
+must be positive integers no greater than 2147483647 ms (Node's timer limit).
+This covers `SendStreamingMessage` / `SubscribeToTask` and their legacy
+`message/stream` / `tasks/resubscribe` equivalents. The timer starts after the
+SDK commits SSE headers; pre-stream validation and failures retain their JSON
+responses. There is no heartbeat while waiting for the SDK's first stream event.
+
+Comments contain no JSON payload and are ignored by SSE event parsers. They
+keep an otherwise idle transport active without changing task state, history,
+results, or event IDs. A client whose idle timeout resets only on parsed JSON
+messages will still time out: reset that transport timer on received bytes, or
+configure a longer timeout. Reverse proxies must forward streaming bytes without
+buffering for keepalives to reach the client.
+
+Heartbeats are skipped while the response requires drain, with no heartbeat
+queue or catch-up burst. Timers stop on completion, disconnect, response errors,
+and server disposal. Heartbeats require a responsive event loop; they cannot
+repair event-loop starvation or guarantee delivery during backpressure.
+
 ## Task stores
 
 A2A task snapshots retain protocol history and artifacts; [dsh-storage](../dsh-storage) separately records the full conversation. Backends save on task-state transitions, including the complete reply at `input-required`, so token-rate stream events never reach Redis or GCS. While a task is working, in-process history accumulates text deltas for `GetTask` and resubscription; a restart before the next state change can lose those transient deltas.
@@ -84,7 +109,7 @@ dsh ships **no authentication or authorization**. The server binds `127.0.0.1` b
 
 ## Compatibility
 
-Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment}@0.2.0-rc.1` — the attachment store is an optional peer) — check the `TODO(verify)` markers in `src/` before upgrading dsh.
+Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment}@0.2.0-rc.2` — the attachment store is an optional peer) — check the `TODO(verify)` markers in `src/` before upgrading dsh.
 
 ## License
 
