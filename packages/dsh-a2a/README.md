@@ -26,7 +26,7 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
         port: 41241
         basePath: /a2a
         heartbeat:
-          enabled: false     # opt in to transport keepalive comments
+          enabled: false     # opt in to SSE heartbeats
           intervalMs: 15000  # positive integer, at most 2147483647
         cwd: /srv/agent-workspaces
         uploadsDir: ''         # file-part upload root; empty = <OS temp>/dsh-a2a-uploads/<date>
@@ -73,20 +73,30 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
 
 ## SSE heartbeats
 
-Set `heartbeat.enabled: true` to send the SSE comment `: heartbeat\n\n` every
-`heartbeat.intervalMs` (default 15000 ms). The default is disabled. Intervals
-must be positive integers no greater than 2147483647 ms (Node's timer limit).
-This covers `SendStreamingMessage` / `SubscribeToTask` and their legacy
+Set `heartbeat.enabled: true` to send heartbeats every `heartbeat.intervalMs`
+(default 15000 ms). The default is disabled. Intervals must be positive integers
+no greater than 2147483647 ms (Node's timer limit). This covers
+`SendStreamingMessage` / `SubscribeToTask` and their legacy
 `message/stream` / `tasks/resubscribe` equivalents. The timer starts after the
 SDK commits SSE headers; pre-stream validation and failures retain their JSON
 responses. There is no heartbeat while waiting for the SDK's first stream event.
 
-Comments contain no JSON payload and are ignored by SSE event parsers. They
-keep an otherwise idle transport active without changing task state, history,
-results, or event IDs. A client whose idle timeout resets only on parsed JSON
-messages will still time out: reset that transport timer on received bytes, or
-configure a longer timeout. Reverse proxies must forward streaming bytes without
-buffering for keepalives to reach the client.
+Heartbeats are JSON artifact updates with `artifact.name === "heartbeat"`, so
+clients that refresh their idle timer on parsed JSON messages receive activity
+throughout otherwise idle task streams. Legacy streams receive:
+
+```text
+data: {"jsonrpc":"2.0","id":"<request-id>","result":{"kind":"artifact-update","taskId":"<task-id>","contextId":"<context-id>","artifact":{"artifactId":"heartbeat","name":"heartbeat","parts":[]},"append":false,"lastChunk":false}}
+
+```
+
+Native A2A 1.0 streams use `result.artifactUpdate` with the same fields (without
+`kind`). Identifiers come from the current request and streamed task, including
+resubscription requests. Clients should refresh their idle timer and discard
+these empty heartbeat artifacts without displaying content. Heartbeats are sent
+directly on the transport, never persisted as task artifacts or history, and do
+not change task status, completion, or event IDs. Reverse proxies must forward
+streaming bytes without buffering for keepalives to reach the client.
 
 Heartbeats are skipped while the response requires drain, with no heartbeat
 queue or catch-up burst. Timers stop on completion, disconnect, response errors,

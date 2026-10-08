@@ -211,7 +211,8 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
           const write = this.write;
           Object.defineProperty(this, 'write', {
             value: (chunk: unknown, ...args: unknown[]) => {
-              if (chunk === ': heartbeat\n\n') throw new Error('heartbeat failed');
+              if (String(chunk).includes('"artifactId":"heartbeat"'))
+                throw new Error('heartbeat failed');
               return Reflect.apply(write, this, [chunk, ...args]);
             },
           });
@@ -260,6 +261,7 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     const timeout = setTimeout(() => controller.abort(), 2000);
     try {
       const legacy = mode.startsWith('legacy');
+      const heartbeat = '"artifactId":"heartbeat"';
       const call = (method: string, params: unknown) =>
         fetch(`http://127.0.0.1:${server.port}/a2a/`, {
           method: 'POST',
@@ -267,7 +269,15 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
             'content-type': 'application/json',
             ...(!legacy ? { 'A2A-Version': '1.0' } : {}),
           },
-          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id:
+              method.includes('subscribe') || method === 'SubscribeToTask'
+                ? 'subscription'
+                : 'send',
+            method,
+            params,
+          }),
           signal: controller.signal,
         });
       const invalid = await call('UnknownMethod', {});
@@ -306,19 +316,44 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
         else {
           const first = await reader.read();
           wire += new TextDecoder().decode(first.value);
-          expect(wire).not.toContain(': heartbeat');
+          expect(wire).not.toContain(heartbeat);
           blocked = false;
         }
       }
+      // Legacy clients refresh their idle timeout only for parsed JSON messages.
+      const parsedClient = legacy;
+      let lastMessage = Date.now();
+      let parsedThrough = 0;
       while (
         mode !== 'disabled' &&
         mode !== 'default' &&
         mode !== 'write failure' &&
-        wire.split(': heartbeat\n\n').length < 3
+        wire.split(heartbeat).length < (parsedClient ? 10 : 3)
       ) {
-        const chunk = await reader.read();
-        expect(chunk.done).toBe(false);
-        wire += new TextDecoder().decode(chunk.value);
+        let idleTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const chunk = await Promise.race([
+            reader.read(),
+            new Promise<never>((_, reject) => {
+              idleTimer = setTimeout(
+                () => reject(new Error('parsed-message idle timeout')),
+                parsedClient ? Math.max(1, 75 - (Date.now() - lastMessage)) : 2000,
+              );
+            }),
+          ]);
+          expect(chunk.done).toBe(false);
+          wire += new TextDecoder().decode(chunk.value);
+          const complete = wire.split('\n\n').slice(0, -1);
+          for (const frame of complete.slice(parsedThrough)) {
+            if (frame.startsWith('data: ')) {
+              JSON.parse(frame.slice(6));
+              lastMessage = Date.now();
+            }
+          }
+          parsedThrough = complete.length;
+        } finally {
+          clearTimeout(idleTimer);
+        }
       }
       if (mode === 'write failure') {
         await vi.waitFor(() =>
@@ -353,6 +388,44 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
         .split('\n\n')
         .filter((frame) => frame.startsWith('data: '))
         .map((frame) => JSON.parse(frame.slice(6)));
+      expect(wire).not.toContain(': heartbeat');
+      if (mode !== 'disabled' && mode !== 'default' && mode !== 'write failure') {
+        const anchor = legacy ? events[0].result : events[0].result.task;
+        const beats = events.filter(
+          (event) =>
+            (legacy ? event.result.artifact : event.result.artifactUpdate?.artifact)?.name ===
+            'heartbeat',
+        );
+        expect(beats.length).toBeGreaterThanOrEqual(2);
+        for (const beat of beats) {
+          expect(beat).toEqual({
+            jsonrpc: '2.0',
+            id: mode.endsWith('subscribe') ? 'subscription' : 'send',
+            result: legacy
+              ? {
+                  kind: 'artifact-update',
+                  taskId: anchor.id,
+                  contextId: anchor.contextId,
+                  artifact: { artifactId: 'heartbeat', name: 'heartbeat', parts: [] },
+                  append: false,
+                  lastChunk: false,
+                }
+              : {
+                  artifactUpdate: {
+                    taskId: anchor.id,
+                    contextId: anchor.contextId,
+                    artifact: { artifactId: 'heartbeat', name: 'heartbeat', parts: [] },
+                    append: false,
+                    lastChunk: false,
+                  },
+                },
+          });
+        }
+        const stored = (await (
+          await call(legacy ? 'tasks/get' : 'GetTask', { id: anchor.id })
+        ).json()) as any;
+        expect(stored.result.artifacts ?? []).toEqual([]);
+      }
       if (mode === 'stream error') {
         expect(events.at(-1).result.statusUpdate.status.state).toBe('TASK_STATE_FAILED');
         expect(errors).toHaveBeenCalled();
@@ -362,7 +435,7 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
         expect(status.state).toBe(legacy ? 'input-required' : 'TASK_STATE_INPUT_REQUIRED');
         expect(status.message.parts[0].text).toBe('done');
       }
-      if (mode === 'disabled' || mode === 'default') expect(wire).not.toContain(': heartbeat');
+      if (mode === 'disabled' || mode === 'default') expect(wire).not.toContain(heartbeat);
       else
         await vi.waitFor(() => {
           for (const timer of timers) expect(cleared).toHaveBeenCalledWith(timer);

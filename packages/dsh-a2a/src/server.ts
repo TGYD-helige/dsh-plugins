@@ -51,7 +51,7 @@ export interface A2aServerOptions {
   };
   executor: AgentExecutor;
   taskStore: TaskStore;
-  heartbeat?: { enabled: boolean; intervalMs: number };
+  heartbeat?: { enabled: boolean; intervalMs: number; mode?: 'comment' | 'artifact' };
   approvalGuard?: (message: Message) => undefined | (() => void);
   beforeWorkingTaskMessage?: (message: Message, requestHeaders: unknown) => Promise<void>;
 }
@@ -68,6 +68,18 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     throw new Error('[dsh-a2a] heartbeat.intervalMs must be an integer from 1 to 2147483647');
   }
   const stopHeartbeats = new Set<() => void>();
+  const heartbeatTask = new AsyncLocalStorage<{ taskId?: string; contextId?: string }>();
+  async function* observeTask(stream: AsyncGenerator<StreamResponse, void, undefined>) {
+    for await (const event of stream) {
+      const state = heartbeatTask.getStore();
+      const payload = event.payload;
+      if (state && payload && payload.$case !== 'message') {
+        state.taskId = payload.$case === 'task' ? payload.value.id : payload.value.taskId;
+        state.contextId = payload.value.contextId;
+      }
+      yield event;
+    }
+  }
   const base = options.basePath.replace(/\/$/, '');
   const publicUrl = (options.card.publicUrl ?? `http://${options.host}:${options.port}`).replace(
     /\/$/,
@@ -248,7 +260,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       const release = guardApproval(args[0].message);
       try {
         if (!release) await beforeWorkingTaskMessage(args[0].message, args[1]);
-        const stream = super.sendMessageStream(...args);
+        const stream = observeTask(super.sendMessageStream(...args));
         try {
           if (release) {
             const first = await approvalReply.run(true, () => stream.next());
@@ -268,10 +280,10 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     ): AsyncGenerator<StreamResponse, void, undefined> {
       const task = taskBuses.get(args[0].id);
       if (!task) {
-        yield* super.resubscribe(...args);
+        yield* observeTask(super.resubscribe(...args));
         return;
       }
-      const stream = super.resubscribe(...args);
+      const stream = observeTask(super.resubscribe(...args));
       try {
         const replay = task.replay.slice();
         const last = replay.at(-1);
@@ -369,7 +381,10 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
   // raise the ceiling here — body-parser skips re-parsing an already-read body.
   app.use(express.json({ limit: '16mb' }));
   if (options.heartbeat?.enabled) {
-    app.use((_req, res, next) => {
+    app.use((req, res, next) => {
+      const task: { taskId?: string; contextId?: string } = {};
+      const legacy =
+        req.body?.method === 'message/stream' || req.body?.method === 'tasks/resubscribe';
       const flushHeaders = res.flushHeaders;
       // Wait for the SDK to commit SSE headers: validation errors stay JSON.
       res.flushHeaders = function () {
@@ -380,7 +395,25 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
           // A slow client gets no additional heartbeat backlog; retry next tick.
           if (res.writableNeedDrain) return;
           try {
-            res.write(': heartbeat\n\n');
+            if (options.heartbeat?.mode === 'artifact') {
+              if (!task.taskId || !task.contextId) return;
+              const update = {
+                taskId: task.taskId,
+                contextId: task.contextId,
+                artifact: { artifactId: 'heartbeat', name: 'heartbeat', parts: [] },
+                append: false,
+                lastChunk: false,
+              };
+              res.write(
+                `data: ${JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: req.body.id ?? null,
+                  result: legacy
+                    ? { kind: 'artifact-update', ...update }
+                    : { artifactUpdate: update },
+                })}\n\n`,
+              );
+            } else res.write(': heartbeat\n\n');
           } catch (error) {
             stop();
             console.error('[dsh-a2a] heartbeat write failed:', error);
@@ -400,7 +433,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
         res.off('close', stop);
         res.off('error', stop);
       };
-      next();
+      heartbeatTask.run(task, next);
     });
   }
   const cardHandler = agentCardHandler({
