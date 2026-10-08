@@ -37,6 +37,7 @@ import {
 } from '@a2a-js/sdk/server';
 import { agentCardHandler, jsonRpcHandler, UserBuilder } from '@a2a-js/sdk/server/express';
 import express, { type RequestHandler } from 'express';
+import { legacyStreamHandler } from './legacy-stream.js';
 
 export interface A2aServerOptions {
   host: string;
@@ -507,7 +508,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       rpcHandler,
     );
   }
-  app.use(base, contextLookup, rpcHandler);
+  app.use(base, contextLookup, legacyStreamHandler(requestHandler), rpcHandler);
 
   const server: Server = createServer(app);
   await new Promise<void>((resolve, reject) => {
