@@ -43,7 +43,17 @@ import type {} from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-subagent';
 import type {} from '@deepseek-ai/dsh-tools';
 import Schema from '@deepseek-ai/schemastery';
-import { LangfuseReporter, type ObservationLevel } from './client.js';
+import { LangfuseReporter, type LangfuseTraceContext, type ObservationLevel } from './client.js';
+import { displayBlocks } from './media.js';
+
+export type { LangfuseTraceContext } from './client.js';
+
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /** Bind standard labels/parent context before a session's next trace starts. */
+    'langfuse/context': (sessionId: string, context: LangfuseTraceContext) => void;
+  }
+}
 
 export const name = 'dsh-langfuse';
 
@@ -59,10 +69,28 @@ export const Config = Schema.object({
   enabled: Schema.boolean().default(false).description('master switch'),
   publicKey: Schema.string().default('').description('Langfuse public key'),
   secretKey: Schema.string().role('secret').default('').description('Langfuse secret key'),
-  baseUrl: Schema.string().default('https://cloud.langfuse.com'),
+  baseUrl: Schema.string()
+    .default('')
+    .description('profile override for LANGFUSE_BASE_URL; defaults to EU cloud'),
   traceName: Schema.string().default('dsh-turn'),
   /** Include full message/tool payloads in Langfuse IO. Disable to log metadata only. */
   captureContent: Schema.boolean().default(true),
+  redactFields: Schema.array(Schema.string())
+    .default([])
+    .description('case-insensitive payload fields to redact'),
+  userId: Schema.string().default(''),
+  tags: Schema.array(Schema.string()).default([]),
+  environment: Schema.string().default(''),
+  release: Schema.string().default(''),
+  captureMedia: Schema.boolean()
+    .default(false)
+    .description('upload attachment images for display; requires captureContent'),
+  maxMediaBytes: Schema.number()
+    .min(1)
+    .step(1)
+    .default(5 * 1024 * 1024)
+    .description('image byte budget per display payload'),
+  mediaTimeoutMs: Schema.number().min(1).max(60_000).step(1).default(5000),
 });
 
 export interface LangfusePluginConfig {
@@ -72,6 +100,14 @@ export interface LangfusePluginConfig {
   baseUrl: string;
   traceName: string;
   captureContent: boolean;
+  redactFields?: string[];
+  userId?: string;
+  tags?: string[];
+  environment?: string;
+  release?: string;
+  captureMedia?: boolean;
+  maxMediaBytes?: number;
+  mediaTimeoutMs?: number;
 }
 
 /** Any observation handle the plugin tracks (v5: trace roots and spans are the same type). */
@@ -84,6 +120,7 @@ interface SessionTrace {
   hasInput: boolean;
   /** The turn's latest assistant text — becomes the trace's output at `turn/end`. */
   lastAssistantText?: string;
+  hadErrors?: boolean;
 }
 
 /**
@@ -222,8 +259,49 @@ function toolCallSummary(args: unknown): string | undefined {
   return undefined;
 }
 
+/** Redact each complete block before exporting fragments that could reconstruct a secret. */
+function redactChunks(chunks: StreamChunk[], reporter: LangfuseReporter): StreamChunk[] {
+  const groups = new Map<string, { text: string; positions: number[] }>();
+  for (const [position, chunk] of chunks.entries()) {
+    if (
+      chunk.type !== 'text-delta' &&
+      chunk.type !== 'reasoning-delta' &&
+      chunk.type !== 'tool-call-delta'
+    )
+      continue;
+    const key = `${chunk.type}:${chunk.index}`;
+    const group = groups.get(key) ?? { text: '', positions: [] };
+    group.text += chunk.type === 'tool-call-delta' ? chunk.argumentsDelta : chunk.text;
+    group.positions.push(position);
+    groups.set(key, group);
+  }
+  const output = [...chunks];
+  for (const group of groups.values()) {
+    const masked = reporter.mask(group.text);
+    if (masked === group.text) continue;
+    // Sensitive content changes, but the record count/type/index remain.
+    for (const [index, position] of group.positions.entries()) {
+      const chunk = chunks[position];
+      const text = index === 0 ? masked : '';
+      if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta')
+        output[position] = { ...chunk, text };
+      else if (chunk.type === 'tool-call-delta')
+        output[position] = { ...chunk, argumentsDelta: text };
+    }
+  }
+  return output;
+}
+
 export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void> | void {
-  if (!config.enabled || !config.publicKey || !config.secretKey) return;
+  if (!config.enabled || /^(false|0)$/i.test(process.env.LANGFUSE_TRACING_ENABLED ?? '')) return;
+  config = {
+    ...config,
+    publicKey: config.publicKey || process.env.LANGFUSE_PUBLIC_KEY || '',
+    secretKey: config.secretKey || process.env.LANGFUSE_SECRET_KEY || '',
+    baseUrl: config.baseUrl || process.env.LANGFUSE_BASE_URL || 'https://cloud.langfuse.com',
+    userId: config.userId || process.env.LANGFUSE_USER_ID,
+  };
+  if (!config.publicKey || !config.secretKey) return;
 
   const reporter = new LangfuseReporter(config);
   const sessions = new Map<string, SessionTrace>();
@@ -231,6 +309,83 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   /** Per-session stack of currently open tools/execute spans (for subagent parenting). */
   const openToolSpans = new Map<string, ObservationHandle[]>();
   const openHooks = new Map<string, Map<string, ObservationHandle>>();
+  const openOperations = new Set<() => void>();
+  const traceContexts = new Map<string, LangfuseTraceContext>();
+  type Handle =
+    | NonNullable<ObservationHandle>
+    | NonNullable<ReturnType<LangfuseReporter['startGeneration']>>;
+  const pendingMedia = new Set<Promise<void>>();
+  const mediaFor = new WeakMap<Handle, Promise<void>>();
+  const mediaOptions = {
+    enabled:
+      config.captureContent &&
+      !!config.captureMedia &&
+      !/^(false|0)$/i.test(process.env.LANGFUSE_MEDIA_UPLOAD_ENABLED ?? ''),
+    maxBytes: config.maxMediaBytes ?? 5 * 1024 * 1024,
+    timeoutMs: config.mediaTimeoutMs ?? 5000,
+  };
+
+  function trackMedia(task: Promise<void>): Promise<void> {
+    const pending = task.catch((error) => {
+      console.error('[dsh-langfuse] media finalization failed:', error);
+    });
+    pendingMedia.add(pending);
+    void pending.then(() => pendingMedia.delete(pending));
+    return pending;
+  }
+
+  function enrichInput(handle: Handle | null, input: Promise<unknown>): void {
+    if (!handle) return;
+    mediaFor.set(
+      handle,
+      trackMedia(input.then((value) => reporter.updateSpan(handle, { input: value }))),
+    );
+  }
+
+  function afterMedia(
+    handle: Handle | null,
+    close: (endedAt: Date) => void,
+    endedAt = new Date(),
+  ): void {
+    const task = handle ? mediaFor.get(handle) : undefined;
+    if (task) trackMedia(task.then(() => close(endedAt)));
+    else close(endedAt);
+  }
+
+  function setMessageInput(handle: ObservationHandle, content: readonly ContentBlock[]): void {
+    if (content.some((block) => block.type !== 'text')) {
+      enrichInput(handle, displayBlocks(content, ctx.get('attachments'), mediaOptions));
+    } else reporter.updateSpan(handle, { input: messageText({ content }) });
+  }
+
+  async function drainMedia(): Promise<void> {
+    while (pendingMedia.size) await Promise.all([...pendingMedia]);
+  }
+
+  ctx.on('langfuse/context', (sessionId, context) => {
+    traceContexts.set(sessionId, {
+      ...context,
+      tags: context.tags ? [...context.tags] : undefined,
+    });
+  });
+
+  function openTrace(sessionId: string | undefined, metadata?: Record<string, unknown>) {
+    const context = sessionId ? traceContexts.get(sessionId) : undefined;
+    if (sessionId) traceContexts.delete(sessionId);
+    return reporter.openTrace({ name: config.traceName, sessionId, metadata, context });
+  }
+
+  function rootSessionId(sessionId: string | undefined): string | undefined {
+    while (sessionId && children.has(sessionId))
+      sessionId = children.get(sessionId)?.parentSessionId;
+    return sessionId;
+  }
+
+  function noteError(sessionId: string | undefined): void {
+    const id = rootSessionId(sessionId);
+    const state = id ? sessions.get(id) : undefined;
+    if (state) state.hadErrors = true;
+  }
 
   function closeHooks(sessionId: string): void {
     for (const span of openHooks.get(sessionId)?.values() ?? []) {
@@ -250,11 +405,10 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
    * (a tree by construction) to the root trace.
    */
   function traceFor(sessionId: string | undefined): ObservationHandle {
-    let id = sessionId;
-    while (id && children.has(id)) id = children.get(id)?.parentSessionId;
+    const id = rootSessionId(sessionId);
     const existing = id ? sessions.get(id) : undefined;
     if (existing) return existing.trace;
-    const trace = reporter.openTrace({ name: config.traceName, sessionId: id });
+    const trace = openTrace(id);
     // hasInput starts true: one-offs never take a turn's first-message input.
     if (trace && id) sessions.set(id, { trace, hasInput: true });
     return trace;
@@ -304,19 +458,26 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   ctx.on('subagent/end', (info) => {
     const child = children.get(info.id);
     if (!child) return;
+    if (info.stopReason === 'error') noteError(info.id);
     children.delete(info.id);
-    reporter.endSpan(child.span, {
-      output: {
-        stopReason: info.stopReason,
-        ...(config.captureContent ? { lastAssistantMessage: info.lastAssistantMessage } : {}),
-      },
-      level:
-        info.stopReason === 'error'
-          ? 'ERROR'
-          : info.stopReason === 'aborted'
-            ? 'WARNING'
-            : 'DEFAULT',
-    });
+    afterMedia(child.span, (endedAt) =>
+      reporter.endSpan(
+        child.span,
+        {
+          output: {
+            stopReason: info.stopReason,
+            ...(config.captureContent ? { lastAssistantMessage: info.lastAssistantMessage } : {}),
+          },
+          level:
+            info.stopReason === 'error'
+              ? 'ERROR'
+              : info.stopReason === 'aborted'
+                ? 'WARNING'
+                : 'DEFAULT',
+        },
+        endedAt,
+      ),
+    );
   });
 
   // ------------------------------------------------------------------
@@ -358,6 +519,8 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       const pending = openHooks.get(sessionId);
       const span = pending?.get(data.handlerId);
       if (span) {
+        if (data.exitCode === undefined || (data.exitCode !== 0 && data.exitCode !== 2))
+          noteError(sessionId);
         reporter.endSpan(span, {
           output: {
             decision: data.decision,
@@ -383,7 +546,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       // The delegated prompt (the child's first user/message) is the
       // subagent span's input; the descriptor enriches the span name.
       if (event.type === 'user/message' && !child.hasInput && config.captureContent) {
-        reporter.updateSpan(child.span, { input: messageText(event.data) });
+        setMessageInput(child.span, event.data.content);
         child.hasInput = true;
       } else if (event.type === 'subagent/descriptor') {
         // The label is the delegation's model-authored description — content.
@@ -405,19 +568,15 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         // keep what it already recorded.
         closeHooks(sessionId);
         const stale = sessions.get(sessionId);
-        if (stale) reporter.endSpan(stale.trace);
-        const trace = reporter.openTrace({
-          name: config.traceName,
-          sessionId,
-          metadata: { turn: event.data.turn },
-        });
+        if (stale) afterMedia(stale.trace, (endedAt) => reporter.endSpan(stale.trace, {}, endedAt));
+        const trace = openTrace(sessionId, { turn: event.data.turn });
         if (trace) sessions.set(sessionId, { trace, hasInput: false });
         break;
       }
       case 'user/message': {
         const state = sessions.get(sessionId);
         if (state && !state.hasInput && config.captureContent) {
-          reporter.updateSpan(state.trace, { input: messageText(event.data) });
+          setMessageInput(state.trace, event.data.content);
           state.hasInput = true;
         }
         break;
@@ -435,10 +594,35 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
           sessions.delete(sessionId);
           // The turn's final answer becomes the trace's output; ending the
           // root span is what exports the trace (v5 exports spans on end).
-          reporter.endSpan(state.trace, {
-            output: state.lastAssistantText,
-            metadata: { turn: event.data.turn, endReason: event.data.reason.kind },
-          });
+          afterMedia(state.trace, (endedAt) =>
+            reporter.endSpan(
+              state.trace,
+              {
+                output: state.lastAssistantText,
+                level:
+                  event.data.reason.kind === 'error'
+                    ? 'ERROR'
+                    : ['aborted', 'blocked', 'max-tokens', 'interrupted'].includes(
+                          event.data.reason.kind,
+                        )
+                      ? 'WARNING'
+                      : 'DEFAULT',
+                statusMessage:
+                  event.data.reason.kind === 'error'
+                    ? contentMessage(config, event.data.reason.error.message)
+                    : undefined,
+                metadata: {
+                  turn: event.data.turn,
+                  endReason: event.data.reason.kind,
+                  ...(state.hadErrors ? { hadErrors: true } : {}),
+                  ...(event.data.reason.kind === 'error'
+                    ? { errorCode: event.data.reason.error.code }
+                    : {}),
+                },
+              },
+              endedAt,
+            ),
+          );
         }
         break;
       }
@@ -450,11 +634,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     closeHooks(sessionId);
     const state = sessions.get(sessionId);
     sessions.delete(sessionId);
+    traceContexts.delete(sessionId);
     openToolSpans.delete(sessionId);
     // End an abandoned root (crash-orphaned turn or between-turns one-off
     // trace) — v5 spans only export on end, so dropping it open would lose
     // everything it recorded.
-    if (state) reporter.endSpan(state.trace);
+    if (state) afterMedia(state.trace, (endedAt) => reporter.endSpan(state.trace, {}, endedAt));
     // Children: keep the entry — background/continuable subagents dispose
     // their session BEFORE subagent/end fires, and the span's close must ride
     // subagent/end (disposing first would either leak the span or close it
@@ -483,6 +668,28 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       modelParameters,
       metadata: { purpose: options.purpose },
     });
+    if (
+      generation &&
+      config.captureContent &&
+      options.messages.some((message) => message.content.some((block) => block.type === 'image'))
+    ) {
+      const budget = { remaining: mediaOptions.maxBytes };
+      enrichInput(
+        generation,
+        Promise.all(
+          options.messages.map(async (message) => ({
+            ...message,
+            content: await displayBlocks(
+              message.content,
+              ctx.get('attachments'),
+              mediaOptions,
+              options.signal,
+              budget,
+            ),
+          })),
+        ).then((messages) => ({ ...input, messages })),
+      );
+    }
 
     // The rawest request a plugin can observe: the loop-built GenerateOptions
     // verbatim, pre-adapter (the provider HTTP body is assembled inside the
@@ -495,47 +702,116 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       metadata: { provider: options.provider },
     });
     const rawChunks: StreamChunk[] = [];
-    const closeRequest = (level: ObservationLevel, statusMessage?: string) => {
-      reporter.endSpan(requestSpan, {
-        output: config.captureContent ? rawChunks : undefined,
-        level,
-        statusMessage,
-        metadata: { chunkCount: rawChunks.length },
-      });
-    };
+    let chunkCount = 0;
+    let toolCallCount = 0;
 
+    let text = '';
+    let reasoning = '';
+    const toolCalls: Array<{
+      id: string;
+      type: 'function';
+      function: { name: string; arguments: string };
+    }> = [];
+    let usage: TokenUsage | undefined;
+    let finish: FinishReason | undefined;
+    let completionStartTime: Date | undefined;
+    let thrownMessage: string | undefined;
+    const outputBody = () =>
+      config.captureContent
+        ? toolCalls.length > 0 || reasoning
+          ? {
+              role: 'assistant',
+              ...(text ? { content: text } : {}),
+              ...(reasoning ? { thinking: [{ type: 'thinking', content: reasoning }] } : {}),
+              ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+            }
+          : text || undefined
+        : undefined;
+    let closed = false;
+    const closeCall = () => {
+      if (closed) return;
+      closed = true;
+      const endedAt = new Date();
+      openOperations.delete(closeCall);
+      const failure =
+        finish && (finish.kind === 'error' || finish.kind === 'aborted') ? finish : undefined;
+      // No terminal finish chunk (the consumer abandoned the stream or
+      // the adapter cut it short): the call's outcome is unknown — mark
+      // it instead of posing as a normal completion.
+      let level: ObservationLevel = 'DEFAULT';
+      let statusMessage: string | undefined;
+      if (thrownMessage !== undefined) {
+        level = 'ERROR';
+        statusMessage = contentMessage(config, thrownMessage);
+      } else if (failure) {
+        level = failure.kind === 'aborted' ? 'WARNING' : 'ERROR';
+        // `failure` is contractually required on error/aborted finishes,
+        // but a non-conformant adapter must never turn observability into
+        // a generator-level TypeError escaping into the agent loop.
+        statusMessage = contentMessage(config, failure.failure?.message ?? 'unknown failure');
+      } else if (!finish) {
+        level = 'WARNING';
+        statusMessage = 'stream closed before the terminal finish chunk';
+      }
+      reporter.endSpan(
+        requestSpan,
+        {
+          output: config.captureContent ? redactChunks(rawChunks, reporter) : undefined,
+          level,
+          statusMessage,
+          metadata: { chunkCount },
+        },
+        endedAt,
+      );
+      if (level === 'ERROR') noteError(options.sessionId);
+      // Partial progress counts on every path: whatever streamed is kept.
+      afterMedia(
+        generation,
+        (endedAt) =>
+          reporter.endGeneration(
+            generation,
+            {
+              name: config.captureContent
+                ? enhanceWithFirstLine(generationName, reporter.mask(text))
+                : undefined,
+              output: outputBody(),
+              usage,
+              completionStartTime,
+              level,
+              statusMessage,
+              metadata: {
+                finishReason: finish?.kind,
+                errorCode: failure?.failure?.code,
+                incomplete: finish ? undefined : true,
+                toolCallCount: toolCallCount > 0 ? toolCallCount : undefined,
+              },
+            },
+            endedAt,
+          ),
+        endedAt,
+      );
+      reporter.endSpan(oneOffRoot, {}, endedAt);
+    };
+    openOperations.add(closeCall);
     let stream: AsyncIterable<StreamChunk>;
     try {
       stream = next();
     } catch (error) {
-      const statusMessage = contentMessage(config, messageOf(error));
-      closeRequest('ERROR', statusMessage);
-      reporter.endGeneration(generation, { level: 'ERROR', statusMessage });
-      reporter.endSpan(oneOffRoot);
+      thrownMessage = messageOf(error);
+      closeCall();
       throw error;
     }
 
-    // Tee the chunk stream: replay every chunk unchanged, then close the
-    // generation from the terminal `finish` chunk and accumulated content.
-    // Stream failures surface as a `finish` chunk with an error/aborted
-    // reason rather than throwing; the single close in `finally` also covers
-    // consumer abandonment and mid-stream throws.
+    // Replay unchanged; unload can finish the observation before this iterator settles.
     return (async function* () {
-      let text = '';
-      const toolCalls: Array<{ name: string; arguments: string }> = [];
-      let usage: TokenUsage | undefined;
-      let finish: FinishReason | undefined;
-      let completionStartTime: Date | undefined;
-      let thrownMessage: string | undefined;
-      const outputBody = () =>
-        config.captureContent
-          ? toolCalls.length > 0
-            ? { text, toolCalls }
-            : text || undefined
-          : undefined;
       try {
         for await (const chunk of stream) {
-          rawChunks.push(chunk);
+          if (closed) {
+            yield chunk;
+            continue;
+          }
+          chunkCount += 1;
+          if (config.captureContent) rawChunks.push(chunk);
           // TTFT is the first real token — block boundaries, usage frames and
           // empty heartbeat deltas are not completions (the predicate above).
           if (completionStartTime === undefined && isTokenDelta(chunk)) {
@@ -543,11 +819,20 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
           }
           switch (chunk.type) {
             case 'text-delta':
-              text += chunk.text;
+              if (config.captureContent) text += chunk.text;
+              break;
+            case 'reasoning-delta':
+              if (config.captureContent) reasoning += chunk.text;
               break;
             case 'block-end':
               if (chunk.block.type === 'tool-call') {
-                toolCalls.push({ name: chunk.block.name, arguments: chunk.block.arguments });
+                toolCallCount += 1;
+                if (config.captureContent)
+                  toolCalls.push({
+                    id: chunk.block.id,
+                    type: 'function',
+                    function: { name: chunk.block.name, arguments: chunk.block.arguments },
+                  });
               }
               break;
             case 'usage':
@@ -566,43 +851,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         thrownMessage = messageOf(error);
         throw error;
       } finally {
-        const failure =
-          finish && (finish.kind === 'error' || finish.kind === 'aborted') ? finish : undefined;
-        // No terminal finish chunk (the consumer abandoned the stream or
-        // the adapter cut it short): the call's outcome is unknown — mark
-        // it instead of posing as a normal completion.
-        let level: ObservationLevel = 'DEFAULT';
-        let statusMessage: string | undefined;
-        if (thrownMessage !== undefined) {
-          level = 'ERROR';
-          statusMessage = contentMessage(config, thrownMessage);
-        } else if (failure) {
-          level = failure.kind === 'aborted' ? 'WARNING' : 'ERROR';
-          // `failure` is contractually required on error/aborted finishes,
-          // but a non-conformant adapter must never turn observability into
-          // a generator-level TypeError escaping into the agent loop.
-          statusMessage = contentMessage(config, failure.failure?.message ?? 'unknown failure');
-        } else if (!finish) {
-          level = 'WARNING';
-          statusMessage = 'stream closed before the terminal finish chunk';
-        }
-        closeRequest(level, statusMessage);
-        // Partial progress counts on every path: whatever streamed is kept.
-        reporter.endGeneration(generation, {
-          name: enhanceWithFirstLine(generationName, text),
-          output: outputBody(),
-          usage,
-          completionStartTime,
-          level,
-          statusMessage,
-          metadata: {
-            finishReason: finish?.kind,
-            errorCode: failure?.failure?.code,
-            incomplete: finish ? undefined : true,
-            toolCallCount: toolCalls.length > 0 ? toolCalls.length : undefined,
-          },
-        });
-        reporter.endSpan(oneOffRoot);
+        closeCall();
       }
     })();
   });
@@ -620,59 +869,96 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     // it — it rides this dispatch's (same one-off rule as llm/stream).
     const oneOffRoot = sessionId ? null : parent;
     // Argument summaries are argument content — they ride captureContent.
-    const argSummary = config.captureContent ? toolCallSummary(exec.arguments) : undefined;
+    const args = config.captureContent ? reporter.mask(exec.arguments) : undefined;
+    const argSummary = config.captureContent ? toolCallSummary(args) : undefined;
     const span = reporter.startSpan(parent, {
       name: `tool:${exec.name}${argSummary ? ` [${argSummary}]` : ''}`,
-      input: config.captureContent ? exec.arguments : undefined,
+      asType: 'tool',
+      input: args,
       metadata: { callId: exec.callId, toolName: exec.name },
     });
     if (sessionId && span) {
       openToolSpans.set(sessionId, [...(openToolSpans.get(sessionId) ?? []), span]);
     }
+    let closed = false;
+    const closeTool = () =>
+      finishTool({ level: 'WARNING', statusMessage: 'plugin unloaded during tool call' });
+    function finishTool(
+      update: NonNullable<Parameters<LangfuseReporter['endSpan']>[1]>,
+      display?: Promise<unknown>,
+    ): void {
+      if (closed) return;
+      closed = true;
+      const endedAt = new Date();
+      openOperations.delete(closeTool);
+      if (sessionId && span) {
+        const remaining = (openToolSpans.get(sessionId) ?? []).filter((s) => s !== span);
+        if (remaining.length) openToolSpans.set(sessionId, remaining);
+        else openToolSpans.delete(sessionId);
+      }
+      const end = (output = update.output) => {
+        reporter.endSpan(span, { ...update, output }, endedAt);
+        reporter.endSpan(oneOffRoot, {}, endedAt);
+      };
+      if (display)
+        trackMedia(
+          display.then(end).catch((error) => {
+            console.error('[dsh-langfuse] media projection failed:', error);
+            end();
+          }),
+        );
+      else end();
+    }
+    openOperations.add(closeTool);
     try {
       const result = await next();
-      reporter.endSpan(span, {
+      if (closed) return result;
+      if (result.isError) noteError(sessionId);
+      const update = {
         output: config.captureContent ? result.content : undefined,
-        level: result.isError ? 'ERROR' : 'DEFAULT',
+        level: (result.isError ? 'ERROR' : 'DEFAULT') as ObservationLevel,
         statusMessage: result.isError ? contentMessage(config, result.error.message) : undefined,
         metadata: { errorCode: result.isError ? result.error.info?.code : undefined },
-      });
+      };
+      if (span && config.captureContent && result.content.some((block) => block.type === 'image')) {
+        finishTool(
+          update,
+          displayBlocks(result.content, ctx.get('attachments'), mediaOptions, exec.signal),
+        );
+      } else finishTool(update);
       return result;
     } catch (error) {
-      reporter.endSpan(span, {
+      noteError(sessionId);
+      finishTool({
         level: 'ERROR',
         statusMessage: contentMessage(config, messageOf(error)),
       });
       throw error;
-    } finally {
-      reporter.endSpan(oneOffRoot);
-      if (sessionId && span) {
-        const remaining = (openToolSpans.get(sessionId) ?? []).filter((s) => s !== span);
-        if (remaining.length > 0) openToolSpans.set(sessionId, remaining);
-        else openToolSpans.delete(sessionId);
-      }
     }
   });
 
   // Durability checkpoint: the store awaits every session/flush listener.
-  ctx.on('session/flush', () => reporter.flush());
+  ctx.on('session/flush', async () => {
+    await drainMedia();
+    await reporter.flush();
+  });
 
   // Lifecycle: this cordis fork has no ready/dispose events — cleanup rides
   // the fiber unload via ctx.effect() (shutdown() chains behind the lazy
   // import, so a still-importing SDK is never shut down mid-construction).
   ctx.effect(() => {
     return async () => {
+      const endedAt = new Date();
+      for (const close of openOperations) close();
+      for (const sessionId of openHooks.keys()) closeHooks(sessionId);
+      await drainMedia();
       // End every tracked observation still open before shutting the exporter
       // down — v5 spans only export on end, so unloading mid-turn (profile
-      // reload) would otherwise silently drop them. (An in-flight generation
-      // isn't tracked; its own tee finally closes it if the stream settles.)
-      for (const sessionId of openHooks.keys()) closeHooks(sessionId);
-      for (const state of sessions.values()) reporter.endSpan(state.trace);
-      for (const child of children.values()) reporter.endSpan(child.span);
-      for (const spans of openToolSpans.values()) {
-        for (const span of spans) reporter.endSpan(span);
-      }
+      // reload) would otherwise silently drop them.
+      for (const state of sessions.values()) reporter.endSpan(state.trace, {}, endedAt);
+      for (const child of children.values()) reporter.endSpan(child.span, {}, endedAt);
       sessions.clear();
+      traceContexts.clear();
       children.clear();
       openToolSpans.clear();
       await reporter.shutdown();

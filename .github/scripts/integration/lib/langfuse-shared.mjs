@@ -72,7 +72,7 @@ export function assert(cond, msg) {
 // Parenting note (v5): the trace IS its root span, so "parented at the trace
 // root" means parentObservationId === the `dsh-turn` root span's id, not null.
 export function evaluateTrace(observations, codeword) {
-  const spans = observations.filter((o) => o.type === 'SPAN');
+  const spans = observations.filter((o) => o.type === 'SPAN' || o.type === 'TOOL');
   const generations = observations.filter((o) => o.type === 'GENERATION');
   const problems = [];
   const need = (condition, message) => {
@@ -110,6 +110,7 @@ export function evaluateTrace(observations, codeword) {
   );
   need(toolSpan, 'missing codeword-bearing "tool:*" span');
   if (toolSpan) {
+    need(toolSpan.type === 'TOOL', 'tool observation must have type TOOL');
     need(toolSpan.endTime != null, `"${toolSpan.name}" span has no endTime (never completed)`);
     need(
       !root || toolSpan.parentObservationId === root.id,
@@ -144,9 +145,14 @@ export function evaluateReasoning(observations) {
       Array.isArray(o.output) &&
       o.output.some((c) => c?.type === 'reasoning-delta'),
   );
-  return has
-    ? []
-    : ['no llm-request span output has a reasoning-delta chunk (thinking should be enabled at max)'];
+  const displayed = observations.some(
+    (o) => o.type === 'GENERATION' && Array.isArray(o.output?.thinking) &&
+      o.output.thinking.some((part) => part?.type === 'thinking' && part.content?.length > 0),
+  );
+  return [
+    ...(!has ? ['no llm-request span output has a reasoning-delta chunk (thinking should be enabled at max)'] : []),
+    ...(!displayed ? ['no generation output displays reasoning'] : []),
+  ];
 }
 
 // A real UserPromptSubmit command hook must inject context into the LLM
@@ -207,7 +213,7 @@ export function evaluateHookTrace(observations, codeword) {
 // fails the delegation-span check). Parenting note (v5): the trace IS its
 // root span, so the delegation span parents at the `dsh-turn` root span's id.
 export function evaluateSubagentTrace(observations, codeword) {
-  const spans = observations.filter((o) => o.type === 'SPAN');
+  const spans = observations.filter((o) => o.type === 'SPAN' || o.type === 'TOOL');
   const generations = observations.filter((o) => o.type === 'GENERATION');
   const problems = [];
   const need = (condition, message) => {
@@ -221,6 +227,7 @@ export function evaluateSubagentTrace(observations, codeword) {
   const delegation = spans.find((o) => o.name?.startsWith('tool:subagent'));
   need(delegation, 'missing delegation "tool:subagent*" span');
   if (delegation) {
+    need(delegation.type === 'TOOL', 'delegation observation must have type TOOL');
     need(delegation.endTime != null, 'delegation span has no endTime (never completed)');
     need(
       !root || delegation.parentObservationId === root.id,
@@ -256,6 +263,7 @@ export function evaluateSubagentTrace(observations, codeword) {
       JSON.stringify(o.input ?? '').includes(codeword),
   );
   need(childTool, 'no codeword-bearing tool span under the "subagent" span');
+  if (childTool) need(childTool.type === 'TOOL', 'child tool observation must have type TOOL');
   return problems;
 }
 
@@ -297,7 +305,7 @@ function spanToObservation(span) {
     id: span.spanId,
     parentObservationId: span.parentSpanId || null,
     name: span.name,
-    type: otlpAttr(span, 'langfuse.observation.type') === 'generation' ? 'GENERATION' : 'SPAN',
+    type: (otlpAttr(span, 'langfuse.observation.type') ?? 'span').toUpperCase(),
     input: otlpJsonAttr(span, 'langfuse.observation.input'),
     output: otlpJsonAttr(span, 'langfuse.observation.output'),
     model: otlpAttr(span, 'langfuse.observation.model.name') ?? undefined,
@@ -309,13 +317,13 @@ function spanToObservation(span) {
 }
 
 // Spans export exactly once (on end), so folding is a plain map.
-function capturedToObservations(captured) {
+export function capturedToObservations(captured) {
   return captured.map(spanToObservation);
 }
 
 // Polls the v1 Observations API until a codeworded generation's trace matches
 // the expected shape or the deadline passes. Returns { ok, state }.
-async function runVerification({ baseUrl, publicKey, secretKey, fromStartTime, codeword, evaluate }) {
+export async function runVerification({ baseUrl, publicKey, secretKey, fromStartTime, toStartTime, codeword, evaluate }) {
   const origin = baseUrl.replace(/\/+$/, '');
   const deadline = Date.now() + VERIFY_DEADLINE_MS;
   const auth = `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString('base64')}`;
@@ -327,6 +335,7 @@ async function runVerification({ baseUrl, publicKey, secretKey, fromStartTime, c
       // trigger request errors on some deployments.
       const query = new URLSearchParams({
         fromStartTime,
+        toStartTime,
         limit: '100',
         page: String(page),
         ...params,
@@ -378,6 +387,7 @@ async function runVerification({ baseUrl, publicKey, secretKey, fromStartTime, c
   }
 
   let lastState = 'no candidate trace seen yet';
+  let traceIds = [];
   while (true) {
     let waitMs = POLL_INTERVAL_MS;
     try {
@@ -385,17 +395,21 @@ async function runVerification({ baseUrl, publicKey, secretKey, fromStartTime, c
       // prompt mentions the marker file; tool-call arguments repeat it). No
       // server-side name filter — generations are renamed `llm-call [<first
       // line>]` at close, so exact-name queries would miss them; the prefix
-      // and the run-unique codeword do the filtering client-side.
-      const candidates = await fetchObservations({ type: 'GENERATION' });
-      const traceIds = [
-        ...new Set(
-          candidates
-            .filter(
-              (o) => o.name?.startsWith('llm-call') && JSON.stringify(o).includes(codeword),
-            )
-            .map((o) => o.traceId),
-        ),
-      ];
+      // and the run-unique codeword do the filtering client-side. Purpose
+      // calls may land in a separate trace before the turn; never cache them.
+      if (traceIds.length === 0) {
+        const candidates = await fetchObservations({ type: 'GENERATION', model: EXPECTED_MODEL });
+        traceIds = [
+          ...new Set(
+            candidates
+              .filter(
+                (o) => o.name?.startsWith('llm-call') && o.metadata?.purpose == null &&
+                JSON.stringify(o).includes(codeword),
+              )
+              .map((o) => o.traceId),
+          ),
+        ];
+      }
 
       for (const traceId of traceIds) {
         const observations = await fetchObservations({ traceId });
@@ -434,7 +448,7 @@ async function runVerification({ baseUrl, publicKey, secretKey, fromStartTime, c
 // In-process fake Langfuse endpoint for the secrets-free mode: the v5 SDK
 // exports OTLP/HTTP JSON (application/json) — capture every span from
 // POST /api/public/otel/v1/traces in memory; anything else 404s loudly.
-async function startFakeIngestion(captured) {
+export async function startFakeIngestion(captured) {
   const server = createServer((req, res) => {
     if (req.method !== 'POST' || !req.url?.startsWith('/api/public/otel/v1/traces')) {
       console.log(`::warning::unexpected ${req.method} ${req.url}`);
@@ -516,6 +530,8 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false }) {
   }
 
   const dshHomeEnv = { DSH_HOME: dshHome };
+  const runId = envOr(process.env.GITHUB_RUN_ID, 'local');
+  const runAttempt = envOr(process.env.GITHUB_RUN_ATTEMPT, '1');
 
   // Install the packed bundle (idempotent — the workflow's Stage A already
   // did it once), then the Langfuse SDK v5 peer stack: the profile template
@@ -574,6 +590,9 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false }) {
     publicKey: ${pluginConnection.publicKey}
     secretKey: ${pluginConnection.secretKey}
     baseUrl: ${pluginConnection.baseUrl}
+    environment: ci
+    release: ${JSON.stringify(envOr(process.env.GITHUB_SHA, 'local'))}
+    tags: ${JSON.stringify(['ci', `scenario:${tag}`, `run:${runId}`, `attempt:${runAttempt}`])}
 
 - id: agent-default-model
   config:
@@ -599,10 +618,7 @@ ${hookPatch}
   // Marker FILE NAMES are the codewords: they flow into tool-span inputs and
   // generation IO, and are unique per leg × CI run so concurrent legs against
   // the same Langfuse project can't cross-match.
-  const runId = envOr(process.env.GITHUB_RUN_ID, 'local');
-  const runAttempt = envOr(process.env.GITHUB_RUN_ATTEMPT, '1');
   const codeword = `ci-marker-${tag}-${runId}-${runAttempt}`;
-  const runStartedAt = new Date(Date.now() - 60_000).toISOString();
 
   function runQuery(prompt) {
     console.log(`\n$ dsh --profile headless "${prompt}"`);
@@ -646,6 +662,7 @@ ${hookPatch}
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     console.log(`\n(${name} attempt ${attempt}/${maxAttempts})`);
     captured.length = 0;
+    const runStartedAt = new Date(Date.now() - 1000).toISOString();
     await runQuery(prompt(markerFile));
     let problems;
     if (realMode) {
@@ -654,6 +671,7 @@ ${hookPatch}
         publicKey,
         secretKey,
         fromStartTime: runStartedAt,
+        toStartTime: new Date().toISOString(),
         codeword,
         evaluate,
       });
