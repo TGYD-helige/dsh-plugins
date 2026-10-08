@@ -1,6 +1,13 @@
 import { Context, type Events } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
-import type { GenerateOptions, StreamChunk, TokenUsage, ToolCallId } from '@deepseek-ai/dsh-llm';
+import type { AttachmentStore } from '@deepseek-ai/dsh-attachment';
+import type {
+  ContentBlock,
+  GenerateOptions,
+  StreamChunk,
+  TokenUsage,
+  ToolCallId,
+} from '@deepseek-ai/dsh-llm';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import type {
   ToolDispatchExecution,
@@ -10,7 +17,7 @@ import type {
 import type { LangfuseGeneration, LangfuseSpan } from '@langfuse/tracing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { LangfuseReporter, usageOf } from './client.js';
-import { apply, inject, name } from './index.js';
+import { apply, inject, type LangfusePluginConfig, name } from './index.js';
 
 // The shared Langfuse SDK mock: the v5 SDK surface is three modules —
 // @langfuse/tracing (startObservation + setLangfuseTracerProvider),
@@ -113,6 +120,7 @@ vi.mock('@langfuse/tracing', () => ({
   ) => {
     if (mocks.state.failCreate) throw new Error('ingestion down');
     const root = new mocks.MockObservation(name, attrs ?? {}, opts?.asType ?? 'span');
+    root.attributes['langfuse.internal.is_app_root'] = true;
     root.parentContext = opts?.parentSpanContext;
     mocks.roots.push(root);
     return root;
@@ -120,6 +128,7 @@ vi.mock('@langfuse/tracing', () => ({
   setLangfuseTracerProvider: (provider: unknown) => {
     mocks.isolatedProviders.push(provider);
   },
+  LangfuseOtelSpanAttributes: { IS_APP_ROOT: 'langfuse.internal.is_app_root' },
 }));
 vi.mock('@langfuse/otel', () => ({ LangfuseSpanProcessor: mocks.MockSpanProcessor }));
 vi.mock('@opentelemetry/sdk-trace-node', () => ({
@@ -137,6 +146,7 @@ const fakeGen = (value: unknown): MockObservation & LangfuseGeneration =>
   value as MockObservation & LangfuseGeneration;
 
 beforeEach(() => {
+  vi.unstubAllEnvs();
   mocks.processors.length = 0;
   mocks.providers.length = 0;
   mocks.roots.length = 0;
@@ -167,6 +177,16 @@ const ev = (type: string, data: unknown): SessionEvent =>
 const sessionOf = (id: string, header: Record<string, unknown> = {}): Session =>
   ({ id, header: { id, ...header } }) as unknown as Session;
 const agentOf = (id: string): Agent => ({ id }) as unknown as Agent;
+const image: Extract<ContentBlock, { type: 'image' }> = {
+  type: 'image',
+  attachment: {
+    attachmentId: 'image-1' as never,
+    mediaType: 'image/png',
+    bytes: 3,
+    width: 1,
+    height: 1,
+  },
+};
 
 const childSessionOf = (id: string, parentSessionId: string, depth = 1): Session =>
   sessionOf(id, { parentSession: parentSessionId, origin: 'subagent', delegationDepth: depth });
@@ -266,7 +286,7 @@ describe('dsh-langfuse plugin', () => {
   let ctx: Context;
 
   /** apply + await the initialization promise it returns. */
-  async function setup(config = enabledConfig): Promise<void> {
+  async function setup(config: LangfusePluginConfig = enabledConfig): Promise<void> {
     await apply(ctx, config);
   }
 
@@ -309,7 +329,7 @@ describe('dsh-langfuse plugin', () => {
         'subagent/end',
       ]),
     );
-    expect(mocks.processors[0].config).toEqual({
+    expect(mocks.processors[0].config).toMatchObject({
       publicKey: 'pk',
       secretKey: 'sk',
       baseUrl: 'https://langfuse.example',
@@ -320,6 +340,544 @@ describe('dsh-langfuse plugin', () => {
   });
 
   describe('trace lifecycle', () => {
+    it('redacts credential property names as well as values, retaining original field matching', async () => {
+      await setup({
+        ...enabledConfig,
+        secretKey: 'configured-credential',
+        redactFields: ['password'],
+      });
+      await ctx.waterfall(
+        'tools/execute',
+        execOf({
+          arguments: {
+            'configured-credential': 'value',
+            'sk-lf-dictionary': 'another',
+            password: 'private-value',
+          },
+        }),
+        async () => okResult(),
+      );
+      const input = mocks.roots[0].spans[0].body.input;
+      expect(JSON.stringify(input)).not.toMatch(
+        /configured-credential|sk-lf-dictionary|private-value/,
+      );
+      expect(input).toMatchObject({ password: '[REDACTED]' });
+    });
+
+    it.each([undefined, agentOf('s1')])(
+      'closes unresolved tools at unload, including one-off roots',
+      async (agent) => {
+        const readImage = vi.fn();
+        ctx.provide('attachments', { readImage } as unknown as AttachmentStore);
+        await setup({ ...enabledConfig, captureMedia: true });
+        let release!: (value: ToolExecutionResult) => void;
+        const resultPromise = new Promise<ToolExecutionResult>((resolve) => {
+          release = resolve;
+        });
+        const operation = ctx.waterfall('tools/execute', execOf({ agent }), () => resultPromise);
+        const root = mocks.roots[0];
+        const tool = root.spans[0];
+        let endedAtShutdown: number[] = [];
+        mocks.providers[0].shutdown.mockImplementationOnce(async () => {
+          endedAtShutdown = [root.ended, tool.ended];
+        });
+        await ctx.fiber.dispose();
+        expect(endedAtShutdown).toEqual([1, 1]);
+        expect(lastUpdate(tool).level).toBe('WARNING');
+        const result = { ...okResult(), content: [image] };
+        release(result);
+        expect(await operation).toBe(result);
+        expect(tool.ended).toBe(1);
+        expect(root.ended).toBe(1);
+        expect(readImage).not.toHaveBeenCalled();
+      },
+    );
+
+    it('exports paused model calls at unload and keeps forwarding their stream without duplicate ends', async () => {
+      await setup();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      async function* source(): AsyncIterable<StreamChunk> {
+        yield textDelta('partial');
+        yield usageChunk({ inputTokens: 10, outputTokens: 3 });
+        await gate;
+        yield finishStop();
+      }
+      const stream = ctx.waterfall('llm/stream', optionsOf(), source)[Symbol.asyncIterator]();
+      await stream.next();
+      await stream.next();
+      const generation = mocks.roots[0].generations[0];
+      const request = generation.spans[0];
+      let endedAtShutdown: number[] = [];
+      mocks.providers[0].shutdown.mockImplementationOnce(async () => {
+        endedAtShutdown = [generation.ended, request.ended];
+      });
+      await ctx.fiber.dispose();
+      expect(endedAtShutdown).toEqual([1, 1]);
+      expect(lastUpdate(generation)).toMatchObject({
+        output: 'partial',
+        level: 'WARNING',
+        usageDetails: { input: 10, output: 3, total: 13 },
+        metadata: { incomplete: true },
+      });
+      expect(lastUpdate(request).output).toEqual([
+        textDelta('partial'),
+        usageChunk({ inputTokens: 10, outputTokens: 3 }),
+      ]);
+      release();
+      expect(await stream.next()).toEqual({ done: false, value: finishStop() });
+      await stream.next();
+      expect(generation.ended).toBe(1);
+      expect(request.ended).toBe(1);
+      expect(lastUpdate(generation).level).toBe('WARNING');
+    });
+
+    it('ends a model call which is never pulled when the plugin unloads', async () => {
+      await setup();
+      ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop()));
+      await ctx.fiber.dispose();
+      const generation = mocks.roots[0].generations[0];
+      expect(generation.ended).toBe(1);
+      expect(generation.spans[0].ended).toBe(1);
+      expect(lastUpdate(generation)).toMatchObject({
+        level: 'WARNING',
+        metadata: { incomplete: true },
+      });
+    });
+
+    it('redacts credentials and JSON fields spanning raw delta boundaries without changing the stream', async () => {
+      await setup({
+        ...enabledConfig,
+        secretKey: 'arbitrary-secret-value',
+        redactFields: ['password'],
+      });
+      const chunks: StreamChunk[] = [
+        textDelta('arbitrary-'),
+        textDelta('secret-value'),
+        {
+          type: 'tool-call-delta',
+          index: 1,
+          id: 'c1' as ToolCallId,
+          argumentsDelta: '{"password":',
+        },
+        {
+          type: 'tool-call-delta',
+          index: 1,
+          id: 'c1' as ToolCallId,
+          argumentsDelta: '"fragmented-private"}',
+        },
+        finishStop(),
+      ];
+      expect(
+        await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks))),
+      ).toEqual(chunks);
+      const raw = lastUpdate(mocks.roots[0].generations[0].spans[0]).output as StreamChunk[];
+      expect(JSON.stringify(raw)).not.toContain('arbitrary-');
+      expect(JSON.stringify(raw)).not.toContain('secret-value');
+      expect(JSON.stringify(raw)).not.toContain('fragmented-private');
+      expect(raw.map((chunk) => chunk.type)).toEqual(chunks.map((chunk) => chunk.type));
+    });
+
+    it('redacts excerpt sources before extracting and truncating observation names', async () => {
+      const secretKey = 'LONG-CREDENTIAL-'.repeat(12);
+      await setup({ ...enabledConfig, secretKey, redactFields: ['path', 'password'] });
+      await ctx.waterfall(
+        'tools/execute',
+        execOf({ arguments: { path: '/private/customer-data' } }),
+        async () => okResult(),
+      );
+      await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () =>
+          streamOf(textDelta('{"password":"private-value"}'), finishStop()),
+        ),
+      );
+      await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () =>
+          streamOf(textDelta(secretKey), finishStop()),
+        ),
+      );
+      const exported = JSON.stringify(mocks.roots);
+      expect(exported).not.toContain('/private/customer-data');
+      expect(exported).not.toContain('private-value');
+      expect(exported).not.toContain(secretKey.slice(0, 70));
+    });
+
+    it('does not delay streaming for image reads and drains their closed observations before flush', async () => {
+      let release!: (value: { ref: typeof image.attachment; data: Uint8Array }) => void;
+      const readImage = vi.fn(
+        () =>
+          new Promise<{ ref: typeof image.attachment; data: Uint8Array }>((resolve) => {
+            release = resolve;
+          }),
+      );
+      ctx.provide('attachments', { readImage } as unknown as AttachmentStore);
+      await setup({ ...enabledConfig, captureMedia: true });
+      const session = sessionOf('s1');
+      ctx.emit('session/event', session, turnStart(0));
+      const chunks = [textDelta('answer'), finishStop()];
+      expect(
+        await drain(
+          ctx.waterfall(
+            'llm/stream',
+            optionsOf({ messages: [{ role: 'user', content: [image] }] }),
+            () => streamOf(...chunks),
+          ),
+        ),
+      ).toEqual(chunks);
+      const generation = mocks.roots[0].generations[0];
+      expect(generation.ended).toBe(0);
+      ctx.emit('session/event', session, turnEnd(0));
+      const flushing = ctx.parallel('session/flush', session);
+      expect(mocks.providers[0].forceFlush).not.toHaveBeenCalled();
+      release({ ref: image.attachment, data: Uint8Array.of(1, 2, 3) });
+      await flushing;
+      expect(generation.ended).toBe(1);
+      expect(mocks.providers[0].forceFlush).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      { label: 'content disabled', captureContent: false, captureMedia: true },
+      { label: 'media disabled', captureContent: true, captureMedia: false },
+      { label: 'size limit', captureContent: true, captureMedia: true, maxMediaBytes: 2 },
+      {
+        label: 'environment kill switch',
+        captureContent: true,
+        captureMedia: true,
+        disabledEnv: true,
+      },
+    ])('never reads or uploads images with $label', async (settings) => {
+      const readImage = vi.fn();
+      ctx.provide('attachments', { readImage } as unknown as AttachmentStore);
+      if ('disabledEnv' in settings) vi.stubEnv('LANGFUSE_MEDIA_UPLOAD_ENABLED', 'false');
+      await setup({ ...enabledConfig, ...settings });
+      await drain(
+        ctx.waterfall(
+          'llm/stream',
+          optionsOf({ messages: [{ role: 'user', content: [image] }] }),
+          () => streamOf(finishStop()),
+        ),
+      );
+      await ctx.parallel('session/flush', sessionOf('s1'));
+      expect(readImage).not.toHaveBeenCalled();
+      expect(JSON.stringify(mocks.roots)).not.toContain('data:image');
+    });
+
+    it('degrades image read failures and missing attachment services to metadata', async () => {
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const readImage = vi.fn(async () => {
+        throw new Error('backend unavailable');
+      });
+      const remove = ctx.provide('attachments', { readImage } as unknown as AttachmentStore);
+      await setup({ ...enabledConfig, captureMedia: true });
+      const options = optionsOf({ messages: [{ role: 'user', content: [image] }] });
+      await drain(ctx.waterfall('llm/stream', options, () => streamOf(finishStop())));
+      await ctx.parallel('session/flush', sessionOf('s1'));
+      expect(errors).toHaveBeenCalledWith(
+        '[dsh-langfuse] image display failed:',
+        expect.any(Error),
+      );
+      expect(JSON.stringify(mocks.roots)).not.toContain('data:image');
+      await remove();
+      await drain(ctx.waterfall('llm/stream', options, () => streamOf(finishStop())));
+      await ctx.parallel('session/flush', sessionOf('s1'));
+      expect(readImage).toHaveBeenCalledTimes(1);
+      expect(mocks.roots[0].generations.every((generation) => generation.ended === 1)).toBe(true);
+      errors.mockRestore();
+    });
+
+    it('bounds a stuck image backend and flushes even when it ignores cancellation', async () => {
+      vi.useFakeTimers();
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        ctx.provide('attachments', {
+          readImage: vi.fn(() => new Promise(() => {})),
+        } as unknown as AttachmentStore);
+        await setup({ ...enabledConfig, captureMedia: true, mediaTimeoutMs: 10 });
+        await drain(
+          ctx.waterfall(
+            'llm/stream',
+            optionsOf({ messages: [{ role: 'user', content: [image] }] }),
+            () => streamOf(finishStop()),
+          ),
+        );
+        const flushed = ctx.parallel('session/flush', sessionOf('s1'));
+        await vi.advanceTimersByTimeAsync(20);
+        await flushed;
+        expect(mocks.roots[0].generations[0].ended).toBe(1);
+        expect(errors).toHaveBeenCalledWith(
+          '[dsh-langfuse] image display failed:',
+          expect.any(Error),
+        );
+      } finally {
+        vi.useRealTimers();
+        errors.mockRestore();
+      }
+    });
+
+    it('renders prompt, generation and tool images without mutating the raw request or agent results', async () => {
+      const readImage = vi.fn(async () => ({
+        ref: image.attachment,
+        data: Uint8Array.of(1, 2, 3),
+      }));
+      ctx.provide('attachments', { readImage } as unknown as AttachmentStore);
+      await setup({ ...enabledConfig, captureMedia: true });
+      const content = [{ type: 'text', text: 'inspect' }, image] as ContentBlock[];
+      const options = optionsOf({ messages: [{ role: 'user', content }] });
+      const before = JSON.stringify(options);
+      const session = sessionOf('s1');
+      ctx.emit('session/event', session, turnStart(0));
+      ctx.emit('session/event', session, ev('user/message', { content }));
+      await drain(ctx.waterfall('llm/stream', options, () => streamOf(finishStop())));
+      const result = { ...okResult(), content: [image] };
+      expect(await ctx.waterfall('tools/execute', execOf(), async () => result)).toBe(result);
+      ctx.emit('session/event', session, turnEnd(0));
+      await ctx.parallel('session/flush', session);
+      const root = mocks.roots[0];
+      const displayImage = { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } };
+      expect(root.attributes['langfuse.trace.input']).toEqual([
+        { type: 'text', text: 'inspect' },
+        displayImage,
+      ]);
+      const generation = root.generations[0];
+      expect(
+        generation.updates.some((u) =>
+          JSON.stringify(u.input).includes('data:image/png;base64,AQID'),
+        ),
+      ).toBe(true);
+      expect(generation.spans[0].body.input).toEqual({ ...options, signal: undefined });
+      expect(lastUpdate(root.spans[0]).output).toEqual([displayImage]);
+      expect(JSON.stringify(options)).toBe(before);
+      expect(result.content).toEqual([image]);
+      expect(root.ended).toBe(1);
+      expect(generation.ended).toBe(1);
+    });
+
+    it('joins explicit per-session parents once, isolates concurrent sessions and inherits child context', async () => {
+      await setup({ ...enabledConfig, userId: 'default', tags: ['default'] });
+      const traceparent = '00-1234567890abcdef1234567890abcdef-1234567890abcdef-01';
+      ctx.emit('langfuse/context', 's1', { traceparent, userId: 'alice', tags: ['request-a'] });
+      ctx.emit('langfuse/context', 's2', {
+        traceparent: '00-fedcba0987654321fedcba0987654321-fedcba0987654321-00',
+        userId: 'bob',
+      });
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/event', sessionOf('s2'), turnStart(0));
+      expect(mocks.roots[0].parentContext).toEqual({
+        traceId: '1234567890abcdef1234567890abcdef',
+        spanId: '1234567890abcdef',
+        traceFlags: 1,
+        isRemote: true,
+      });
+      ctx.emit('session/event', sessionOf('s1'), userMessage('incoming request'));
+      expect(mocks.roots[0].attributes).not.toHaveProperty('langfuse.trace.name');
+      expect(mocks.roots[0].attributes['langfuse.internal.is_app_root']).toBe(false);
+      expect(mocks.roots[0].attributes).not.toHaveProperty('langfuse.trace.input');
+      expect(mocks.roots[1].attributes['user.id']).toBe('bob');
+      ctx.emit('session/created', childSessionOf('child', 's1'));
+      expect(mocks.roots[0].spans[0].attributes['user.id']).toBe('alice');
+      expect(mocks.roots[0].spans[0].attributes['langfuse.trace.tags']).toEqual(['request-a']);
+      ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+      ctx.emit('session/event', sessionOf('s1'), turnStart(1));
+      expect(mocks.roots[2].parentContext).toEqual({
+        traceId: '0'.repeat(32),
+        spanId: '0'.repeat(16),
+        traceFlags: 0,
+      });
+      expect(mocks.roots[2].attributes['user.id']).toBe('default');
+      expect(mocks.roots[1].parentContext).toMatchObject({
+        traceId: 'fedcba0987654321fedcba0987654321',
+        traceFlags: 0,
+      });
+    });
+
+    it('rejects malformed and all-zero trace parents without breaking a turn', async () => {
+      await setup();
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+      for (const traceparent of [
+        'bad-header',
+        `00-${'0'.repeat(32)}-1234567890abcdef-01`,
+        `00-1234567890abcdef1234567890abcdef-${'0'.repeat(16)}-01`,
+      ]) {
+        ctx.emit('langfuse/context', 's1', { traceparent });
+        ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+        expect(mocks.roots.at(-1)?.parentContext).toMatchObject({ traceId: '0'.repeat(32) });
+      }
+      expect(errors).toHaveBeenCalledWith(
+        '[dsh-langfuse] invalid traceparent; starting an independent trace',
+      );
+      errors.mockRestore();
+    });
+
+    it('uses the final turn result for root severity and records recovered errors separately', async () => {
+      await setup();
+      const session = sessionOf('s1');
+      ctx.emit('session/event', session, turnStart(0));
+      await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishError('transient'))),
+      );
+      await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () =>
+          streamOf(textDelta('recovered'), finishStop()),
+        ),
+      );
+      ctx.emit('session/event', session, turnEnd(0));
+      expect(lastUpdate(mocks.roots[0])).toMatchObject({
+        level: 'DEFAULT',
+        metadata: { endReason: 'completed', hadErrors: true },
+      });
+      ctx.emit('session/event', session, turnStart(1));
+      ctx.emit(
+        'session/event',
+        session,
+        ev('turn/end', {
+          turn: 1,
+          reason: { kind: 'error', error: { code: 'FATAL', message: 'final failure' } },
+        }),
+      );
+      expect(lastUpdate(mocks.roots[1])).toMatchObject({
+        level: 'ERROR',
+        statusMessage: 'final failure',
+        metadata: { endReason: 'error', errorCode: 'FATAL' },
+      });
+      ctx.emit('session/event', session, turnStart(2));
+      ctx.emit(
+        'session/event',
+        session,
+        ev('turn/end', { turn: 2, reason: { kind: 'aborted', reason: { kind: 'user' } } }),
+      );
+      expect(lastUpdate(mocks.roots[2])).toMatchObject({
+        level: 'WARNING',
+        metadata: { endReason: 'aborted' },
+      });
+    });
+
+    it('shows reasoning beside text and tool calls while preserving every raw chunk', async () => {
+      await setup();
+      const chunks: StreamChunk[] = [
+        { type: 'reasoning-delta', index: 0, text: 'Compare the options. ' },
+        { type: 'reasoning-delta', index: 0, text: 'Read the file.' },
+        textDelta('Checking now'),
+        toolCallEnd('read_file'),
+        finishStop(),
+      ];
+      const received = await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks)),
+      );
+      expect(received).toEqual(chunks);
+      const generation = mocks.roots[0].generations[0];
+      expect(lastUpdate(generation).output).toEqual({
+        text: 'Checking now',
+        reasoning: 'Compare the options. Read the file.',
+        toolCalls: [{ name: 'read_file', arguments: '{}' }],
+      });
+      expect(lastUpdate(generation.spans[0]).output).toEqual(chunks);
+      await ctx.waterfall('tools/execute', execOf(), async () => okResult());
+      expect(mocks.roots[0].spans[0].asType).toBe('tool');
+    });
+
+    it('propagates user and tags through tools, generations and subagents', async () => {
+      await setup({ ...enabledConfig, userId: 'operator', tags: ['production', 'experiment'] });
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/created', childSessionOf('child', 's1'));
+      await drain(
+        ctx.waterfall(
+          'llm/stream',
+          optionsOf({ sessionId: 'child' as GenerateOptions['sessionId'] }),
+          () => streamOf(finishStop()),
+        ),
+      );
+      await ctx.waterfall('tools/execute', execOf({ agent: agentOf('child') }), async () =>
+        okResult(),
+      );
+      const root = mocks.roots[0];
+      const child = root.spans[0];
+      for (const observation of [
+        root,
+        child,
+        child.generations[0],
+        child.generations[0].spans[0],
+        child.spans[0],
+      ]) {
+        expect(observation.attributes['user.id']).toBe('operator');
+        expect(observation.attributes['langfuse.trace.tags']).toEqual(['production', 'experiment']);
+      }
+    });
+
+    it('accepts env-only credentials and profile environment/release with a master kill switch', async () => {
+      vi.stubEnv('LANGFUSE_PUBLIC_KEY', 'pk-lf-env');
+      vi.stubEnv('LANGFUSE_SECRET_KEY', 'sk-lf-env');
+      vi.stubEnv('LANGFUSE_BASE_URL', 'https://env.example');
+      await setup({
+        ...enabledConfig,
+        publicKey: '',
+        secretKey: '',
+        baseUrl: '',
+        environment: 'staging',
+        release: 'build-42',
+      });
+      expect(mocks.processors[0].config).toMatchObject({
+        publicKey: 'pk-lf-env',
+        secretKey: 'sk-lf-env',
+        baseUrl: 'https://env.example',
+        environment: 'staging',
+        release: 'build-42',
+      });
+      vi.stubEnv('LANGFUSE_TRACING_ENABLED', 'false');
+      await apply(new Context(), enabledConfig);
+      expect(mocks.processors).toHaveLength(1);
+    });
+
+    it('redacts credentials and configured fields in all reporter payloads and names', async () => {
+      await setup({
+        ...enabledConfig,
+        publicKey: 'pk-lf-public',
+        secretKey: 'secret-value',
+        redactFields: ['password'],
+      });
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      await drain(
+        ctx.waterfall(
+          'llm/stream',
+          optionsOf({
+            system: 'secret-value',
+            messages: [{ role: 'user', content: [{ type: 'text', text: 'sk-lf-other' }] }],
+          }),
+          () => streamOf(textDelta('secret-value sk-lf-other'), finishStop()),
+        ),
+      );
+      await ctx.waterfall(
+        'tools/execute',
+        execOf({ arguments: { password: 'hidden', path: 'secret-value' } }),
+        async () => errResult('secret-value sk-lf-other'),
+      );
+      const exported = JSON.stringify(mocks.roots);
+      expect(exported).not.toMatch(/secret-value|sk-lf-other|hidden/);
+      expect(exported).toContain('[REDACTED]');
+      const { mask } = mocks.processors[0].config as {
+        mask: (input: { data: unknown }) => unknown;
+      };
+      expect(mask({ data: { password: 'hidden', nested: ['sk-lf-other'] } })).toEqual({
+        password: '[REDACTED]',
+        nested: ['[REDACTED]'],
+      });
+      expect(mask({ data: { arguments: '{"Password":"string-hidden"}' } })).toEqual({
+        arguments: '{"Password":"[REDACTED]"}',
+      });
+    });
+
+    it('keeps reply content out of observation names when captureContent is false', async () => {
+      await setup({ ...enabledConfig, captureContent: false });
+      await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () =>
+          streamOf(textDelta('PRIVATE REPLY'), finishStop()),
+        ),
+      );
+      expect(mocks.roots[0].generations[0].name).toBe('llm-call');
+      expect(JSON.stringify(mocks.roots)).not.toContain('PRIVATE REPLY');
+    });
+
     it('reports a hook invocation and result as one span inside the turn trace', async () => {
       await setup();
       const session = sessionOf('s1');
@@ -462,6 +1020,7 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
       expect(lastUpdate(root)).toEqual({
         output: 'done, the bug is fixed',
+        level: 'DEFAULT',
         metadata: { turn: 0, endReason: 'completed' },
       });
       expect(root.attributes['langfuse.trace.output']).toBe('done, the bug is fixed');
@@ -492,7 +1051,7 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
       const root = fakeObs(mocks.roots[0]);
       expect(root.updates).toEqual([
-        { output: undefined, metadata: { turn: 0, endReason: 'completed' } },
+        { output: undefined, level: 'DEFAULT', metadata: { turn: 0, endReason: 'completed' } },
       ]);
       expect(JSON.stringify(root.updates)).not.toContain('secret');
       // The trace-level IO keys (langfuse.trace.*) live in attributes, not
@@ -1266,11 +1825,45 @@ describe('usageOf', () => {
 });
 
 describe('LangfuseReporter', () => {
+  it.each(['prefix-sk-lf-key?private-tail', 'sk-lf-key?private-tail', 'abcab'])(
+    'redacts overlapping exact and recognizable credentials: %s',
+    async (secretKey) => {
+      const reporter = new LangfuseReporter({ ...config, secretKey });
+      await reporter.ready;
+      expect(reporter.mask(secretKey)).toBe('[REDACTED]');
+      if (secretKey === 'abcab') expect(reporter.mask('abcabcab')).toBe('[REDACTED]');
+      await reporter.shutdown();
+    },
+  );
+
+  it('redacts processor environment/release labels, including SDK env fallbacks', async () => {
+    vi.stubEnv('LANGFUSE_TRACING_ENVIRONMENT', 'sk-lf-environment');
+    vi.stubEnv('LANGFUSE_RELEASE', 'sk-lf-release');
+    const reporter = new LangfuseReporter(config);
+    await reporter.ready;
+    expect(mocks.processors[0].config).toMatchObject({
+      environment: 'redacted',
+      release: '[REDACTED]',
+    });
+    await reporter.shutdown();
+    const explicit = new LangfuseReporter({
+      ...config,
+      environment: 'staging',
+      release: 'sk-lf-explicit',
+    });
+    await explicit.ready;
+    expect(mocks.processors[1].config).toMatchObject({
+      environment: 'staging',
+      release: '[REDACTED]',
+    });
+    await explicit.shutdown();
+  });
+
   it('lazily constructs the export pipeline with the connection config', async () => {
     const reporter = new LangfuseReporter(config);
     expect(mocks.processors).toHaveLength(0);
     await reporter.ready;
-    expect(mocks.processors[0].config).toEqual(config);
+    expect(mocks.processors[0].config).toMatchObject(config);
     expect(mocks.providers[0].config.spanProcessors).toEqual([mocks.processors[0]]);
     expect(mocks.isolatedProviders).toEqual([mocks.providers[0]]);
   });

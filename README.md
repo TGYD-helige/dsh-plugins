@@ -38,6 +38,8 @@ dsh is in developer preview and **will** break compatibility between releases. P
 
 `dsh-a2a`'s approval bridge has an optional `@deepseek-ai/dsh-user-approval` peer floor of `>=0.1.6-alpha.2 || >=0.1.7-alpha.1 || >=0.2.0-rc.1` (tested at `0.2.0-rc.1`).
 
+`dsh-langfuse`'s optional image display uses `@deepseek-ai/dsh-attachment >=0.2.0-rc.1` (tested at `0.2.0-rc.1`); metadata-only tracing does not require an attachment backend.
+
 ## Install
 
 Every package is a dsh **bundle** and ships a `cordis.patch.yml`. With the dsh CLI:

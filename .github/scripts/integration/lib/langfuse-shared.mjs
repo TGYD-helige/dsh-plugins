@@ -72,7 +72,7 @@ export function assert(cond, msg) {
 // Parenting note (v5): the trace IS its root span, so "parented at the trace
 // root" means parentObservationId === the `dsh-turn` root span's id, not null.
 export function evaluateTrace(observations, codeword) {
-  const spans = observations.filter((o) => o.type === 'SPAN');
+  const spans = observations.filter((o) => o.type === 'SPAN' || o.type === 'TOOL');
   const generations = observations.filter((o) => o.type === 'GENERATION');
   const problems = [];
   const need = (condition, message) => {
@@ -110,6 +110,7 @@ export function evaluateTrace(observations, codeword) {
   );
   need(toolSpan, 'missing codeword-bearing "tool:*" span');
   if (toolSpan) {
+    need(toolSpan.type === 'TOOL', 'tool observation must have type TOOL');
     need(toolSpan.endTime != null, `"${toolSpan.name}" span has no endTime (never completed)`);
     need(
       !root || toolSpan.parentObservationId === root.id,
@@ -144,9 +145,11 @@ export function evaluateReasoning(observations) {
       Array.isArray(o.output) &&
       o.output.some((c) => c?.type === 'reasoning-delta'),
   );
-  return has
-    ? []
-    : ['no llm-request span output has a reasoning-delta chunk (thinking should be enabled at max)'];
+  const displayed = observations.some((o) => o.type === 'GENERATION' && o.output?.reasoning?.length > 0);
+  return [
+    ...(!has ? ['no llm-request span output has a reasoning-delta chunk (thinking should be enabled at max)'] : []),
+    ...(!displayed ? ['no generation output displays reasoning'] : []),
+  ];
 }
 
 // A real UserPromptSubmit command hook must inject context into the LLM
@@ -207,7 +210,7 @@ export function evaluateHookTrace(observations, codeword) {
 // fails the delegation-span check). Parenting note (v5): the trace IS its
 // root span, so the delegation span parents at the `dsh-turn` root span's id.
 export function evaluateSubagentTrace(observations, codeword) {
-  const spans = observations.filter((o) => o.type === 'SPAN');
+  const spans = observations.filter((o) => o.type === 'SPAN' || o.type === 'TOOL');
   const generations = observations.filter((o) => o.type === 'GENERATION');
   const problems = [];
   const need = (condition, message) => {
@@ -221,6 +224,7 @@ export function evaluateSubagentTrace(observations, codeword) {
   const delegation = spans.find((o) => o.name?.startsWith('tool:subagent'));
   need(delegation, 'missing delegation "tool:subagent*" span');
   if (delegation) {
+    need(delegation.type === 'TOOL', 'delegation observation must have type TOOL');
     need(delegation.endTime != null, 'delegation span has no endTime (never completed)');
     need(
       !root || delegation.parentObservationId === root.id,
@@ -256,6 +260,7 @@ export function evaluateSubagentTrace(observations, codeword) {
       JSON.stringify(o.input ?? '').includes(codeword),
   );
   need(childTool, 'no codeword-bearing tool span under the "subagent" span');
+  if (childTool) need(childTool.type === 'TOOL', 'child tool observation must have type TOOL');
   return problems;
 }
 
@@ -297,7 +302,7 @@ function spanToObservation(span) {
     id: span.spanId,
     parentObservationId: span.parentSpanId || null,
     name: span.name,
-    type: otlpAttr(span, 'langfuse.observation.type') === 'generation' ? 'GENERATION' : 'SPAN',
+    type: (otlpAttr(span, 'langfuse.observation.type') ?? 'span').toUpperCase(),
     input: otlpJsonAttr(span, 'langfuse.observation.input'),
     output: otlpJsonAttr(span, 'langfuse.observation.output'),
     model: otlpAttr(span, 'langfuse.observation.model.name') ?? undefined,
@@ -309,7 +314,7 @@ function spanToObservation(span) {
 }
 
 // Spans export exactly once (on end), so folding is a plain map.
-function capturedToObservations(captured) {
+export function capturedToObservations(captured) {
   return captured.map(spanToObservation);
 }
 
@@ -434,7 +439,7 @@ async function runVerification({ baseUrl, publicKey, secretKey, fromStartTime, c
 // In-process fake Langfuse endpoint for the secrets-free mode: the v5 SDK
 // exports OTLP/HTTP JSON (application/json) — capture every span from
 // POST /api/public/otel/v1/traces in memory; anything else 404s loudly.
-async function startFakeIngestion(captured) {
+export async function startFakeIngestion(captured) {
   const server = createServer((req, res) => {
     if (req.method !== 'POST' || !req.url?.startsWith('/api/public/otel/v1/traces')) {
       console.log(`::warning::unexpected ${req.method} ${req.url}`);

@@ -42,9 +42,23 @@ export interface LangfuseConnectionConfig {
   publicKey: string;
   secretKey: string;
   baseUrl: string;
+  redactFields?: string[];
+  environment?: string;
+  release?: string;
+  userId?: string;
+  tags?: string[];
+  captureContent?: boolean;
+  captureMedia?: boolean;
 }
 
 export type ObservationLevel = 'DEFAULT' | 'WARNING' | 'ERROR';
+
+/** Standard request context supplied by a host for one session's next trace. */
+export interface LangfuseTraceContext {
+  userId?: string;
+  tags?: string[];
+  traceparent?: string;
+}
 
 /** Any observation that can parent a span (trace root span or nested span/generation). */
 type Observation = LangfuseSpan | LangfuseGeneration;
@@ -52,7 +66,9 @@ type Observation = LangfuseSpan | LangfuseGeneration;
 /** The trace-correlating attributes stamped on every observation of a trace. */
 interface TraceContext {
   sessionId?: string;
-  traceName: string;
+  traceName?: string;
+  userId?: string;
+  tags?: string[];
 }
 
 /**
@@ -62,6 +78,21 @@ interface TraceContext {
  * parent instead of adopting the ambient context's active span.
  */
 const NO_PARENT = { traceId: '0'.repeat(32), spanId: '0'.repeat(16), traceFlags: 0 };
+
+function parentContext(traceparent: string | undefined) {
+  if (traceparent === undefined) return NO_PARENT;
+  const match = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/.exec(traceparent);
+  if (!match || /^0+$/.test(match[1]) || /^0+$/.test(match[2])) {
+    console.error('[dsh-langfuse] invalid traceparent; starting an independent trace');
+    return NO_PARENT;
+  }
+  return {
+    traceId: match[1],
+    spanId: match[2],
+    traceFlags: Number.parseInt(match[3], 16) & 1,
+    isRemote: true,
+  };
+}
 
 /**
  * Map dsh token accounting onto Langfuse's `usageDetails`, keeping every
@@ -99,6 +130,7 @@ export function usageOf(usage: TokenUsage): Record<string, number> {
 
 export class LangfuseReporter {
   private tracing: typeof import('@langfuse/tracing') | null = null;
+  private api: typeof import('@opentelemetry/api') | null = null;
   private provider: NodeTracerProvider | null = null;
   /**
    * Observation → its trace's correlating attributes; children inherit their
@@ -121,24 +153,116 @@ export class LangfuseReporter {
     this.ready = this.init();
   }
 
+  /** Clone telemetry only; never mutate harness-owned messages or tool results. */
+  mask<T>(data: T): T {
+    const secrets = [this.config.publicKey, this.config.secretKey].filter(Boolean);
+    const fields = new Set(this.config.redactFields?.map((key) => key.toLowerCase()));
+    const seen = new WeakSet<object>();
+    const redactText = (text: string): string => {
+      const ranges: Array<[number, number]> = Array.from(
+        text.matchAll(/(?:pk|sk)-lf-[\w-]+/g),
+        (match) => [match.index, match.index + match[0].length],
+      );
+      for (const secret of secrets) {
+        for (
+          let index = text.indexOf(secret);
+          index !== -1;
+          index = text.indexOf(secret, index + 1)
+        ) {
+          ranges.push([index, index + secret.length]);
+        }
+      }
+      let output = '';
+      let end = 0;
+      // Match the original text once, merging overlap before changing any bytes.
+      for (const [start, stop] of ranges.sort((a, b) => a[0] - b[0])) {
+        if (start >= end) output += `${text.slice(end, start)}[REDACTED]`;
+        end = Math.max(end, stop);
+      }
+      return output + text.slice(end);
+    };
+    const redact = (value: unknown): unknown => {
+      if (typeof value === 'string') {
+        // Tool-call arguments and SDK attributes may themselves be JSON text.
+        if (fields.size && /^\s*[[{]/.test(value)) {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(value);
+          } catch {
+            /* not JSON */
+          }
+          if (parsed !== undefined) {
+            const masked = JSON.stringify(redact(parsed));
+            if (masked !== JSON.stringify(parsed)) return masked;
+          }
+        }
+        return redactText(value);
+      }
+      if (!value || typeof value !== 'object' || value instanceof Date) return value;
+      if (seen.has(value)) return '[Circular]';
+      seen.add(value);
+      const result = Array.isArray(value)
+        ? value.map(redact)
+        : Object.fromEntries(
+            Object.entries(value).map(([key, child]) => [
+              redact(key),
+              fields.has(key.toLowerCase()) ? '[REDACTED]' : redact(child),
+            ]),
+          );
+      seen.delete(value);
+      return result;
+    };
+    try {
+      return redact(data) as T;
+    } catch (error) {
+      console.error('[dsh-langfuse] redaction failed:', error);
+      return '[REDACTED]' as T;
+    }
+  }
+
   /** Dynamically import the SDK and wire the isolated export pipeline. */
   private async init(): Promise<void> {
     try {
-      const [tracing, otel, sdkNode] = await Promise.all([
+      const [tracing, otel, sdkNode, api] = await Promise.all([
         import('@langfuse/tracing'),
         import('@langfuse/otel'),
         import('@opentelemetry/sdk-trace-node'),
+        import('@opentelemetry/api'),
       ]);
+      const environment =
+        this.config.environment || process.env.LANGFUSE_TRACING_ENVIRONMENT || undefined;
+      const maskedEnvironment = this.mask(environment);
       const processor = new otel.LangfuseSpanProcessor({
         publicKey: this.config.publicKey,
         secretKey: this.config.secretKey,
         baseUrl: this.config.baseUrl,
+        environment: maskedEnvironment === environment ? environment : 'redacted',
+        release: this.mask(this.config.release || process.env.LANGFUSE_RELEASE || undefined),
+        mediaUploadEnabled:
+          !!this.config.captureMedia &&
+          this.config.captureContent !== false &&
+          !/^(false|0)$/i.test(process.env.LANGFUSE_MEDIA_UPLOAD_ENABLED ?? ''),
+        mask: ({ data }) => {
+          // OTEL attributes arrive as serialized JSON; configured field names
+          // still need structural redaction at the final exporter boundary.
+          if (typeof data === 'string') {
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(data);
+            } catch {
+              /* plain text */
+            }
+            if (parsed !== undefined) return JSON.stringify(this.mask(parsed));
+          }
+          return this.mask(data);
+        },
       });
       this.provider = new sdkNode.NodeTracerProvider({ spanProcessors: [processor] });
       // Isolated provider, not provider.register(): the process-global OTEL
       // provider stays untouched. Set `tracing` last — observation methods
       // gate on it, and it must never be visible before the provider is wired.
       tracing.setLangfuseTracerProvider(this.provider);
+      this.api = api;
       this.tracing = tracing;
     } catch (error) {
       console.error('[dsh-langfuse] client init failed:', error);
@@ -152,8 +276,13 @@ export class LangfuseReporter {
    */
   private stampTraceContext(observation: Observation, context: TraceContext | undefined): void {
     if (!context) return;
-    observation.otelSpan.setAttribute('langfuse.trace.name', context.traceName);
-    if (context.sessionId) observation.otelSpan.setAttribute('session.id', context.sessionId);
+    if (context.traceName)
+      observation.otelSpan.setAttribute('langfuse.trace.name', this.mask(context.traceName));
+    if (context.sessionId)
+      observation.otelSpan.setAttribute('session.id', this.mask(context.sessionId));
+    if (context.userId) observation.otelSpan.setAttribute('user.id', this.mask(context.userId));
+    if (context.tags?.length)
+      observation.otelSpan.setAttribute('langfuse.trace.tags', this.mask(context.tags));
     this.traceContext.set(observation, context);
   }
 
@@ -162,16 +291,30 @@ export class LangfuseReporter {
     name: string;
     sessionId?: string;
     metadata?: Record<string, unknown>;
+    context?: LangfuseTraceContext;
   }): LangfuseSpan | null {
-    if (!this.tracing) return null;
+    const tracing = this.tracing;
+    const api = this.api;
+    if (!tracing || !api) return null;
     try {
-      const root = this.tracing.startObservation(
-        input.name,
-        { metadata: input.metadata },
-        { parentSpanContext: NO_PARENT },
+      const parent = parentContext(input.context?.traceparent);
+      input = this.mask(input);
+      const root = api.context.with(api.ROOT_CONTEXT, () =>
+        tracing.startObservation(
+          input.name,
+          { metadata: input.metadata },
+          { parentSpanContext: parent },
+        ),
       );
-      this.stampTraceContext(root, { sessionId: input.sessionId, traceName: input.name });
-      this.roots.add(root);
+      this.stampTraceContext(root, {
+        sessionId: input.sessionId,
+        traceName: parent === NO_PARENT ? input.name : undefined,
+        userId: input.context?.userId ?? this.config.userId,
+        tags: input.context?.tags ?? this.config.tags,
+      });
+      // External traces retain their owner's trace name and trace-level IO.
+      if (parent === NO_PARENT) this.roots.add(root);
+      else root.otelSpan.setAttribute(tracing.LangfuseOtelSpanAttributes.IS_APP_ROOT, false);
       return root;
     } catch (error) {
       console.error('[dsh-langfuse] trace creation failed:', error);
@@ -190,17 +333,21 @@ export class LangfuseReporter {
       metadata?: Record<string, unknown>;
     },
   ): LangfuseGeneration | null {
-    if (!parent) return null;
+    const api = this.api;
+    if (!parent || !api) return null;
     try {
-      const generation = parent.startObservation(
-        input.name,
-        {
-          model: input.model,
-          input: input.input,
-          modelParameters: input.modelParameters,
-          metadata: input.metadata,
-        },
-        { asType: 'generation' },
+      input = this.mask(input);
+      const generation = api.context.with(api.ROOT_CONTEXT, () =>
+        parent.startObservation(
+          input.name,
+          {
+            model: input.model,
+            input: input.input,
+            modelParameters: input.modelParameters,
+            metadata: input.metadata,
+          },
+          { asType: 'generation' },
+        ),
       );
       this.stampTraceContext(generation, this.traceContext.get(parent));
       return generation;
@@ -224,6 +371,7 @@ export class LangfuseReporter {
   ): void {
     if (!generation) return;
     try {
+      update = this.mask(update);
       generation.update({
         output: update.output,
         usageDetails: update.usage ? usageOf(update.usage) : undefined,
@@ -243,14 +391,21 @@ export class LangfuseReporter {
   /** Open a span (one per tool dispatch, or a nested detail span) under any observation parent. */
   startSpan(
     parent: Observation | null,
-    input: { name: string; input?: unknown; metadata?: Record<string, unknown> },
+    input: { name: string; input?: unknown; metadata?: Record<string, unknown>; asType?: 'tool' },
   ): LangfuseSpan | null {
-    if (!parent) return null;
+    const api = this.api;
+    if (!parent || !api) return null;
     try {
-      const span = parent.startObservation(input.name, {
+      input = this.mask(input);
+      const attributes = {
         input: input.input,
         metadata: input.metadata,
-      });
+      };
+      const span = api.context.with(api.ROOT_CONTEXT, () =>
+        input.asType === 'tool'
+          ? parent.startObservation(input.name, attributes, { asType: 'tool' })
+          : parent.startObservation(input.name, attributes),
+      );
       this.stampTraceContext(span, this.traceContext.get(parent));
       return span;
     } catch (error) {
@@ -268,11 +423,12 @@ export class LangfuseReporter {
    * servers derive the trace row's IO from exactly those keys.
    */
   updateSpan(
-    span: LangfuseSpan | null,
+    span: Observation | null,
     update: { name?: string; input?: unknown; metadata?: Record<string, unknown> },
   ): void {
     if (!span) return;
     try {
+      update = this.mask(update);
       span.update({ input: update.input, metadata: update.metadata });
       if (update.name) span.otelSpan.updateName(update.name);
       if (update.input !== undefined && this.roots.has(span)) {
@@ -300,6 +456,7 @@ export class LangfuseReporter {
   ): void {
     if (!span) return;
     try {
+      update = this.mask(update);
       span.update(update);
       if (update.output !== undefined && this.roots.has(span)) {
         span.setTraceIO({ output: update.output });
@@ -328,6 +485,7 @@ export class LangfuseReporter {
     const tracing = this.tracing;
     this.provider = null;
     this.tracing = null;
+    this.api = null;
     if (!provider || !tracing) return;
     try {
       await provider.shutdown();
