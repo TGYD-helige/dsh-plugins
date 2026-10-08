@@ -92,6 +92,10 @@ export const Config = Schema.object({
   host: Schema.string().default('127.0.0.1'),
   port: Schema.natural().default(41241),
   basePath: Schema.string().default('/a2a'),
+  heartbeat: Schema.object({
+    enabled: Schema.boolean().default(false),
+    intervalMs: Schema.natural().min(1).max(2_147_483_647).default(15_000),
+  }),
   /** Working directory for agents spawned by A2A tasks. Must be absolute. */
   cwd: Schema.string().default(process.cwd()),
   /**
@@ -141,6 +145,7 @@ export interface A2aPluginConfig {
   host: string;
   port: number;
   basePath: string;
+  heartbeat?: { enabled: boolean; intervalMs: number };
   cwd: string;
   uploadsDir: string;
   agent: { provider: string; model: string; preset: string };
@@ -220,6 +225,7 @@ export function apply(
       host: config.host,
       port: config.port,
       basePath: config.basePath,
+      heartbeat: config.heartbeat,
       card: {
         name: config.card.name,
         description: config.card.description,

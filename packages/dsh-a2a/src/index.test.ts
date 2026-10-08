@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // module, which pulls workspace-internal packages absent here (dsh-scope).
 vi.mock('@deepseek-ai/dsh-agent', () => ({ installModelSelection: vi.fn() }));
 
-import { type A2aPluginConfig, apply, inject, name } from './index.js';
+import { type A2aPluginConfig, apply, Config, inject, name } from './index.js';
 
 const config = (overrides: Partial<A2aPluginConfig> = {}): A2aPluginConfig => ({
   enabled: true,
@@ -38,6 +38,17 @@ describe('dsh-a2a plugin', () => {
   it('exposes the plugin name and the agents dependency', () => {
     expect(name).toBe('dsh-a2a');
     expect(inject).toEqual(['agents']);
+  });
+
+  it('defaults heartbeats off at 15 seconds and validates configured intervals', () => {
+    expect(Config({}).heartbeat).toEqual({ enabled: false, intervalMs: 15_000 });
+    expect(Config({ heartbeat: { enabled: true, intervalMs: 25_000 } }).heartbeat).toEqual({
+      enabled: true,
+      intervalMs: 25_000,
+    });
+    for (const intervalMs of [0, -1, 1.5, Infinity, 2_147_483_648]) {
+      expect(() => Config({ heartbeat: { enabled: true, intervalMs } })).toThrow();
+    }
   });
 
   it('does nothing when disabled', () => {
