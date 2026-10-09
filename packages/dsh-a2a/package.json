@@ -66,6 +66,7 @@
     }
   },
   "devDependencies": {
+    "@a2a-js/sdk-v03": "npm:@a2a-js/sdk@0.3.14",
     "@deepseek-ai/cordis": "^4.0.4",
     "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
     "@deepseek-ai/dsh-attachment": "0.2.0-rc.2",
