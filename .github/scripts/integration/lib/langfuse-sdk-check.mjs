@@ -56,6 +56,7 @@ try {
     reporter.openTrace({ name: 'dsh-turn', sessionId: 'sdk-session' }),
   );
   assert.ok(root, 'SDK initialization must create a real observation');
+  reporter.updateSpan(root, { input: { prompt: 'sdk-marker', password: 'private-value' } });
   const tool = propagateAttributes(ambient, () =>
     reporter.startSpan(root, {
       name: 'tool:read',
@@ -77,7 +78,7 @@ try {
     output: { role: 'assistant', content: 'answer', thinking: [{ type: 'thinking', content: 'check' }] },
     usage: { inputTokens: 10, outputTokens: 4, reasoningTokens: 1 },
   });
-  reporter.endSpan(root);
+  reporter.endSpan(root, { output: 'sdk-answer' });
   const external = reporter.openTrace({
     name: 'sdk-external',
     context: {
@@ -91,6 +92,12 @@ try {
   const own = captured.find((span) => span.name === 'dsh-turn');
   const joined = captured.find((span) => span.name === 'sdk-external');
   assert.equal(attribute(own, keys.IS_APP_ROOT), true);
+  assert.deepEqual(JSON.parse(attribute(own, keys.TRACE_INPUT)), {
+    prompt: 'sdk-marker', password: '[REDACTED]',
+  });
+  assert.equal(attribute(own, keys.TRACE_OUTPUT), 'sdk-answer');
+  assert.equal(attribute(own, keys.TRACE_INPUT), attribute(own, keys.OBSERVATION_INPUT));
+  assert.equal(attribute(own, keys.TRACE_OUTPUT), attribute(own, keys.OBSERVATION_OUTPUT));
   assert.equal(
     attribute(joined, keys.IS_APP_ROOT),
     false,
