@@ -95,6 +95,23 @@ Observability is a no-throw seam: backend errors are logged with a `[dsh-langfus
 
 Run `pnpm test:sdk` at the repository root for a secrets-free check using the real Langfuse SDK and the existing local OTLP receiver. It verifies export, native tool type, SDK label redaction, ambient-baggage isolation, external trace ownership, and agent-less tool unload. It is separate from the mocked unit suite and the gateway/real-Langfuse E2E legs.
 
+### Trace overview compatibility
+
+Overall input/output belongs to the `dsh-turn` root observation. The root is exported when the turn ends; while a long turn is running, child observations can already be visible before the root appears. After completion, allow asynchronous ingestion to settle.
+
+The plugin also sends deprecated `langfuse.trace.input` / `langfuse.trace.output` attributes on independently owned roots for legacy Trace overview compatibility. It never writes these fields when joining an externally owned trace. [Langfuse recommends root-observation IO](https://langfuse.com/faq/all/empty-trace-input-and-output); empty Trace overview fields alone do not establish missing observation data.
+
+Real Trace/root API read-back was verified on self-hosted Langfuse **3.172.1** with JS SDK **5.10.1** and **5.11.1**. This verifies new synthetic turns, including children exported before the root and an external observation joining the trace. It does not establish compatibility for every server version or repair historical traces. [Issue #59](https://github.com/TGYD-helige/dsh-plugins/issues/59) contains a historical SDK 5.11.1 trace whose root IO is present but Trace IO remains empty; the cause of that discrepancy has not been reproduced on new turns. For that trace, select the `dsh-turn` observation to read the overall request and response.
+
+To verify your deployment without an LLM, set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` in the process environment, then run:
+
+```bash
+pnpm --filter @amaster.ai/dsh-langfuse build
+node .github/scripts/integration/lib/langfuse-trace-io-check.mjs
+```
+
+The check creates a synthetic trace in environment `ci` and polls both v1 APIs within a shared two-minute deadline, retrying transient network errors, HTTP 429 (honoring `Retry-After` seconds), and 5xx responses. It reads each observation directly by ID, retrying 404 while ingestion settles; other permanent 4xx errors fail immediately. It explicitly requests Trace IO (`fields=core,io`), rather than relying on server-configured default fields. It first verifies the owner's root and Trace IO, then exports an external observation and waits for its distinct IO in the same trace while checking the owner's Trace IO remains intact. Credentials and response bodies are not printed. A root-only success does not pass this check.
+
 Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs — check the `TODO(verify)` markers in `src/` before upgrading dsh.
 
 ## License
