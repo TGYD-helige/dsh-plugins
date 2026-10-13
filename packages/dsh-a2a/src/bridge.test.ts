@@ -18,6 +18,7 @@ import type {
 } from '@deepseek-ai/dsh-agent';
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment';
 import type { Session, SessionEvent, SessionId, TurnEndReason } from '@deepseek-ai/dsh-session';
+import type { ToolDispatchExecution } from '@deepseek-ai/dsh-tools';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // The real dsh-agent root module imports workspace-internal packages
@@ -195,6 +196,220 @@ const textOfStatus = (update: StatusUpdate | undefined) => {
   const part = update?.status?.message?.parts[0];
   return part?.content?.$case === 'text' ? part.content.value : undefined;
 };
+
+describe('subagent tool streaming', () => {
+  async function setup(enabled = true) {
+    const ctx = new Context();
+    const agents = fakeAgents(ctx);
+    const bridge = new A2aBridge(ctx, { cwd: '/tmp', subagentTools: { enabled } });
+    runScript = (fake) => fake.emit([event('turn/start', { turn: 1 })]);
+    const bus = new DefaultExecutionEventBus();
+    const { seen } = collect(bus);
+    const execution = new DshAgentExecutor(bridge).execute(
+      requestContext(userMessage('delegate'), 'task', 'parent'),
+      bus,
+    );
+    await vi.waitFor(() => expect(agents.created).toHaveLength(1));
+    await vi.waitFor(() => expect(seen).toHaveLength(2));
+    const parent = agents.created[0];
+    const spawn = async (
+      agent: Agent,
+      callId: string,
+      id: string,
+      wait = Promise.resolve(),
+      restored = false,
+    ) => {
+      let child!: { session: Session; agent: Agent };
+      await ctx.waterfall(
+        'tools/execute',
+        { agent, callId, name: 'subagent' } as ToolDispatchExecution,
+        async () => {
+          await wait;
+          const session = {
+            id,
+            header: { parentSession: agent.session.id, origin: 'subagent' },
+            firstLifecycleSeq: restored ? 10 : 0,
+            inheritedEventCount: 0,
+          } as unknown as Session;
+          ctx.emit('session/created', session);
+          child = { session, agent: { id, session } as unknown as Agent };
+          return { isError: false, value: null, content: [] };
+        },
+      );
+      return child;
+    };
+    const tools = (session: Session, name = 'read') => {
+      ctx.emit(
+        'session/event',
+        session,
+        event('tool/call', { callId: 'same-call', name, arguments: '{}' } as never),
+      );
+      ctx.emit(
+        'session/event',
+        session,
+        event('tool/result', {
+          message: {
+            role: 'tool',
+            toolCallId: 'same-call',
+            content: [{ type: 'text', text: 'ok' }],
+          },
+        } as never),
+      );
+    };
+    const finish = async () => {
+      parent.emit([assistantMessage('parent only'), turnEnd({ kind: 'completed' })]);
+      await execution;
+      await bridge.dispose();
+      await ctx.fiber.dispose();
+    };
+    return { ctx, bridge, parent, spawn, tools, seen, execution, finish };
+  }
+
+  it('attributes concurrent descendants and isolates child output, usage and completion', async () => {
+    const f = await setup();
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const first = f.spawn(f.parent.agent, 'delegate-a', 'child-a', waiting);
+    const b = await f.spawn(f.parent.agent, 'delegate-b', 'child-b');
+    release();
+    const a = await first;
+    f.tools(b.session, 'write');
+    f.tools(a.session, 'read');
+    const nested = await f.spawn(a.agent, 'nested-call', 'grandchild');
+    f.tools(nested.session, 'search');
+    f.ctx.emit('session/event', a.session, assistantMessage('child text'));
+    f.ctx.emit('agent/assistant-stream', { agent: a.agent, frame: textDelta('child delta') });
+    f.ctx.emit(
+      'session/event',
+      a.session,
+      turnEnd({ kind: 'error', error: { message: 'child failed' } } as never),
+    );
+    f.ctx.emit('session/disposed', a.session);
+    const updates = statusUpdates(f.seen);
+    const childTools = updates.filter(
+      (u) => u.metadata?.dshAgent && (u.metadata.dshAgent as { source?: unknown }).source,
+    );
+    expect(childTools).toHaveLength(6);
+    expect(childTools.map((u) => (u.metadata!.dshAgent as { source: unknown }).source)).toEqual([
+      ...Array(2).fill({
+        sessionId: 'child-b',
+        agentId: 'child-b',
+        parentSessionId: 'parent',
+        parentCallId: 'delegate-b',
+      }),
+      ...Array(2).fill({
+        sessionId: 'child-a',
+        agentId: 'child-a',
+        parentSessionId: 'parent',
+        parentCallId: 'delegate-a',
+      }),
+      ...Array(2).fill({
+        sessionId: 'grandchild',
+        agentId: 'grandchild',
+        parentSessionId: 'child-a',
+        parentCallId: 'nested-call',
+      }),
+    ]);
+    expect(
+      childTools.every(
+        (u) =>
+          u.taskId === 'task' &&
+          u.contextId === 'parent' &&
+          u.status?.state === TaskState.TASK_STATE_WORKING,
+      ),
+    ).toBe(true);
+    expect(childTools.map((u) => u.status!.message!.parts[0].content!.value)).toEqual([
+      { callId: 'same-call', name: 'write', arguments: '{}' },
+      { callId: 'same-call', name: 'write', result: 'ok', isError: false },
+      { callId: 'same-call', name: 'read', arguments: '{}' },
+      { callId: 'same-call', name: 'read', result: 'ok', isError: false },
+      { callId: 'same-call', name: 'search', arguments: '{}' },
+      { callId: 'same-call', name: 'search', result: 'ok', isError: false },
+    ]);
+    expect(updates.every((u) => u.status?.state === TaskState.TASK_STATE_WORKING)).toBe(true);
+    f.parent.stream([textDelta('parent delta')]);
+    await f.finish();
+    const final = statusUpdates(f.seen).at(-1)!;
+    expect(textOfStatus(final)).toBe('parent only');
+    expect(final.metadata?.usage).toEqual({ inputTokens: 3, outputTokens: 4 });
+    expect(statusUpdates(f.seen).some((u) => textOfStatus(u) === 'parent delta')).toBe(true);
+  });
+
+  it('keeps child tools off by default and ignores unattributed children', async () => {
+    const f = await setup(false);
+    const child = await f.spawn(f.parent.agent, 'delegate', 'child');
+    f.tools(child.session);
+    expect(f.seen).toHaveLength(2);
+    await f.finish();
+    const enabled = await setup();
+    const orphan = {
+      id: 'orphan',
+      header: { parentSession: 'parent', origin: 'subagent' },
+    } as unknown as Session;
+    enabled.ctx.emit('session/created', orphan);
+    enabled.tools(orphan);
+    expect(enabled.seen).toHaveLength(2);
+    await enabled.finish();
+  });
+
+  it('drops background events between streams and after task rebinding', async () => {
+    const f = await setup();
+    const child = await f.spawn(f.parent.agent, 'delegate', 'child');
+    f.parent.emit([turnEnd({ kind: 'completed' })]);
+    await f.execution;
+    const count = f.seen.length;
+    f.tools(child.session);
+    expect(f.seen).toHaveLength(count);
+    await f.bridge.ensureTask('replacement', 'parent');
+    const bus = new DefaultExecutionEventBus();
+    const { seen } = collect(bus);
+    const executing = new DshAgentExecutor(f.bridge).execute(
+      requestContext(userMessage('next'), 'replacement', 'parent'),
+      bus,
+    );
+    await vi.waitFor(() => expect(seen).toHaveLength(2));
+    f.tools(child.session);
+    expect(seen).toHaveLength(2);
+    const nested = await f.spawn(child.agent, 'late-delegation', 'late-child');
+    f.tools(nested.session);
+    expect(seen).toHaveLength(2);
+    f.parent.emit([turnEnd({ kind: 'completed' })]);
+    await executing;
+    await f.finish();
+  });
+
+  it('does not attribute a resumed child to the tool that woke it', async () => {
+    const f = await setup();
+    const child = await f.spawn(f.parent.agent, 'wake-call', 'restored-child', undefined, true);
+    f.tools(child.session);
+    expect(f.seen).toHaveLength(2);
+    await f.finish();
+  });
+
+  it('swallows child publish errors without settling the parent', async () => {
+    const f = await setup();
+    const child = await f.spawn(f.parent.agent, 'delegate', 'child');
+    const { entry } = await f.bridge.ensureTask('task', 'parent');
+    const publish = vi.spyOn(entry.bus!, 'publish').mockImplementationOnce(() => {
+      throw new Error('broken bus');
+    });
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(() => f.tools(child.session)).not.toThrow();
+      expect(errors).toHaveBeenCalledWith(
+        '[dsh-a2a] failed to translate child tool event:',
+        expect.any(Error),
+      );
+      expect(entry.turnActive).toBe(true);
+    } finally {
+      publish.mockRestore();
+      errors.mockRestore();
+      await f.finish();
+    }
+  });
+});
 
 describe('A2aBridge + DshAgentExecutor', () => {
   let ctx: Context;

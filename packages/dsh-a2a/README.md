@@ -30,6 +30,8 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
           intervalMs: 15000  # positive integer, at most 2147483647
         cwd: /srv/agent-workspaces
         uploadsDir: ''         # file-part upload root; empty = <OS temp>/dsh-a2a-uploads/<date>
+        subagentTools:
+          enabled: false      # opt in to attributed local descendant tool calls/results
         agent:
           provider: ''       # dsh provider/model for A2A sessions; empty = profile default
           model: ''
@@ -103,6 +105,14 @@ queue or catch-up burst. Timers stop on completion, disconnect, response errors,
 and server disposal. Heartbeats require a responsive event loop; they cannot
 repair event-loop starvation or guarantee delivery during backpressure.
 
+## Subagent tools
+
+`subagentTools.enabled` defaults to `false`. When enabled, tool calls/results from local descendant sessions created inside `tools/execute` are forwarded to the owning A2A task. Each child has a separate translator: its text, reasoning, usage and turn state never enter the parent's translator, and child completion or disposal never settles the parent task. Main-agent streaming keeps its existing format.
+
+Child events retain the parent's A2A `taskId` and `contextId`. `metadata.dshAgent.source` carries `{ sessionId, agentId, parentSessionId, parentCallId }` (exported as `SubagentToolSource`): the source child, its immediate parent, and the exact dispatch call that created it. DSH agent IDs are session IDs. Use `(source.sessionId, data.callId)` to identify a child tool call; use `(source.parentSessionId, source.parentCallId)` to attach it to its delegation, including nested descendants. The link is captured with async dispatch context, never inferred from event ordering or descriptions. Verified against DSH 0.2.0-rc.1 and 0.2.0-rc.2's in-process child creation path.
+
+Forwarding follows the owning task's active request bus. Background child events between streams are dropped, with no buffering, replay, extra stream or extension of parent settlement; if the same task opens another stream, live events can appear there. Rebinding the parent context to a new task permanently excludes children created for the old task. Providers running outside this process expose no local child events, so only their parent delegation call/result remain visible. Sessions without a captured dispatch link (including children loaded after a process restart, or created outside tool dispatch) are not forwarded; durable attribution for those cases requires an upstream DSH lineage field.
+
 ## Task stores
 
 A2A task snapshots retain protocol history and artifacts; [dsh-storage](../dsh-storage) separately records the full conversation. Backends save on task-state transitions, including the complete reply at `input-required`, so token-rate stream events never reach Redis or GCS. While a task is working, in-process history accumulates text deltas for `GetTask` and resubscription; a restart before the next state change can lose those transient deltas.
@@ -119,7 +129,7 @@ dsh ships **no authentication or authorization**. The server binds `127.0.0.1` b
 
 ## Compatibility
 
-Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment}@0.2.0-rc.2` — the attachment store is an optional peer) — check the `TODO(verify)` markers in `src/` before upgrading dsh.
+Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment,tools}@0.2.0-rc.2` — the attachment store is an optional peer) — the session peer floor is `>=0.2.0-rc.1` because child attribution uses `firstLifecycleSeq` to reject restored sessions; check the `TODO(verify)` markers in `src/` before upgrading dsh.
 
 ## License
 

@@ -14,6 +14,7 @@
  * autonomous turns through `a2a/task-settlement`.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { type Message, TaskState } from '@a2a-js/sdk';
 import { AgentEvent, type AgentExecutionEvent, type ExecutionEventBus } from '@a2a-js/sdk/server';
 import type { Context } from '@deepseek-ai/cordis';
@@ -33,6 +34,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
 import type { ContentBlock } from '@deepseek-ai/dsh-llm/types';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
+import type {} from '@deepseek-ai/dsh-tools';
 import type { ApprovalOutcome, ApprovalRequestEvent } from '@deepseek-ai/dsh-user-approval/types';
 import {
   type A2aApproval,
@@ -53,6 +55,15 @@ export interface BridgeOptions {
   agentOptions?: { provider?: string; model?: string };
   /** Agent preset id; empty/absent = the deployment default (when a roster exists). */
   preset?: string;
+  /** Forward attributed descendant tool events; disabled by default. */
+  subagentTools?: { enabled: boolean };
+}
+
+interface Delegation {
+  entry: TaskEntry;
+  taskId: string;
+  parentSessionId: string;
+  parentCallId: string;
 }
 
 /**
@@ -111,6 +122,11 @@ export class A2aBridge {
   >();
   private readonly approvals = new Map<string, PendingApproval>();
   private readonly codec: A2aApprovalCodec;
+  private readonly delegation = new AsyncLocalStorage<Delegation>();
+  private readonly children = new WeakMap<
+    Session,
+    Delegation & { translator: SessionTranslator }
+  >();
 
   constructor(
     private readonly ctx: Context,
@@ -122,6 +138,56 @@ export class A2aBridge {
     ctx.on('session/disposed', (session) => this.onSessionDisposed(session));
     ctx.on('agent/assistant-stream', ({ agent, frame }) => this.onAssistantStream(agent, frame));
     ctx.on('approval/request', (req, next) => this.onApprovalRequest(req, next));
+    if (options.subagentTools?.enabled) {
+      // Async context distinguishes concurrent dispatches without relying on event order.
+      ctx.on('tools/execute', (exec, next) => {
+        const session = exec.agent?.session;
+        if (!session) return next();
+        const child = this.children.get(session);
+        const entry = this.bySession.get(session.id) ?? child?.entry;
+        if (!entry || entry.staleTurn || (child && child.taskId !== entry.taskId)) return next();
+        return this.delegation.run(
+          {
+            entry,
+            taskId: entry.taskId,
+            parentSessionId: session.id,
+            parentCallId: exec.callId,
+          },
+          next,
+        );
+      });
+      // Verified against dsh-subagent/session 0.2.0-rc.2: local child creation runs inside dispatch.
+      ctx.on('session/created', (session) => {
+        try {
+          const delegation = this.delegation.getStore();
+          if (
+            !delegation ||
+            session.header.origin !== 'subagent' ||
+            session.header.parentSession !== delegation.parentSessionId ||
+            // A wake/resume dispatch is not the original creating delegation.
+            session.firstLifecycleSeq !== session.inheritedEventCount ||
+            delegation.taskId !== delegation.entry.taskId
+          )
+            return;
+          this.children.set(session, {
+            ...delegation,
+            translator: new SessionTranslator(
+              delegation.taskId,
+              delegation.entry.sessionId,
+              undefined,
+              {
+                sessionId: session.id,
+                agentId: session.id,
+                parentSessionId: delegation.parentSessionId,
+                parentCallId: delegation.parentCallId,
+              },
+            ),
+          });
+        } catch (error) {
+          console.error('[dsh-a2a] failed to attribute child session:', error);
+        }
+      });
+    }
   }
 
   /**
@@ -627,7 +693,23 @@ export class A2aBridge {
 
   private onSessionEvent(session: Session, event: SessionEvent): void {
     const entry = this.bySession.get(session.id as string);
-    if (!entry) return;
+    if (!entry) {
+      const child = this.children.get(session);
+      if (
+        !child ||
+        child.taskId !== child.entry.taskId ||
+        !child.entry.bus ||
+        child.entry.staleTurn ||
+        (event.type !== 'tool/call' && event.type !== 'tool/result')
+      )
+        return;
+      try {
+        for (const out of child.translator.handle(event)) child.entry.bus.publish(out);
+      } catch (error) {
+        console.error('[dsh-a2a] failed to translate child tool event:', error);
+      }
+      return;
+    }
     if (entry.staleTurn) {
       if (event.type === 'turn/end') entry.staleTurn = false;
       return;
@@ -748,6 +830,7 @@ export class A2aBridge {
   }
 
   private onSessionDisposed(session: Session): void {
+    this.children.delete(session);
     const entry = this.bySession.get(session.id as string);
     if (!entry) return;
     this.withdrawApprovals(entry);

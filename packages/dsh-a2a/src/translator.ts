@@ -53,10 +53,19 @@ interface DshAgentEventMetadata {
   dshAgent: {
     kind: 'text-content' | 'thought' | 'tool-call' | 'tool-result' | 'state-change';
     reason?: string;
+    source?: SubagentToolSource;
   };
   model?: string;
   usage?: TokenUsage;
   error?: string;
+}
+
+/** Immediate delegation edge; tool call IDs are scoped by their source session. */
+export interface SubagentToolSource {
+  sessionId: string;
+  agentId: string;
+  parentSessionId: string;
+  parentCallId: string;
 }
 
 /** One text part in the 1.0 wire model. */
@@ -134,6 +143,7 @@ export class SessionTranslator {
     private readonly taskId: string,
     private readonly contextId: string,
     private readonly model?: string,
+    private readonly source?: SubagentToolSource,
   ) {}
 
   /** Translate one session event into zero or more A2A events. Never throws on unknown types. */
@@ -269,7 +279,9 @@ export class SessionTranslator {
     message?: Message,
     error?: string,
   ): AgentExecutionEvent {
-    const metadata: Record<string, unknown> = { dshAgent };
+    const metadata: Record<string, unknown> = {
+      dshAgent: this.source ? { ...dshAgent, source: this.source } : dshAgent,
+    };
     if (this.model) metadata.model = this.model;
     const terminal = state !== TaskState.TASK_STATE_WORKING;
     if (terminal && this.usage) metadata.usage = this.usage;
