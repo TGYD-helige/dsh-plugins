@@ -44,9 +44,11 @@ import type {} from '@deepseek-ai/dsh-subagent';
 import type {} from '@deepseek-ai/dsh-tools';
 import Schema from '@deepseek-ai/schemastery';
 import { LangfuseReporter, type LangfuseTraceContext, type ObservationLevel } from './client.js';
+import { isHookInvoked, isHookResult } from './hooks.js';
 import { displayBlocks } from './media.js';
 
 export type { LangfuseTraceContext } from './client.js';
+export { appendHookEvent, type HookInvoked, type HookResult } from './hooks.js';
 
 declare module '@deepseek-ai/cordis' {
   interface Events {
@@ -113,6 +115,16 @@ export interface LangfusePluginConfig {
 /** Any observation handle the plugin tracks (v5: trace roots and spans are the same type). */
 type ObservationHandle = ReturnType<LangfuseReporter['startSpan']>;
 
+interface HookObservation {
+  span: ObservationHandle;
+  root?: ObservationHandle;
+  turn: number;
+  point: string;
+  handlerId: string;
+  persistent: boolean;
+  turnTrace?: ObservationHandle;
+}
+
 /** Per-session open turn trace. */
 interface SessionTrace {
   trace: NonNullable<ObservationHandle>;
@@ -121,6 +133,7 @@ interface SessionTrace {
   /** The turn's latest assistant text — becomes the trace's output at `turn/end`. */
   lastAssistantText?: string;
   hadErrors?: boolean;
+  turn?: number;
 }
 
 /**
@@ -130,30 +143,12 @@ interface SessionTrace {
  */
 interface ChildSession {
   parentSessionId: string;
+  turnTrace?: ObservationHandle;
+  turn?: number;
   /** The open `subagent` span for this child (null when creation failed). */
   span: ObservationHandle;
   /** Whether the span input was set — the child's first `user/message` wins. */
   hasInput: boolean;
-}
-
-// dsh-hook-protocol merges these log-only records into SessionEventMap when a
-// hook bridge is installed. Shapes verified against
-// @deepseek-ai/dsh-hook-protocol@0.1.7-rc.2 lib/types/types.d.ts; keep this
-// observer independent of that optional peer.
-interface HookInvoked {
-  turn: number;
-  point: string;
-  dialect: string;
-  matcher?: string;
-  handlerId: string;
-}
-
-interface HookResult {
-  decision: string;
-  exitCode?: number;
-  stderrSummary?: string;
-  durationMs: number;
-  handlerId: string;
 }
 
 const messageOf = (error: unknown): string =>
@@ -308,7 +303,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   const children = new Map<string, ChildSession>();
   /** Per-session stack of currently open tools/execute spans (for subagent parenting). */
   const openToolSpans = new Map<string, ObservationHandle[]>();
-  const openHooks = new Map<string, Map<string, ObservationHandle>>();
+  const openHooks = new Map<string, Map<string, HookObservation>>();
   const openOperations = new Set<() => void>();
   const traceContexts = new Map<string, LangfuseTraceContext>();
   type Handle =
@@ -387,11 +382,17 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     if (state) state.hadErrors = true;
   }
 
-  function closeHooks(sessionId: string): void {
-    for (const span of openHooks.get(sessionId)?.values() ?? []) {
-      reporter.endSpan(span, { level: 'WARNING', statusMessage: 'hook result not observed' });
+  function closeHooks(sessionId: string, legacyOnly = false): void {
+    const pending = openHooks.get(sessionId);
+    for (const [key, hook] of pending ?? []) {
+      // Per-execution IDs allow results after turn closure without colliding with the next turn.
+      if (legacyOnly && hook.persistent) continue;
+      const update = { level: 'WARNING' as const, statusMessage: 'hook result not observed' };
+      reporter.endSpan(hook.span, update);
+      reporter.endSpan(hook.root ?? null, update);
+      pending?.delete(key);
     }
-    openHooks.delete(sessionId);
+    if (pending?.size === 0) openHooks.delete(sessionId);
   }
 
   /**
@@ -446,7 +447,14 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         delegationDepth: session.header.delegationDepth,
       },
     });
-    children.set(childId, { parentSessionId, span, hasInput: false });
+    children.set(childId, {
+      parentSessionId,
+      span,
+      hasInput: false,
+      turnTrace:
+        children.get(parentSessionId)?.turnTrace ??
+        sessions.get(rootSessionId(parentSessionId) ?? '')?.trace,
+    });
   });
 
   ctx.on('subagent/start', (info) => {
@@ -488,61 +496,101 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     const sessionId: string = session.id;
     const hookEvent: { type: string; data: unknown } = event;
     if (hookEvent.type === 'hook/invoked') {
-      const data = hookEvent.data as HookInvoked | null;
-      if (!data || typeof data.handlerId !== 'string' || typeof data.point !== 'string') return;
-      const pending = openHooks.get(sessionId) ?? new Map<string, ObservationHandle>();
-      if (pending.has(data.handlerId)) {
-        reporter.endSpan(pending.get(data.handlerId) ?? null, {
+      const data = hookEvent.data;
+      if (!isHookInvoked(data)) return;
+      const pending = openHooks.get(sessionId) ?? new Map<string, HookObservation>();
+      const key = data.invocationId ? `run:${data.invocationId}` : `handler:${data.handlerId}`;
+      if (pending.has(key)) {
+        reporter.endSpan(pending.get(key)?.span ?? null, {
           level: 'WARNING',
           statusMessage: 'hook result not observed',
         });
       }
-      pending.set(
-        data.handlerId,
-        reporter.startSpan(parentFor(sessionId), {
-          name: `hook:${data.point}`,
-          metadata: {
-            turn: data.turn,
-            point: data.point,
-            dialect: data.dialect,
-            matcher: data.matcher,
-            handlerId: data.handlerId,
-          },
-        }),
-      );
+      const previous = pending.get(key);
+      if (previous?.root) reporter.endSpan(previous.root, { level: 'WARNING' });
+      const child = children.get(sessionId);
+      const inTurn = child ? child.turn === data.turn : sessions.get(sessionId)?.turn === data.turn;
+      const root =
+        data.invocationId && !inTurn
+          ? // A late hook must not consume context queued for the next turn.
+            reporter.openTrace({
+              name: config.traceName,
+              sessionId,
+              metadata: { turn: data.turn, detachedHook: true },
+            })
+          : undefined;
+      const span = reporter.startSpan(root === undefined ? parentFor(sessionId) : root, {
+        name: `hook:${data.point}`,
+        metadata: {
+          turn: data.turn,
+          point: data.point,
+          dialect: data.dialect,
+          matcher: data.matcher,
+          handlerId: data.handlerId,
+          ...(data.invocationId ? { invocationId: data.invocationId } : {}),
+          ...(config.captureContent && data.name ? { name: data.name } : {}),
+        },
+      });
+      pending.set(key, {
+        span,
+        root,
+        turn: data.turn,
+        point: data.point,
+        handlerId: data.handlerId,
+        persistent: !!data.invocationId,
+        turnTrace:
+          root === undefined ? (child?.turnTrace ?? sessions.get(sessionId)?.trace) : undefined,
+      });
       openHooks.set(sessionId, pending);
       return;
     }
     if (hookEvent.type === 'hook/result') {
-      const data = hookEvent.data as HookResult | null;
-      if (!data || typeof data.handlerId !== 'string' || typeof data.decision !== 'string') return;
+      const data = hookEvent.data;
+      if (!isHookResult(data)) return;
       const pending = openHooks.get(sessionId);
-      const span = pending?.get(data.handlerId);
+      const key = data.invocationId ? `run:${data.invocationId}` : `handler:${data.handlerId}`;
+      const hook = pending?.get(key);
+      if (
+        !hook ||
+        hook.handlerId !== data.handlerId ||
+        hook.turn !== data.turn ||
+        hook.point !== data.point
+      )
+        return;
+      const span = hook.span;
+      const failed = data.outcome
+        ? data.outcome === 'failed' || data.outcome === 'timed-out'
+        : data.exitCode === undefined || (data.exitCode !== 0 && data.exitCode !== 2);
+      const level: ObservationLevel = failed
+        ? 'ERROR'
+        : data.outcome === 'cancelled' || ['block', 'deny', 'stop'].includes(data.decision)
+          ? 'WARNING'
+          : 'DEFAULT';
       if (span) {
-        if (data.exitCode === undefined || (data.exitCode !== 0 && data.exitCode !== 2))
+        if (failed && sessions.get(rootSessionId(sessionId) ?? '')?.trace === hook.turnTrace)
           noteError(sessionId);
         reporter.endSpan(span, {
           output: {
             decision: data.decision,
+            ...(data.outcome ? { outcome: data.outcome } : {}),
+            ...(data.signal ? { signal: data.signal } : {}),
             exitCode: data.exitCode,
             stderrSummary: config.captureContent ? data.stderrSummary : undefined,
           },
-          level:
-            data.exitCode === undefined || (data.exitCode !== 0 && data.exitCode !== 2)
-              ? 'ERROR'
-              : data.decision === 'block' || data.decision === 'deny' || data.decision === 'stop'
-                ? 'WARNING'
-                : 'DEFAULT',
+          level,
           metadata: { durationMs: data.durationMs },
         });
       }
-      pending?.delete(data.handlerId);
+      reporter.endSpan(hook.root ?? null, { level });
+      pending?.delete(key);
       if (pending?.size === 0) openHooks.delete(sessionId);
       return;
     }
-    if (event.type === 'turn/end') closeHooks(sessionId);
+    if (event.type === 'turn/end') closeHooks(sessionId, true);
     const child = children.get(sessionId);
     if (child) {
+      if (event.type === 'turn/start') child.turn = event.data.turn;
+      if (event.type === 'turn/end') child.turn = undefined;
       // The delegated prompt (the child's first user/message) is the
       // subagent span's input; the descriptor enriches the span name.
       if (event.type === 'user/message' && !child.hasInput && config.captureContent) {
@@ -566,11 +614,11 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         // whose `turn/end` was never seen (crash-orphaned): end and replace
         // it — v5 spans only export on end, so the stale root must close to
         // keep what it already recorded.
-        closeHooks(sessionId);
+        closeHooks(sessionId, true);
         const stale = sessions.get(sessionId);
         if (stale) afterMedia(stale.trace, (endedAt) => reporter.endSpan(stale.trace, {}, endedAt));
         const trace = openTrace(sessionId, { turn: event.data.turn });
-        if (trace) sessions.set(sessionId, { trace, hasInput: false });
+        if (trace) sessions.set(sessionId, { trace, hasInput: false, turn: event.data.turn });
         break;
       }
       case 'user/message': {
