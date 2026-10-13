@@ -69,7 +69,10 @@ export function isHookResult(data: unknown): data is HookResult {
   );
 }
 
-/** Append standard telemetry without narrowing custom dialects or changing hook decisions. */
+/**
+ * Append standard telemetry without changing hook decisions.
+ * Runtime invariants still apply; rejected custom/late records return false.
+ */
 export function appendHookEvent<K extends keyof HookEventMap>(
   session: Session,
   type: K,
@@ -83,7 +86,7 @@ export function appendHookEvent<K extends keyof HookEventMap>(
     ) {
       throw new TypeError('invalid hook telemetry fields');
     }
-    // The optional upstream hook-protocol augmentation still restricts dialects.
+    // Widen TypeScript only; session.append still enforces installed runtime invariants.
     const append = session.append as unknown as (type: K, data: HookEventMap[K]) => unknown;
     append.call(session, type, data);
     return true;
