@@ -14,6 +14,7 @@ const config = (overrides: Partial<A2aPluginConfig> = {}): A2aPluginConfig => ({
   basePath: '/a2a',
   cwd: process.cwd(),
   uploadsDir: '',
+  subagentTools: { enabled: false },
   agent: { provider: '', model: '', preset: '' },
   card: { name: 'test-agent', description: 'd', version: '0.0.0', publicUrl: '' },
   taskStore: 'memory',
@@ -55,6 +56,12 @@ describe('dsh-a2a plugin', () => {
     const result = apply(ctx, config({ enabled: false }));
     expect(result).toBeUndefined();
     expect(console.log).not.toHaveBeenCalled();
+  });
+
+  it('requires an explicit opt-in for subagent tool streaming', () => {
+    expect(Config({}).subagentTools).toEqual({ enabled: false });
+    expect(Config({ subagentTools: { enabled: true } }).subagentTools).toEqual({ enabled: true });
+    expect(() => Config({ subagentTools: { enabled: 'yes' as never } })).toThrow();
   });
 
   it('serves the agent card while loaded and closes the server on fiber unload', async () => {

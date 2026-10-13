@@ -31,6 +31,7 @@ import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
 export type { A2aApproval, A2aApprovalCodec, A2aApprovalReply } from './approval.js';
 export { defaultApprovalCodec } from './approval.js';
 export type { A2aFileMaterializer } from './content.js';
+export type { SubagentToolSource } from './translator.js';
 
 /** Event emitted when one A2A user message enters the dsh inbox. */
 export const A2A_MESSAGE_ADMITTED_EVENT = 'a2a/message-admitted' as const;
@@ -103,6 +104,9 @@ export const Config = Schema.object({
    * below it). Empty = <OS temp>/dsh-a2a-uploads.
    */
   uploadsDir: Schema.string().default(''),
+  subagentTools: Schema.object({
+    enabled: Schema.boolean().default(false),
+  }),
   agent: Schema.object({
     provider: Schema.string().default(''),
     model: Schema.string().default(''),
@@ -148,6 +152,7 @@ export interface A2aPluginConfig {
   heartbeat?: { enabled: boolean; intervalMs: number };
   cwd: string;
   uploadsDir: string;
+  subagentTools: { enabled: boolean };
   agent: { provider: string; model: string; preset: string };
   card: { name: string; description: string; version: string; publicUrl: string };
   taskStore: 'memory' | 'redis' | 'gcs';
@@ -188,6 +193,7 @@ export function apply(
         model: config.agent.model || undefined,
       },
       preset: config.agent.preset || undefined,
+      subagentTools: config.subagentTools,
     });
 
     const store = createTaskStore(config);
