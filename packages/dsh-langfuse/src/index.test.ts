@@ -8,7 +8,7 @@ import type {
   TokenUsage,
   ToolCallId,
 } from '@deepseek-ai/dsh-llm';
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
+import { type Session, type SessionEvent, SessionStore } from '@deepseek-ai/dsh-session';
 import type {
   ToolDispatchExecution,
   ToolExecutionResult,
@@ -17,7 +17,7 @@ import type {
 import type { LangfuseGeneration, LangfuseSpan } from '@langfuse/tracing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { LangfuseReporter, usageOf } from './client.js';
-import { apply, inject, type LangfusePluginConfig, name } from './index.js';
+import { appendHookEvent, apply, inject, type LangfusePluginConfig, name } from './index.js';
 
 // The shared Langfuse SDK mock: the v5 SDK surface is three modules —
 // @langfuse/tracing (startObservation + setLangfuseTracerProvider),
@@ -941,6 +941,368 @@ describe('dsh-langfuse plugin', () => {
       expect(hook.ended).toBe(1);
       ctx.emit('session/event', session, turnEnd(0));
       expect(mocks.roots[0].ended).toBe(1);
+    });
+
+    it('correlates concurrent custom hook runs and records explicit process outcomes', async () => {
+      await setup();
+      const session = sessionOf('custom');
+      ctx.emit('session/event', session, turnStart(0));
+      for (const invocationId of ['first', 'second']) {
+        ctx.emit(
+          'session/event',
+          session,
+          ev('hook/invoked', {
+            turn: 0,
+            point: 'BeforeAgent',
+            dialect: 'company-validator',
+            handlerId: 'same-command',
+            invocationId,
+            name: 'Validate request',
+          }),
+        );
+      }
+      expect(mocks.roots[0].spans).toHaveLength(2);
+      expect(mocks.roots[0].spans.every((span) => span.ended === 0)).toBe(true);
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/result', {
+          turn: 0,
+          point: 'BeforeAgent',
+          handlerId: 'same-command',
+          invocationId: 'second',
+          decision: 'pass',
+          outcome: 'timed-out',
+          signal: 'SIGTERM',
+          durationMs: 100,
+        }),
+      );
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/result', {
+          turn: 0,
+          point: 'BeforeAgent',
+          handlerId: 'same-command',
+          invocationId: 'first',
+          decision: 'pass',
+          outcome: 'success',
+          exitCode: 2,
+          durationMs: 7,
+        }),
+      );
+      expect(lastUpdate(mocks.roots[0].spans[0])).toMatchObject({
+        level: 'DEFAULT',
+        output: { outcome: 'success', exitCode: 2 },
+      });
+      expect(lastUpdate(mocks.roots[0].spans[1])).toMatchObject({
+        level: 'ERROR',
+        output: { outcome: 'timed-out', signal: 'SIGTERM' },
+      });
+      expect(mocks.roots[0].spans[0].body.metadata).toMatchObject({
+        dialect: 'company-validator',
+        invocationId: 'first',
+        name: 'Validate request',
+      });
+    });
+
+    it('keeps custom runs correlated across turn closure and exports detached cancellation hooks', async () => {
+      await setup();
+      const session = sessionOf('custom');
+      ctx.emit('session/event', session, turnStart(0));
+      const invoked = {
+        turn: 0,
+        point: 'AfterAgent',
+        dialect: 'gemini',
+        handlerId: 'cancel-command',
+        invocationId: 'running',
+      };
+      ctx.emit('session/event', session, ev('hook/invoked', invoked));
+      ctx.emit('session/event', session, turnEnd(0));
+      expect(mocks.roots[0].spans[0].ended).toBe(0);
+      ctx.emit('session/event', session, turnStart(1));
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/result', {
+          turn: 0,
+          point: 'AfterAgent',
+          handlerId: 'cancel-command',
+          invocationId: 'running',
+          decision: 'pass',
+          outcome: 'cancelled',
+          signal: 'SIGTERM',
+          durationMs: 12,
+        }),
+      );
+      expect(lastUpdate(mocks.roots[0].spans[0])).toMatchObject({
+        level: 'WARNING',
+        output: { outcome: 'cancelled' },
+      });
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/invoked', { ...invoked, invocationId: 'detached' }),
+      );
+      expect(mocks.roots).toHaveLength(3);
+      expect(mocks.roots[2].body.metadata).toMatchObject({ turn: 0, detachedHook: true });
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/result', {
+          turn: 0,
+          point: 'AfterAgent',
+          handlerId: 'cancel-command',
+          invocationId: 'detached',
+          decision: 'pass',
+          outcome: 'success',
+          exitCode: 0,
+          durationMs: 3,
+        }),
+      );
+      expect(mocks.roots[2].ended).toBe(1);
+      expect(mocks.roots[2].spans[0].ended).toBe(1);
+      expect(mocks.roots[1].ended).toBe(0);
+    });
+
+    it.each([
+      ['success', 'DEFAULT'],
+      ['failed', 'ERROR'],
+      ['timed-out', 'ERROR'],
+      ['cancelled', 'WARNING'],
+    ])('reports custom %s independently of the hook decision', async (outcome, level) => {
+      await setup({ ...enabledConfig, secretKey: 'sk-lf-private', redactFields: ['name'] });
+      const session = sessionOf('custom');
+      ctx.emit('session/event', session, turnStart(0));
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/invoked', {
+          turn: 0,
+          point: 'BeforeAgent',
+          dialect: 'gemini',
+          handlerId: 'h',
+          invocationId: 'run',
+          name: 'PRIVATE NAME',
+        }),
+      );
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/result', {
+          turn: 0,
+          point: 'BeforeAgent',
+          handlerId: 'h',
+          invocationId: 'run',
+          decision: 'pass',
+          outcome,
+          durationMs: 9,
+          stderrSummary: 'sk-lf-private',
+        }),
+      );
+      const hook = mocks.roots[0].spans[0];
+      expect(lastUpdate(hook)).toMatchObject({ level, output: { decision: 'pass', outcome } });
+      expect(JSON.stringify(hook)).not.toContain('sk-lf-private');
+      expect(JSON.stringify(hook)).not.toContain('PRIVATE NAME');
+      expect(hook.ended).toBe(1);
+    });
+
+    it('withholds custom names and stderr with content capture off and closes abandoned runs', async () => {
+      await setup({ ...enabledConfig, captureContent: false });
+      const session = sessionOf('custom');
+      ctx.emit('session/event', session, turnStart(0));
+      const invoked = {
+        turn: 0,
+        point: 'BeforeAgent',
+        dialect: 'gemini',
+        handlerId: 'h',
+        invocationId: 'run',
+        name: 'PRIVATE NAME',
+      };
+      ctx.emit('session/event', session, ev('hook/invoked', invoked));
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/result', {
+          turn: 0,
+          point: 'BeforeAgent',
+          handlerId: 'h',
+          invocationId: 'run',
+          decision: 'pass',
+          outcome: 'failed',
+          durationMs: 9,
+          stderrSummary: 'PRIVATE STDERR',
+        }),
+      );
+      expect(JSON.stringify(mocks.roots)).not.toContain('PRIVATE');
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/invoked', { ...invoked, invocationId: 'abandoned' }),
+      );
+      ctx.emit('session/event', session, turnEnd(0));
+      expect(mocks.roots[0].spans[1].ended).toBe(0);
+      await ctx.fiber.dispose();
+      expect(mocks.roots[0].spans[1].ended).toBe(1);
+      expect(lastUpdate(mocks.roots[0].spans[1])).toMatchObject({
+        level: 'WARNING',
+        statusMessage: 'hook result not observed',
+      });
+    });
+
+    it('ignores malformed or unpaired records and contains hook exporter failures', async () => {
+      await setup();
+      const session = sessionOf('custom');
+      ctx.emit('session/event', session, turnStart(0));
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/result', {
+          turn: 0,
+          point: 'BeforeAgent',
+          handlerId: 'missing',
+          decision: 'pass',
+          durationMs: 1,
+        }),
+      );
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/invoked', {
+          turn: 0,
+          point: 'BeforeAgent',
+          dialect: 'gemini',
+          handlerId: 'h',
+          invocationId: 12,
+        }),
+      );
+      expect(mocks.roots[0].spans).toHaveLength(0);
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        mocks.state.failCreate = true;
+        expect(() =>
+          ctx.emit(
+            'session/event',
+            session,
+            ev('hook/invoked', {
+              turn: 0,
+              point: 'BeforeAgent',
+              dialect: 'gemini',
+              handlerId: 'h',
+              invocationId: 'run',
+            }),
+          ),
+        ).not.toThrow();
+        expect(error).toHaveBeenCalledWith(
+          '[dsh-langfuse] span creation failed:',
+          expect.any(Error),
+        );
+      } finally {
+        error.mockRestore();
+        await ctx.fiber.dispose();
+      }
+    });
+
+    it('does not let late child hook failures mark a new parent turn as erroneous', async () => {
+      await setup();
+      const parent = sessionOf('parent');
+      const child = childSessionOf('child', 'parent');
+      ctx.emit('session/event', parent, turnStart(0));
+      ctx.emit('session/created', child);
+      ctx.emit('session/event', child, turnStart(0));
+      ctx.emit(
+        'session/event',
+        child,
+        ev('hook/invoked', {
+          turn: 0,
+          point: 'AfterAgent',
+          dialect: 'gemini',
+          handlerId: 'h',
+          invocationId: 'old',
+        }),
+      );
+      ctx.emit('session/event', child, turnEnd(0));
+      ctx.emit('session/event', parent, turnEnd(0));
+      ctx.emit('session/event', parent, turnStart(1));
+      ctx.emit(
+        'session/event',
+        child,
+        ev('hook/result', {
+          turn: 0,
+          point: 'AfterAgent',
+          handlerId: 'h',
+          invocationId: 'old',
+          decision: 'pass',
+          outcome: 'failed',
+          durationMs: 1,
+        }),
+      );
+      ctx.emit('session/event', parent, turnEnd(1));
+      expect(lastUpdate(mocks.roots[1]).metadata).not.toHaveProperty('hadErrors');
+      expect(mocks.roots[0].spans[0].spans[0].ended).toBe(1);
+      await ctx.fiber.dispose();
+    });
+
+    it('keeps next-turn context queued when a detached hook arrives', async () => {
+      await setup();
+      const session = sessionOf('custom');
+      const context = {
+        traceparent: '00-1234567890abcdef1234567890abcdef-1234567890abcdef-01',
+        userId: 'next-turn-owner',
+        tags: ['next-turn'],
+      };
+      ctx.emit('langfuse/context', session.id, context);
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/invoked', {
+          turn: 0,
+          point: 'AfterAgent',
+          dialect: 'gemini',
+          handlerId: 'h',
+          invocationId: 'late',
+        }),
+      );
+      ctx.emit('session/event', session, turnStart(1));
+      expect(mocks.roots[1].parentContext).toMatchObject({
+        traceId: '1234567890abcdef1234567890abcdef',
+        spanId: '1234567890abcdef',
+      });
+      expect(mocks.roots[0].parentContext).not.toMatchObject({
+        traceId: '1234567890abcdef1234567890abcdef',
+      });
+      await ctx.fiber.dispose();
+    });
+
+    it('exports custom producer records written through a live Session', async () => {
+      await setup();
+      new SessionStore(ctx);
+      const session = ctx.sessions.create();
+      expect(
+        appendHookEvent(session, 'hook/invoked', {
+          turn: 0,
+          point: 'BeforeAgent',
+          dialect: 'company-validator',
+          handlerId: 'h',
+          invocationId: 'run',
+        }),
+      ).toBe(true);
+      expect(
+        appendHookEvent(session, 'hook/result', {
+          turn: 0,
+          point: 'BeforeAgent',
+          handlerId: 'h',
+          invocationId: 'run',
+          decision: 'pass',
+          outcome: 'success',
+          exitCode: 0,
+          durationMs: 3,
+        }),
+      ).toBe(true);
+      expect(mocks.roots[0].spans[0].body.metadata).toMatchObject({ dialect: 'company-validator' });
+      expect(mocks.roots[0].spans[0].ended).toBe(1);
+      expect(mocks.roots[0].ended).toBe(1);
+      await ctx.fiber.dispose();
     });
 
     it('marks a failed hook script as an error', async () => {

@@ -89,11 +89,56 @@ Compaction and session-title calls passing through `llm/stream` already receive 
 
 Hook spans appear when a dsh hook bridge emits the paired session records. The current `hook/result` record does not contain stdout; successful script output can appear in the LLM request when the bridge injects it as context, while the hook span reports decision, exit code, duration, and bounded stderr. `SessionStart` runs before the first turn and does not emit these records, so it has no hook span.
 
+### Custom hook producers
+
+Custom bridges use the same `hook/invoked` and `hook/result` session records. The writer and consumer accept an unrestricted `dialect` source string (`gemini`, `codex`, `company-validator`, etc.); admission to the session log still depends on installed runtime invariants. No dialect registration or separate exporter is needed. The plugin observes records only and never executes hooks or changes their decisions.
+
+Import `appendHookEvent`, `HookInvoked`, and `HookResult` from `@amaster.ai/dsh-langfuse`. This typed writer uses the real `session.append` publication path without redeclaring `SessionEventMap`. Its TypeScript adaptation allows custom payloads despite the optional upstream `dsh-hook-protocol` type augmentation; it does not widen that package's runtime contract, runner, or bridge APIs. The writer validates fields, catches append failures, logs `[dsh-langfuse]`, and returns a boolean; telemetry success must never control a hook's decision.
+
+**Runtime compatibility boundary (verified with `dsh-hook-protocol@0.2.0-rc.2`).** When its invariant companion is registered and enabled through `dsh-invariants`, it rejects dialects other than `claude-code`/`codex`, invocations outside an open turn, and results after their turn closes or while another turn is open. A type assertion cannot bypass these pre-commit checks. `appendHookEvent` returns `false` for rejected records; they are not committed or published and produce no Langfuse hook observation.
+
+| Runtime composition | Claude Code/Codex pairs in the open turn | Custom dialects | Detached invocations / late results |
+| --- | --- | --- | --- |
+| No active hook-protocol invariant | Supported | Supported | Supported with `invocationId` |
+| Active hook-protocol invariant 0.2.0-rc.2 | Supported | Rejected | Rejected |
+
+The writer never disables or reconfigures invariants. Applications using the active companion need an upstream contract change before adopting custom or late records. The producer still owns hook execution and decisions even when telemetry is rejected. The following custom example requires a runtime composition that admits those records.
+
+```ts
+import { randomUUID } from 'node:crypto';
+import { appendHookEvent } from '@amaster.ai/dsh-langfuse';
+
+// The bridge determines turn/point, executes the command, and owns its outcome.
+const invocationId = randomUUID();
+const identity = { turn, point: 'BeforeAgent', handlerId: 'request-validator', invocationId };
+appendHookEvent(session, 'hook/invoked', {
+  ...identity,
+  dialect: 'company-validator',
+  name: 'Validate request',
+});
+// After execution, including exceptions, timeout or cancellation:
+appendHookEvent(session, 'hook/result', {
+  ...identity,
+  decision: 'pass',
+  outcome: 'success',
+  exitCode: 0,
+  durationMs: 37,
+});
+```
+
+Every custom execution should have a unique `invocationId` and a result emitted in the producer's `finally` path. Both records must share `turn`, `point`, `handlerId`, and `invocationId`. `handlerId` identifies the configured handler; `invocationId` identifies one execution, including concurrent executions of that handler. Optional `name` labels the hook. Unmatched/skipped hooks must not emit an invocation: these records represent actual execution. The producer bounds `stderrSummary` and omits unavailable optional fields rather than writing `undefined` into the JSON session log.
+
+`hook/result.outcome` describes process execution independently of `decision`: `success` is normal completion, `failed` is execution failure, `timed-out` is deadline termination, and `cancelled` is cancellation. The producer maps its process semantics to these values; an exit code expressing a policy denial can still be a successful execution. Optional `exitCode` and `signal` preserve process details. Failed/timed-out executions receive ERROR observations, cancellation receives WARNING, and successful executions retain decision-based warnings. Records without an explicit outcome preserve the legacy exit-code interpretation (0/2 are non-error). The plugin records `durationMs` and never infers a timeout or cancellation from a missing exit code.
+
+For records admitted by the session, runs with `invocationId` retain correlation after `turn/end` and a subsequent `turn/start`; a late result ends the original hook span without attaching it to the new turn. Invocations arriving outside their originating turn receive a separate root with `detachedHook: true` and the original turn number; their result ends both hook and root so they export without waiting for another turn. These detached hook roots do not consume `langfuse/context` queued for the next turn. Detached producers must finish reporting before the session is disposed. Session disposal/plugin unload closes unfinished runs with `hook result not observed`; this means missing telemetry, not proof of execution failure. Legacy records without `invocationId` still close at turn boundaries.
+
+Custom names and stderr follow `captureContent`; credentials and `redactFields` are masked by the existing reporter. New outcomes, correlation IDs, dialect, point, duration and process metadata remain available with content capture disabled. The event writer does not sanitize the session log itself: application producers remain responsible for what they persist. Applications must explicitly replace any private hook events with this standard producer path, reuse the same `invocationId`, and report the actual outcome; installing/upgrading the plugin does not adapt an application bridge or repair historical Trace overview IO (Issue #59).
+
 Observability is a no-throw seam: backend errors are logged with a `[dsh-langfuse]` prefix and never escape into the agent loop.
 
 ## Compatibility
 
-Run `pnpm test:sdk` at the repository root for a secrets-free check using the real Langfuse SDK and the existing local OTLP receiver. It verifies export, native tool type, SDK label redaction, ambient-baggage isolation, external trace ownership, and agent-less tool unload. It is separate from the mocked unit suite and the gateway/real-Langfuse E2E legs.
+Run `pnpm test:sdk` at the repository root for a secrets-free check using the real Langfuse SDK and the existing local OTLP receiver. It verifies export, native tool type, SDK label redaction, ambient-baggage isolation, external trace ownership, agent-less tool unload, and custom hook export across turn closure. It is separate from the mocked unit suite and the gateway/real-Langfuse E2E legs.
 
 ### Trace overview compatibility
 

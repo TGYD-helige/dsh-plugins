@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { LangfuseReporter } from '../../../../packages/dsh-langfuse/lib/client.js';
-import { apply } from '../../../../packages/dsh-langfuse/lib/index.js';
+import { appendHookEvent, apply } from '../../../../packages/dsh-langfuse/lib/index.js';
 import {
   capturedToObservations,
   evaluateReasoning,
@@ -225,6 +225,42 @@ try {
   assert.equal(await operation, result);
   assert.equal(captured.length, 10, 'late completion must not export the same tool again');
   assert.equal(imageReads, 1, 'late completion must not start another image read');
+  // Real session producer + SDK export, including results after their parent ended.
+  const hookOffset = captured.length;
+  ctx = new Context();
+  const { SessionStore } = await import(require.resolve('@deepseek-ai/dsh-session'));
+  new SessionStore(ctx);
+  await apply(ctx, { ...connection, enabled: true, traceName: 'dsh-turn', captureContent: false });
+  const session = ctx.sessions.create();
+  session.append('turn/start', { turn: 0 });
+  const identity = { turn: 0, point: 'AfterAgent', handlerId: 'validator', invocationId: 'running' };
+  assert.equal(appendHookEvent(session, 'hook/invoked', {
+    ...identity, dialect: 'company-validator', name: 'PRIVATE HOOK',
+  }), true);
+  session.append('turn/end', { turn: 0, reason: { kind: 'completed' } });
+  session.append('turn/start', { turn: 1 });
+  assert.equal(appendHookEvent(session, 'hook/result', {
+    ...identity, decision: 'pass', outcome: 'cancelled', signal: 'SIGTERM', durationMs: 12,
+    stderrSummary: 'PRIVATE STDERR',
+  }), true);
+  const detached = { ...identity, invocationId: 'detached' };
+  assert.equal(appendHookEvent(session, 'hook/invoked', { ...detached, dialect: 'gemini' }), true);
+  assert.equal(appendHookEvent(session, 'hook/result', {
+    ...detached, decision: 'pass', outcome: 'success', exitCode: 0, durationMs: 3,
+  }), true);
+  await ctx.parallel('session/flush', session);
+  const hookObservations = capturedToObservations(captured.slice(hookOffset));
+  const runningHook = hookObservations.find((o) => o.metadata?.invocationId === 'running');
+  const detachedHook = hookObservations.find((o) => o.metadata?.invocationId === 'detached');
+  const turnRoot = hookObservations.find((o) => o.name === 'dsh-turn' && Number(o.metadata?.turn) === 0 && !o.metadata?.detachedHook);
+  const detachedRoot = hookObservations.find((o) => o.metadata?.detachedHook);
+  assert.equal(runningHook.parentObservationId, turnRoot.id);
+  assert.equal(runningHook.output.outcome, 'cancelled');
+  assert.equal(detachedHook.parentObservationId, detachedRoot.id);
+  assert.equal(detachedHook.output.outcome, 'success');
+  assert.equal(hookObservations.length, 4, 'late and detached hook spans and their roots must export before session disposal');
+  assert.doesNotMatch(JSON.stringify(captured.slice(hookOffset)), /PRIVATE/);
+  await ctx.fiber.dispose();
   console.log('real Langfuse SDK / OTLP checks passed');
 } finally {
   await ctx?.fiber.dispose();
