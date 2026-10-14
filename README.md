@@ -12,6 +12,7 @@ Composable, config-driven plugins for [DeepSeek Harness (dsh)](https://github.co
 | [`@amaster.ai/dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
 | [`@amaster.ai/dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call (plus a nested `llm-request` span with the verbatim loop-built request), one span per tool call or hook run, one trace per turn; subagent child sessions nested under the parent's tree | `llm/stream` + `tools/execute` waterfalls, `session/event` (including `hook/*`), `session/created` + `subagent/start`/`subagent/end` |
 | [`@amaster.ai/dsh-policy`](packages/dsh-policy) | Declarative tool-call policy: config-driven `allow`/`deny`/`ask` rules (tool name, args pattern, per-segment shell command prefix/regex, priority) — Gemini CLI-style policy files as plain plugin config | `tools/pre-execute` waterfall (`ask` rides dsh's approval seam) |
+| [`@amaster.ai/dsh-subagent-filesystem`](packages/dsh-subagent-filesystem) | Discovers Markdown specialist roles through the caller's filesystem and delegates through native in-process subagents | `ctx.fs`, scoped `ctx.tools` / `ctx.systemPrompt`, `agent/created`, `ctx.subagents` |
 
 ## Plugin previews
 
@@ -21,6 +22,9 @@ Composable, config-driven plugins for [DeepSeek Harness (dsh)](https://github.co
     <td><strong>dsh-storage</strong><br><a href="packages/dsh-storage"><img src="packages/dsh-storage/preview.png" alt="dsh-storage preview" width="260"></a></td>
     <td><strong>dsh-langfuse</strong><br><a href="packages/dsh-langfuse"><img src="packages/dsh-langfuse/preview.png" alt="dsh-langfuse preview" width="260"></a></td>
     <td><strong>dsh-policy</strong><br><a href="packages/dsh-policy"><img src="packages/dsh-policy/preview.png" alt="dsh-policy preview" width="260"></a></td>
+  </tr>
+  <tr>
+    <td><strong>dsh-subagent-filesystem</strong><br><a href="packages/dsh-subagent-filesystem"><img src="packages/dsh-subagent-filesystem/preview.png" alt="dsh-subagent-filesystem preview" width="260"></a></td>
   </tr>
 </table>
 
@@ -41,6 +45,8 @@ dsh is in developer preview and **will** break compatibility between releases. P
 `dsh-a2a` requires `@deepseek-ai/dsh-session >=0.2.0-rc.1`: optional subagent tool streaming uses the session lifecycle offset to distinguish newly created children from restored sessions, preventing false delegation attribution. Other dsh peer floors remain unchanged.
 
 `dsh-langfuse`'s optional image display uses `@deepseek-ai/dsh-attachment >=0.2.0-rc.1` (tested at `0.2.0-rc.2`); metadata-only tracing does not require an attachment backend.
+
+`dsh-subagent-filesystem` requires dsh services at `>=0.2.0-rc.1` (tested at `0.2.0-rc.2`) and the native in-process `spawn` provider. It supports foreground reports and continuable background children; Markdown definitions cannot override models, tools, or permissions.
 
 ## Install
 
