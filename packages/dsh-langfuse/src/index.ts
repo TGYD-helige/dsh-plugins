@@ -8,7 +8,7 @@
  *   from the chunk stream), plus a nested `llm-request` **span** holding the
  *   same options and collected chunk stream (the rawest request/response a
  *   plugin can observe — the provider HTTP body is assembled inside the adapter).
- * - `tools/execute` waterfall → one Langfuse **span** per tool dispatch
+ * - `tools/pre-execute` → `tools/result` → one Langfuse **span** per tool pipeline
  *   (routed to the session's trace via `exec.agent.id` — the agent/session
  *   shared identity).
  * - `hook/invoked` / `hook/result` session records → one **span** per hook run.
@@ -29,7 +29,7 @@
  * @module dsh-langfuse
  */
 
-import type { Context } from '@deepseek-ai/cordis';
+import type { Context, Events } from '@deepseek-ai/cordis';
 import type {
   ContentBlock,
   FinishReason,
@@ -122,6 +122,7 @@ interface HookObservation {
   point: string;
   handlerId: string;
   persistent: boolean;
+  callId?: string;
   turnTrace?: ObservationHandle;
 }
 
@@ -301,8 +302,13 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   const reporter = new LangfuseReporter(config);
   const sessions = new Map<string, SessionTrace>();
   const children = new Map<string, ChildSession>();
-  /** Per-session stack of currently open tools/execute spans (for subagent parenting). */
+  /** Per-session stack of currently open tool pipeline spans (for subagent parenting). */
   const openToolSpans = new Map<string, ObservationHandle[]>();
+  const toolCalls = new Map<string, Map<string, { span: ObservationHandle; turn?: number }>>();
+  const toolResults = new WeakMap<
+    object,
+    (result: Parameters<Events['tools/result']>[1]) => void
+  >();
   const openHooks = new Map<string, Map<string, HookObservation>>();
   const openOperations = new Set<() => void>();
   const traceContexts = new Map<string, LangfuseTraceContext>();
@@ -519,18 +525,25 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
               metadata: { turn: data.turn, detachedHook: true },
             })
           : undefined;
-      const span = reporter.startSpan(root === undefined ? parentFor(sessionId) : root, {
-        name: `hook:${data.point}`,
-        metadata: {
-          turn: data.turn,
-          point: data.point,
-          dialect: data.dialect,
-          matcher: data.matcher,
-          handlerId: data.handlerId,
-          ...(data.invocationId ? { invocationId: data.invocationId } : {}),
-          ...(config.captureContent && data.name ? { name: data.name } : {}),
+      const tool = data.callId ? toolCalls.get(sessionId)?.get(data.callId) : undefined;
+      const hookName = config.captureContent ? reporter.mask({ name: data.name }).name : undefined;
+      const span = reporter.startSpan(
+        root === undefined ? (tool?.turn === data.turn ? tool.span : parentFor(sessionId)) : root,
+        {
+          name: `hook:${data.point}${hookName ? `:${hookName}` : ''}`,
+          input: config.captureContent ? data.input : undefined,
+          metadata: {
+            turn: data.turn,
+            point: data.point,
+            dialect: data.dialect,
+            matcher: data.matcher,
+            handlerId: data.handlerId,
+            ...(data.invocationId ? { invocationId: data.invocationId } : {}),
+            ...(data.callId ? { callId: data.callId } : {}),
+            ...(config.captureContent && data.name ? { name: data.name } : {}),
+          },
         },
-      });
+      );
       pending.set(key, {
         span,
         root,
@@ -538,6 +551,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         point: data.point,
         handlerId: data.handlerId,
         persistent: !!data.invocationId,
+        callId: data.callId,
         turnTrace:
           root === undefined ? (child?.turnTrace ?? sessions.get(sessionId)?.trace) : undefined,
       });
@@ -554,7 +568,8 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         !hook ||
         hook.handlerId !== data.handlerId ||
         hook.turn !== data.turn ||
-        hook.point !== data.point
+        hook.point !== data.point ||
+        (data.callId !== undefined && hook.callId !== data.callId)
       )
         return;
       const span = hook.span;
@@ -567,6 +582,20 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
           ? 'WARNING'
           : 'DEFAULT';
       if (span) {
+        const processOutput: Record<string, string> = {};
+        const truncation: Record<string, boolean> = {};
+        if (config.captureContent) {
+          const masked = reporter.mask({
+            stdout: data.stdout,
+            stderr: data.stderr,
+            stderrSummary: data.stderrSummary,
+          });
+          for (const [field, text] of Object.entries(masked)) {
+            if (text === undefined) continue;
+            processOutput[field] = text.slice(0, 4096);
+            truncation[`${field}Truncated`] = text.length > 4096;
+          }
+        }
         if (failed && sessions.get(rootSessionId(sessionId) ?? '')?.trace === hook.turnTrace)
           noteError(sessionId);
         reporter.endSpan(span, {
@@ -575,10 +604,10 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
             ...(data.outcome ? { outcome: data.outcome } : {}),
             ...(data.signal ? { signal: data.signal } : {}),
             exitCode: data.exitCode,
-            stderrSummary: config.captureContent ? data.stderrSummary : undefined,
+            ...(config.captureContent ? { result: data.result, ...processOutput } : {}),
           },
           level,
-          metadata: { durationMs: data.durationMs },
+          metadata: { durationMs: data.durationMs, ...truncation },
         });
       }
       reporter.endSpan(hook.root ?? null, { level });
@@ -586,6 +615,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       if (pending?.size === 0) openHooks.delete(sessionId);
       return;
     }
+    if (event.type === 'turn/end' || event.type === 'turn/start') toolCalls.delete(sessionId);
     if (event.type === 'turn/end') closeHooks(sessionId, true);
     const child = children.get(sessionId);
     if (child) {
@@ -684,6 +714,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     sessions.delete(sessionId);
     traceContexts.delete(sessionId);
     openToolSpans.delete(sessionId);
+    toolCalls.delete(sessionId);
     // End an abandoned root (crash-orphaned turn or between-turns one-off
     // trace) — v5 spans only export on end, so dropping it open would lose
     // everything it recorded.
@@ -905,84 +936,100 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   });
 
   // ------------------------------------------------------------------
-  // Span per tool dispatch. This waterfall IS async: `next()` returns the
-  // normalized dispatch result promise. Open spans are tracked per session
+  // Span per tool pipeline, including pre/post hooks and denied calls.
+  // Open spans are tracked per session
   // so a subagent span opened mid-dispatch (foreground delegation) parents
   // under the enclosing tool span.
   // ------------------------------------------------------------------
-  ctx.on('tools/execute', async (exec, next) => {
-    const sessionId = exec.agent?.id;
-    const parent = parentFor(sessionId);
-    // An agent-less dispatch's trace root has no session lifecycle to close
-    // it — it rides this dispatch's (same one-off rule as llm/stream).
-    const oneOffRoot = sessionId ? null : parent;
-    // Argument summaries are argument content — they ride captureContent.
-    const args = config.captureContent ? reporter.mask(exec.arguments) : undefined;
-    const argSummary = config.captureContent ? toolCallSummary(args) : undefined;
-    const span = reporter.startSpan(parent, {
-      name: `tool:${exec.name}${argSummary ? ` [${argSummary}]` : ''}`,
-      asType: 'tool',
-      input: args,
-      metadata: { callId: exec.callId, toolName: exec.name },
-    });
-    if (sessionId && span) {
-      openToolSpans.set(sessionId, [...(openToolSpans.get(sessionId) ?? []), span]);
-    }
-    let closed = false;
-    const closeTool = () =>
-      finishTool({ level: 'WARNING', statusMessage: 'plugin unloaded during tool call' });
-    function finishTool(
-      update: NonNullable<Parameters<LangfuseReporter['endSpan']>[1]>,
-      display?: Promise<unknown>,
-    ): void {
-      if (closed) return;
-      closed = true;
-      const endedAt = new Date();
-      openOperations.delete(closeTool);
-      if (sessionId && span) {
-        const remaining = (openToolSpans.get(sessionId) ?? []).filter((s) => s !== span);
-        if (remaining.length) openToolSpans.set(sessionId, remaining);
-        else openToolSpans.delete(sessionId);
-      }
-      const end = (output = update.output) => {
-        reporter.endSpan(span, { ...update, output }, endedAt);
-        reporter.endSpan(oneOffRoot, {}, endedAt);
-      };
-      if (display)
-        trackMedia(
-          display.then(end).catch((error) => {
-            console.error('[dsh-langfuse] media projection failed:', error);
-            end();
-          }),
-        );
-      else end();
-    }
-    openOperations.add(closeTool);
-    try {
-      const result = await next();
-      if (closed) return result;
-      if (result.isError) noteError(sessionId);
-      const update = {
-        output: config.captureContent ? result.content : undefined,
-        level: (result.isError ? 'ERROR' : 'DEFAULT') as ObservationLevel,
-        statusMessage: result.isError ? contentMessage(config, result.error.message) : undefined,
-        metadata: { errorCode: result.isError ? result.error.info?.code : undefined },
-      };
-      if (span && config.captureContent && result.content.some((block) => block.type === 'image')) {
-        finishTool(
-          update,
-          displayBlocks(result.content, ctx.get('attachments'), mediaOptions, exec.signal),
-        );
-      } else finishTool(update);
-      return result;
-    } catch (error) {
-      noteError(sessionId);
-      finishTool({
-        level: 'ERROR',
-        statusMessage: contentMessage(config, messageOf(error)),
+  ctx.on(
+    'tools/pre-execute',
+    (exec, next) => {
+      const sessionId = exec.agent?.id;
+      const parent = parentFor(sessionId);
+      // An agent-less dispatch's trace root has no session lifecycle to close
+      // it — it rides this dispatch's (same one-off rule as llm/stream).
+      const oneOffRoot = sessionId ? null : parent;
+      // Argument summaries are argument content — they ride captureContent.
+      const args = config.captureContent ? reporter.mask(exec.arguments) : undefined;
+      const argSummary = config.captureContent ? toolCallSummary(args) : undefined;
+      const span = reporter.startSpan(parent, {
+        name: `tool:${exec.name}${argSummary ? ` [${argSummary}]` : ''}`,
+        asType: 'tool',
+        input: args,
+        metadata: { callId: exec.callId, toolName: exec.name },
       });
-      throw error;
-    }
+      if (sessionId && span) {
+        openToolSpans.set(sessionId, [...(openToolSpans.get(sessionId) ?? []), span]);
+        const calls = toolCalls.get(sessionId) ?? new Map();
+        calls.set(exec.callId, {
+          span,
+          turn: children.get(sessionId)?.turn ?? sessions.get(sessionId)?.turn,
+        });
+        toolCalls.set(sessionId, calls);
+      }
+      let closed = false;
+      const closeTool = () =>
+        finishTool({ level: 'WARNING', statusMessage: 'plugin unloaded during tool call' });
+      function finishTool(
+        update: NonNullable<Parameters<LangfuseReporter['endSpan']>[1]>,
+        display?: Promise<unknown>,
+      ): void {
+        if (closed) return;
+        closed = true;
+        const endedAt = new Date();
+        openOperations.delete(closeTool);
+        toolResults.delete(exec);
+        if (sessionId && toolCalls.get(sessionId)?.get(exec.callId)?.span === span) {
+          const calls = toolCalls.get(sessionId)!;
+          calls.delete(exec.callId);
+          if (!calls.size) toolCalls.delete(sessionId);
+        }
+        if (sessionId && span) {
+          const remaining = (openToolSpans.get(sessionId) ?? []).filter((s) => s !== span);
+          if (remaining.length) openToolSpans.set(sessionId, remaining);
+          else openToolSpans.delete(sessionId);
+        }
+        const end = (output = update.output) => {
+          reporter.endSpan(span, { ...update, output }, endedAt);
+          reporter.endSpan(oneOffRoot, {}, endedAt);
+        };
+        if (display)
+          trackMedia(
+            display.then(end).catch((error) => {
+              console.error('[dsh-langfuse] media projection failed:', error);
+              end();
+            }),
+          );
+        else end();
+      }
+      openOperations.add(closeTool);
+      toolResults.set(exec, (result) => {
+        if (closed) return;
+        if (result.isError) noteError(sessionId);
+        const update = {
+          output: config.captureContent ? result.content : undefined,
+          level: (result.isError ? 'ERROR' : 'DEFAULT') as ObservationLevel,
+          statusMessage: result.isError ? contentMessage(config, result.error.message) : undefined,
+          metadata: { errorCode: result.isError ? result.error.info?.code : undefined },
+        };
+        if (
+          span &&
+          config.captureContent &&
+          result.content.some((block) => block.type === 'image')
+        ) {
+          finishTool(
+            update,
+            displayBlocks(result.content, ctx.get('attachments'), mediaOptions, exec.signal),
+          );
+        } else finishTool(update);
+      });
+      return next();
+    },
+    { prepend: true },
+  );
+
+  ctx.on('tools/result', (exec, result) => {
+    toolResults.get(exec)?.(result);
   });
 
   // Durability checkpoint: the store awaits every session/flush listener.
@@ -1009,6 +1056,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       traceContexts.clear();
       children.clear();
       openToolSpans.clear();
+      toolCalls.clear();
       await reporter.shutdown();
     };
   });

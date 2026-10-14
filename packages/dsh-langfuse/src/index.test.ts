@@ -268,6 +268,27 @@ const execOf = (over: Partial<ToolDispatchExecution> = {}): ToolDispatchExecutio
   ...over,
 });
 
+// Drive the public pipeline and final result notification, including thrown dispatches.
+async function dispatchTool(
+  ctx: Context,
+  exec: ToolDispatchExecution,
+  run: () => Promise<ToolExecutionResult>,
+): Promise<ToolExecutionResult> {
+  await ctx.waterfall('tools/pre-execute', exec, async () => ({ kind: 'allow' }));
+  try {
+    const result = await ctx.waterfall('tools/execute', exec, run);
+    ctx.emit('tools/result', exec, result);
+    return result;
+  } catch (error) {
+    ctx.emit(
+      'tools/result',
+      exec,
+      errResult(error instanceof Error ? error.message : String(error)),
+    );
+    throw error;
+  }
+}
+
 const okResult = (): ToolExecutionResult => ({
   isError: false,
   value: null,
@@ -326,7 +347,8 @@ describe('dsh-langfuse plugin', () => {
         'session/disposed',
         'session/flush',
         'llm/stream',
-        'tools/execute',
+        'tools/pre-execute',
+        'tools/result',
         'subagent/start',
         'subagent/end',
       ]),
@@ -348,8 +370,8 @@ describe('dsh-langfuse plugin', () => {
         secretKey: 'configured-credential',
         redactFields: ['password'],
       });
-      await ctx.waterfall(
-        'tools/execute',
+      await dispatchTool(
+        ctx,
         execOf({
           arguments: {
             'configured-credential': 'value',
@@ -376,7 +398,7 @@ describe('dsh-langfuse plugin', () => {
         const resultPromise = new Promise<ToolExecutionResult>((resolve) => {
           release = resolve;
         });
-        const operation = ctx.waterfall('tools/execute', execOf({ agent }), () => resultPromise);
+        const operation = dispatchTool(ctx, execOf({ agent }), () => resultPromise);
         const root = mocks.roots[0];
         const tool = root.spans[0];
         let endedAtShutdown: number[] = [];
@@ -485,10 +507,8 @@ describe('dsh-langfuse plugin', () => {
     it('redacts excerpt sources before extracting and truncating observation names', async () => {
       const secretKey = 'LONG-CREDENTIAL-'.repeat(12);
       await setup({ ...enabledConfig, secretKey, redactFields: ['path', 'password'] });
-      await ctx.waterfall(
-        'tools/execute',
-        execOf({ arguments: { path: '/private/customer-data' } }),
-        async () => okResult(),
+      await dispatchTool(ctx, execOf({ arguments: { path: '/private/customer-data' } }), async () =>
+        okResult(),
       );
       await drain(
         ctx.waterfall('llm/stream', optionsOf(), () =>
@@ -530,7 +550,7 @@ describe('dsh-langfuse plugin', () => {
       expect(generation.ended).toBe(0);
       const completedAt = new Date();
       const result = { ...okResult(), content: [image] };
-      expect(await ctx.waterfall('tools/execute', execOf(), async () => result)).toBe(result);
+      expect(await dispatchTool(ctx, execOf(), async () => result)).toBe(result);
       const toolCompletedAt = new Date();
       ctx.emit('session/event', session, ev('user/message', { content: [image] }));
       ctx.emit('session/event', session, turnEnd(0));
@@ -643,7 +663,7 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit('session/event', session, ev('user/message', { content }));
       await drain(ctx.waterfall('llm/stream', options, () => streamOf(finishStop())));
       const result = { ...okResult(), content: [image] };
-      expect(await ctx.waterfall('tools/execute', execOf(), async () => result)).toBe(result);
+      expect(await dispatchTool(ctx, execOf(), async () => result)).toBe(result);
       ctx.emit('session/event', session, turnEnd(0));
       await ctx.parallel('session/flush', session);
       const root = mocks.roots[0];
@@ -788,7 +808,7 @@ describe('dsh-langfuse plugin', () => {
         ],
       });
       expect(lastUpdate(generation.spans[0]).output).toEqual(chunks);
-      await ctx.waterfall('tools/execute', execOf(), async () => okResult());
+      await dispatchTool(ctx, execOf(), async () => okResult());
       expect(mocks.roots[0].spans[0].asType).toBe('tool');
     });
 
@@ -803,9 +823,7 @@ describe('dsh-langfuse plugin', () => {
           () => streamOf(finishStop()),
         ),
       );
-      await ctx.waterfall('tools/execute', execOf({ agent: agentOf('child') }), async () =>
-        okResult(),
-      );
+      await dispatchTool(ctx, execOf({ agent: agentOf('child') }), async () => okResult());
       const root = mocks.roots[0];
       const child = root.spans[0];
       for (const observation of [
@@ -862,8 +880,8 @@ describe('dsh-langfuse plugin', () => {
           () => streamOf(textDelta('secret-value sk-lf-other'), finishStop()),
         ),
       );
-      await ctx.waterfall(
-        'tools/execute',
+      await dispatchTool(
+        ctx,
         execOf({ arguments: { password: 'hidden', path: 'secret-value' } }),
         async () => errResult('secret-value sk-lf-other'),
       );
@@ -891,6 +909,155 @@ describe('dsh-langfuse plugin', () => {
       );
       expect(mocks.roots[0].generations[0].name).toBe('llm-call');
       expect(JSON.stringify(mocks.roots)).not.toContain('PRIVATE REPLY');
+    });
+
+    it('captures hook context under its explicit tool across the whole pipeline', async () => {
+      await setup({ ...enabledConfig, secretKey: 'sk-lf-private', redactFields: ['token'] });
+      const session = sessionOf('s1');
+      ctx.emit('session/event', session, turnStart(0));
+      const first = execOf({ callId: 'first' as ToolCallId });
+      const second = execOf({ callId: 'second' as ToolCallId });
+      await ctx.waterfall('tools/pre-execute', first, async () => ({ kind: 'allow' }));
+      await ctx.waterfall('tools/pre-execute', second, async () => ({ kind: 'allow' }));
+      const tool = mocks.roots[0].spans[0];
+      for (const point of ['BeforeTool', 'AfterTool']) {
+        const identity = { turn: 0, point, handlerId: 'h', invocationId: point, callId: 'first' };
+        ctx.emit(
+          'session/event',
+          session,
+          ev('hook/invoked', {
+            ...identity,
+            dialect: 'gemini',
+            name: 'validate',
+            input: { path: 'a.ts', token: 'PRIVATE', key: 'sk-lf-private' },
+          }),
+        );
+        expect(tool.spans).toHaveLength(point === 'BeforeTool' ? 1 : 2);
+        const hook = tool.spans.at(-1)!;
+        expect(hook.name).toBe(`hook:${point}:validate`);
+        expect(hook.body.input).toEqual({ path: 'a.ts', token: '[REDACTED]', key: '[REDACTED]' });
+        expect(tool.ended).toBe(0);
+        ctx.emit(
+          'session/event',
+          session,
+          ev('hook/result', {
+            ...identity,
+            decision: 'pass',
+            outcome: 'success',
+            exitCode: 0,
+            durationMs: 3,
+            result: {
+              reason: 'checked',
+              additionalContext: 'context',
+              continue: true,
+              token: 'PRIVATE',
+            },
+            stdout: 'x'.repeat(5000),
+            stderr: 'sk-lf-private',
+          }),
+        );
+        expect(lastUpdate(hook)).toMatchObject({
+          output: {
+            decision: 'pass',
+            outcome: 'success',
+            exitCode: 0,
+            result: {
+              reason: 'checked',
+              additionalContext: 'context',
+              continue: true,
+              token: '[REDACTED]',
+            },
+            stdout: 'x'.repeat(4096),
+            stderr: '[REDACTED]',
+          },
+          metadata: { stdoutTruncated: true },
+        });
+        expect(hook.ended).toBe(1);
+      }
+      ctx.emit('tools/result', second, okResult());
+      expect(tool.ended).toBe(0);
+      ctx.emit('tools/result', first, okResult());
+      expect(tool.ended).toBe(1);
+      expect(mocks.roots[0].spans[1].spans).toHaveLength(0);
+    });
+
+    it('keeps late tool hooks on their original trace when call IDs repeat next turn', async () => {
+      await setup();
+      const session = sessionOf('s1');
+      ctx.emit('session/event', session, turnStart(0));
+      const first = execOf();
+      await ctx.waterfall('tools/pre-execute', first, async () => ({ kind: 'allow' }));
+      const identity = {
+        turn: 0,
+        point: 'AfterTool',
+        handlerId: 'h',
+        invocationId: 'late',
+        callId: 'c1',
+      };
+      ctx.emit('session/event', session, ev('hook/invoked', { ...identity, dialect: 'gemini' }));
+      ctx.emit('tools/result', first, okResult());
+      ctx.emit('session/event', session, turnEnd(0));
+      ctx.emit('session/event', session, turnStart(1));
+      const second = execOf();
+      await ctx.waterfall('tools/pre-execute', second, async () => ({ kind: 'allow' }));
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/result', {
+          ...identity,
+          decision: 'pass',
+          outcome: 'failed',
+          durationMs: 12,
+        }),
+      );
+      expect(mocks.roots[0].spans[0].spans[0].ended).toBe(1);
+      expect(mocks.roots[1].spans[0].spans).toHaveLength(0);
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/invoked', {
+          ...identity,
+          invocationId: 'detached',
+          dialect: 'gemini',
+        }),
+      );
+      expect(mocks.roots[2].body.metadata).toMatchObject({ turn: 0, detachedHook: true });
+      expect(mocks.roots[2].spans).toHaveLength(1);
+      ctx.emit('tools/result', second, okResult());
+      ctx.emit('session/event', session, turnEnd(1));
+      expect(lastUpdate(mocks.roots[1]).metadata).not.toHaveProperty('hadErrors');
+      await ctx.fiber.dispose();
+    });
+
+    it('starts before registered pre hooks and records denied calls without dispatch', async () => {
+      const session = sessionOf('s1');
+      ctx.on('tools/pre-execute', async (exec) => {
+        const identity = { turn: 0, point: 'BeforeTool', handlerId: 'h', callId: exec.callId };
+        ctx.emit('session/event', session, ev('hook/invoked', { ...identity, dialect: 'gemini' }));
+        ctx.emit(
+          'session/event',
+          session,
+          ev('hook/result', {
+            ...identity,
+            decision: 'deny',
+            exitCode: 2,
+            durationMs: 1,
+          }),
+        );
+        return { kind: 'deny', reason: 'blocked' };
+      });
+      await setup();
+      ctx.emit('session/event', session, turnStart(0));
+      const exec = execOf();
+      expect(
+        await ctx.waterfall('tools/pre-execute', exec, async () => ({ kind: 'allow' })),
+      ).toEqual({ kind: 'deny', reason: 'blocked' });
+      const tool = mocks.roots[0].spans[0];
+      expect(tool.spans[0].ended).toBe(1);
+      expect(tool.ended).toBe(0);
+      ctx.emit('tools/result', exec, errResult('blocked'));
+      expect(tool.ended).toBe(1);
+      expect(lastUpdate(tool)).toMatchObject({ level: 'ERROR', statusMessage: 'blocked' });
     });
 
     it('reports a hook invocation and result as one span inside the turn trace', async () => {
@@ -1118,6 +1285,7 @@ describe('dsh-langfuse plugin', () => {
         handlerId: 'h',
         invocationId: 'run',
         name: 'PRIVATE NAME',
+        input: { payload: 'PRIVATE INPUT' },
       };
       ctx.emit('session/event', session, ev('hook/invoked', invoked));
       ctx.emit(
@@ -1132,6 +1300,9 @@ describe('dsh-langfuse plugin', () => {
           outcome: 'failed',
           durationMs: 9,
           stderrSummary: 'PRIVATE STDERR',
+          stdout: 'PRIVATE STDOUT',
+          stderr: 'PRIVATE STDERR',
+          result: { additionalContext: 'PRIVATE RESULT' },
         }),
       );
       expect(JSON.stringify(mocks.roots)).not.toContain('PRIVATE');
@@ -1858,7 +2029,7 @@ describe('dsh-langfuse plugin', () => {
 
     it('withholds tool failure text, keeping level and error code', async () => {
       await setup(redacted);
-      await ctx.waterfall('tools/execute', execOf(), async () =>
+      await dispatchTool(ctx, execOf(), async () =>
         errResult('cat: /etc/shadow: permission denied', 'E_PERM'),
       );
       const span = fakeObs(mocks.roots[0]).spans[0];
@@ -1874,7 +2045,7 @@ describe('dsh-langfuse plugin', () => {
     it('withholds thrown tool error text', async () => {
       await setup(redacted);
       await expect(
-        ctx.waterfall('tools/execute', execOf(), async () => {
+        dispatchTool(ctx, execOf(), async () => {
           throw new Error('connect to postgres://user:pass@db failed');
         }),
       ).rejects.toThrow('postgres://');
@@ -1890,7 +2061,7 @@ describe('dsh-langfuse plugin', () => {
       await setup();
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
 
-      const result = await ctx.waterfall('tools/execute', execOf(), async () => okResult());
+      const result = await dispatchTool(ctx, execOf(), async () => okResult());
       expect(result).toEqual(okResult());
 
       const root = fakeObs(mocks.roots[0]);
@@ -1910,7 +2081,7 @@ describe('dsh-langfuse plugin', () => {
 
     it('marks an isError result as ERROR with the failure message', async () => {
       await setup();
-      const result = await ctx.waterfall('tools/execute', execOf(), async () => errResult('nope'));
+      const result = await dispatchTool(ctx, execOf(), async () => errResult('nope'));
       expect(result.isError).toBe(true);
       expect(lastUpdate(fakeObs(mocks.roots[0]).spans[0])).toMatchObject({
         level: 'ERROR',
@@ -1921,7 +2092,7 @@ describe('dsh-langfuse plugin', () => {
     it('reports and rethrows a dispatch failure', async () => {
       await setup();
       await expect(
-        ctx.waterfall('tools/execute', execOf(), async () => {
+        dispatchTool(ctx, execOf(), async () => {
           throw new Error('dispatch boom');
         }),
       ).rejects.toThrow('dispatch boom');
@@ -1933,7 +2104,7 @@ describe('dsh-langfuse plugin', () => {
 
     it('falls back to a session-less trace when the exec carries no agent', async () => {
       await setup();
-      await ctx.waterfall('tools/execute', execOf({ agent: undefined }), async () => okResult());
+      await dispatchTool(ctx, execOf({ agent: undefined }), async () => okResult());
       const root = fakeObs(mocks.roots[0]);
       expect(root.attributes['session.id']).toBeUndefined();
       expect(root.spans).toHaveLength(1);
@@ -1951,8 +2122,8 @@ describe('dsh-langfuse plugin', () => {
       await setup();
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
 
-      await ctx.waterfall(
-        'tools/execute',
+      await dispatchTool(
+        ctx,
         execOf({ name: 'subagent', arguments: { description: 'read marker', prompt: 'go' } }),
         async () => {
           // Inside the foreground delegation dispatch: the child session
@@ -2126,8 +2297,8 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
       ctx.emit('session/created', childSessionOf('c1', 's1'));
 
-      await ctx.waterfall(
-        'tools/execute',
+      await dispatchTool(
+        ctx,
         execOf({ agent: agentOf('c1'), name: 'read_file', arguments: { path: 'ci-marker.txt' } }),
         async () => okResult(),
       );

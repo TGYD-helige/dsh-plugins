@@ -10,6 +10,9 @@ export interface HookInvoked {
   /** Unique per execution, shared with its result; required for concurrent runs. */
   invocationId?: string;
   name?: string;
+  /** Tool execution identity; omit for agent hooks. */
+  callId?: string;
+  input?: unknown;
 }
 
 export interface HookResult {
@@ -17,6 +20,11 @@ export interface HookResult {
   point: string;
   handlerId: string;
   invocationId?: string;
+  callId?: string;
+  /** Parsed hook output; process status remains in the fields below. */
+  result?: Record<string, unknown>;
+  stdout?: string;
+  stderr?: string;
   decision: string;
   outcome?: 'success' | 'failed' | 'timed-out' | 'cancelled';
   exitCode?: number;
@@ -40,6 +48,7 @@ function baseFields(data: unknown): data is HookInvoked & HookResult {
     value.point.length > 0 &&
     typeof value.handlerId === 'string' &&
     value.handlerId.length > 0 &&
+    (value.callId === undefined || (typeof value.callId === 'string' && value.callId.length > 0)) &&
     (value.invocationId === undefined ||
       (typeof value.invocationId === 'string' && value.invocationId.length > 0))
   );
@@ -65,7 +74,11 @@ export function isHookResult(data: unknown): data is HookResult {
       ['success', 'failed', 'timed-out', 'cancelled'].includes(data.outcome)) &&
     (data.exitCode === undefined || Number.isSafeInteger(data.exitCode)) &&
     (data.signal === undefined || typeof data.signal === 'string') &&
-    (data.stderrSummary === undefined || typeof data.stderrSummary === 'string')
+    (data.stderrSummary === undefined || typeof data.stderrSummary === 'string') &&
+    (data.stdout === undefined || typeof data.stdout === 'string') &&
+    (data.stderr === undefined || typeof data.stderr === 'string') &&
+    (data.result === undefined ||
+      (data.result !== null && typeof data.result === 'object' && !Array.isArray(data.result)))
   );
 }
 
