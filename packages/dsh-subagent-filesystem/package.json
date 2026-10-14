@@ -48,7 +48,8 @@
     "@deepseek-ai/dsh-session-query": ">=0.2.0-rc.1",
     "@deepseek-ai/dsh-subagent": ">=0.2.0-rc.1",
     "@deepseek-ai/dsh-system-prompt": ">=0.2.0-rc.1",
-    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.1"
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.1",
+    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.1"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
@@ -62,7 +63,8 @@
     "@deepseek-ai/dsh-scope": "0.2.0-rc.2",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.3",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2"
   },
   "engines": {
     "node": "^20.19 || ^22.12 || >=24.0"

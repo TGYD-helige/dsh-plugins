@@ -3,14 +3,16 @@ import type Agents from '@deepseek-ai/dsh-agent';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type FileSystem from '@deepseek-ai/dsh-fs';
 import { type FsTarget, FsTargetKey } from '@deepseek-ai/dsh-fs';
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { createScope } from '@deepseek-ai/dsh-scope';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import type SessionQuery from '@deepseek-ai/dsh-session-query';
 import type Subagents from '@deepseek-ai/dsh-subagent';
+import { resolveChildAgentOptions } from '@deepseek-ai/dsh-subagent';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import Tools from '@deepseek-ai/dsh-tools';
 import { afterEach, expect, it, vi } from 'vitest';
-import { apply, inject } from './index.js';
+import { apply, type Config, inject } from './index.js';
 
 const role = `---\nname: inventory-analyst\ndescription: Investigate stock discrepancies\n---\nCompare movements. Keep {{literal}} unchanged.`;
 const contexts: Context[] = [];
@@ -21,7 +23,7 @@ afterEach(async () => {
 
 async function setup(
   files = new Map([['/remote/a/agents/inventory.md', role]]),
-  config = { enabled: true, root: 'agents' },
+  config: Config = { enabled: true, root: 'agents' },
 ) {
   const ctx = new Context();
   contexts.push(ctx);
@@ -336,3 +338,34 @@ it('contains provider and result failures and always disposes an accepted foregr
   expect((await h.delegate()).isError).toBe(true);
   expect(h.start).toHaveBeenCalledOnce();
 });
+
+it.each([false, true])(
+  'passes configured child model and tool filters to native spawn (background=%s)',
+  async (background) => {
+    const h = await setup(undefined, {
+      enabled: true,
+      root: 'agents',
+      agentOptions: {
+        provider: 'anthropic',
+        model: 'specialist-model',
+        reasoningEffort: ReasoningEffortId('high'),
+      },
+      toolFilter: { deny: ['todo_write'] },
+    });
+    Object.assign(h.parent, { options: { provider: 'anthropic', model: 'parent-model' } });
+    Object.assign(h.parent.session, { requestHeader: () => undefined });
+    const result = await h.delegate(h.parent, {
+      prompt: 'Explain discrepancy',
+      description: 'Stock check',
+      run_in_background: background,
+    });
+    expect(result.isError).toBe(false);
+    const request = h.start.mock.calls[0][1];
+    expect(request.toolFilter).toEqual({ deny: ['todo_write'] });
+    expect(resolveChildAgentOptions(h.parent, request.agentOptions, 1)).toMatchObject({
+      provider: 'anthropic',
+      model: 'specialist-model',
+      reasoningEffort: ReasoningEffortId('high'),
+    });
+  },
+);

@@ -1,8 +1,9 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { dirname } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
-import type { Agent } from '@deepseek-ai/dsh-agent';
+import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-fs';
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import type { SessionId } from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-session-query';
 import { settleRun } from '@deepseek-ai/dsh-subagent';
@@ -13,13 +14,35 @@ import { parseDocument } from 'yaml';
 
 export const name = 'dsh-subagent-filesystem';
 export const inject = ['fs', 'tools', 'subagents', 'systemPrompt', 'sessionQuery'];
-export const Config = Schema.object({
+export const Config: Schema<Config> = Schema.object({
   enabled: Schema.boolean().default(false),
   root: Schema.string().default('agents'),
+  agentOptions: Schema.union([
+    Schema.const(undefined),
+    Schema.object({
+      provider: Schema.string(),
+      model: Schema.string(),
+      reasoningEffort: Schema.transform(Schema.string().min(1), ReasoningEffortId),
+      maxTokens: Schema.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER),
+    }),
+  ]).default(undefined),
+  toolFilter: Schema.union([
+    Schema.const(undefined),
+    Schema.object({
+      allow: Schema.union([Schema.const(undefined), Schema.array(Schema.string())]).default(
+        undefined,
+      ),
+      deny: Schema.union([Schema.const(undefined), Schema.array(Schema.string())]).default(
+        undefined,
+      ),
+    }),
+  ]).default(undefined),
 });
 export interface Config {
   enabled: boolean;
   root?: string;
+  agentOptions?: AgentOptions;
+  toolFilter?: { allow?: string[]; deny?: string[] };
 }
 
 interface Role {
@@ -239,6 +262,8 @@ export function apply(ctx: Context, config: Config): void {
                       parent: agent,
                       prompt: [{ type: 'text' as const, text: args.prompt }],
                       maxDepth: agent.ctx.get('subagents')!.resolveMaxDepth(),
+                      ...(config.agentOptions ? { agentOptions: config.agentOptions } : {}),
+                      ...(config.toolFilter ? { toolFilter: config.toolFilter } : {}),
                     };
                     if (args.run_in_background) {
                       const child = await agent.ctx.get('subagents')!.startContinuable({

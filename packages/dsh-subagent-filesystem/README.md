@@ -19,11 +19,18 @@ Enable the bundle in the profile's `cordis.patch.yml`:
   config:
     enabled: true
     root: agents
+    agentOptions:
+      provider: anthropic
+      model: your-specialist-model
+    toolFilter:
+      deny: [todo_write]
 ```
 
 Disabled by default. `root` defaults to `agents`, relative to the agent's initial workspace directory; sandbox deployments can explicitly select `/agents`. Discovery scans direct `*.md` children only. A missing root produces an empty catalog. Files are loaded when the agent is created; create a new agent to pick up changes. Watching and hot reload are outside the initial scope.
 
 Requires the `fs`, `tools`, `subagents`, `systemPrompt`, and `sessionQuery` services, plus the native in-process provider registered as `spawn`. The standard headless profile supplies these capabilities. DSH peer floor: `>=0.2.0-rc.1`; tested DSH: `0.2.0-rc.2`; tested Cordis: `4.0.4`.
+
+`agentOptions` and `toolFilter` are trusted host defaults forwarded to native spawn for both foreground and continuable children. They use the same model and tool-filter semantics as `dsh-tool-subagent`; omission preserves the parent model and native tool visibility. Role Markdown still accepts only `name` and `description`.
 
 ## Definition format
 

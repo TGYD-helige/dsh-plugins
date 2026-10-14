@@ -27,6 +27,7 @@ const workDir = mkdtempSync(join(process.env.RUNNER_TEMP ?? tmpdir(), 'dsh-subag
 const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
 const dsh = process.env.DSH_CLI ?? 'dsh';
 const model = integrationModel();
+const parentModel = fake ? (model === 'deepseek-v4-pro' ? 'deepseek-v4-flash' : 'deepseek-v4-pro') : model;
 const roleMarker = `role-${randomUUID()}`;
 const appMarker = `application-${randomUUID()}`;
 const evidence = `inventory-${randomUUID()}`;
@@ -51,13 +52,17 @@ writeFileSync(join(dshHome, 'profiles', 'headless', 'cordis.patch.yml'), `
 - id: subagent-filesystem
   config:
     enabled: true
+    agentOptions:
+      provider: deepseek-official
+      model: ${model}
+      maxTokens: 4096
 - id: system-prompt
   config:
     personaPrefix: 'Application marker: ${appMarker}. Preserve this marker in specialist reports.'
 - id: agent-default-model
   config:
     provider: deepseek-official
-    model: ${model}
+    model: ${parentModel}
 - id: llm-deepseek
   config:
     thinking: disabled
@@ -143,6 +148,9 @@ try {
       const childRequests = requests.filter((r) => JSON.stringify(r.system).includes(roleMarker));
       assert(childRequests.length > 0, 'The role must reach a child system prompt');
       const first = childRequests[0];
+      assert(childRequests.every((r) => r.model === model), 'Specialists must use the configured child model');
+      assert(childRequests.every((r) => r.max_tokens === 4096), 'Specialists must use the configured output cap');
+      if (fake) assert(requests.some((r) => !JSON.stringify(r.system).includes(roleMarker) && r.model === parentModel), 'Parent model must remain distinct');
       const system = JSON.stringify(first.system);
       assert(system.includes(appMarker), 'Inherited application persona must survive');
       assert(system.includes('DeepSeek Harness'), 'Harness instructions must survive');
@@ -156,7 +164,7 @@ try {
       assert(requests.some((r) => !JSON.stringify(r.system).includes(roleMarker)), 'The role must remain child-scoped');
       for (const marker of [roleMarker, appMarker, evidence, '{{inventory_literal}}']) assert(output.includes(marker), `Missing report evidence: ${marker}`);
       const childTools = [...new Set(childRequests.flatMap((r) => r.messages.flatMap((m) => Array.isArray(m.content) ? m.content.filter((b) => b.type === 'tool_use').map((b) => b.name) : [])))];
-      console.log(`E2E_PROOF ${JSON.stringify({ mode: fake ? 'local deterministic transport' : 'real LLM', requests: requests.length, specialistRequests: childRequests.length, specialistTools: childTools, checksPassed: ['role in child system', 'application persona and Harness instructions preserved', 'literal template preserved', 'task in user content only', 'role absent from user-task prefix', 'specialist tool result contains file evidence', 'role absent from parent system', 'final report contains all expected evidence'] })}`);
+      console.log(`E2E_PROOF ${JSON.stringify({ mode: fake ? 'local deterministic transport' : 'real LLM', requests: requests.length, specialistRequests: childRequests.length, specialistTools: childTools, checksPassed: ['configured child model and output cap preserved', 'role in child system', 'application persona and Harness instructions preserved', 'literal template preserved', 'task in user content only', 'role absent from user-task prefix', 'specialist tool result contains file evidence', 'role absent from parent system', 'final report contains all expected evidence'] })}`);
       console.log(`SCENARIO_OK (Markdown specialist + inherited persona + resource read; ${fake ? 'local deterministic transport' : 'real LLM'})`);
       break;
     } catch (error) {
