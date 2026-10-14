@@ -619,14 +619,17 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHoo
   }
 
   if (toolHooks) {
-    const profileDir = join(dshHome, 'profiles', 'headless');
+    const fixtureDir = join(dshHome, 'profiles', 'headless', 'tool-hooks-fixture');
+    mkdirSync(fixtureDir, { recursive: true });
+    // An anonymous manifest excludes the loose fixture from DeepSeek's package inventory.
+    writeFileSync(join(fixtureDir, 'package.json'), JSON.stringify({ private: true }));
     for (const file of ['tool-hook-bridge.mjs', 'tool-hook-script.mjs']) {
-      copyFileSync(new URL(`./${file}`, import.meta.url), join(profileDir, file));
+      copyFileSync(new URL(`./${file}`, import.meta.url), join(fixtureDir, file));
     }
     hookPatch = `
 - insert:
     - id: langfuse-tool-hooks-e2e
-      name: ${JSON.stringify(join(profileDir, 'tool-hook-bridge.mjs'))}
+      name: ${JSON.stringify(join(fixtureDir, 'tool-hook-bridge.mjs'))}
 `;
   }
 
