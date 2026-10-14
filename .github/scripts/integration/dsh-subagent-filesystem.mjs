@@ -30,7 +30,8 @@ const model = integrationModel();
 const roleMarker = `role-${randomUUID()}`;
 const appMarker = `application-${randomUUID()}`;
 const evidence = `inventory-${randomUUID()}`;
-const task = 'Read the supporting inventory evidence. Return your configured role marker, inherited application marker, literal template example, and evidence verbatim.';
+const taskMarker = `task-${randomUUID()}`;
+const task = `Task marker: ${taskMarker}. Read the supporting inventory evidence. Return your configured role marker, inherited application marker, literal template example, and evidence verbatim.`;
 const definition = join(workDir, 'agents', 'inventory-analyst.md');
 const evidencePath = join(workDir, 'agents', 'resources', 'token.txt');
 mkdirSync(join(workDir, 'agents', 'resources'), { recursive: true });
@@ -127,7 +128,7 @@ try {
   for (let attempt = 1; attempt <= (fake ? 1 : 3); attempt++) {
     requests = [];
     const output = await new Promise((done, reject) => {
-      const child = spawn(dsh, ['--profile', 'headless', `Use subagent_inventory_analyst to delegate this task: ${task}. Return its report verbatim. Do not read evidence yourself.`], {
+      const child = spawn(dsh, ['--profile', 'headless', `Use subagent_inventory_analyst to delegate this task: ${task} Preserve the task marker in the delegated prompt. Return its report verbatim. Do not read evidence yourself.`], {
         cwd: workDir,
         timeout: 8 * 60_000,
         env: { ...netEnv(), DSH_HOME: dshHome, DSH_PERMISSION_MODE: 'danger-full-access', DSH_TELEMETRY_DISABLED: '1', DEEPSEEK_BASE_URL: `http://127.0.0.1:${server.address().port}`, DEEPSEEK_API_KEY: 'local-e2e-proxy' },
@@ -148,7 +149,8 @@ try {
       assert(system.includes('{{inventory_literal}}'), 'Markdown template braces must stay literal');
       assert(system.includes(join(workDir, 'agents')), 'The role resource directory must reach the child');
       const users = JSON.stringify(first.messages.filter((m) => m.role === 'user'));
-      assert(users.includes(task), 'The task must remain user content');
+      assert(users.includes(taskMarker), 'The delegated task marker must remain user content');
+      assert(!system.includes(taskMarker), 'The task must not become a system instruction');
       assert(!users.includes(roleMarker), 'Role instructions must not become a user-task prefix');
       assert(childRequests.some((r) => r.messages.some((m) => Array.isArray(m.content) && m.content.some((b) => b.type === 'tool_result' && JSON.stringify(b.content).includes(evidence)))), 'The specialist must read its supporting evidence through a tool');
       assert(requests.some((r) => !JSON.stringify(r.system).includes(roleMarker)), 'The role must remain child-scoped');
