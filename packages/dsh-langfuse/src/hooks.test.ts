@@ -154,3 +154,36 @@ it('respects the installed upstream hook invariant and contains rejected telemet
     await ctx.fiber.dispose();
   }
 });
+
+it('rejects malformed optional tool and result fields without appending', async () => {
+  const ctx = new Context();
+  new SessionStore(ctx);
+  const session = ctx.sessions.create();
+  session.append('turn/start', { turn: 0 });
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const identity = { turn: 0, point: 'AfterTool', handlerId: 'h' };
+  try {
+    expect(
+      appendHookEvent(session, 'hook/invoked', {
+        ...identity,
+        dialect: 'gemini',
+        callId: '',
+      }),
+    ).toBe(false);
+    for (const fields of [{ result: [] }, { stdout: 3 }, { stderr: true }]) {
+      expect(
+        appendHookEvent(session, 'hook/result', {
+          ...identity,
+          decision: 'pass',
+          durationMs: 1,
+          ...fields,
+        } as never),
+      ).toBe(false);
+    }
+    expect(session.seq).toBe(1);
+    expect(error).toHaveBeenCalledWith('[dsh-langfuse] hook reporting failed:', expect.any(Error));
+  } finally {
+    error.mockRestore();
+    await ctx.fiber.dispose();
+  }
+});

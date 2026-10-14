@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { apply as applyHookBridge } from './tool-hook-bridge.mjs';
 import { createRequire } from 'node:module';
 import { LangfuseReporter } from '../../../../packages/dsh-langfuse/lib/client.js';
 import { appendHookEvent, apply } from '../../../../packages/dsh-langfuse/lib/index.js';
@@ -7,6 +11,7 @@ import {
   capturedToObservations,
   evaluateReasoning,
   evaluateTrace,
+  evaluateToolHookTrace,
   startFakeIngestion,
   runVerification,
 } from './langfuse-shared.mjs';
@@ -45,6 +50,7 @@ const attribute = (span, key) => {
   return value?.stringValue ?? value?.boolValue;
 };
 let ctx;
+let hookWorkDir;
 try {
   await reporter.ready;
   const ambient = {
@@ -213,11 +219,12 @@ try {
   const pending = new Promise((resolve) => {
     release = resolve;
   });
-  const operation = ctx.waterfall(
-    'tools/execute',
-    { name: 'read', arguments: {}, callId: 'call', signal: new AbortController().signal },
-    () => pending,
-  );
+  const exec = { name: 'read', arguments: {}, callId: 'call', signal: new AbortController().signal };
+  await ctx.waterfall('tools/pre-execute', exec, async () => ({ kind: 'allow' }));
+  const operation = ctx.waterfall('tools/execute', exec, () => pending).then((result) => {
+    ctx.emit('tools/result', exec, result);
+    return result;
+  });
   await ctx.fiber.dispose();
   assert.equal(captured.length, 10, 'unload must export an agent-less tool and its root');
   const result = { isError: false, content: [{ type: 'image', attachment: {} }] };
@@ -225,6 +232,63 @@ try {
   assert.equal(await operation, result);
   assert.equal(captured.length, 10, 'late completion must not export the same tool again');
   assert.equal(imageReads, 1, 'late completion must not start another image read');
+  // Drive the separate E2E producer through the REAL tool runtime and script.
+  const treeOffset = captured.length;
+  hookWorkDir = mkdtempSync(join(tmpdir(), 'langfuse-tool-hooks-'));
+  const hookCodeword = 'ci-marker-tool-hooks-sdk-1';
+  const markerFile = `${hookCodeword}.txt`;
+  writeFileSync(join(hookWorkDir, markerFile), `${hookCodeword}-content\n`);
+  ctx = new Context();
+  const { SessionStore: HookSessionStore } = await import(require.resolve('@deepseek-ai/dsh-session'));
+  const toolRequire = createRequire(require.resolve('@deepseek-ai/dsh-tools'));
+  const { default: SystemPrompt } = await import(toolRequire.resolve('@deepseek-ai/dsh-system-prompt'));
+  const { default: ToolRuntime, defineTool } = await import(require.resolve('@deepseek-ai/dsh-tools'));
+  new HookSessionStore(ctx);
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolRuntime);
+  await apply(ctx, { ...connection, enabled: true, traceName: 'dsh-turn', captureContent: true });
+  await ctx.plugin({ name: 'tool-hooks-fixture', apply: applyHookBridge });
+  const toolSession = ctx.sessions.create(undefined, { meta: { cwd: hookWorkDir } });
+  toolSession.append('turn/start', { turn: 0 });
+  ctx.tools.register(defineTool({
+    name: 'read', description: 'read the marker file',
+    parameters: { path: { type: 'string', required: true } },
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    execute: (args) => readFileSync(join(hookWorkDir, args.path), 'utf8'),
+  }));
+  const hookStream = ctx.waterfall('llm/stream', { provider: 'fixture', model: integrationModel(),
+    sessionId: toolSession.id, messages: [{ role: 'user', content: [{ type: 'text', text: markerFile }] }],
+  }, async function* () {
+    yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1 } };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  });
+  for await (const _ of hookStream) { /* drain */ }
+  const hookToolResult = await ctx.tools.execute({ name: 'read', arguments: { path: markerFile },
+    callId: 'hook-call', agent: { id: toolSession.id }, signal: new AbortController().signal });
+  assert.equal(hookToolResult.isError, false);
+  toolSession.append('turn/end', { turn: 0, reason: { kind: 'completed' } });
+  await ctx.parallel('session/flush', toolSession);
+  const treeSpans = captured.slice(treeOffset);
+  const tree = capturedToObservations(treeSpans).map((observation, index) => ({
+    ...observation,
+    startTime: new Date(Number(BigInt(treeSpans[index].startTimeUnixNano) / 1000000n)).toISOString(),
+    endTime: new Date(Number(BigInt(treeSpans[index].endTimeUnixNano) / 1000000n)).toISOString(),
+  }));
+  assert.deepEqual(evaluateToolHookTrace(tree, hookCodeword), []);
+  // Each assertion must detect the specific E2E regression, not just accept a fixture.
+  for (const mutate of [
+    (hook) => { hook.parentObservationId = tree.find((o) => o.name === 'dsh-turn').id; },
+    (hook) => { hook.input = undefined; },
+    (hook) => { hook.output = { decision: 'pass', exitCode: 0 }; },
+    (hook) => { hook.metadata.callId = 'wrong-call'; },
+    (hook) => { hook.startTime = undefined; },
+    (hook) => { hook.output.result.token = 'sk-lf-hook-fixture-private'; },
+  ]) {
+    const broken = structuredClone(tree);
+    mutate(broken.find((o) => o.name === 'hook:AfterTool:verify-marker'));
+    assert.ok(evaluateToolHookTrace(broken, hookCodeword).length > 0);
+  }
+  await ctx.fiber.dispose();
   // Real session producer + SDK export, including results after their parent ended.
   const hookOffset = captured.length;
   ctx = new Context();
@@ -235,13 +299,14 @@ try {
   session.append('turn/start', { turn: 0 });
   const identity = { turn: 0, point: 'AfterAgent', handlerId: 'validator', invocationId: 'running' };
   assert.equal(appendHookEvent(session, 'hook/invoked', {
-    ...identity, dialect: 'company-validator', name: 'PRIVATE HOOK',
+    ...identity, dialect: 'company-validator', name: 'PRIVATE HOOK', input: { text: 'PRIVATE INPUT' },
   }), true);
   session.append('turn/end', { turn: 0, reason: { kind: 'completed' } });
   session.append('turn/start', { turn: 1 });
   assert.equal(appendHookEvent(session, 'hook/result', {
     ...identity, decision: 'pass', outcome: 'cancelled', signal: 'SIGTERM', durationMs: 12,
-    stderrSummary: 'PRIVATE STDERR',
+    stderrSummary: 'PRIVATE STDERR', stdout: 'PRIVATE STDOUT', stderr: 'PRIVATE STDERR',
+    result: { additionalContext: 'PRIVATE RESULT' },
   }), true);
   const detached = { ...identity, invocationId: 'detached' };
   assert.equal(appendHookEvent(session, 'hook/invoked', { ...detached, dialect: 'gemini' }), true);
@@ -263,6 +328,7 @@ try {
   await ctx.fiber.dispose();
   console.log('real Langfuse SDK / OTLP checks passed');
 } finally {
+  if (hookWorkDir) rmSync(hookWorkDir, { recursive: true, force: true });
   await ctx?.fiber.dispose();
   await reporter.shutdown();
   await new Promise((resolve) => server.close(resolve));

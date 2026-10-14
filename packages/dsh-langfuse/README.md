@@ -5,7 +5,7 @@
 Langfuse observability for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness):
 
 - one **generation** per LLM call (`llm/stream` waterfall), plus a nested `llm-request` span carrying the verbatim loop-built request
-- one **tool observation** per tool call (`tools/execute` waterfall)
+- one **tool observation** per tool call (`tools/pre-execute` through `tools/result`)
 - one **span** per `hook/invoked` / `hook/result` pair, with hook point, decision, exit code, and duration (stderr summary follows `captureContent`)
 - one **trace** per session turn (`session/event`) — in the v5 SDK the trace IS its root span, ended (and thereby exported) at `turn/end`
 - subagent child sessions nested under the parent's tree (`session/created` header link + `subagent/start` / `subagent/end`)
@@ -87,7 +87,7 @@ Generation `usageDetails` has disjoint `input`, `cache_read_input_tokens`, `cach
 
 Compaction and session-title calls passing through `llm/stream` already receive their own generation and `purpose` metadata, including out-of-turn calls. Tools using the same LLM service are observed there too; adding a second generation from tool-result usage would duplicate accounting.
 
-Hook spans appear when a dsh hook bridge emits the paired session records. The current `hook/result` record does not contain stdout; successful script output can appear in the LLM request when the bridge injects it as context, while the hook span reports decision, exit code, duration, and bounded stderr. `SessionStart` runs before the first turn and does not emit these records, so it has no hook span.
+Hook spans appear when a dsh hook bridge emits the paired session records. With content capture enabled, they show `hook:<point>:<name>`, optional input and parsed result, and available bounded process output alongside execution status. Producers must emit these fields; upgrading this plugin cannot recover omitted data. `SessionStart` only appears if a producer reports it and the installed runtime admits the records.
 
 ### Custom hook producers
 
@@ -115,6 +115,7 @@ appendHookEvent(session, 'hook/invoked', {
   ...identity,
   dialect: 'company-validator',
   name: 'Validate request',
+  input: { request: 'example' },
 });
 // After execution, including exceptions, timeout or cancellation:
 appendHookEvent(session, 'hook/result', {
@@ -123,22 +124,27 @@ appendHookEvent(session, 'hook/result', {
   outcome: 'success',
   exitCode: 0,
   durationMs: 37,
+  result: { reason: 'valid', additionalContext: 'checked', continue: true },
 });
 ```
 
-Every custom execution should have a unique `invocationId` and a result emitted in the producer's `finally` path. Both records must share `turn`, `point`, `handlerId`, and `invocationId`. `handlerId` identifies the configured handler; `invocationId` identifies one execution, including concurrent executions of that handler. Optional `name` labels the hook. Unmatched/skipped hooks must not emit an invocation: these records represent actual execution. The producer bounds `stderrSummary` and omits unavailable optional fields rather than writing `undefined` into the JSON session log.
+Every custom execution should have a unique `invocationId` and a result emitted in the producer's `finally` path. Both records must share `turn`, `point`, `handlerId`, and `invocationId`. `handlerId` identifies the configured handler; `invocationId` identifies one execution, including concurrent executions of that handler. Optional `name` labels the observation when content capture is enabled. `HookInvoked.input` carries the script payload; `HookResult.result` carries the parsed output object, including available reasons, additional context and continue/stop instructions. The consumer preserves these producer-defined fields without interpreting them as decisions. Unmatched/skipped hooks must not emit an invocation: these records represent actual execution. Optional `stdout`, `stderr` and legacy `stderrSummary` are masked, then limited to 4096 characters each in observations, with `stdoutTruncated`, `stderrTruncated` and `stderrSummaryTruncated` metadata. Producers should also bound persisted process output and omit unavailable optional fields rather than writing `undefined` into the JSON session log.
+
+Tool hooks should include the execution's `callId` in both records. The plugin matches it within the originating session and turn; it never chooses the last active tool. Tool observations begin at `tools/pre-execute` (a prepended observer) and end at `tools/result`, covering synchronous/awaited BeforeTool and AfterTool hooks, pre-dispatch denials, and final post-policy output. Bridges must run BeforeTool within the pre-execute waterfall and AfterTool within post-execute, before the final result notification. A bridge registered with prepend ahead of this observer must delegate before reporting its hook. Agent hooks and legacy records without `callId` remain under the turn/subagent. Unknown or already finished calls fall back to that parent; late invocations outside the originating turn use the detached-root behavior below.
 
 `hook/result.outcome` describes process execution independently of `decision`: `success` is normal completion, `failed` is execution failure, `timed-out` is deadline termination, and `cancelled` is cancellation. The producer maps its process semantics to these values; an exit code expressing a policy denial can still be a successful execution. Optional `exitCode` and `signal` preserve process details. Failed/timed-out executions receive ERROR observations, cancellation receives WARNING, and successful executions retain decision-based warnings. Records without an explicit outcome preserve the legacy exit-code interpretation (0/2 are non-error). The plugin records `durationMs` and never infers a timeout or cancellation from a missing exit code.
 
 For records admitted by the session, runs with `invocationId` retain correlation after `turn/end` and a subsequent `turn/start`; a late result ends the original hook span without attaching it to the new turn. Invocations arriving outside their originating turn receive a separate root with `detachedHook: true` and the original turn number; their result ends both hook and root so they export without waiting for another turn. These detached hook roots do not consume `langfuse/context` queued for the next turn. Detached producers must finish reporting before the session is disposed. Session disposal/plugin unload closes unfinished runs with `hook result not observed`; this means missing telemetry, not proof of execution failure. Legacy records without `invocationId` still close at turn boundaries.
 
-Custom names and stderr follow `captureContent`; credentials and `redactFields` are masked by the existing reporter. New outcomes, correlation IDs, dialect, point, duration and process metadata remain available with content capture disabled. The event writer does not sanitize the session log itself: application producers remain responsible for what they persist. Applications must explicitly replace any private hook events with this standard producer path, reuse the same `invocationId`, and report the actual outcome; installing/upgrading the plugin does not adapt an application bridge or repair historical Trace overview IO (Issue #59).
+Custom names, hook input, parsed results and raw process output follow `captureContent`; credentials and `redactFields` are masked by the existing reporter. New outcomes, correlation IDs, dialect, point, duration and process metadata remain available with content capture disabled. The event writer does not sanitize the session log itself: application producers remain responsible for what they persist. Applications must explicitly replace any private hook events with this standard producer path, reuse the same `invocationId`, and report the actual outcome; installing/upgrading the plugin does not adapt an application bridge or repair historical Trace overview IO (Issue #59).
 
 Observability is a no-throw seam: backend errors are logged with a `[dsh-langfuse]` prefix and never escape into the agent loop.
 
 ## Compatibility
 
-Run `pnpm test:sdk` at the repository root for a secrets-free check using the real Langfuse SDK and the existing local OTLP receiver. It verifies export, native tool type, SDK label redaction, ambient-baggage isolation, external trace ownership, agent-less tool unload, and custom hook export across turn closure. It is separate from the mocked unit suite and the gateway/real-Langfuse E2E legs.
+Run `pnpm test:sdk` at the repository root for a secrets-free check using the real Langfuse SDK and the existing local OTLP receiver. It verifies export, native tool type, SDK label redaction, ambient-baggage isolation, external trace ownership, agent-less tool unload, the real tool runtime and hook processes, tool-hook parenting and enclosing timestamps, content masking, and custom hook export across turn closure. It is separate from the mocked unit suite and the gateway/real-Langfuse E2E legs.
+
+The independent `dsh-langfuse.tool-hooks` E2E leg boots the packed plugin in the real headless profile, asks the model to read a marker file, and executes BeforeTool/AfterTool scripts through an E2E-only producer. It requires both gateway and Langfuse credentials, then polls the real Observations API to verify named hooks, tool-call parenting, enclosing tool timestamps, script input and parsed output, credential masking, and stdout truncation. The existing `dsh-langfuse.hook` leg continues to check the upstream Codex UserPromptSubmit bridge; the new fixture verifies the shared event contract and does not substitute for the application's Gemini bridge integration.
 
 ### Trace overview compatibility
 

@@ -15,6 +15,9 @@
  *   which forks don't receive; fake mode covers LANGFUSE-keyless same-repo
  *   runs and local development for the base/subagent legs. The hook leg
  *   requires real Langfuse keys so a green result proves API read-back.
+ * - tool-hooks leg: an E2E-only producer executes BeforeTool/AfterTool processes
+ *   and verifies their inputs, parsed results, masking, truncation and parenting
+ *   through real Langfuse API read-back.
  * - hook leg: mount dsh-hooks-codex, run a script that reads the hook payload
  *   and a workspace file, then verify stdout reaches the LLM request and the
  *   result recorded through stderr reaches the completed Langfuse span.
@@ -202,6 +205,48 @@ export function evaluateHookTrace(observations, codeword) {
       Number(hook.metadata.durationMs) < 0
     ) {
       problems.push('hook span has no durationMs');
+    }
+  }
+  return problems;
+}
+
+// The separate tool-hooks leg runs a real process in each tool phase.
+export function evaluateToolHookTrace(observations, codeword) {
+  const problems = evaluateTrace(observations, codeword);
+  const tools = observations.filter((o) => o.type === 'TOOL' && JSON.stringify(o.input ?? '').includes(codeword));
+  for (const tool of tools) {
+    for (const point of ['BeforeTool', 'AfterTool']) {
+      const hook = observations.find((o) => o.name === `hook:${point}:verify-marker` &&
+        o.parentObservationId === tool.id && o.metadata?.callId === tool.metadata?.callId);
+      if (!hook) {
+        problems.push(`missing ${point} under tool call ${tool.metadata?.callId}`);
+        continue;
+      }
+      const times = [tool.startTime, tool.endTime, hook.startTime, hook.endTime].map(Date.parse);
+      if (times.some((time) => !Number.isFinite(time)) || times[2] < times[0] || times[3] > times[1]) {
+        problems.push(`${point} is unfinished or outside the tool lifetime`);
+      }
+      if (hook.input?.callId !== tool.metadata?.callId || hook.input?.toolName !== tool.metadata?.toolName ||
+        !JSON.stringify(hook.input?.arguments ?? '').includes(codeword) || hook.input?.token !== '[REDACTED]') {
+        problems.push(`${point} input is missing, mismatched, or unmasked`);
+      }
+      if (point === 'AfterTool' && !JSON.stringify(hook.input?.toolResult?.content ?? '').includes(`${codeword}-content`)) {
+        problems.push('AfterTool input does not contain the real tool result');
+      }
+      const output = hook.output;
+      if (output?.decision !== 'pass' || output?.outcome !== 'success' || output?.exitCode !== 0 ||
+        output?.result?.reason !== 'marker-verified' || output?.result?.additionalContext !== codeword ||
+        output?.result?.continue !== true || output?.result?.token !== '[REDACTED]' ||
+        output?.stdout?.length !== 4096 || String(hook.metadata?.stdoutTruncated) !== 'true' ||
+        output?.stderr !== `marker-verified:${point}`) {
+        problems.push(`${point} output is missing status, structured result, masking, or truncation`);
+      }
+      if (hook.metadata?.durationMs == null || !Number.isFinite(Number(hook.metadata?.durationMs)) || Number(hook.metadata?.durationMs) < 0) {
+        problems.push(`${point} has no valid duration`);
+      }
+      if (JSON.stringify(hook).includes('sk-lf-hook-fixture-private')) {
+        problems.push(`${point} exported an unmasked credential`);
+      }
     }
   }
   return problems;
@@ -474,7 +519,7 @@ export async function startFakeIngestion(captured) {
 }
 
 /**
- * Run one leg to green: { tag, name, prompt, evaluate, hook? }. The marker file
+ * Run one leg to green: { tag, name, prompt, evaluate, hook?, toolHooks? }. The marker file
  * `${codeword}.txt` is written into the workspace and its name is the
  * codeword the leg verifies on. Failures log `::error::` and exit non-zero.
  */
@@ -487,7 +532,7 @@ export async function runScenario(opts) {
   }
 }
 
-async function scenarioMain({ tag, name, prompt, evaluate, hook = false }) {
+async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHooks = false }) {
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-langfuse-${tag}-e2e`);
   mkdirSync(workDir, { recursive: true });
   const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
@@ -498,7 +543,7 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false }) {
 
   const publicKey = envOr(process.env.LANGFUSE_PUBLIC_KEY, '');
   const secretKey = envOr(process.env.LANGFUSE_SECRET_KEY, '');
-  if (hook && (!publicKey || !secretKey)) {
+  if ((hook || toolHooks) && (!publicKey || !secretKey)) {
     throw new Error('hook E2E requires LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY');
   }
   // A half-configured pair is a misconfiguration — never silently fake it.
@@ -570,6 +615,18 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false }) {
       config:
         configPath: ${JSON.stringify(hookConfigPath)}
         model: ${JSON.stringify(EXPECTED_MODEL)}
+`;
+  }
+
+  if (toolHooks) {
+    const profileDir = join(dshHome, 'profiles', 'headless');
+    for (const file of ['tool-hook-bridge.mjs', 'tool-hook-script.mjs']) {
+      copyFileSync(new URL(`./${file}`, import.meta.url), join(profileDir, file));
+    }
+    hookPatch = `
+- insert:
+    - id: langfuse-tool-hooks-e2e
+      name: ${JSON.stringify(join(profileDir, 'tool-hook-bridge.mjs'))}
 `;
   }
 
