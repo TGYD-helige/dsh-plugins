@@ -1,0 +1,3 @@
+- insert:
+    - id: subagent-filesystem
+      name: '@amaster.ai/dsh-subagent-filesystem'
