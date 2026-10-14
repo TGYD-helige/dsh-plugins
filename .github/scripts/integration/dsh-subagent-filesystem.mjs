@@ -155,6 +155,8 @@ try {
       assert(childRequests.some((r) => r.messages.some((m) => Array.isArray(m.content) && m.content.some((b) => b.type === 'tool_result' && JSON.stringify(b.content).includes(evidence)))), 'The specialist must read its supporting evidence through a tool');
       assert(requests.some((r) => !JSON.stringify(r.system).includes(roleMarker)), 'The role must remain child-scoped');
       for (const marker of [roleMarker, appMarker, evidence, '{{inventory_literal}}']) assert(output.includes(marker), `Missing report evidence: ${marker}`);
+      const childTools = [...new Set(childRequests.flatMap((r) => r.messages.flatMap((m) => Array.isArray(m.content) ? m.content.filter((b) => b.type === 'tool_use').map((b) => b.name) : [])))];
+      console.log(`E2E_PROOF ${JSON.stringify({ mode: fake ? 'local deterministic transport' : 'real LLM', requests: requests.length, specialistRequests: childRequests.length, specialistTools: childTools, checksPassed: ['role in child system', 'application persona and Harness instructions preserved', 'literal template preserved', 'task in user content only', 'role absent from user-task prefix', 'specialist tool result contains file evidence', 'role absent from parent system', 'final report contains all expected evidence'] })}`);
       console.log(`SCENARIO_OK (Markdown specialist + inherited persona + resource read; ${fake ? 'local deterministic transport' : 'real LLM'})`);
       break;
     } catch (error) {
