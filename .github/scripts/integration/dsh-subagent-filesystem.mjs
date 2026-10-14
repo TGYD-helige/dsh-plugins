@@ -11,6 +11,15 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { integrationModel, netEnv, requireEnv, run } from './lib/ci-shared.mjs';
 
+function upstreamUrl(baseUrl, route) {
+  const base = baseUrl.replace(/\/+$/, '');
+  const root = new URL(base).pathname.endsWith('/v1') ? base : `${base}/v1`;
+  return `${root}${route.replace(/^\/v1(?=\/)/, '')}`;
+}
+assert.equal(upstreamUrl('https://example.invalid/v1/', '/v1/messages'), 'https://example.invalid/v1/messages');
+assert.equal(upstreamUrl('https://example.invalid', '/v1/messages'), 'https://example.invalid/v1/messages');
+assert.equal(upstreamUrl('https://example.invalid/anthropic', '/v1/messages'), 'https://example.invalid/anthropic/v1/messages');
+
 requireEnv(['DSH_PKG_TARBALL']);
 const fake = process.env.DSH_SUBAGENT_E2E_FAKE === '1';
 if (!fake) requireEnv(['DSH_INTEGRATION_BASE_URL', 'DSH_INTEGRATION_API_KEY']);
@@ -62,7 +71,7 @@ const server = createServer(async (req, res) => {
     const body = raw ? JSON.parse(raw) : {};
     if (body.messages) requests.push(body);
     if (!fake) {
-      const upstream = await fetch(`${process.env.DSH_INTEGRATION_BASE_URL.replace(/\/$/, '')}${req.url}`, {
+      const upstream = await fetch(upstreamUrl(process.env.DSH_INTEGRATION_BASE_URL, req.url), {
         method: req.method,
         headers: { 'content-type': 'application/json', 'x-api-key': process.env.DSH_INTEGRATION_API_KEY, authorization: `Bearer ${process.env.DSH_INTEGRATION_API_KEY}`, 'anthropic-version': req.headers['anthropic-version'] ?? '2023-06-01' },
         body: req.method === 'GET' ? undefined : raw,
