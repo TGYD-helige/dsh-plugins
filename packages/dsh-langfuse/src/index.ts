@@ -302,6 +302,24 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   const reporter = new LangfuseReporter(config);
   const sessions = new Map<string, SessionTrace>();
   const children = new Map<string, ChildSession>();
+  const completedTurns = new Map<
+    string,
+    { sessionId: string; parent: NonNullable<ObservationHandle>; turnTrace: ObservationHandle }
+  >();
+
+  function rememberTurn(
+    sessionId: string,
+    turn: number,
+    parent: ObservationHandle,
+    turnTrace: ObservationHandle,
+  ): void {
+    if (!parent) return;
+    const key = JSON.stringify([sessionId, turn]);
+    completedTurns.delete(key);
+    completedTurns.set(key, { sessionId, parent, turnTrace });
+    // Bound retained SDK handles across all sessions; older hooks use the standalone fallback.
+    if (completedTurns.size > 128) completedTurns.delete(completedTurns.keys().next().value!);
+  }
   /** Per-session stack of currently open tool pipeline spans (for subagent parenting). */
   const openToolSpans = new Map<string, ObservationHandle[]>();
   const toolCalls = new Map<string, Map<string, { span: ObservationHandle; turn?: number }>>();
@@ -516,8 +534,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       if (previous?.root) reporter.endSpan(previous.root, { level: 'WARNING' });
       const child = children.get(sessionId);
       const inTurn = child ? child.turn === data.turn : sessions.get(sessionId)?.turn === data.turn;
-      const root =
+      const completed =
         data.invocationId && !inTurn
+          ? completedTurns.get(JSON.stringify([sessionId, data.turn]))
+          : undefined;
+      const root =
+        data.invocationId && !inTurn && !completed
           ? // A late hook must not consume context queued for the next turn.
             reporter.openTrace({
               name: config.traceName,
@@ -528,7 +550,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       const tool = data.callId ? toolCalls.get(sessionId)?.get(data.callId) : undefined;
       const hookName = config.captureContent ? reporter.mask({ name: data.name }).name : undefined;
       const span = reporter.startSpan(
-        root === undefined ? (tool?.turn === data.turn ? tool.span : parentFor(sessionId)) : root,
+        completed?.parent ??
+          (root === undefined
+            ? tool?.turn === data.turn
+              ? tool.span
+              : parentFor(sessionId)
+            : root),
         {
           name: `hook:${data.point}${hookName ? `:${hookName}` : ''}`,
           input: config.captureContent ? data.input : undefined,
@@ -552,8 +579,11 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         handlerId: data.handlerId,
         persistent: !!data.invocationId,
         callId: data.callId,
-        turnTrace:
-          root === undefined ? (child?.turnTrace ?? sessions.get(sessionId)?.trace) : undefined,
+        turnTrace: completed
+          ? completed.turnTrace
+          : root === undefined
+            ? (child?.turnTrace ?? sessions.get(sessionId)?.trace)
+            : undefined,
       });
       openHooks.set(sessionId, pending);
       return;
@@ -620,7 +650,10 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     const child = children.get(sessionId);
     if (child) {
       if (event.type === 'turn/start') child.turn = event.data.turn;
-      if (event.type === 'turn/end') child.turn = undefined;
+      if (event.type === 'turn/end') {
+        rememberTurn(sessionId, event.data.turn, child.span, child.turnTrace ?? null);
+        child.turn = undefined;
+      }
       // The delegated prompt (the child's first user/message) is the
       // subagent span's input; the descriptor enriches the span name.
       if (event.type === 'user/message' && !child.hasInput && config.captureContent) {
@@ -670,6 +703,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         const state = sessions.get(sessionId);
         if (state) {
           sessions.delete(sessionId);
+          rememberTurn(sessionId, event.data.turn, state.trace, state.trace);
           // The turn's final answer becomes the trace's output; ending the
           // root span is what exports the trace (v5 exports spans on end).
           afterMedia(state.trace, (endedAt) =>
@@ -713,6 +747,9 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     const state = sessions.get(sessionId);
     sessions.delete(sessionId);
     traceContexts.delete(sessionId);
+    for (const [key, completed] of completedTurns) {
+      if (completed.sessionId === sessionId) completedTurns.delete(key);
+    }
     openToolSpans.delete(sessionId);
     toolCalls.delete(sessionId);
     // End an abandoned root (crash-orphaned turn or between-turns one-off
@@ -1053,6 +1090,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       for (const state of sessions.values()) reporter.endSpan(state.trace, {}, endedAt);
       for (const child of children.values()) reporter.endSpan(child.span, {}, endedAt);
       sessions.clear();
+      completedTurns.clear();
       traceContexts.clear();
       children.clear();
       openToolSpans.clear();

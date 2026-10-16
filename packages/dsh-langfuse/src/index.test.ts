@@ -1021,8 +1021,9 @@ describe('dsh-langfuse plugin', () => {
           dialect: 'gemini',
         }),
       );
-      expect(mocks.roots[2].body.metadata).toMatchObject({ turn: 0, detachedHook: true });
-      expect(mocks.roots[2].spans).toHaveLength(1);
+      expect(mocks.roots).toHaveLength(2);
+      expect(mocks.roots[0].spans[1].name).toBe('hook:AfterTool');
+      expect(mocks.roots[1].spans[0].spans).toHaveLength(0);
       ctx.emit('tools/result', second, okResult());
       ctx.emit('session/event', session, turnEnd(1));
       expect(lastUpdate(mocks.roots[1]).metadata).not.toHaveProperty('hadErrors');
@@ -1173,13 +1174,13 @@ describe('dsh-langfuse plugin', () => {
       });
     });
 
-    it('keeps custom runs correlated across turn closure and exports detached cancellation hooks', async () => {
+    it('keeps delayed cancellation hooks on their completed turn across the next turn', async () => {
       await setup();
       const session = sessionOf('custom');
       ctx.emit('session/event', session, turnStart(0));
       const invoked = {
         turn: 0,
-        point: 'AfterAgent',
+        point: 'UserCancel',
         dialect: 'gemini',
         handlerId: 'cancel-command',
         invocationId: 'running',
@@ -1193,7 +1194,7 @@ describe('dsh-langfuse plugin', () => {
         session,
         ev('hook/result', {
           turn: 0,
-          point: 'AfterAgent',
+          point: 'UserCancel',
           handlerId: 'cancel-command',
           invocationId: 'running',
           decision: 'pass',
@@ -1211,25 +1212,52 @@ describe('dsh-langfuse plugin', () => {
         session,
         ev('hook/invoked', { ...invoked, invocationId: 'detached' }),
       );
-      expect(mocks.roots).toHaveLength(3);
-      expect(mocks.roots[2].body.metadata).toMatchObject({ turn: 0, detachedHook: true });
+      expect(mocks.roots).toHaveLength(2);
+      expect(mocks.roots[0].spans[1].name).toBe('hook:UserCancel');
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/invoked', {
+          ...invoked,
+          turn: 1,
+          invocationId: 'new-turn',
+        }),
+      );
       ctx.emit(
         'session/event',
         session,
         ev('hook/result', {
           turn: 0,
-          point: 'AfterAgent',
+          point: 'UserCancel',
           handlerId: 'cancel-command',
           invocationId: 'detached',
           decision: 'pass',
-          outcome: 'success',
-          exitCode: 0,
+          outcome: 'failed',
+          exitCode: 1,
           durationMs: 3,
         }),
       );
-      expect(mocks.roots[2].ended).toBe(1);
-      expect(mocks.roots[2].spans[0].ended).toBe(1);
+      expect(mocks.roots[0].ended).toBe(1);
+      expect(mocks.roots[0].spans[1].ended).toBe(1);
       expect(mocks.roots[1].ended).toBe(0);
+      expect(mocks.roots[1].spans[0].ended).toBe(0);
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/result', {
+          turn: 1,
+          point: 'UserCancel',
+          handlerId: 'cancel-command',
+          invocationId: 'new-turn',
+          decision: 'pass',
+          outcome: 'success',
+          exitCode: 0,
+          durationMs: 1,
+        }),
+      );
+      expect(mocks.roots[1].spans[0].ended).toBe(1);
+      ctx.emit('session/event', session, turnEnd(1));
+      expect(lastUpdate(mocks.roots[1]).metadata).not.toHaveProperty('hadErrors');
     });
 
     it.each([
@@ -1398,6 +1426,32 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit(
         'session/event',
         child,
+        ev('hook/invoked', {
+          turn: 0,
+          point: 'UserCancel',
+          dialect: 'gemini',
+          handlerId: 'h',
+          invocationId: 'delayed',
+        }),
+      );
+      expect(mocks.roots).toHaveLength(2);
+      expect(mocks.roots[0].spans[0].spans[1].name).toBe('hook:UserCancel');
+      ctx.emit(
+        'session/event',
+        child,
+        ev('hook/result', {
+          turn: 0,
+          point: 'UserCancel',
+          handlerId: 'h',
+          invocationId: 'delayed',
+          decision: 'pass',
+          outcome: 'failed',
+          durationMs: 1,
+        }),
+      );
+      ctx.emit(
+        'session/event',
+        child,
         ev('hook/result', {
           turn: 0,
           point: 'AfterAgent',
@@ -1443,6 +1497,74 @@ describe('dsh-langfuse plugin', () => {
         traceId: '1234567890abcdef1234567890abcdef',
       });
       await ctx.fiber.dispose();
+    });
+
+    it('keeps next-turn context queued when a hook reuses a completed turn', async () => {
+      await setup();
+      const session = sessionOf('custom');
+      ctx.emit('session/event', session, turnStart(0));
+      ctx.emit('session/event', session, turnEnd(0));
+      const root = mocks.roots[0];
+      const endedAt = root.endedAt;
+      ctx.emit('langfuse/context', session.id, { userId: 'next-turn-owner' });
+      ctx.emit(
+        'session/event',
+        session,
+        ev('hook/invoked', {
+          turn: 0,
+          point: 'UserCancel',
+          dialect: 'gemini',
+          handlerId: 'h',
+          invocationId: 'late',
+        }),
+      );
+      expect(mocks.roots).toHaveLength(1);
+      expect(root.spans[0].name).toBe('hook:UserCancel');
+      ctx.emit('session/event', session, turnStart(1));
+      expect(mocks.roots[1].attributes['user.id']).toBe('next-turn-owner');
+      expect(root.endedAt).toBe(endedAt);
+      expect(root.ended).toBe(1);
+    });
+
+    it('bounds completed-turn parents across sessions and clears them on session disposal', async () => {
+      await setup();
+      const late = { turn: 0, point: 'UserCancel', dialect: 'gemini', handlerId: 'h' };
+      for (let index = 0; index < 129; index++) {
+        const session = sessionOf(`session-${index}`);
+        ctx.emit('session/event', session, turnStart(0));
+        ctx.emit('session/event', session, turnEnd(0));
+      }
+      ctx.emit(
+        'session/event',
+        sessionOf('session-0'),
+        ev('hook/invoked', {
+          ...late,
+          invocationId: 'evicted',
+        }),
+      );
+      expect(mocks.roots[129].body.metadata).toMatchObject({ detachedHook: true });
+      ctx.emit(
+        'session/event',
+        sessionOf('session-1'),
+        ev('hook/invoked', {
+          ...late,
+          invocationId: 'retained',
+        }),
+      );
+      expect(mocks.roots).toHaveLength(130);
+      expect(mocks.roots[1].spans).toHaveLength(1);
+      ctx.emit('session/disposed', sessionOf('session-1'));
+      ctx.emit(
+        'session/event',
+        sessionOf('session-1'),
+        ev('hook/invoked', {
+          ...late,
+          invocationId: 'disposed',
+        }),
+      );
+      expect(mocks.roots[130].body.metadata).toMatchObject({ detachedHook: true });
+      await ctx.fiber.dispose();
+      expect(mocks.roots[1].ended).toBe(1);
     });
 
     it('exports custom producer records written through a live Session', async () => {
