@@ -18,6 +18,8 @@
  * - tool-hooks leg: an E2E-only producer executes BeforeTool/AfterTool processes
  *   and verifies their inputs, parsed results, masking, truncation and parenting
  *   through real Langfuse API read-back.
+ * - cancel-hook leg: cancel at a real tool boundary, queue the next turn, then
+ *   verify a detached UserCancel process remains under the aborted root.
  * - hook leg: mount dsh-hooks-codex, run a script that reads the hook payload
  *   and a workspace file, then verify stdout reaches the LLM request and the
  *   result recorded through stderr reaches the completed Langfuse span.
@@ -249,6 +251,35 @@ export function evaluateToolHookTrace(observations, codeword) {
       }
     }
   }
+  return problems;
+}
+
+// Cancelled turns have no final answer; verify their own root and the delayed hook.
+export function evaluateCancelHookTrace(observations, codeword) {
+  const problems = [];
+  const generation = observations.find((o) => o.type === 'GENERATION' &&
+    o.name?.startsWith('llm-call') && o.metadata?.purpose == null &&
+    JSON.stringify(o.input ?? '').includes(codeword));
+  const root = observations.find((o) => o.name === 'dsh-turn' && o.id === generation?.parentObservationId);
+  const hook = observations.find((o) => o.name === 'hook:UserCancel:cancel-observer');
+  if (!generation?.endTime) problems.push('missing completed codeworded generation');
+  if (!root?.endTime || root.metadata?.endReason !== 'aborted' || root.level !== 'WARNING') {
+    problems.push('originating root must retain its aborted status');
+  }
+  if (!hook || hook.parentObservationId !== root?.id || hook.traceId !== root?.traceId) {
+    problems.push('UserCancel must share the cancelled root trace and parent span ID');
+  }
+  const times = [root?.endTime, hook?.startTime, hook?.endTime].map(Date.parse);
+  if (times.some((time) => !Number.isFinite(time)) || times[0] > times[1] || times[1] >= times[2]) {
+    problems.push('UserCancel must run after the original root ended with its own duration');
+  }
+  if (!hook?.input?.marker?.includes(codeword) ||
+    !(Number(hook.input.nextTurn) > Number(root?.metadata?.turn)) ||
+    hook.output?.outcome !== 'success' || hook.output?.exitCode !== 0 ||
+    hook.output?.result?.reason !== 'cancel-observed' || !(Number(hook.metadata?.durationMs) >= 50)) {
+    problems.push('missing successful detached process output after the next turn started');
+  }
+  if (observations.some((o) => o.metadata?.detachedHook)) problems.push('unexpected detached root');
   return problems;
 }
 
@@ -519,7 +550,7 @@ export async function startFakeIngestion(captured) {
 }
 
 /**
- * Run one leg to green: { tag, name, prompt, evaluate, hook?, toolHooks? }. The marker file
+ * Run one leg to green: { tag, name, prompt, evaluate, hook?, toolHooks?, cancelHook? }. The marker file
  * `${codeword}.txt` is written into the workspace and its name is the
  * codeword the leg verifies on. Failures log `::error::` and exit non-zero.
  */
@@ -532,7 +563,7 @@ export async function runScenario(opts) {
   }
 }
 
-async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHooks = false }) {
+async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHooks = false, cancelHook = false }) {
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-langfuse-${tag}-e2e`);
   mkdirSync(workDir, { recursive: true });
   const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
@@ -543,7 +574,7 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHoo
 
   const publicKey = envOr(process.env.LANGFUSE_PUBLIC_KEY, '');
   const secretKey = envOr(process.env.LANGFUSE_SECRET_KEY, '');
-  if ((hook || toolHooks) && (!publicKey || !secretKey)) {
+  if ((hook || toolHooks || cancelHook) && (!publicKey || !secretKey)) {
     throw new Error('hook E2E requires LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY');
   }
   // A half-configured pair is a misconfiguration — never silently fake it.
@@ -618,18 +649,19 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHoo
 `;
   }
 
-  if (toolHooks) {
-    const fixtureDir = join(dshHome, 'profiles', 'headless', 'tool-hooks-fixture');
+  if (toolHooks || cancelHook) {
+    const bridge = cancelHook ? 'cancel-hook-bridge.mjs' : 'tool-hook-bridge.mjs';
+    const fixtureDir = join(dshHome, 'profiles', 'headless', `${tag}-fixture`);
     mkdirSync(fixtureDir, { recursive: true });
     // An anonymous manifest excludes the loose fixture from DeepSeek's package inventory.
     writeFileSync(join(fixtureDir, 'package.json'), JSON.stringify({ private: true }));
-    for (const file of ['tool-hook-bridge.mjs', 'tool-hook-script.mjs']) {
+    for (const file of cancelHook ? [bridge] : [bridge, 'tool-hook-script.mjs']) {
       copyFileSync(new URL(`./${file}`, import.meta.url), join(fixtureDir, file));
     }
     hookPatch = `
 - insert:
-    - id: langfuse-tool-hooks-e2e
-      name: ${JSON.stringify(join(fixtureDir, 'tool-hook-bridge.mjs'))}
+    - id: langfuse-${tag}-e2e
+      name: ${JSON.stringify(join(fixtureDir, bridge))}
 `;
   }
 

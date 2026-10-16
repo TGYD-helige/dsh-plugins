@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { apply as applyHookBridge } from './tool-hook-bridge.mjs';
+import { apply as applyCancelBridge } from './cancel-hook-bridge.mjs';
 import { createRequire } from 'node:module';
 import { LangfuseReporter } from '../../../../packages/dsh-langfuse/lib/client.js';
 import { appendHookEvent, apply } from '../../../../packages/dsh-langfuse/lib/index.js';
@@ -12,6 +13,7 @@ import {
   evaluateReasoning,
   evaluateTrace,
   evaluateToolHookTrace,
+  evaluateCancelHookTrace,
   startFakeIngestion,
   runVerification,
 } from './langfuse-shared.mjs';
@@ -289,6 +291,62 @@ try {
     assert.ok(evaluateToolHookTrace(broken, hookCodeword).length > 0);
   }
   await ctx.fiber.dispose();
+  // Exercise the CI cancellation producer and evaluator through real Session/SDK export.
+  const cancelOffset = captured.length;
+  ctx = new Context();
+  const { SessionStore: CancelSessionStore } = await import(require.resolve('@deepseek-ai/dsh-session'));
+  new CancelSessionStore(ctx);
+  const cancelSession = ctx.sessions.create();
+  const cancelCodeword = 'ci-marker-cancel-hook-sdk-1';
+  ctx.provide('agents', { get: () => ({
+    cancel: () => cancelSession.append('turn/end', { turn: 0, reason: { kind: 'aborted' } }),
+    followup: () => cancelSession.append('turn/start', { turn: 1 }),
+  }) });
+  await apply(ctx, { ...connection, enabled: true, traceName: 'dsh-turn', captureContent: true });
+  applyCancelBridge(ctx);
+  cancelSession.append('turn/start', { turn: 0 });
+  const cancelStream = ctx.waterfall('llm/stream', { provider: 'fixture', model: integrationModel(),
+    sessionId: cancelSession.id, messages: [{ role: 'user', content: [{ type: 'text', text: `${cancelCodeword}.txt` }] }],
+    signal: new AbortController().signal }, async function* () {
+    yield { type: 'text-delta', index: 0, text: 'Reading marker.' };
+  });
+  for await (const _ of cancelStream) { /* drain */ }
+  let hookReported = false;
+  ctx.on('session/event', (_session, event) => {
+    if (event.type === 'hook/result') hookReported = true;
+  });
+  const cancelExec = { name: 'read', arguments: { path: `${cancelCodeword}.txt` },
+    callId: 'cancel-call', agent: { id: cancelSession.id }, signal: new AbortController().signal };
+  await ctx.waterfall('tools/pre-execute', cancelExec, async () => ({ kind: 'allow' }));
+  await ctx.parallel('session/flush', cancelSession);
+  assert.equal(hookReported, true, 'session/flush must wait for detached hook results before exit');
+  ctx.emit('tools/result', cancelExec, { content: [], isError: true,
+    error: { code: 'TOOL_ABORTED', message: 'Cancelled by the E2E fixture' } });
+  await ctx.parallel('session/flush', cancelSession);
+  const cancelTree = captured.slice(cancelOffset).map((span) => ({
+    ...capturedToObservations([span])[0], traceId: span.traceId,
+    level: attribute(span, 'langfuse.observation.level'),
+    startTime: new Date(Number(BigInt(span.startTimeUnixNano) / 1_000_000n)).toISOString(),
+    endTime: new Date(Number(BigInt(span.endTimeUnixNano) / 1_000_000n)).toISOString(),
+  }));
+  assert.deepEqual(evaluateCancelHookTrace(cancelTree, cancelCodeword), []);
+  for (const mutate of [
+    (root, hook) => { hook.parentObservationId = 'wrong-parent'; },
+    (root, hook) => { hook.traceId = 'wrong-trace'; },
+    (root) => { root.metadata.endReason = 'completed'; },
+    (root, hook) => { hook.startTime = '2000-01-01T00:00:00Z'; },
+    (root, hook) => { hook.input.nextTurn = 0; },
+    (root, hook) => { hook.metadata.durationMs = 0; },
+    (root, hook) => { hook.output.result = undefined; },
+    (root) => { root.metadata.detachedHook = true; },
+  ]) {
+    const broken = structuredClone(cancelTree);
+    mutate(broken.find((o) => o.name === 'dsh-turn'),
+      broken.find((o) => o.name === 'hook:UserCancel:cancel-observer'));
+    assert.ok(evaluateCancelHookTrace(broken, cancelCodeword).length > 0);
+  }
+  await ctx.fiber.dispose();
+
   // Real session producer + SDK export, including results after their parent ended.
   const hookOffset = captured.length;
   ctx = new Context();
@@ -301,14 +359,17 @@ try {
   assert.equal(appendHookEvent(session, 'hook/invoked', {
     ...identity, dialect: 'company-validator', name: 'PRIVATE HOOK', input: { text: 'PRIVATE INPUT' },
   }), true);
-  session.append('turn/end', { turn: 0, reason: { kind: 'completed' } });
+  session.append('turn/end', { turn: 0, reason: { kind: 'aborted' } });
+  await ctx.parallel('session/flush', session);
+  const endedTurn = structuredClone(captured.slice(hookOffset).find((s) => s.name === 'dsh-turn'));
   session.append('turn/start', { turn: 1 });
   assert.equal(appendHookEvent(session, 'hook/result', {
     ...identity, decision: 'pass', outcome: 'cancelled', signal: 'SIGTERM', durationMs: 12,
     stderrSummary: 'PRIVATE STDERR', stdout: 'PRIVATE STDOUT', stderr: 'PRIVATE STDERR',
     result: { additionalContext: 'PRIVATE RESULT' },
   }), true);
-  const detached = { ...identity, invocationId: 'detached' };
+  const detached = { ...identity, point: 'UserCancel', invocationId: 'detached' };
+  await Promise.resolve();
   assert.equal(appendHookEvent(session, 'hook/invoked', { ...detached, dialect: 'gemini' }), true);
   assert.equal(appendHookEvent(session, 'hook/result', {
     ...detached, decision: 'pass', outcome: 'success', exitCode: 0, durationMs: 3,
@@ -318,12 +379,20 @@ try {
   const runningHook = hookObservations.find((o) => o.metadata?.invocationId === 'running');
   const detachedHook = hookObservations.find((o) => o.metadata?.invocationId === 'detached');
   const turnRoot = hookObservations.find((o) => o.name === 'dsh-turn' && Number(o.metadata?.turn) === 0 && !o.metadata?.detachedHook);
-  const detachedRoot = hookObservations.find((o) => o.metadata?.detachedHook);
+  assert.ok(turnRoot);
+  assert.equal(turnRoot.metadata.endReason, 'aborted');
   assert.equal(runningHook.parentObservationId, turnRoot.id);
   assert.equal(runningHook.output.outcome, 'cancelled');
-  assert.equal(detachedHook.parentObservationId, detachedRoot.id);
+  assert.equal(detachedHook.parentObservationId, turnRoot.id, 'delayed UserCancel must parent to the cancelled turn root');
+  const exportedHook = captured.slice(hookOffset).find((s) => s.name === 'hook:UserCancel');
+  assert.equal(exportedHook.traceId, endedTurn.traceId);
+  assert.equal(exportedHook.parentSpanId, endedTurn.spanId);
+  assert.ok(BigInt(exportedHook.startTimeUnixNano) >= BigInt(endedTurn.endTimeUnixNano));
+  assert.equal(detachedHook.metadata.durationMs, '3');
+  assert.deepEqual(captured.slice(hookOffset).filter((s) => s.name === 'dsh-turn'), [endedTurn],
+    'late reporting must neither re-export nor change the ended root');
   assert.equal(detachedHook.output.outcome, 'success');
-  assert.equal(hookObservations.length, 4, 'late and detached hook spans and their roots must export before session disposal');
+  assert.equal(hookObservations.length, 3, 'both hooks must export on the original root before session disposal');
   assert.doesNotMatch(JSON.stringify(captured.slice(hookOffset)), /PRIVATE/);
   await ctx.fiber.dispose();
   console.log('real Langfuse SDK / OTLP checks passed');
