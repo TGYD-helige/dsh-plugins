@@ -40,11 +40,13 @@ This is an early dsh-preview ecosystem. The plugin shapes, config schemas, and s
 
 dsh is in developer preview and **will** break compatibility between releases. Plugins declare the oldest compatible dsh version as a fixed peer floor and every release records the tested dsh version in this matrix; the floor moves only when a plugin starts requiring a newer dsh API. Installs ride `dsh plugin add`, which is pnpm-only — pnpm's peer matching has no prerelease gate, so any newer dsh (alpha or stable) satisfies the floor without warnings. npm consumers are gated differently: npm never lets a prerelease satisfy a range unless the range names that release tuple with a prerelease comparator, so the peer ranges also name the 0.1.6, 0.1.7, and 0.2.0 prerelease tuples. Drop each union member once that line ships a final release.
 
+`dsh-a2a` inbox execution additionally tests the unmodified official DSH `0.2.1-rc.2` npm runtime. Its agent peer floor is `>=0.2.0-rc.2 || >=0.2.1-alpha.1`, for the public send/claim/pre-step interfaces. Queueing uses `Agent.send`; no core patch is required.
+
 `dsh-a2a`'s approval bridge has an optional `@deepseek-ai/dsh-user-approval` peer floor of `>=0.1.6-alpha.2 || >=0.1.7-alpha.1 || >=0.2.0-rc.1` (tested at `0.2.0-rc.2`).
 
-`dsh-a2a` requires `@deepseek-ai/dsh-session >=0.2.0-rc.1`: optional subagent tool streaming uses the session lifecycle offset to distinguish newly created children from restored sessions, preventing false delegation attribution. Other dsh peer floors remain unchanged.
+`dsh-a2a` requires `@deepseek-ai/dsh-session >=0.2.0-rc.1`: optional subagent tool streaming uses the session lifecycle offset to distinguish newly created children from restored sessions, preventing false delegation attribution. Other dsh peer floors remain unchanged apart from the agent floor above.
 
-`dsh-langfuse`'s optional image display uses `@deepseek-ai/dsh-attachment >=0.2.0-rc.1` (tested at `0.2.0-rc.2`); metadata-only tracing does not require an attachment backend.
+`dsh-langfuse`'s optional image display uses `@deepseek-ai/dsh-attachment >=0.2.0-rc.1` (tested at `0.2.1-rc.2`); metadata-only tracing does not require an attachment backend.
 
 `dsh-subagent-filesystem` requires dsh services at `>=0.2.0-rc.1` (tested at `0.2.0-rc.2`) and the native in-process `spawn` provider. It supports foreground reports and continuable background children; Markdown definitions cannot override models, tools, or permissions.
 

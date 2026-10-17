@@ -367,7 +367,7 @@ describe('dsh-langfuse plugin', () => {
     expect(mocks.isolatedProviders).toEqual([mocks.providers[0]]);
   });
 
-  it('keeps admission, controls, execution and terminal outcomes in one trace per native task', async () => {
+  it('keeps admission, execution and terminal outcomes in one trace per native task', async () => {
     await setup({
       ...enabledConfig,
       publicKey: 'public-inbox-test',
@@ -398,9 +398,7 @@ describe('dsh-langfuse plugin', () => {
     event('resolved');
     event('admitted', 'run');
     event('admitted', 'cancel');
-    event('paused', undefined, ['run', 'cancel']);
     event('canceled', 'cancel');
-    event('resume', undefined, ['run']);
     ctx.emit('session/event', session, turnStart(1));
     event('selected', 'run');
     event('prepared', 'run');
@@ -415,17 +413,8 @@ describe('dsh-langfuse plugin', () => {
     expect(mocks.roots).toHaveLength(2);
     expect(running.ended).toBe(0);
     expect(canceled.ended).toBe(1);
-    expect(canceled.spans.map((span) => span.name)).toEqual([
-      'inbox:admitted',
-      'inbox:paused',
-      'inbox:canceled',
-    ]);
-    expect(running.spans.map((span) => span.name)).toEqual([
-      'inbox:admitted',
-      'inbox:paused',
-      'inbox:resume',
-      'agent:turn',
-    ]);
+    expect(canceled.spans.map((span) => span.name)).toEqual(['inbox:admitted', 'inbox:canceled']);
+    expect(running.spans.map((span) => span.name)).toEqual(['inbox:admitted', 'agent:turn']);
     expect(running.spans.at(-1)?.spans[0].name).toBe('inbox:prepare');
     ctx.emit('session/event', session, turnStart(2));
     event('selected', 'run');
@@ -435,7 +424,6 @@ describe('dsh-langfuse plugin', () => {
     ctx.emit('session/event', session, turnEnd(2));
     expect(running.spans.filter((span) => span.name === 'agent:turn')).toHaveLength(2);
     expect(running.ended).toBe(1);
-    event('resume', undefined, ['run']);
     event('completed', 'run');
     expect(mocks.roots).toHaveLength(2);
     expect(running.ended).toBe(1);
@@ -517,7 +505,6 @@ describe('dsh-langfuse plugin', () => {
         pending: 2,
         target: 'next-turn' as const,
         position: 2,
-        paused: true,
         agentStatus: 'idle',
         input: 'Summarize the queued report',
       };
@@ -536,7 +523,6 @@ describe('dsh-langfuse plugin', () => {
             target: 'next-turn',
             position: 2,
             pending: 2,
-            paused: true,
           }),
         }),
       );

@@ -302,14 +302,12 @@ export class A2aBridge {
           resumeSessionId: sessionId,
           agentOptions,
           setup,
-          ...(this.inbox ? { keepInboxOnDispose: true } : {}),
         })
       : await this.ctx.agents.create({
           sessionId,
           meta: { cwd: this.options.cwd, ...(agentPreset ? { agentPreset } : {}) },
           agentOptions,
           setup,
-          ...(this.inbox ? { keepInboxOnDispose: true } : {}),
         });
     const entry: TaskEntry = {
       taskId,
@@ -428,7 +426,7 @@ export class A2aBridge {
     await Promise.allSettled([...entry.running]);
   }
 
-  /** The native inbox selects task ownership before assembling its first prompt. */
+  /** The official inbox claim selects the task that owns the next model step. */
   bindInboxTask(
     entry: TaskEntry,
     taskId: string,

@@ -62,7 +62,6 @@ interface A2aInboxEvent {
   target?: 'next-turn' | 'next-step';
   input?: string;
   position?: number;
-  paused?: boolean;
   agentStatus?: string;
   taskId?: string;
   taskIds?: string[];
@@ -637,7 +636,6 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         pending: event.pending,
         target: event.target,
         position: event.position,
-        paused: event.paused,
         agentStatus: event.agentStatus,
         turn: event.turn,
         step: event.step,
@@ -652,7 +650,6 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         target: event.target,
         position: event.position,
         pending: event.pending,
-        paused: event.paused,
         agentStatus: event.agentStatus,
       };
       if (event.phase === 'selected') {
@@ -745,10 +742,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
             level: phase === 'failed' ? 'ERROR' : phase === 'canceled' ? 'WARNING' : 'DEFAULT',
           };
           closeTask(task, new Date(event.at));
-        } else
-          reporter.updateSpan(task.trace, {
-            metadata: { taskState: event.phase === 'paused' ? 'paused' : undefined },
-          });
+        }
       }
       if (event.phase === 'disposed') suspendTasks(id);
       if (event.phase === 'disposed' || event.phase === 'cleared') {

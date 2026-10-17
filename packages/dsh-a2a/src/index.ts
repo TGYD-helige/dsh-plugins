@@ -93,7 +93,7 @@ export const inject = ['agents'];
 
 export const Config = Schema.object({
   inbox: Schema.object({ enabled: Schema.boolean().default(false) }).description(
-    'Use durable native inbox execution (requires the upstream native inbox capability).',
+    'Use the official DSH inbox for queued turns and steering.',
   ),
   enabled: Schema.boolean().default(false),
   host: Schema.string().default('127.0.0.1'),

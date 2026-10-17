@@ -1,7 +1,7 @@
 /** Real loop, A2A HTTP, and JSONL restart; only model responses are scripted. */
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { cp, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
@@ -12,7 +12,8 @@ import LlmRuntime from '@deepseek-ai/dsh-llm';
 import SessionStore from '@deepseek-ai/dsh-session';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
-import ToolRuntime from '@deepseek-ai/dsh-tools';
+import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools';
+import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
 import AgentRegistry from '@deepseek-ai/dsh-agent';
 import AgentLoop from '@deepseek-ai/dsh-agent-loop';
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl';
@@ -25,13 +26,36 @@ import { MemoryTaskStore, SanitizedTaskStore } from '../../../packages/dsh-a2a/s
 import { startA2aServer } from '../../../packages/dsh-a2a/src/server.js';
 
 const require = createRequire(new URL('../../../packages/dsh-a2a/package.json', import.meta.url));
-const { Message } = await import(pathToFileURL(require.resolve('@a2a-js/sdk')).href);
+const { Message, TaskState } = await import(pathToFileURL(require.resolve('@a2a-js/sdk')).href);
 const { ServerCallContext } = await import(pathToFileURL(require.resolve('@a2a-js/sdk/server')).href);
-const { MockAdapter, textResponse } = await import(`${process.env.DSH_SOURCE_ROOT}/packages/core/agent-loop/tests/mock-adapter.ts`);
+import { LlmAdapter, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm';
+function textResponse(text: string): StreamChunk[] {
+  return [{ type: 'block-start', index: 0, blockType: 'text' }, { type: 'text-delta', index: 0, text },
+    { type: 'block-end', index: 0, block: { type: 'text', text } }, { type: 'usage', usage: { inputTokens: 10, outputTokens: text.length } }, { type: 'finish', reason: { kind: 'stop' } }];
+}
+class MockAdapter extends LlmAdapter {
+  requests: GenerateOptions[] = [];
+  constructor(private script: Array<StreamChunk[] | 'hang'>) { super(); }
+  async resolveModel(provider: string, model: string) { return { provider, id: model, name: model }; }
+  async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    this.requests.push(options);
+    const reply = this.script.shift();
+    if (reply === 'hang') {
+      await new Promise<void>((_, reject) => {
+        const abort = () => reject(new Error('aborted'));
+        if (options.signal?.aborted) abort();
+        else options.signal?.addEventListener('abort', abort, { once: true });
+      });
+    } else {
+      if (!reply) throw new Error('Script exhausted');
+      for (const chunk of reply) { options.signal?.throwIfAborted(); yield chunk; }
+    }
+  }
+}
 const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const dispose of cleanups.splice(0).reverse()) await dispose(); });
 
-async function boot(options: { root?: string; store?: SanitizedTaskStore; backend?: MemoryTaskStore; script?: unknown[]; langfuseUrl?: string; langfuse?: Langfuse.LangfusePluginConfig; contextId?: string } = {}) {
+async function boot(options: { root?: string; store?: SanitizedTaskStore; backend?: MemoryTaskStore; script?: Array<StreamChunk[] | 'hang'>; langfuseUrl?: string; langfuse?: Langfuse.LangfusePluginConfig; contextId?: string } = {}) {
   const ctx = new Context();
   cleanups.push(() => ctx.fiber.dispose());
   for (const plugin of [LlmRuntime, SessionStore, SessionProjectionRegistry, SystemPrompt, ToolRuntime, AgentRegistry]) await ctx.plugin(plugin);
@@ -68,43 +92,30 @@ async function boot(options: { root?: string; store?: SanitizedTaskStore; backen
   return { ctx, adapter, bridge, inbox, store, backend, server, rpc, send, completed };
 }
 
-it('durably queues separate tasks and wakes them in order without duplicate user messages', async () => {
+it('removes failed admission input from the official queue after a flush error', async () => {
   const f = await boot();
-  const tasks = [];
-  for (const id of ['one', 'two']) {
-    const task = await f.send(id, { wakeup: false });
-    expect(task.status.state).toBe('TASK_STATE_SUBMITTED');
-    tasks.push(task);
-  }
-  expect(f.adapter.requests).toHaveLength(0);
-  await f.inbox.wake('native-test');
   const agent = await f.inbox.resolve('native-test');
-  await agent.whenIdle();
-  for (const task of tasks) await f.completed(task.id);
-  expect(agent.session.snapshotEvents().filter(e => e.type === 'user/message').map(e => e.data.content)).toEqual([[{ type: 'text', text: 'one' }], [{ type: 'text', text: 'two' }]]);
+  let failFlush = true;
+  f.ctx.on('session/flush', () => {
+    if (failFlush && agent.inbox.nextTurn.length) {
+      failFlush = false;
+      throw new Error('admission checkpoint failed');
+    }
+  });
+  const task = await f.send('failed-admission', { wakeup: false });
+  await expect.poll(async () => (await f.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_FAILED');
+  expect(agent.inbox.nextTurn).toHaveLength(0);
+  const next = await f.send('next');
+  await f.completed(next.id);
+  expect(f.adapter.requests).toHaveLength(1);
+  expect(JSON.stringify(f.adapter.requests[0])).not.toContain('failed-admission');
 });
 
-it('cold-restores paused A2A inputs from JSONL and resumes the original tasks with no credentials', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'a2a-inbox-durable-'));
-  cleanups.push(() => rm(root, { recursive: true, force: true }));
-  const first = await boot({ root });
-  const tasks = [await first.send('one', { wakeup: false }), await first.send('two', { wakeup: false })];
-  const original = await first.inbox.resolve('native-test');
-  const ids = original.inbox.nextTurn.map(m => m.id);
-  await first.inbox.pause('native-test');
-  await first.bridge.dispose();
-  const second = await boot({ root, backend: first.backend });
-  const restored = await second.inbox.resolve('native-test');
-  expect(restored.inbox.nextTurn.map(m => m.id)).toEqual(ids);
-  expect(await second.inbox.wake('native-test')).toEqual([]);
-  expect(second.adapter.requests).toHaveLength(0);
-  const prepared: unknown[] = [];
-  second.ctx.on('a2a/before-assembly', detail => { prepared.push(detail.requestHeaders); });
-  await second.inbox.wake('native-test', { resume: true });
-  await restored.whenIdle();
-  for (const task of tasks) await second.completed(task.id);
-  expect(prepared).toEqual([undefined, undefined]);
-  expect(restored.session.snapshotEvents().filter(e => e.type === 'user/message').map(e => e.data.id)).toEqual(ids);
+it('uses the official published DSH queue without a capability patch', async () => {
+  const f = await boot();
+  const first = await f.send('first');
+  await f.completed(first.id);
+  expect(f.adapter.requests).toHaveLength(1);
 });
 
 it.each([true, false])('records steering in the active turn while ordinary input waits with captureContent=%s', async captureContent => {
@@ -149,158 +160,6 @@ it.each([true, false])('records steering in the active turn while ordinary input
 
 });
 
-it('requires extension negotiation and rejects inactive steering without losing queued inputs', async () => {
-  const f = await boot();
-  const first = await f.send('first', { wakeup: false });
-  const malformed = await f.rpc('SendMessage', { message: { messageId: 'bad', contextId: 'native-test', taskId: first.id, role: 'ROLE_USER', parts: [{ text: 'bad' }], metadata: { [INBOX_EXTENSION]: { target: 'next-step' } } }, configuration: { returnImmediately: true } });
-  expect(malformed.error).toBeDefined();
-  const unnegotiated = await f.rpc('SendMessage', { message: { messageId: 'bad-header', role: 'ROLE_USER', parts: [{ text: 'bad' }], metadata: { [INBOX_EXTENSION]: { wakeup: false } } } }, false);
-  expect(unnegotiated.error).toBeDefined();
-  await f.inbox.wake('native-test');
-  await (await f.inbox.resolve('native-test')).whenIdle();
-  await f.completed(first.id);
-});
-
-it('keeps resubscriptions observing later turns on the same task after send clients detach', async () => {
-  const f = await boot({ script: [textResponse('answer-one'), textResponse('answer-two')] });
-  const first = await f.send('one', { wakeup: false });
-  await f.send('two', { wakeup: false }, first.id);
-  const subscription = await fetch(`http://127.0.0.1:${f.server.port}/a2a/`, {
-    method: 'POST', headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'SubscribeToTask', params: { id: first.id } }),
-  });
-  expect(subscription.ok).toBe(true);
-  const body = subscription.text();
-  await f.inbox.wake('native-test');
-  await (await f.inbox.resolve('native-test')).whenIdle();
-  const text = await body;
-  const events = text.split('\n\n').filter(frame => frame.startsWith('data: ')).map(frame => JSON.parse(frame.slice(6)).result);
-  expect(events[0].task.id).toBe(first.id);
-  const answers = new Map<string, string>();
-  for (const event of events) {
-    const update = event.statusUpdate;
-    if (update?.metadata?.dshAgent?.kind !== 'text-content') continue;
-    const message = update.status.message;
-    answers.set(message.messageId, (answers.get(message.messageId) ?? '') + message.parts[0].text);
-  }
-  expect([...answers.values()]).toEqual(['answer-one', 'answer-two']);
-  expect(events.at(-1).statusUpdate.status.state).toBe('TASK_STATE_COMPLETED');
-});
-
-it('keeps canceled task terminal while retained input resumes under a fresh task', async () => {
-  const f = await boot();
-  const task = await f.send('one', { wakeup: false });
-  await f.inbox.cancel(task.id, { retainInbox: true });
-  await expect.poll(async () => (await f.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_CANCELED');
-  expect(await f.inbox.wake('native-test')).toEqual([]);
-  const ids = await f.inbox.wake('native-test', { resume: true });
-  expect(ids).toHaveLength(1);
-  expect(ids[0]).not.toBe(task.id);
-  await (await f.inbox.resolve('native-test')).whenIdle();
-  await f.completed(ids[0]);
-  expect((await f.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_CANCELED');
-  expect((await f.rpc('GetTask', { id: ids[0] })).result.history[0].referenceTaskIds).toContain(task.id);
-});
-
-it('rejects a failing admission observer only as telemetry and keeps successful input runnable', async () => {
-  const f = await boot();
-  f.ctx.on('a2a/message-admitted', () => { throw new Error('observer failed'); });
-  f.ctx.on('a2a/inbox', () => { throw new Error('inbox observer failed'); });
-  const task = await f.send('one', { wakeup: false });
-  await f.inbox.wake('native-test');
-  await (await f.inbox.resolve('native-test')).whenIdle();
-  await f.completed(task.id);
-  expect(f.adapter.requests).toHaveLength(1);
-});
-
-it('parks pending work on active pause and never restarts the canceled task', async () => {
-  const f = await boot({ script: ['hang', textResponse('next')] });
-  const active = await f.send('active');
-  await expect.poll(() => f.adapter.requests.length).toBe(1);
-  const queued = await f.send('queued');
-  await f.inbox.pause('native-test');
-  await expect.poll(async () => (await f.rpc('GetTask', { id: active.id })).result.status.state).toBe('TASK_STATE_CANCELED');
-  expect(await f.inbox.wake('native-test')).toEqual([]);
-  await f.inbox.wake('native-test', { resume: true });
-  await (await f.inbox.resolve('native-test')).whenIdle();
-  await f.completed(queued.id);
-  expect(f.adapter.requests).toHaveLength(2);
-  expect((await f.rpc('GetTask', { id: active.id })).result.status.state).toBe('TASK_STATE_CANCELED');
-});
-
-it('reports interrupted committed input after restart without replaying its model request', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'a2a-inbox-committed-'));
-  cleanups.push(() => rm(root, { recursive: true, force: true }));
-  const first = await boot({ root, script: ['hang'] });
-  const task = await first.send('committed');
-  await expect.poll(() => first.adapter.requests.length).toBe(1);
-  await first.bridge.dispose();
-  const second = await boot({ root, backend: first.backend });
-  await second.inbox.beforeTask(task.id, new ServerCallContext());
-  await second.inbox.wake('native-test');
-  await expect.poll(async () => (await second.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_FAILED');
-  expect(second.adapter.requests).toHaveLength(0);
-});
-
-it('rejects missing message IDs before admitting follow-ups', async () => {
-  const f = await boot();
-  const task = await f.send('one', { wakeup: false });
-  const malformed = await f.rpc('SendMessage', { message: { taskId: task.id, role: 'ROLE_USER', parts: [{ text: 'phantom' }] } });
-  expect(malformed.error).toBeDefined();
-  const agent = await f.inbox.resolve('native-test');
-  expect(agent.inbox.nextTurn).toHaveLength(1);
-  await f.inbox.wake('native-test');
-  await agent.whenIdle();
-  await f.completed(task.id);
-  expect(f.adapter.requests).toHaveLength(1);
-});
-
-it('cancels cold queued input before any wake or local task restoration', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'a2a-inbox-cancel-'));
-  cleanups.push(() => rm(root, { recursive: true, force: true }));
-  const first = await boot({ root });
-  const task = await first.send('discard', { wakeup: false });
-  await first.bridge.dispose();
-  const second = await boot({ root, backend: first.backend });
-  const canceled = await second.rpc('CancelTask', { id: task.id });
-  expect(canceled.error).toBeUndefined();
-  expect(canceled.result.status.state).toBe('TASK_STATE_CANCELED');
-  expect(await second.inbox.wake('native-test', { resume: true })).toEqual([]);
-  expect((await second.inbox.resolve('native-test')).inbox.nextTurn).toHaveLength(0);
-  expect(second.adapter.requests).toHaveLength(0);
-});
-
-it('resumes retained steering separately from another queued task', async () => {
-  const f = await boot({ script: ['hang', textResponse('steered'), textResponse('ordinary')] });
-  const active = await f.send('active');
-  await expect.poll(() => f.adapter.requests.length).toBe(1);
-  const ordinary = await f.send('ordinary');
-  await f.send('steering', { target: 'next-step' }, active.id);
-  await f.inbox.cancel(active.id, { retainInbox: true });
-  const agent = await f.inbox.resolve('native-test');
-  await agent.whenIdle();
-  const resumed = await f.inbox.wake('native-test', { resume: true });
-  await agent.whenIdle();
-  for (const id of resumed) await f.completed(id);
-  await f.completed(ordinary.id);
-  expect(agent.session.snapshotEvents().filter(e => e.type === 'user/message').map(e => e.data.content[0].text)).toEqual(['active', 'steering', 'ordinary']);
-  expect((await f.rpc('GetTask', { id: active.id })).result.status.state).toBe('TASK_STATE_CANCELED');
-});
-
-it('retains pending task identity when the core disposes before the bridge', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'a2a-inbox-dispose-'));
-  cleanups.push(() => rm(root, { recursive: true, force: true }));
-  const first = await boot({ root });
-  const task = await first.send('retained', { wakeup: false });
-  await first.ctx.fiber.dispose();
-  const second = await boot({ root, backend: first.backend });
-  await second.inbox.wake('native-test');
-  await (await second.inbox.resolve('native-test')).whenIdle();
-  await second.completed(task.id);
-  expect(second.adapter.requests).toHaveLength(1);
-});
-
-
 it('inserts queued tasks during an active turn without consuming or duplicating them', async () => {
   const f = await boot();
   let release!: () => void;
@@ -311,7 +170,7 @@ it('inserts queued tasks during an active turn without consuming or duplicating 
     return next();
   });
   const order: string[] = [];
-  f.ctx.on('a2a/before-assembly', detail => { order.push(detail.a2aMessage.messageId); });
+  f.ctx.on('a2a/before-step', detail => { order.push(detail.a2aMessage.messageId); });
   try {
     const active = await f.send('active');
     await expect.poll(() => firstRequest).toBe(true);
@@ -340,106 +199,11 @@ it('inserts queued tasks during an active turn without consuming or duplicating 
   }
 });
 
-it('does not mint duplicate replacement tasks for concurrent resumes', async () => {
-  const f = await boot();
-  const canceled = await f.send('one', { wakeup: false });
-  await f.inbox.cancel(canceled.id, { retainInbox: true });
-  const resumed = await Promise.all([
-    f.inbox.wake('native-test', { resume: true }),
-    f.inbox.wake('native-test', { resume: true }),
-  ]);
-  await (await f.inbox.resolve('native-test')).whenIdle();
-  const ids = [...new Set(resumed.flat())];
-  expect(ids).toHaveLength(1);
-  await f.completed(ids[0]);
-  const tasks = await f.rpc('ListTasks', { contextId: 'native-test' });
-  expect(tasks.result.tasks).toHaveLength(2);
-  expect(f.adapter.requests).toHaveLength(1);
-});
-
-it('clears a cold durable inbox before resolving or waking its context', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'a2a-inbox-clear-'));
-  cleanups.push(() => rm(root, { recursive: true, force: true }));
-  const first = await boot({ root });
-  await first.send('discard', { wakeup: false });
-  await first.inbox.pause('native-test');
-  await first.bridge.dispose();
-  const second = await boot({ root, backend: first.backend });
-  await second.bridge.clearContext('native-test');
-  const restored = await second.inbox.resolve('native-test');
-  expect(restored.inbox.nextTurn).toHaveLength(0);
-  expect(await second.inbox.wake('native-test', { resume: true })).toEqual([]);
-  expect(second.adapter.requests).toHaveLength(0);
-});
-
-it('continues independent queued tasks after a preparation failure', async () => {
-  const f = await boot();
-  let release!: () => void;
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  let preparing = false;
-  f.ctx.on('a2a/before-assembly', async detail => {
-    if (detail.a2aMessage.messageId !== 'bad') return;
-    preparing = true;
-    await gate;
-    throw new Error('preparation failed');
-  });
-  try {
-    const bad = await f.send('bad');
-    await expect.poll(() => preparing).toBe(true);
-    const good = await f.send('good');
-    release();
-    await f.completed(good.id);
-    expect((await f.rpc('GetTask', { id: bad.id })).result.status.state).toBe('TASK_STATE_FAILED');
-    expect(f.adapter.requests).toHaveLength(1);
-  } finally { release(); }
-});
-
-it('subscribes to a cold pending task before wake without executing it', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'a2a-inbox-subscribe-'));
-  cleanups.push(() => rm(root, { recursive: true, force: true }));
-  const first = await boot({ root });
-  const task = await first.send('one', { wakeup: false });
-  await first.bridge.dispose();
-  const second = await boot({ root, backend: first.backend });
-  const subscription = await fetch(`http://127.0.0.1:${second.server.port}/a2a/`, {
-    method: 'POST', headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'SubscribeToTask', params: { id: task.id } }),
-  });
-  const output = subscription.text();
-  expect(second.adapter.requests).toHaveLength(0);
-  await second.inbox.wake('native-test');
-  await second.completed(task.id);
-  const frames = (await output).split('\n\n').filter(frame => frame.startsWith('data: ')).map(frame => JSON.parse(frame.slice(6)).result);
-  expect(frames.at(-1).statusUpdate.status.state).toBe('TASK_STATE_COMPLETED');
-});
-
-it('aborts active work promptly and awaits durable terminal cancellation before returning', async () => {
-  const f = await boot({ script: ['hang'] });
-  const task = await f.send('retained');
-  await expect.poll(() => f.adapter.requests.length).toBe(1);
-  const agent = await f.inbox.resolve('native-test');
-  const save = f.backend.save.bind(f.backend);
-  let release!: () => void;
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  let writing = false;
-  f.backend.save = async (snapshot, context) => {
-    if (snapshot.status?.state === 5) { writing = true; await gate; }
-    return save(snapshot, context);
-  };
-  let returned = false;
-  const canceled = f.inbox.cancel(task.id, { retainInbox: true }).then(() => { returned = true; });
-  try {
-    await expect.poll(() => writing).toBe(true);
-    await expect.poll(() => agent.status).toBe('idle');
-    expect(returned).toBe(false);
-  } finally { release(); await canceled; }
-});
-
 it('persists completion when a legacy streaming send disconnects', async () => {
   const f = await boot();
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
-  f.ctx.on('a2a/before-assembly', () => gate);
+  f.ctx.on('a2a/before-step', () => gate);
   const abort = new AbortController();
   try {
     const response = await fetch(`http://127.0.0.1:${f.server.port}/a2a/`, {
@@ -457,292 +221,6 @@ it('persists completion when a legacy streaming send disconnects', async () => {
     await (await f.inbox.resolve('native-test')).whenIdle();
     await f.completed(anchor.id);
   } finally { abort.abort(); release(); }
-});
-
-it.each([false, true])('shares cancellation acknowledgment and retries failed persistence (failure=%s)', async fail => {
-  const f = await boot();
-  const task = await f.send('retained', { wakeup: false });
-  const checkpoint = f.store.checkpoint.bind(f.store);
-  let release!: () => void;
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  let entered = false;
-  f.store.checkpoint = async (snapshot, context) => {
-    if (snapshot.status?.state === 5) {
-      entered = true;
-      await gate;
-      if (fail) throw new Error('checkpoint unavailable');
-    }
-    await checkpoint(snapshot, context);
-  };
-  const first = f.inbox.cancel(task.id, { retainInbox: true });
-  await expect.poll(() => entered).toBe(true);
-  let returned = false;
-  const second = f.inbox.cancel(task.id, { retainInbox: true }).then(() => { returned = true; });
-  const results = Promise.allSettled([first, second]);
-  try {
-    await f.rpc('GetTask', { id: task.id });
-    expect(returned).toBe(false);
-  } finally { release(); }
-  expect((await results).map(result => result.status)).toEqual(fail ? ['rejected', 'rejected'] : ['fulfilled', 'fulfilled']);
-  fail = false;
-  await f.inbox.cancel(task.id, { retainInbox: true });
-  expect((await f.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_CANCELED');
-});
-
-it('fails a committed task whose terminal checkpoint was lost without replaying its completed turn', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'a2a-inbox-terminal-gap-'));
-  cleanups.push(() => rm(root, { recursive: true, force: true }));
-  const first = await boot({ root });
-  const task = await first.send('completed');
-  await first.completed(task.id);
-  await first.bridge.dispose();
-  const context = new ServerCallContext();
-  const snapshot = await first.backend.load(task.id, context);
-  await first.backend.save({ ...snapshot!, status: { ...snapshot!.status!, state: 2 } }, context);
-  const second = await boot({ root, backend: first.backend });
-  await second.inbox.wake('native-test');
-  await expect.poll(async () => (await second.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_FAILED');
-  expect(second.adapter.requests).toHaveLength(0);
-});
-
-it('joins a cancellation flush before shutdown can close its task backend', async () => {
-  const f = await boot();
-  const task = await f.send('retained', { wakeup: false });
-  let release!: () => void;
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  let flushing = false;
-  f.ctx.on('session/flush', async () => {
-    if (flushing) return;
-    flushing = true;
-    await gate;
-  });
-  const canceled = f.inbox.cancel(task.id, { retainInbox: true });
-  await expect.poll(() => flushing).toBe(true);
-  let closed = false;
-  const shutdown = f.inbox.shutdown().then(() => f.store.close()).then(() => { closed = true; });
-  try {
-    await f.rpc('GetTask', { id: task.id });
-    expect(closed).toBe(false);
-  } finally { release(); await Promise.all([canceled, shutdown]); }
-});
-
-it('keeps host follow-ups owned by their task while two settlement hooks wait', async () => {
-  const f = await boot({ script: [textResponse('answer-A'), textResponse('answer-B'), textResponse('followup-A')] });
-  let releaseA!: () => void;
-  let releaseB!: () => void;
-  const gateA = new Promise<void>(resolve => { releaseA = resolve; });
-  const gateB = new Promise<void>(resolve => { releaseB = resolve; });
-  const a = await f.send('A', { wakeup: false });
-  const b = await f.send('B', { wakeup: false });
-  const hooks: string[] = [];
-  f.ctx.on('a2a/task-settlement', async detail => {
-    hooks.push(detail.taskId);
-    if (detail.taskId === a.id) {
-      await gateA;
-      await f.inbox.enqueue(a.id, Message.fromJSON({ messageId: 'host-A', role: 'ROLE_USER', parts: [{ text: 'followup' }] }));
-    } else await gateB;
-  });
-  try {
-    await f.inbox.wake('native-test');
-    await expect.poll(() => hooks).toEqual([a.id, b.id]);
-    releaseA();
-    await f.completed(a.id);
-    const task = (await f.rpc('GetTask', { id: a.id })).result;
-    expect(task.status.message.parts[0].text).toBe('followup-A');
-    expect((await f.rpc('GetTask', { id: b.id })).result.status.state).toBe('TASK_STATE_WORKING');
-  } finally { releaseA(); releaseB(); }
-});
-
-it('does not expose rejected admission history and accepts a retry after a checkpoint failure', async () => {
-  const f = await boot();
-  const task = await f.send('one', { wakeup: false });
-  const save = f.backend.save.bind(f.backend);
-  let failed = false;
-  f.backend.save = async (snapshot, context) => {
-    if (!failed && snapshot.history.some(message => message.messageId === 'retry')) {
-      failed = true;
-      throw new Error('admission checkpoint failed');
-    }
-    await save(snapshot, context);
-  };
-  const rejected = await f.rpc('SendMessage', { message: { messageId: 'retry', taskId: task.id, role: 'ROLE_USER', parts: [{ text: 'retry' }], metadata: { [INBOX_EXTENSION]: { wakeup: false } } }, configuration: { returnImmediately: true } });
-  expect(rejected.error).toBeDefined();
-  const accepted = (await f.rpc('GetTask', { id: task.id })).result;
-  expect(accepted.history.map(message => message.messageId)).toEqual(['one']);
-  await f.send('retry', { wakeup: false }, task.id);
-  await f.inbox.wake('native-test');
-  const agent = await f.inbox.resolve('native-test');
-  await agent.whenIdle();
-  await f.completed(task.id);
-  expect(agent.session.snapshotEvents().filter(e => e.type === 'user/message').map(e => e.data.content[0].text)).toEqual(['one', 'retry']);
-});
-
-
-it.each([true, false])('exports readable inbox lifecycle through the real SDK with captureContent=%s', async captureContent => {
-  const captured: unknown[] = [];
-  const collector = await startFakeIngestion(captured);
-  cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
-  const f = await boot({ langfuse: { enabled: true, publicKey: 'public-inbox-test', secretKey: 'secret-inbox-test', baseUrl: `http://127.0.0.1:${collector.address().port}`, captureContent } });
-  const traceparent = '00-11111111111111111111111111111111-2222222222222222-01';
-  f.ctx.on('a2a/before-assembly', async detail => {
-    f.ctx.emit('langfuse/context', detail.contextId, { traceparent, userId: 'inbox-user' });
-    const turn = detail.agent.session.snapshotEvents().filter(event => event.type === 'turn/start').at(-1).data.turn;
-    const hook = { turn, point: 'BeforeAgent', handlerId: 'prepare', invocationId: detail.dshMessageId };
-    Langfuse.appendHookEvent(detail.agent.session, 'hook/invoked', { ...hook, dialect: 'test' });
-    await new Promise(resolve => setTimeout(resolve, 20));
-    Langfuse.appendHookEvent(detail.agent.session, 'hook/result', { ...hook, decision: 'pass', outcome: 'success', durationMs: 20 });
-    if (detail.a2aMessage.messageId === 'failed') throw new Error('preparation failed');
-  });
-  const first = await f.send('first', { wakeup: false }, undefined, 'private-first');
-  const failed = await f.send('failed', { wakeup: false }, undefined, 'private-failed');
-  const second = await f.send('second', { wakeup: false }, undefined, 'private-second');
-  const canceled = await f.send('canceled', { wakeup: false }, undefined, 'private-canceled');
-  await f.inbox.pause('native-test');
-  await f.inbox.cancel(canceled.id);
-  await new Promise(resolve => setTimeout(resolve, 20));
-  await f.inbox.wake('native-test', { resume: true });
-  const agent = await f.inbox.resolve('native-test');
-  await agent.whenIdle();
-  await f.completed(first.id);
-  await f.completed(second.id);
-  expect((await f.rpc('GetTask', { id: failed.id })).result.status.state).toBe('TASK_STATE_FAILED');
-  await f.ctx.parallel('session/flush', agent.session);
-  const observations = capturedToObservations(captured);
-  for (const phase of ['admitted', 'paused', 'canceled', 'resume', 'prepare']) {
-    expect(observations.some(observation => observation.name === `inbox:${phase}`)).toBe(true);
-  }
-  const roots = observations.filter(observation => observation.name === 'a2a-task');
-  expect(roots.map(root => root.metadata.taskId).sort()).toEqual([first.id, failed.id, second.id, canceled.id].sort());
-  expect(roots.map(root => root.metadata.taskState).sort()).toEqual(['completed', 'completed', 'failed', 'canceled'].sort());
-  const turns = observations.filter(observation => observation.name === 'agent:turn');
-  expect(turns).toHaveLength(3);
-  expect(turns.every(turn => roots.some(root => root.id === turn.parentObservationId && root.traceId === turn.traceId))).toBe(true);
-  for (const root of roots.filter(root => root.metadata.taskId !== canceled.id)) {
-    expect(captured.find(span => span.spanId === root.id).links).toEqual(expect.arrayContaining([expect.objectContaining({ traceId: '11111111111111111111111111111111', spanId: '2222222222222222' })]));
-  }
-  const canceledRoot = roots.find(root => root.metadata.taskId === canceled.id);
-  expect(observations.filter(observation => observation.parentObservationId === canceledRoot.id).map(observation => observation.name)).toEqual(['inbox:admitted', 'inbox:paused', 'inbox:canceled']);
-  expect(observations.filter(observation => observation.type === 'GENERATION')).toHaveLength(2);
-  expect(observations.some(observation => observation.name === 'inbox:wait')).toBe(false);
-  expect(roots.filter(root => root.metadata.taskId !== canceled.id).every(root => Number(root.metadata.waitMs) >= 20)).toBe(true);
-  const preparations = observations.filter(observation => observation.name === 'inbox:prepare');
-  expect(preparations).toHaveLength(3);
-  for (const preparation of preparations) {
-    const raw = captured.find(span => span.spanId === preparation.id);
-    const parent = captured.find(span => span.spanId === preparation.parentObservationId);
-    expect(BigInt(parent.startTimeUnixNano)).toBeLessThanOrEqual(BigInt(raw.startTimeUnixNano));
-    expect(Number(BigInt(raw.endTimeUnixNano) - BigInt(raw.startTimeUnixNano)) / 1e6).toBeCloseTo(Number(preparation.metadata.prepareMs), 0);
-  }
-  const hooks = observations.filter(observation => observation.name === 'hook:BeforeAgent');
-  expect(hooks).toHaveLength(3);
-  expect(hooks.every(hook => turns.some(turn => turn.id === hook.parentObservationId))).toBe(true);
-  expect(observations.every(observation => observation.sessionId === 'native-test' && observation.endTime)).toBe(true);
-  expect(JSON.stringify(captured)).not.toContain('secret-inbox-test');
-  if (captureContent) {
-    expect(preparations.map(preparation => preparation.input)).toEqual(['private-first', 'private-failed', 'private-second']);
-    expect(observations.find(observation => observation.name === 'inbox:admitted')?.output).toMatchObject({ state: 'admitted', pending: 1, target: 'next-turn', position: 1 });
-    expect(preparations.map(preparation => preparation.output?.state)).toEqual(['prepared', 'prepare-failed', 'prepared']);
-  } else {
-    expect(JSON.stringify(captured)).not.toMatch(/private-first|private-second|private-canceled|private-failed/);
-  }
-});
-
-
-it('exports recovered inbox identity and queue waiting across a durable restart', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'a2a-inbox-observability-'));
-  cleanups.push(() => rm(root, { recursive: true, force: true }));
-  const captured: unknown[] = [];
-  const collector = await startFakeIngestion(captured);
-  cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
-  const langfuseUrl = `http://127.0.0.1:${collector.address().port}`;
-  const first = await boot({ root, langfuseUrl });
-  first.ctx.emit('langfuse/context', 'native-test', { traceparent: '00-11111111111111111111111111111111-2222222222222222-01' });
-  const task = await first.send('restored-input', { wakeup: false });
-  await first.inbox.pause('native-test');
-  await first.bridge.dispose();
-  await first.ctx.fiber.dispose();
-  const second = await boot({ root, langfuseUrl, backend: first.backend });
-  second.ctx.on('a2a/before-assembly', async () => { await new Promise(resolve => setTimeout(resolve, 20)); });
-  const agent = await second.inbox.resolve('native-test');
-  await second.inbox.wake('native-test', { resume: true });
-  await agent.whenIdle();
-  await second.completed(task.id);
-  await second.ctx.parallel('session/flush', agent.session);
-  const observations = capturedToObservations(captured);
-  expect(observations.find(observation => observation.name === 'inbox:restored')?.metadata).toMatchObject({ taskId: task.id, messageId: 'restored-input' });
-  expect(observations.some(observation => observation.name === 'inbox:wait')).toBe(false);
-  const roots = observations.filter(observation => observation.name === 'a2a-task');
-  expect(roots).toHaveLength(2);
-  expect(new Set(roots.map(root => root.traceId)).size).toBe(1);
-  expect(roots.map(root => root.metadata.taskState)).toEqual(['suspended', 'completed']);
-  const turn = observations.find(observation => observation.name === 'agent:turn');
-  expect(turn.metadata.taskId).toBe(task.id);
-  expect(Number(turn.metadata.waitMs)).toBeGreaterThanOrEqual(0);
-  const preparation = captured.find(span => span.name === 'inbox:prepare');
-  const parent = captured.find(span => span.spanId === turn.id);
-  expect(BigInt(parent.startTimeUnixNano)).toBeLessThanOrEqual(BigInt(preparation.startTimeUnixNano));
-  expect(BigInt(parent.endTimeUnixNano)).toBeGreaterThanOrEqual(BigInt(preparation.endTimeUnixNano));
-  expect(Number(BigInt(preparation.endTimeUnixNano) - BigInt(preparation.startTimeUnixNano)) / 1e6).toBeGreaterThanOrEqual(20);
-});
-
-
-it('keeps multiple turns and queue controls inside their owning task traces', async () => {
-  const captured: unknown[] = [];
-  const collector = await startFakeIngestion(captured);
-  cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
-  const f = await boot({ langfuseUrl: `http://127.0.0.1:${collector.address().port}` });
-  const task = await f.send('one', { wakeup: false });
-  await f.send('two', { wakeup: false }, task.id);
-  await f.inbox.wake('native-test');
-  const agent = await f.inbox.resolve('native-test');
-  await agent.whenIdle();
-  await f.completed(task.id);
-  const cleared = await f.send('clear-me', { wakeup: false });
-  await f.inbox.clear('native-test');
-  await f.ctx.parallel('session/flush', agent.session);
-  const observations = capturedToObservations(captured);
-  const roots = observations.filter(observation => observation.name === 'a2a-task');
-  expect(roots).toHaveLength(2);
-  const completed = roots.find(root => root.metadata.taskId === task.id);
-  expect(completed.metadata.taskState).toBe('completed');
-  expect(observations.filter(observation => observation.name === 'agent:turn' && observation.parentObservationId === completed.id)).toHaveLength(2);
-  expect(observations.filter(observation => observation.name === 'inbox:completed')).toHaveLength(1);
-  const canceled = roots.find(root => root.metadata.taskId === cleared.id);
-  expect(canceled.metadata.taskState).toBe('canceled');
-  expect(observations.filter(observation => observation.parentObservationId === canceled.id).map(observation => observation.name)).toEqual(['inbox:admitted', 'inbox:cleared']);
-  expect(roots.every(root => root.endTime)).toBe(true);
-});
-
-it('keeps active cancellation and retained replacement in distinct linked task traces', async () => {
-  const captured: unknown[] = [];
-  const collector = await startFakeIngestion(captured);
-  cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
-  const f = await boot({ langfuseUrl: `http://127.0.0.1:${collector.address().port}`, script: ['hang', textResponse('replacement'), textResponse('ordinary')] });
-  const active = await f.send('active');
-  await expect.poll(() => f.adapter.requests.length).toBe(1);
-  const ordinary = await f.send('ordinary');
-  await f.send('steering', { target: 'next-step' }, active.id);
-  await f.inbox.cancel(active.id, { retainInbox: true });
-  const agent = await f.inbox.resolve('native-test');
-  await agent.whenIdle();
-  const resumed = await f.inbox.wake('native-test', { resume: true });
-  await agent.whenIdle();
-  for (const id of resumed) await f.completed(id);
-  await f.completed(ordinary.id);
-  await f.ctx.parallel('session/flush', agent.session);
-  const observations = capturedToObservations(captured);
-  const roots = observations.filter(observation => observation.name === 'a2a-task');
-  expect(roots).toHaveLength(3);
-  const canceled = roots.find(root => root.metadata.taskId === active.id);
-  expect(canceled.metadata.taskState).toBe('canceled');
-  expect(observations.filter(observation => observation.parentObservationId === canceled.id).map(observation => observation.name)).toEqual(expect.arrayContaining(['inbox:admitted', 'inbox:paused', 'agent:turn', 'inbox:canceled']));
-  const turn = observations.find(observation => observation.name === 'agent:turn' && observation.parentObservationId === canceled.id);
-  const raw = captured.find(span => span.spanId === canceled.id);
-  expect(BigInt(raw.endTimeUnixNano)).toBeGreaterThanOrEqual(BigInt(turn.endTime));
-  const replacement = roots.find(root => root.metadata.taskId === resumed[0]);
-  expect(JSON.parse(replacement.metadata.referenceTaskIds)).toContain(active.id);
-  expect(observations.filter(observation => observation.parentObservationId === replacement.id).map(observation => observation.name)).toEqual(expect.arrayContaining(['inbox:reassigned', 'inbox:resume', 'agent:turn', 'inbox:completed']));
-  expect(new Set(roots.map(root => root.traceId)).size).toBe(3);
 });
 
 it('rediscovers late inbox traces and filters admissions through the Langfuse read-back API', async () => {
@@ -776,6 +254,304 @@ it('rediscovers late inbox traces and filters admissions through the Langfuse re
   expect(queries.find(query => query.get('name') === 'inbox:admitted')?.has('model')).toBe(false);
 }, 25_000);
 
+it('drains parked official inbox input on a real waking send in FIFO order', async () => {
+  const f = await boot();
+  const first = await f.send('one', { wakeup: false });
+  const second = await f.send('two', { wakeup: false });
+  const agent = await f.inbox.resolve('native-test');
+  expect(f.adapter.requests).toHaveLength(0);
+  const ids = agent.inbox.nextTurn.map(message => message.id);
+  const third = await f.send('three');
+  for (const task of [first, second, third]) await f.completed(task.id);
+  const messages = agent.session.snapshotEvents().filter(event => event.type === 'user/message');
+  expect(messages.map(event => event.data.content[0].text)).toEqual(['one', 'two', 'three']);
+  expect(messages.slice(0, 2).map(event => event.data.id)).toEqual(ids);
+});
+
+it('requires negotiated extension controls and rejects steering without an active task', async () => {
+  const f = await boot();
+  const task = await f.send('parked', { wakeup: false });
+  const inactive = await f.rpc('SendMessage', { message: { messageId: 'steer', taskId: task.id, role: 'ROLE_USER', parts: [{ text: 'steer' }], metadata: { [INBOX_EXTENSION]: { target: 'next-step' } } }, configuration: { returnImmediately: true } });
+  expect(inactive.error).toBeDefined();
+  const unnegotiated = await f.rpc('SendMessage', { message: { messageId: 'unnegotiated', role: 'ROLE_USER', parts: [{ text: 'bad' }], metadata: { [INBOX_EXTENSION]: { wakeup: false } } } }, false);
+  expect(unnegotiated.error).toBeDefined();
+  const trigger = await f.send('trigger');
+  await f.completed(task.id); await f.completed(trigger.id);
+});
+
+it('keeps CancelTask terminal and removes only its queued input', async () => {
+  const f = await boot();
+  const canceled = await f.send('cancel-me', { wakeup: false });
+  const other = await f.send('keep-me', { wakeup: false });
+  const result = await f.rpc('CancelTask', { id: canceled.id });
+  expect(result.error).toBeUndefined();
+  expect(result.result.status.state).toBe('TASK_STATE_CANCELED');
+  const retry = await f.rpc('SendMessage', { message: { messageId: 'retry', taskId: canceled.id, role: 'ROLE_USER', parts: [{ text: 'retry' }] } });
+  expect(retry.error).toBeDefined();
+  const trigger = await f.send('new-task');
+  await f.completed(other.id); await f.completed(trigger.id);
+  const agent = await f.inbox.resolve('native-test');
+  expect(agent.session.snapshotEvents().filter(event => event.type === 'user/message').map(event => event.data.content[0].text)).toEqual(['keep-me', 'new-task']);
+});
+
+it('preserves other queued tasks when canceling an active task using the official API', async () => {
+  const f = await boot({ script: ['hang', textResponse('other'), textResponse('new')] });
+  const active = await f.send('active');
+  await expect.poll(() => f.adapter.requests.length).toBe(1);
+  const other = await f.send('other');
+  expect((await f.rpc('CancelTask', { id: active.id })).result.status.state).toBe('TASK_STATE_CANCELED');
+  const agent = await f.inbox.resolve('native-test');
+  await agent.whenIdle();
+  expect(agent.inbox.nextTurn).toHaveLength(1);
+  expect((await f.rpc('GetTask', { id: other.id })).result.status.state).toBe('TASK_STATE_SUBMITTED');
+  const next = await f.send('next');
+  await f.completed(other.id); await f.completed(next.id);
+  expect((await f.rpc('GetTask', { id: active.id })).result.status.state).toBe('TASK_STATE_CANCELED');
+});
+
+it('keeps multiple turns and resubscription inside one standard A2A task', async () => {
+  const f = await boot({ script: [textResponse('answer-one'), textResponse('answer-two')] });
+  const task = await f.send('one', { wakeup: false });
+  const subscription = await fetch(`http://127.0.0.1:${f.server.port}/a2a/`, { method: 'POST', headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' }, body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'SubscribeToTask', params: { id: task.id } }) });
+  const output = subscription.text();
+  await f.send('two', {}, task.id);
+  await f.completed(task.id);
+  const events = (await output).split('\n\n').filter(frame => frame.startsWith('data: ')).map(frame => JSON.parse(frame.slice(6)).result);
+  expect(events.at(-1).statusUpdate.status.state).toBe('TASK_STATE_COMPLETED');
+  expect((await f.rpc('GetTask', { id: task.id })).result.status.message.parts[0].text).toBe('answer-two');
+  expect(f.adapter.requests).toHaveLength(2);
+});
+
+it('runs preparation at the official pre-step boundary after system-prompt assembly', async () => {
+  const f = await boot();
+  const order: string[] = [];
+  const assemble = f.ctx.systemPrompt.assemble.bind(f.ctx.systemPrompt);
+  f.ctx.systemPrompt.assemble = async (...args) => { order.push('assemble'); return assemble(...args); };
+  f.ctx.on('a2a/before-step', () => { order.push('prepare'); });
+  const task = await f.send('one');
+  await f.completed(task.id);
+  expect(order.slice(0, 2)).toEqual(['assemble', 'prepare']);
+});
+
+it('fails a claimed task if official prompt assembly fails before pre-step', async () => {
+  const f = await boot();
+  const assemble = f.ctx.systemPrompt.assemble.bind(f.ctx.systemPrompt);
+  f.ctx.systemPrompt.assemble = async () => { throw new Error('assembly failed'); };
+  const task = await f.send('bad');
+  await expect.poll(async () => (await f.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_FAILED');
+  f.ctx.systemPrompt.assemble = assemble;
+  const next = await f.send('next');
+  await f.completed(next.id);
+  expect(f.adapter.requests).toHaveLength(1);
+});
+
+it('nests assembly-time hooks under the claimed task even if assembly fails', async () => {
+  const captured: unknown[] = [];
+  const collector = await startFakeIngestion(captured);
+  cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
+  const f = await boot({ langfuseUrl: `http://127.0.0.1:${collector.address().port}` });
+  f.ctx.systemPrompt.assemble = async () => {
+    const agent = await f.inbox.resolve('native-test');
+    const hook = { turn: 1, point: 'BeforeAgent', handlerId: 'assembly', invocationId: 'assembly-1' };
+    Langfuse.appendHookEvent(agent.session, 'hook/invoked', { ...hook, dialect: 'test' });
+    Langfuse.appendHookEvent(agent.session, 'hook/result', { ...hook, decision: 'pass', outcome: 'success', durationMs: 0 });
+    throw new Error('assembly failed');
+  };
+  const task = await f.send('one');
+  await expect.poll(async () => (await f.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_FAILED');
+  const agent = await f.inbox.resolve('native-test');
+  await f.ctx.parallel('session/flush', agent.session);
+  const observations = capturedToObservations(captured);
+  const root = observations.find(observation => observation.name === 'a2a-task');
+  const turn = observations.find(observation => observation.name === 'agent:turn');
+  const hook = observations.find(observation => observation.name === 'hook:BeforeAgent');
+  expect(root.metadata.taskState).toBe('failed');
+  expect(turn.parentObservationId).toBe(root.id);
+  expect(hook.parentObservationId).toBe(turn.id);
+  expect(observations.every(observation => observation.endTime)).toBe(true);
+});
+
+it('restores official pending ownership before concurrent waking sends after a crash snapshot', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'official-inbox-snapshot-'));
+  const restoredRoot = root + '-restored';
+  cleanups.push(() => rm(root, { recursive: true, force: true }));
+  cleanups.push(() => rm(restoredRoot, { recursive: true, force: true }));
+  const first = await boot({ root });
+  const tasks = [await first.send('one', { wakeup: false }), await first.send('two', { wakeup: false })];
+  const original = await first.inbox.resolve('native-test');
+  const ids = original.inbox.nextTurn.map(message => message.id);
+  const canceled = await first.send('canceled-before-crash', { wakeup: false });
+  await first.ctx.parallel('session/flush', original.session);
+  await cp(root, restoredRoot, { recursive: true });
+  const backend = new MemoryTaskStore();
+  for (const task of tasks) await backend.save(await first.store.load(task.id, new ServerCallContext()), new ServerCallContext());
+  const terminal = await first.store.load(canceled.id, new ServerCallContext());
+  terminal.status.state = TaskState.TASK_STATE_CANCELED;
+  await backend.save(terminal, new ServerCallContext());
+  await first.bridge.dispose();
+  const second = await boot({ root: restoredRoot, backend });
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const load = backend.load.bind(backend);
+  let loading = false;
+  backend.load = async (...args) => {
+    if (args[0] === tasks[0].id && !loading) { loading = true; await gate; }
+    return load(...args);
+  };
+  let restoredIds: string[] = [];
+  let claimed = 0;
+  second.ctx.on('agent/created', ({ agent }) => { restoredIds = agent.inbox.nextTurn.map(message => message.id); });
+  second.ctx.on('agent/inbox/claimed', () => { claimed++; });
+  const restoring = second.inbox.resolve('native-test');
+  await expect.poll(() => loading).toBe(true);
+  const sending = second.send('trigger');
+  try {
+    await new Promise(resolve => setTimeout(resolve, 25));
+    expect(claimed).toBe(0);
+  } finally { release(); }
+  const agent = await restoring;
+  const trigger = await sending;
+  expect(restoredIds.slice(0, 2)).toEqual(ids);
+  expect(restoredIds).toHaveLength(3);
+  expect((await second.rpc('GetTask', { id: canceled.id })).result.status.state).toBe('TASK_STATE_CANCELED');
+  for (const task of [...tasks, trigger]) await second.completed(task.id);
+  const messages = agent.session.snapshotEvents().filter(event => event.type === 'user/message');
+  expect(messages.map(event => event.data.content[0].text)).toEqual(['one', 'two', 'trigger']);
+  expect(messages.slice(0, 2).map(event => event.data.id)).toEqual(ids);
+});
+
+it('fails every consumed task owner if a recovered mixed batch fails before pre-step', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'official-inbox-mixed-'));
+  const restoredRoot = root + '-restored';
+  cleanups.push(() => rm(root, { recursive: true, force: true }));
+  cleanups.push(() => rm(restoredRoot, { recursive: true, force: true }));
+  const first = await boot({ root, script: ['hang'] });
+  const active = await first.send('active');
+  await expect.poll(() => first.adapter.requests.length).toBe(1);
+  await first.send('steering', { target: 'next-step' }, active.id);
+  const ordinary = await first.send('ordinary', { wakeup: false });
+  const original = await first.inbox.resolve('native-test');
+  await first.ctx.parallel('session/flush', original.session);
+  await cp(root, restoredRoot, { recursive: true });
+  const backend = new MemoryTaskStore();
+  for (const task of [active, ordinary]) await backend.save(await first.store.load(task.id, new ServerCallContext()), new ServerCallContext());
+  await first.bridge.dispose();
+  const second = await boot({ root: restoredRoot, backend });
+  second.ctx.systemPrompt.assemble = async () => { throw new Error('assembly failed'); };
+  await second.send('trigger');
+  for (const task of [active, ordinary]) await expect.poll(async () => (await second.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_FAILED');
+  expect(second.adapter.requests).toHaveLength(0);
+});
+
+it('reports a cold interrupted task as failed without replaying consumed input', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'official-inbox-interrupted-'));
+  const restoredRoot = root + '-restored';
+  cleanups.push(() => rm(root, { recursive: true, force: true }));
+  cleanups.push(() => rm(restoredRoot, { recursive: true, force: true }));
+  const first = await boot({ root, script: ['hang'] });
+  const task = await first.send('committed');
+  await expect.poll(() => first.adapter.requests.length).toBe(1);
+  const agent = await first.inbox.resolve('native-test');
+  await first.ctx.parallel('session/flush', agent.session);
+  await cp(root, restoredRoot, { recursive: true });
+  const backend = new MemoryTaskStore();
+  await backend.save(await first.store.load(task.id, new ServerCallContext()), new ServerCallContext());
+  await first.bridge.dispose();
+  const second = await boot({ root: restoredRoot, backend });
+  const subscription = await fetch(`http://127.0.0.1:${second.server.port}/a2a/`, { method: 'POST', headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' }, body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'SubscribeToTask', params: { id: task.id } }) });
+  await subscription.body?.cancel();
+  await expect.poll(async () => (await second.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_FAILED');
+  expect(second.adapter.requests).toHaveLength(0);
+});
+
+it('fails the whole task when its first accepted turn fails with more owned input queued', async () => {
+  const f = await boot();
+  const task = await f.send('bad', { wakeup: false });
+  await f.send('same-task-pending', { wakeup: false }, task.id);
+  f.ctx.on('a2a/before-step', detail => { if (detail.a2aMessage.messageId === 'bad') throw new Error('prepare failed'); });
+  const trigger = await f.send('different-task-trigger');
+  await expect.poll(async () => (await f.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_FAILED');
+  const agent = await f.inbox.resolve('native-test');
+  expect(agent.inbox.nextTurn.map(message => message.source.taskId)).not.toContain(task.id);
+  expect((await f.rpc('GetTask', { id: trigger.id })).result.status.state).toBe('TASK_STATE_SUBMITTED');
+  expect(f.adapter.requests).toHaveLength(0);
+});
+
+it('preserves official tool additionalContexts in the active task', async () => {
+  const call: StreamChunk[] = [{ type: 'block-start', index: 0, blockType: 'tool-call' },
+    { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'context-call', name: 'context', arguments: '{}' } },
+    { type: 'finish', reason: { kind: 'tool-calls' } }];
+  const f = await boot({ script: [call, textResponse('done')] });
+  f.ctx.tools.register(defineTool({ name: 'context', description: 'Provide context', parameters: {}, output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }, execute: async () => 'tool result' }));
+  f.ctx.on('tools/execute', async (_exec, next) => ({ ...await next(), additionalContexts: [createUserMessage({ content: [{ type: 'text', text: 'official tool context' }], source: { kind: 'user' } })] }));
+  const task = await f.send('use context');
+  await f.completed(task.id);
+  expect(f.adapter.requests).toHaveLength(2);
+  expect(JSON.stringify(f.adapter.requests[1])).toContain('official tool context');
+});
+
+it('cancels active continuation and discards owned queued input after settlement failure', async () => {
+  const f = await boot({ script: [textResponse('one'), 'hang', textResponse('must not run')] });
+  let reject!: () => void;
+  const gate = new Promise<void>(resolve => { reject = resolve; });
+  f.ctx.on('a2a/task-settlement', async () => { await gate; throw new Error('settlement failed'); });
+  const task = await f.send('one', { wakeup: false });
+  await f.send('active-continuation', {}, task.id);
+  await expect.poll(() => f.adapter.requests.length).toBe(2);
+  await f.send('future-continuation', { wakeup: false }, task.id);
+  reject();
+  await expect.poll(async () => (await f.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_FAILED');
+  const agent = await f.inbox.resolve('native-test');
+  await expect.poll(() => agent.status).toBe('idle');
+  expect(agent.inbox.nextTurn).toHaveLength(0);
+  expect(f.adapter.requests).toHaveLength(2);
+});
+
+it('clears pending input and terminates its protocol task while idle', async () => {
+  const f = await boot();
+  const task = await f.send('clear-me', { wakeup: false });
+  const agent = await f.inbox.resolve('native-test');
+  await f.inbox.clear('native-test');
+  expect(agent.inbox.nextTurn).toHaveLength(0);
+  await expect.poll(async () => (await f.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_CANCELED');
+  expect(f.adapter.requests).toHaveLength(0);
+});
+
+it.each([true, false])('exports one full task lifecycle with official DSH and captureContent=%s', async captureContent => {
+  const captured: unknown[] = [];
+  const collector = await startFakeIngestion(captured);
+  cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
+  const f = await boot({ langfuse: { enabled: true, publicKey: 'public-inbox-test', secretKey: 'secret-inbox-test', baseUrl: `http://127.0.0.1:${collector.address().port}`, captureContent } });
+  const assemble = f.ctx.systemPrompt.assemble.bind(f.ctx.systemPrompt);
+  f.ctx.systemPrompt.assemble = async (...args) => { await new Promise(resolve => setTimeout(resolve, 20)); return assemble(...args); };
+  const first = await f.send('first', { wakeup: false }, undefined, 'private-first');
+  const canceled = await f.send('canceled', { wakeup: false }, undefined, 'private-canceled');
+  await f.rpc('CancelTask', { id: canceled.id });
+  await f.send('second', {}, first.id, 'private-second');
+  await f.completed(first.id);
+  const agent = await f.inbox.resolve('native-test');
+  await f.ctx.parallel('session/flush', agent.session);
+  const observations = capturedToObservations(captured);
+  const roots = observations.filter(observation => observation.name === 'a2a-task');
+  expect(roots).toHaveLength(2);
+  const complete = roots.find(root => root.metadata.taskId === first.id);
+  expect(complete.metadata.taskState).toBe('completed');
+  const preparation = observations.find(observation => observation.name === 'inbox:prepare');
+  expect(preparation.metadata.waitMs).toBe(complete.metadata.waitMs);
+  expect(Number(preparation.metadata.prepareMs)).toBeGreaterThanOrEqual(20);
+  const turns = observations.filter(observation => observation.name === 'agent:turn');
+  expect(turns).toHaveLength(2);
+  expect(turns.every(turn => turn.parentObservationId === complete.id && turn.traceId === complete.traceId)).toBe(true);
+  expect(observations.filter(observation => observation.type === 'GENERATION').every(generation => turns.some(turn => turn.id === generation.parentObservationId))).toBe(true);
+  const canceledRoot = roots.find(root => root.metadata.taskId === canceled.id);
+  expect(canceledRoot.metadata.taskState).toBe('canceled');
+  expect(observations.filter(observation => observation.parentObservationId === canceledRoot.id).map(observation => observation.name)).toEqual(['inbox:admitted', 'inbox:canceled']);
+  expect(observations.every(observation => observation.endTime)).toBe(true);
+  expect(observations.some(observation => observation.name === 'inbox:wait')).toBe(false);
+  if (captureContent) expect(complete.input).toBe('private-first');
+  else expect(JSON.stringify(captured)).not.toMatch(/private-first|private-second|private-canceled/);
+});
+
 it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable inbox traces in the real Langfuse project', async () => {
   const { LANGFUSE_PUBLIC_KEY: publicKey, LANGFUSE_SECRET_KEY: secretKey, LANGFUSE_BASE_URL: baseUrl } = process.env;
   expect(publicKey && secretKey && baseUrl, 'Live inbox verification requires LANGFUSE_* credentials and URL').toBeTruthy();
@@ -794,10 +570,8 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable i
     `请为发布前检查列出三项待办：构建、测试、检查发布说明。先不要执行命令。\n测试编号：${inputs[0]}`,
     `补充上一条要求：只保留构建和测试，并把测试排在第一位。\n测试编号：${inputs[1]}`,
   ];
-  const tasks = [];
-  for (const [index, input] of inputs.entries()) tasks.push(await f.send(input, { wakeup: false }, undefined, prompts[index]));
+  const tasks = [await f.send(inputs[0], { wakeup: false }, undefined, prompts[0])];
   const canceled = await f.send(`${contextId}-canceled`, { wakeup: false }, undefined, '这条排队输入将在执行前取消，不应进入模型请求。');
-  await f.inbox.pause(contextId);
   await f.inbox.cancel(canceled.id);
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
@@ -810,7 +584,7 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable i
   const steeringText = `运行中引导：不要发布，只保留构建和测试；当前任务继续，不另起一轮。\n测试编号：${steeringId}`;
   const agent = await f.inbox.resolve(contextId);
   try {
-    await f.inbox.wake(contextId, { resume: true });
+    tasks.push(await f.send(inputs[1], {}, undefined, prompts[1]));
     await expect.poll(() => requested).toBe(true);
     await f.send(steeringId, { target: 'next-step' }, tasks[0].id, steeringText);
   } finally { release(); }
@@ -830,7 +604,7 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable i
         if (root?.input !== prompts[index] || root?.output !== replies[index + 1]) problems.push('missing readable turn conversation');
         const turn = observations.find(observation => observation.name === 'agent:turn' && observation.parentObservationId === root?.id);
         if (!turn?.endTime || root?.metadata?.taskState !== 'completed') problems.push('missing completed lifecycle and ended turn');
-        for (const phase of ['admitted', 'paused', 'resume', 'completed']) {
+        for (const phase of ['admitted', 'completed']) {
           if (!observations.some(observation => observation.name === `inbox:${phase}` && observation.parentObservationId === root?.id)) problems.push(`missing task child ${phase}`);
         }
         if (!observations.some(observation => observation.name === 'inbox:prepare' && observation.parentObservationId === turn?.id)) problems.push('missing preparation child');
@@ -853,7 +627,7 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable i
     evaluate(observations) {
       const root = observations.find(observation => observation.name === 'dsh-inbox' && observation.metadata?.taskId === canceled.id);
       const phases = observations.filter(observation => observation.parentObservationId === root?.id).map(observation => observation.name);
-      return root?.endTime && root.metadata?.taskState === 'canceled' && ['inbox:admitted', 'inbox:paused', 'inbox:canceled'].every(phase => phases.includes(phase)) && !observations.some(observation => observation.type === 'GENERATION' || observation.name === 'agent:turn') ? [] : ['missing complete queued cancellation lifecycle'];
+      return root?.endTime && root.metadata?.taskState === 'canceled' && ['inbox:admitted', 'inbox:canceled'].every(phase => phases.includes(phase)) && !observations.some(observation => observation.type === 'GENERATION' || observation.name === 'agent:turn') ? [] : ['missing complete queued cancellation lifecycle'];
     },
   });
   expect(cancellation.ok, cancellation.state).toBe(true);
