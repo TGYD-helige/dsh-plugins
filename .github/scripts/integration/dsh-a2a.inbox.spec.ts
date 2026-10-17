@@ -671,14 +671,17 @@ it('exports recovered inbox identity and queue waiting across a durable restart'
 });
 
 
-it('discovers inbox admissions and scripted generations through the Langfuse read-back API', async () => {
+it('rediscovers late inbox traces and filters admissions through the Langfuse read-back API', async () => {
   const queries: URLSearchParams[] = [];
+  let discovered = false;
   const server = createServer((request, response) => {
     const query = new URL(request.url!, 'http://localhost').searchParams;
     queries.push(query);
     const name = query.get('name') ?? 'llm-call';
+    const traceId = query.get('traceId') ?? (discovered ? 'trace' : 'later-turn');
+    if (!query.has('traceId')) discovered = true;
     response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
-      data: [{ id: 'observation', traceId: 'trace', name, metadata: { messageId: 'inbox-api-marker' } }],
+      data: [{ id: 'observation', traceId, name, metadata: { messageId: 'inbox-api-marker' } }],
       meta: { totalPages: 1 },
     }));
   });
@@ -689,15 +692,15 @@ it('discovers inbox admissions and scripted generations through the Langfuse rea
     const result = await runVerification({ baseUrl, publicKey: 'test-public', secretKey: 'test-secret',
       fromStartTime: new Date(0).toISOString(), toStartTime: new Date().toISOString(),
       codeword: 'inbox-api-marker', model: 'mock', observationName,
-      evaluate: observations => observations.length === 1 ? [] : ['missing observation'],
+      evaluate: observations => observations.length === 1 && observations[0].traceId === 'trace' ? [] : ['waiting for the original turn'],
     });
     expect(result.ok, result.state).toBe(true);
   }
   expect(queries[0].get('model')).toBe('mock');
   expect(queries[0].get('type')).toBe('GENERATION');
-  expect(queries[2].get('name')).toBe('inbox:admitted');
-  expect(queries[2].has('model')).toBe(false);
-});
+  expect(queries.filter(query => query.get('model') === 'mock')).toHaveLength(2);
+  expect(queries.find(query => query.get('name') === 'inbox:admitted')?.has('model')).toBe(false);
+}, 25_000);
 
 it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable inbox traces in the real Langfuse project', async () => {
   const { LANGFUSE_PUBLIC_KEY: publicKey, LANGFUSE_SECRET_KEY: secretKey, LANGFUSE_BASE_URL: baseUrl } = process.env;

@@ -463,7 +463,6 @@ export async function runVerification({ baseUrl, publicKey, secretKey, fromStart
   }
 
   let lastState = 'no candidate trace seen yet';
-  let traceIds = [];
   while (true) {
     let waitMs = POLL_INTERVAL_MS;
     try {
@@ -472,22 +471,20 @@ export async function runVerification({ baseUrl, publicKey, secretKey, fromStart
       // server-side name filter — generations are renamed `llm-call [<first
       // line>]` at close, so exact-name queries would miss them; the prefix
       // and the run-unique codeword do the filtering client-side. Purpose
-      // calls may land in a separate trace before the turn; never cache them.
-      if (traceIds.length === 0) {
-        const candidates = await fetchObservations(observationName
-          ? { name: observationName }
-          : { type: 'GENERATION', model });
-        traceIds = [
-          ...new Set(
-            candidates
-              .filter(
-                (o) => (observationName ? o.name === observationName : o.name?.startsWith('llm-call')) && o.metadata?.purpose == null &&
-                JSON.stringify(o).includes(codeword),
-              )
-              .map((o) => o.traceId),
-          ),
-        ];
-      }
+      // calls or later turns may arrive first; rediscover candidates on every poll.
+      const candidates = await fetchObservations(observationName
+        ? { name: observationName }
+        : { type: 'GENERATION', model });
+      const traceIds = [
+        ...new Set(
+          candidates
+            .filter(
+              (o) => (observationName ? o.name === observationName : o.name?.startsWith('llm-call')) && o.metadata?.purpose == null &&
+              JSON.stringify(o).includes(codeword),
+            )
+            .map((o) => o.traceId),
+        ),
+      ];
 
       for (const traceId of traceIds) {
         const observations = await fetchObservations({ traceId });
