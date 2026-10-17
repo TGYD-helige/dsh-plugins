@@ -32,3 +32,7 @@ These controls are forwarded directly to the official DSH `Agent.send(message, t
 Successful admission preserves the original A2A `messageId` alongside the DSH message identity. A failing observer cannot veto insertion. Validation failures on an existing task reject the request without terminating previously accepted work. Completion and `CancelTask` are terminal; later work uses a new task, with `referenceTaskIds` if the client wants to reference an earlier task.
 
 DSH owns pending-input persistence and execution. This extension does not replay consumed claims, automatically restart terminal tasks, or guarantee exactly-once execution or tool effects. Durable protocol task queries additionally require a durable A2A TaskStore.
+
+Same-process hosts may promote an unclaimed independent queued input through `a2aInbox.promote(contextId, nativeMessageId, activeTaskId)`. This is not a wire metadata privilege. Promotion preserves both message identities, transfers next-step ownership to the active task and settles the original task canceled. Ordinary future turns should use independent task identities so a failure in the active task does not discard them.
+
+Local recovery requires durable DSH session persistence and a durable TaskStore (`filesystem` with a retained `filesystem.root`, Redis, or GCS). Hosts own startup discovery and waking. Promotion recovery repairs incomplete ownership moves only; consumed claims and committed model input are not automatically replayed. Explicit cancellation stays terminal.

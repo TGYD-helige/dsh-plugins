@@ -11,6 +11,7 @@ import {
 } from '@a2a-js/sdk/server';
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent, AssistantStreamFrame, InboxTarget } from '@deepseek-ai/dsh-agent';
+import type { GoalMessageSource } from '@deepseek-ai/dsh-goal';
 import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm/types';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
@@ -50,11 +51,14 @@ interface InboxSource {
   message: string;
   target: InboxTarget;
   queuedAt?: number;
+  promotedFrom?: string;
+  promotionId?: string;
 }
 
 declare module '@deepseek-ai/dsh-llm/types' {
   interface MessageSourceMap {
     a2a: InboxSource;
+    goal: GoalMessageSource;
   }
 }
 declare module '@deepseek-ai/cordis' {
@@ -77,6 +81,8 @@ export interface A2aInbox {
     message: Message,
     options?: { target?: InboxTarget; wakeup?: boolean },
   ): Promise<void>;
+  /** Transfer one unclaimed independent input into the active task. */
+  promote(contextId: string, messageId: string, taskId: string): Promise<void>;
   /** Standard cancellation is terminal and removes only this task's pending input. */
   cancel(taskId: string): Promise<string | undefined>;
 }
@@ -103,10 +109,13 @@ interface ContextRun {
   // shortcut: settled handles live until context clear/unload; reclaim once task delivery exposes a drain acknowledgment.
   tasks: Map<string, TaskRun>;
   active?: TaskRun;
+  goalOwner?: { goalId: string; task: TaskRun };
   claimed: Set<TaskRun>;
   turnStart?: SessionEvent;
   admissions: Set<AbortController>;
   admissionTail: Promise<void>;
+  promotions: Map<string, Promise<void>>;
+  rolledBack: Set<string>;
 }
 
 export class NativeInbox implements A2aInbox {
@@ -127,10 +136,34 @@ export class NativeInbox implements A2aInbox {
       await this.prepare(detail);
       return next();
     });
+    ctx.on('goal/changed', ({ agent, change }) => {
+      const run = this.contexts.get(agent.session.id);
+      if (!run) return;
+      const previous = run.goalOwner;
+      if (change.goal?.phase === 'active' && change.goal.activation === 'armed') {
+        const task = previous?.goalId === change.ref.id ? previous.task : run.active;
+        if (task && !task.settled) run.goalOwner = { goalId: change.ref.id, task };
+      } else run.goalOwner = undefined;
+      if (previous) this.settle(run, previous.task);
+    });
+    ctx.on('agent/status', ({ agent, status }) => {
+      const run = this.contexts.get(agent.session.id);
+      if (status !== 'idle' || !run?.goalOwner) return;
+      const { task } = run.goalOwner;
+      try {
+        const goal = ctx.get('goals')?.get(agent);
+        if (goal?.phase === 'active' && goal.activation === 'armed') return;
+        run.goalOwner = undefined;
+        this.settle(run, task);
+      } catch (error) {
+        run.goalOwner = undefined;
+        this.fail(task, agent.session.id, error);
+      }
+    });
     ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
       const run = this.contexts.get(agent.session.id);
-      if (!run || message.source.kind !== 'a2a') return;
-      const task = run.tasks.get(message.source.taskId);
+      if (!run) return;
+      const task = this.owner(run, message);
       if (task && !task.settled) {
         run.claimed.add(task);
         if (!run.active) this.select(run, task);
@@ -180,6 +213,174 @@ export class NativeInbox implements A2aInbox {
     throw new Error('Host input must address a live A2A task.');
   }
 
+  // A non-canceled removal keeps an interrupted move distinguishable from explicit cancellation.
+  private moveInput(agent: Agent, message: UserMessage, target: InboxTarget): void {
+    const from = target === 'next-step' ? 'next-turn' : 'next-step';
+    const items = from === 'next-turn' ? agent.inbox.nextTurn : agent.inbox.nextStep;
+    const index = items.findIndex((item) => item.id === message.id);
+    if (index < 0) throw new Error('Queued input has already been claimed.');
+    agent.session.append('agent/inbox/spliced', {
+      target: from,
+      start: index,
+      removedCount: 1,
+      inserted: [],
+    });
+    agent.inbox.append(target, message);
+  }
+
+  async promote(contextId: string, messageId: string, taskId: string): Promise<void> {
+    const run = await this.context(contextId);
+    const operation = run.admissionTail.then(() => this.promoteInput(run, messageId, taskId));
+    run.admissionTail = operation.catch(() => {});
+    run.promotions.set(messageId, operation);
+    const clear = () => {
+      if (run.promotions.get(messageId) === operation) run.promotions.delete(messageId);
+    };
+    void operation.then(clear, clear);
+    return operation;
+  }
+
+  private async promoteInput(run: ContextRun, messageId: string, taskId: string): Promise<void> {
+    const agent = run.entry.handle.agent;
+    const target = run.tasks.get(taskId);
+    const message = agent.inbox.nextTurn.find((item) => item.id === messageId);
+    if (message?.source.kind !== 'a2a') throw new Error('Queued input has already been claimed.');
+    const source = run.tasks.get(message.source.taskId);
+    if (!target || !source) throw new Error('Promotion requires live source and target tasks.');
+    const valid = () =>
+      !this.stopping &&
+      !this.bridge.isClearing(run.entry.sessionId) &&
+      !target.settled &&
+      !target.controller.signal.aborted &&
+      run.active === target &&
+      source !== target &&
+      !source.settled &&
+      !source.controller.signal.aborted &&
+      source.task.history.length === 1 &&
+      !source.pendingRequests &&
+      !run.claimed.has(source) &&
+      agent.inbox.nextTurn.some((item) => item === message);
+    if (!valid())
+      throw new Error('Promotion requires an unclaimed independent input and an active target.');
+    const original = Message.fromJSON(JSON.parse(message.source.message));
+    original.taskId = taskId;
+    original.referenceTaskIds = [...new Set([...original.referenceTaskIds, source.task.id])];
+    const promotionId = randomUUID();
+    const promoted: UserMessage = {
+      ...message,
+      source: {
+        ...message.source,
+        taskId,
+        target: 'next-step',
+        promotedFrom: source.task.id,
+        promotionId,
+        message: JSON.stringify(Message.toJSON(original)),
+      },
+    };
+    target.pendingRequests++;
+    try {
+      await this.checkpoint(target.task, target.context);
+      if (!valid()) throw new Error('Promotion raced input consumption or task settlement.');
+      target.task.history = [...target.task.history, original];
+      target.headers.set(message.id, source.headers.get(message.id));
+      if (!agent.inbox.replace(message.id, promoted))
+        throw new Error('Queued input has already been claimed.');
+      this.moveInput(agent, promoted, 'next-step');
+      try {
+        await this.flush(agent.session);
+      } catch (error) {
+        // Until the session checkpoint succeeds, the independent task still owns this input.
+        const rollback = {
+          ...message,
+          source: { ...message.source, promotedFrom: source.task.id },
+        };
+        run.rolledBack.add(promotionId);
+        const live =
+          this.contexts.get(run.entry.sessionId) === run &&
+          !this.stopping &&
+          !this.bridge.isClearing(run.entry.sessionId);
+        if (live && !source.settled && !source.controller.signal.aborted) {
+          if (this.pending(run).some((item) => item.id === message.id)) {
+            agent.inbox.replace(message.id, rollback);
+            this.moveInput(agent, rollback, 'next-turn');
+          } else agent.inbox.append('next-turn', rollback);
+        } else if (live) agent.inbox.remove(message.id);
+        target.task.history = target.task.history.filter(
+          (item) => item.messageId !== original.messageId,
+        );
+        target.headers.delete(message.id);
+        try {
+          if (live) await this.flush(agent.session);
+        } catch (rollbackError) {
+          console.error('[dsh-a2a] promotion rollback checkpoint failed:', rollbackError);
+        }
+        throw error;
+      }
+      if (
+        this.stopping ||
+        this.contexts.get(run.entry.sessionId) !== run ||
+        this.bridge.isClearing(run.entry.sessionId)
+      )
+        throw new Error('Promotion was interrupted by context disposal.');
+      source.controller.abort();
+      try {
+        await this.checkpoint(target.task, target.context);
+      } finally {
+        await this.cancel(source.task.id);
+      }
+      this.observeInput('promoted', run, promoted);
+    } finally {
+      target.pendingRequests--;
+      this.settle(run, target);
+    }
+  }
+
+  /** Repair only an incomplete ownership move, never an ordinary DSH claim. */
+  private async recoverPromotions(run: ContextRun, context: ServerCallContext): Promise<void> {
+    const agent = run.entry.handle.agent;
+    const transfers = new Map<
+      string,
+      { message: UserMessage & { source: InboxSource }; placed: boolean }
+    >();
+    for (const event of agent.session.snapshotEvents()) {
+      if (event.type !== 'agent/inbox/spliced') continue;
+      for (const message of event.data.inserted) {
+        if (message.source.kind !== 'a2a' || !message.source.promotedFrom) continue;
+        transfers.set(message.id, {
+          message: message as UserMessage & { source: InboxSource },
+          placed: event.data.target === message.source.target,
+        });
+      }
+    }
+    for (const { message, placed } of transfers.values()) {
+      if (!placed) {
+        const queued = this.pending(run).find((item) => item.id === message.id);
+        if (queued) this.moveInput(agent, message, message.source.target);
+        else agent.inbox.append(message.source.target, message);
+      }
+      if (this.pending(run).some((item) => item.id === message.id)) {
+        const recipient = await this.store.load(message.source.taskId, context);
+        if (!recipient || recipient.contextId !== agent.session.id)
+          throw new Error('Promoted A2A task is not accessible.');
+        const original = Message.fromJSON(JSON.parse(message.source.message));
+        if (!recipient.history.some((item) => item.messageId === original.messageId)) {
+          recipient.history.push(original);
+          await this.checkpoint(recipient, context);
+        }
+      }
+      if (message.source.promotedFrom === message.source.taskId) continue;
+      const former = await this.store.load(message.source.promotedFrom!, context);
+      if (!former || this.terminal(former)) continue;
+      former.status = {
+        state: TaskState.TASK_STATE_CANCELED,
+        message: undefined,
+        timestamp: new Date().toISOString(),
+      };
+      await this.flush(agent.session);
+      await this.checkpoint(former, context);
+    }
+  }
+
   private context(contextId: string, context = new ServerCallContext()): Promise<ContextRun> {
     if (this.stopping) return Promise.reject(new Error('Native inbox is unloading.'));
     const existing = this.contexts.get(contextId);
@@ -194,7 +395,10 @@ export class NativeInbox implements A2aInbox {
           claimed: new Set(),
           admissions: new Set(),
           admissionTail: Promise.resolve(),
+          promotions: new Map(),
+          rolledBack: new Set(),
         };
+        await this.recoverPromotions(run, context);
         const snapshots = new Map<string, Task>();
         for (const message of this.pending(run)) {
           if (message.source.kind !== 'a2a' || snapshots.has(message.source.taskId)) continue;
@@ -253,20 +457,21 @@ export class NativeInbox implements A2aInbox {
     fields: Partial<A2aInboxEvent> = {},
   ): void {
     try {
-      if (message.source.kind !== 'a2a') return;
-      const original = Message.fromJSON(JSON.parse(message.source.message));
+      const task = this.owner(run, message);
+      if (!task) return;
+      const original = this.protocolMessage(run, task, message);
       const position = this.pending(run).findIndex((input) => input.id === message.id);
       this.observe(phase, run, {
-        target: message.source.target,
+        target: message.source.kind === 'a2a' ? message.source.target : 'next-turn',
         input: original.parts
           .flatMap((part) => (part.content?.$case === 'text' ? [part.content.value] : []))
           .join('\n'),
         position: position < 0 ? undefined : position + 1,
-        taskId: message.source.taskId,
+        taskId: task.task.id,
         messageId: original.messageId,
         referenceTaskIds: original.referenceTaskIds,
         nativeMessageId: message.id,
-        queuedAt: message.source.queuedAt,
+        queuedAt: message.source.kind === 'a2a' ? message.source.queuedAt : undefined,
         ...fields,
       });
     } catch (error) {
@@ -619,6 +824,35 @@ export class NativeInbox implements A2aInbox {
     }
   }
 
+  private protocolMessage(run: ContextRun, task: TaskRun, message: UserMessage): Message {
+    if (message.source.kind === 'a2a') return Message.fromJSON(JSON.parse(message.source.message));
+    return Message.fromJSON({
+      messageId: message.id,
+      taskId: task.task.id,
+      contextId: run.entry.sessionId,
+      role: 'ROLE_USER',
+      parts: message.content
+        .filter((block) => block.type === 'text')
+        .map((block) => ({ text: block.text })),
+    });
+  }
+
+  private owner(run: ContextRun, message: UserMessage): TaskRun | undefined {
+    if (message.source.kind === 'a2a') return run.tasks.get(message.source.taskId);
+    if (message.source.kind !== 'goal' || message.source.round <= 0) return;
+    const goal = this.ctx.get('goals')?.get(run.entry.handle.agent);
+    if (
+      run.goalOwner &&
+      goal &&
+      run.goalOwner.goalId === message.source.goalId &&
+      goal.id === message.source.goalId &&
+      goal.revision === message.source.revision &&
+      goal.phase === 'active' &&
+      goal.activation === 'armed'
+    )
+      return run.goalOwner.task;
+  }
+
   private async prepare(detail: {
     agent: Agent;
     messages: UserMessage[];
@@ -629,7 +863,29 @@ export class NativeInbox implements A2aInbox {
     const run = this.contexts.get(detail.agent.session.id);
     if (!run) return;
     if (this.stopping) throw new Error('Inbox is unloading.');
-    if (!run.active && detail.messages.some((message) => message.source.kind !== 'a2a'))
+    for (let index = detail.messages.length - 1; index >= 0; index--) {
+      const message = detail.messages[index]!;
+      if (message.source.kind !== 'a2a' || !message.source.promotionId) continue;
+      const promotion = run.promotions.get(message.id);
+      if (promotion) {
+        let onAbort!: () => void;
+        try {
+          await Promise.race([
+            promotion.catch(() => {}),
+            new Promise<never>((_resolve, reject) => {
+              onAbort = () => reject(detail.signal.reason);
+              detail.signal.addEventListener('abort', onAbort, { once: true });
+              if (detail.signal.aborted) onAbort();
+            }),
+          ]);
+          detail.signal.throwIfAborted();
+        } finally {
+          detail.signal.removeEventListener('abort', onAbort);
+        }
+      }
+      if (run.rolledBack.delete(message.source.promotionId)) detail.messages.splice(index, 1);
+    }
+    if (!run.active && detail.messages.some((message) => !this.owner(run, message)))
       throw new Error('Native host input requires task-attributed a2aInbox.enqueue().');
     // Restarted steering and an ordinary queued turn may be claimed together by the core.
     // Requeue other owners before committing any user message, keeping task lifecycles separate.
@@ -650,8 +906,8 @@ export class NativeInbox implements A2aInbox {
         if (deferred.includes(detail.messages[index]!)) detail.messages.splice(index, 1);
     }
     for (const message of detail.messages) {
-      if (message.source.kind !== 'a2a') continue;
-      const task = run.tasks.get(message.source.taskId);
+      const task = this.owner(run, message);
+      if (!task && message.source.kind !== 'a2a') continue;
       if (!task || task.settled)
         throw new Error('Queued input has no live A2A task; restore it before waking.');
       if (run.active && run.active !== task)
@@ -665,7 +921,7 @@ export class NativeInbox implements A2aInbox {
           agent: detail.agent,
           contextId: detail.agent.session.id,
           taskId: task.task.id,
-          a2aMessage: Message.fromJSON(JSON.parse(message.source.message)),
+          a2aMessage: this.protocolMessage(run, task, message),
           dshMessageId: message.id,
           requestHeaders: task.headers.get(message.id),
           signal: detail.signal,
@@ -777,6 +1033,7 @@ export class NativeInbox implements A2aInbox {
     } else if (
       !task.settlementReady ||
       task.pendingRequests ||
+      run.goalOwner?.task === task ||
       run.active === task ||
       this.pending(run).some(
         (message) => message.source.kind === 'a2a' && message.source.taskId === task.task.id,

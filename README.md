@@ -8,7 +8,7 @@ Composable, config-driven plugins for [DeepSeek Harness (dsh)](https://github.co
 
 | Package | What it does | Primary seams |
 | --- | --- | --- |
-| [`@amaster.ai/dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) **1.0** (JSON-RPC + SSE, with a v0.3 compatibility layer): streaming turns, task cancel, task list, tool approvals, agent card, opt-in native inbox execution; pluggable task-state stores (memory/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, `approval/request`, own HTTP server |
+| [`@amaster.ai/dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) **1.0** (JSON-RPC + SSE, with a v0.3 compatibility layer): streaming turns, task cancel, task list, tool approvals, agent card, opt-in native inbox execution; pluggable task-state stores (memory/filesystem/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, `approval/request`, own HTTP server |
 | [`@amaster.ai/dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
 | [`@amaster.ai/dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call (plus a nested `llm-request` span with the verbatim loop-built request), one span per tool call or hook run, one trace per turn; subagent child sessions nested under the parent's tree | `llm/stream`, `tools/pre-execute` → `tools/result`, `session/event` (including `hook/*`), `session/created` + `subagent/start`/`subagent/end` |
 | [`@amaster.ai/dsh-policy`](packages/dsh-policy) | Declarative tool-call policy: config-driven `allow`/`deny`/`ask` rules (tool name, args pattern, per-segment shell command prefix/regex, priority) — Gemini CLI-style policy files as plain plugin config | `tools/pre-execute` waterfall (`ask` rides dsh's approval seam) |
@@ -41,6 +41,8 @@ This is an early dsh-preview ecosystem. The plugin shapes, config schemas, and s
 dsh is in developer preview and **will** break compatibility between releases. Plugins declare the oldest compatible dsh version as a fixed peer floor and every release records the tested dsh version in this matrix; the floor moves only when a plugin starts requiring a newer dsh API. Installs ride `dsh plugin add`, which is pnpm-only — pnpm's peer matching has no prerelease gate, so any newer dsh (alpha or stable) satisfies the floor without warnings. npm consumers are gated differently: npm never lets a prerelease satisfy a range unless the range names that release tuple with a prerelease comparator, so the peer ranges also name the 0.1.6, 0.1.7, 0.2.0, and 0.2.1 prerelease tuples. Drop each union member once that line ships a final release.
 
 `dsh-a2a` inbox execution additionally tests the unmodified official DSH `0.2.1-rc.2` npm runtime. Its agent peer floor is `>=0.2.0-rc.2 || >=0.2.1-alpha.1`, for the public send/claim/pre-step interfaces. Queueing uses `Agent.send`; no core patch is required.
+
+`dsh-a2a`'s optional Goal integration consumes `@deepseek-ai/dsh-goal >=0.2.0-rc.2 || >=0.2.1-alpha.1` and preserves official Goal round validation (tested with the Goal service and round driver at `0.2.1-rc.2`).
 
 `dsh-a2a`'s approval bridge has an optional `@deepseek-ai/dsh-user-approval` peer floor of `>=0.1.6-alpha.2 || >=0.1.7-alpha.1 || >=0.2.0-rc.1 || >=0.2.1-rc.1` (tested at `0.2.1-rc.2`).
 
@@ -100,7 +102,9 @@ All plugins are **disabled by default** and configured through the standard dsh 
         host: 127.0.0.1   # no auth built in — keep loopback or front with a proxy
         port: 41241
         cwd: /srv/agent-workspaces
-        taskStore: redis  # memory | redis | gcs — A2A task state only
+        taskStore: redis  # memory | filesystem | redis | gcs — A2A task state only
+        filesystem:
+          root: /srv/dsh/a2a-tasks
         redis:
           url: redis://127.0.0.1:6379
         gcs:
@@ -136,9 +140,9 @@ SQL Server note: Prisma's sqlserver connector has no `Json` type, so its variant
 
 The logical message id rides in `metadata.id`; message rows use a deterministic hash of `(session_id, message id)` as their primary key, so re-projected events upsert in place rather than duplicate — on every connector (the source project's `metadata.id` JSON-path lookup only works on PostgreSQL/MySQL). Session rows are matched by `session_id` and keep their cuid primary keys — the per-session serialization chain makes the find-then-write safe, and rows from the early scaffold (or the source project) are continued, never duplicated. Upgrade note: the early scaffold wrote messages with cuid keys; if you ran it, dedupe those by `metadata.id` before enabling this version.
 
-**Native inbox mode is opt-in and requires an unreleased upstream DSH capability**; the default compatibility matrix above covers legacy execution. See [native inbox execution](packages/dsh-a2a/README.md#native-inbox-execution) for queueing, steering, pause/recovery semantics and the source integration check.
+**Native inbox mode is opt-in and uses the official DSH APIs**; it is tested with the unmodified `0.2.1-rc.2` npm runtime. See [native inbox execution](packages/dsh-a2a/README.md#native-inbox-execution) for queueing, steering, pause/recovery semantics and the runtime integration checks.
 
-A2A task snapshots are separate from the full conversation log: `dsh-a2a` ships pluggable `TaskStore` backends — in-memory (default), Redis (task JSON + TTL), and GCS (gzipped task JSON). The snapshots retain A2A history and artifacts at task-state transitions; `dsh-storage` separately records the full conversation. Streamed text deltas stay in process until the next state change, so token-rate events never reach Redis or GCS. Redis and GCS keys are scoped to the A2A tenant and user; older unscoped records require migration or expiry.
+A2A task snapshots are separate from the full conversation log: `dsh-a2a` ships pluggable `TaskStore` backends — in-memory (default), filesystem (private atomic JSON snapshots), Redis (task JSON + TTL), and GCS (gzipped task JSON). The snapshots retain A2A history and artifacts at task-state transitions; `dsh-storage` separately records the full conversation. Streamed text deltas stay in process until the next state change, so token-rate events never reach Redis or GCS. Redis and GCS keys are scoped to the A2A tenant and user; older unscoped records require migration or expiry.
 
 ## Security
 

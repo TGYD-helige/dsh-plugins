@@ -18,9 +18,37 @@ dsh plugin --profile my-agent add @amaster.ai/dsh-a2a
 
 Standard `SendMessage` / `SendStreamingMessage`, task queries, cancellation and subscriptions remain the wire interface. The negotiated [inbox extension](../../docs/protocol/inbox-v1.md) forwards `target` and `wakeup` to DSH. `wakeup: false` leaves an idle driver parked; it does not prevent an active driver from consuming pending input. A later real waking message releases pending input.
 
-The same-process `a2aInbox` service exposes `resolve(contextId)`, `content(message, contextId)`, `enqueue(taskId, message, { target?, wakeup? })`, and `cancel(taskId)`. There is no separate pause, wake-only, resume, or retained-task restart operation. Cancellation is terminal and removes that task's pending input. Other tasks' input is retained according to official DSH cancellation semantics, and may wait for the next waking message. Clearing a context discards all its pending work.
+The same-process `a2aInbox` service exposes `resolve(contextId)`, `content(message, contextId)`, `enqueue(taskId, message, { target?, wakeup? })`, `promote(contextId, nativeMessageId, activeTaskId)`, and `cancel(taskId)`. There is no separate pause, wake-only, resume, or retained-task restart operation. Cancellation is terminal and removes that task's pending input. Other tasks' input is retained according to official DSH cancellation semantics, and may wait for the next waking message. Clearing a context discards all its pending work.
 
-`a2a/before-followup` validates admission; `a2a/before-step` runs at the official pre-step boundary, after system-prompt assembly and before model execution. It cannot change the already assembled system prompt. Original request headers remain process-local. DSH persistence restores its own pending projection; the plugin does not replay splice logs or recover consumed claims. Graceful disposal follows the official runtime's cancellation behavior. Durable A2A task snapshots still require a Redis or GCS TaskStore; an in-memory store is sufficient without restart requirements.
+`a2a/before-followup` validates admission; `a2a/before-step` runs at the official pre-step boundary, after system-prompt assembly and before model execution. It cannot change the already assembled system prompt. Original request headers remain process-local. DSH persistence restores its own pending projection; the plugin does not replay splice logs or recover consumed claims. Graceful disposal follows the official runtime's cancellation behavior. Durable A2A task snapshots require a filesystem, Redis or GCS TaskStore; an in-memory store is sufficient without restart requirements.
+
+### Goal rounds
+
+When the optional official `@deepseek-ai/dsh-goal` and `dsh-goal-round-driver` plugins are mounted, a Goal created or resumed during an A2A task keeps that task open while the Goal is active and armed. Automatic rounds retain the driver's original native message ID, content and `goal` source. The official driver still validates its reservation, revision and round; the plugin selects the owning task for streaming and `a2a/before-step` billing attribution. Editing the same Goal from another task preserves its original owner. Completing, pausing, blocking or disarming the Goal releases that ownership. A cold restart does not inherit automatic Goal authority: the host must explicitly resume it through a live attributed task.
+
+### Promote a queued input
+
+Queue an ordinary future turn as a new task (omit `taskId`). To steer an active task with that already admitted input, pass its **native DSH message ID**, available from `agent.inbox.nextTurn` or `a2a/inbox` observations:
+
+```ts
+await ctx.a2aInbox.promote(contextId, nativeMessageId, activeTaskId);
+```
+
+Only an unclaimed, single-message independent task in the same context can be promoted. The native ID and A2A `messageId` stay unchanged; the target task owns the next-step input, and `referenceTaskIds` records the original task, which settles canceled after the durable transfer. Claimed input, a finished target, concurrent consumption or task settlement reject a stale request. A failed session checkpoint restores independent ownership; a later storage error can report failure after the transfer committed: inspect the queue and task states before sending new input. Recovery repairs interrupted transfers without replaying an ordinary DSH claim or committed model input.
+
+### Local restart recovery
+
+Select `taskStore: filesystem` with `filesystem.root` pointing at a retained directory, and separately enable durable DSH session persistence. Keep queued file materialization on retained storage as well. Each task snapshot is scoped by tenant and user, written to a private temporary file and atomically renamed; no additional service is needed. Use one host writer per directory. Files have no automatic expiry; context clearing deletes task snapshots.
+
+After a crash, the host discovers sessions, calls `a2aInbox.resolve(contextId)` and supplies a real attributed waking input through the normal API. Restored unclaimed inputs keep their original task ownership. Startup scanning and scheduling remain host responsibilities. Explicit cancellation stays terminal and discards only the canceled task's input. This does not promise exactly-once external side effects, replay of consumed input, or graceful-unload retention beyond the official DSH lifecycle.
+
+The dedicated `E2E (dsh-a2a native ownership / issue-75)` integration job runs these regressions with unmodified npm DSH and scripted model responses. Its Langfuse scenario verifies Goal rounds and promoted input under the original task trace, canceled source ownership, and execution restored after SIGKILL. Same-repository CI also sends the scenario to the configured real Langfuse project and polls its Observations API; fork PRs use the local collector without credentials.
+
+```sh
+node .github/scripts/check-inbox.mjs -t issue-75
+# With LANGFUSE_BASE_URL, LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY configured:
+DSH_ISSUE75_LANGFUSE_LIVE=true node .github/scripts/check-inbox.mjs -t 'issue-75.*reports Goal continuation'
+```
 
 ## Configuration
 
@@ -51,7 +79,9 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
           description: My dsh agent over A2A
           version: 0.1.0
           publicUrl: https://agent.example.com
-        taskStore: redis       # memory | redis | gcs
+        taskStore: redis       # memory | filesystem | redis | gcs
+        filesystem:
+          root: /srv/dsh/a2a-tasks # required when taskStore: filesystem
         redis:
           url: redis://127.0.0.1:6379
           keyPrefix: a2a
@@ -128,6 +158,7 @@ Forwarding follows the owning task's active request bus. Background child events
 A2A task snapshots retain protocol history and artifacts; [dsh-storage](../dsh-storage) separately records the full conversation. Backends save on task-state transitions, including the complete reply at `input-required`, so token-rate stream events never reach Redis or GCS. While a task is working, in-process history accumulates text deltas for `GetTask` and resubscription; a restart before the next state change can lose those transient deltas.
 
 - `memory` (default) — in-process, lost on restart
+- `filesystem` — private, atomically replaced JSON snapshots under `filesystem.root`; no additional peer dependency
 - `redis` — task JSON under `<keyPrefix>:tasks:<scope>:<taskId>` with a TTL; requires the `ioredis` peer
 - `gcs` — gzipped task JSON at `<prefix>/<scope>/<taskId>/metadata.json.gz`; requires the `@google-cloud/storage` peer. `archiveWorkspace()` (tar of the workspace) exists but is not wired to the lifecycle yet.
 
@@ -138,6 +169,8 @@ A2A task snapshots retain protocol history and artifacts; [dsh-storage](../dsh-s
 dsh ships **no authentication or authorization**. The server binds `127.0.0.1` by default; if you expose it, put an authenticated reverse proxy in front and treat every agent as running with the host process's OS privileges. File parts carrying a `url` are fetched server-side (http/https only, bounded) — another reason to keep the endpoint off untrusted networks.
 
 ## Compatibility
+
+Optional Goal integration requires `@deepseek-ai/dsh-goal >=0.2.0-rc.2 || >=0.2.1-alpha.1` and the official Goal round driver (both tested at `0.2.1-rc.2`).
 
 Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment,tools}@0.2.1-rc.2` — the attachment store is an optional peer) — the session peer floor is `>=0.2.0-rc.1` because child attribution uses `firstLifecycleSeq` to reject restored sessions; check the `TODO(verify)` markers in `src/` before upgrading dsh.
 
