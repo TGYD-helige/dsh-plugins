@@ -249,6 +249,18 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore()) {
 }
 
 describe('native A2A inbox', () => {
+  it('removes owned input when the admission flush fails after send', async () => {
+    const f = harness();
+    f.ctx.on('session/flush', () => {
+      if (f.agent.inbox.nextTurn.length) throw new Error('admission checkpoint failed');
+    });
+    const request = f.send('one', { parked: true });
+    await request.execution;
+    expect(request.events.at(-1).data.status.state).toBe(TaskState.TASK_STATE_FAILED);
+    expect(f.agent.inbox.nextTurn).toHaveLength(0);
+    expect(f.consumed).toHaveLength(0);
+  });
+
   it('rejects duplicate follow-up admission without terminating the accepted task', async () => {
     const f = harness();
     const original = f.send('one', { parked: true });

@@ -92,6 +92,25 @@ async function boot(options: { root?: string; store?: SanitizedTaskStore; backen
   return { ctx, adapter, bridge, inbox, store, backend, server, rpc, send, completed };
 }
 
+it('removes failed admission input from the official queue after a flush error', async () => {
+  const f = await boot();
+  const agent = await f.inbox.resolve('native-test');
+  let failFlush = true;
+  f.ctx.on('session/flush', () => {
+    if (failFlush && agent.inbox.nextTurn.length) {
+      failFlush = false;
+      throw new Error('admission checkpoint failed');
+    }
+  });
+  const task = await f.send('failed-admission', { wakeup: false });
+  await expect.poll(async () => (await f.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_FAILED');
+  expect(agent.inbox.nextTurn).toHaveLength(0);
+  const next = await f.send('next');
+  await f.completed(next.id);
+  expect(f.adapter.requests).toHaveLength(1);
+  expect(JSON.stringify(f.adapter.requests[0])).not.toContain('failed-admission');
+});
+
 it('uses the official published DSH queue without a capability patch', async () => {
   const f = await boot();
   const first = await f.send('first');

@@ -573,13 +573,10 @@ export class NativeInbox implements A2aInbox {
         metadata: undefined,
       };
       bus.publish(AgentEvent.task(snapshot));
-      bus.publish(terminalStatusUpdate(taskId, contextId, 'failed', text));
       if (task) {
-        task.task.status = snapshot.status;
-        task.settled = true;
-        task.controller.abort();
-        task.finish();
-      }
+        this.fail(task, contextId, error);
+        await task.done;
+      } else bus.publish(terminalStatusUpdate(taskId, contextId, 'failed', text));
     } finally {
       bus.finished();
     }
