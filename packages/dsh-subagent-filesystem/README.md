@@ -23,7 +23,7 @@ Enable the bundle in the profile's `cordis.patch.yml`:
 
 Disabled by default. `root` defaults to `agents`, relative to the agent's initial workspace directory; sandbox deployments can explicitly select `/agents`. Discovery scans direct `*.md` children only. A missing root produces an empty catalog. Files are loaded when the agent is created; create a new agent to pick up changes. Watching and hot reload are outside the initial scope.
 
-Requires the `fs`, `tools`, `subagents`, `systemPrompt`, and `sessionQuery` services, plus the native in-process provider registered as `spawn`. The standard headless profile supplies these capabilities. DSH peer floor: `>=0.2.0-rc.1`; tested DSH: `0.2.0-rc.2`; tested Cordis: `4.0.4`.
+Requires the `fs`, `tools`, `subagents`, `systemPrompt`, and `sessionQuery` services, plus the native in-process provider registered as `spawn`. The standard headless profile supplies these capabilities. DSH peer floor: `>=0.2.1-rc.2`; tested DSH: `0.2.1-rc.2`; tested Cordis: `4.0.5`. This version uses managed activations and requires DSH 0.2.1-rc.2 or newer; use plugin v0.1.27 with DSH 0.2.0.
 
 ## Definition format
 

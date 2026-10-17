@@ -5,7 +5,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-fs';
 import type { SessionId } from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-session-query';
-import { settleRun } from '@deepseek-ai/dsh-subagent';
+import type {} from '@deepseek-ai/dsh-subagent';
 import type {} from '@deepseek-ai/dsh-system-prompt';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import Schema from '@deepseek-ai/schemastery';
@@ -125,7 +125,7 @@ export function apply(ctx: Context, config: Config): void {
     lifecycle.abort();
     await Promise.allSettled([...pending]);
     const released = await Promise.allSettled(
-      [...children].map(([parent, ids]) => ctx.subagents.drainContinuableChildren(parent, ids)),
+      [...children].map(([parent, ids]) => ctx.subagents.drainChildren(parent, ids)),
     );
     for (const result of released) {
       if (result.status === 'rejected')
@@ -240,26 +240,40 @@ export function apply(ctx: Context, config: Config): void {
                       prompt: [{ type: 'text' as const, text: args.prompt }],
                       maxDepth: agent.ctx.get('subagents')!.resolveMaxDepth(),
                     };
+                    const child = await agent.ctx.get('subagents')!.startActivation({
+                      provider: 'spawn',
+                      label: args.description,
+                      request,
+                      signal,
+                      delivery: args.run_in_background ? 'parent' : 'caller',
+                    });
                     if (args.run_in_background) {
-                      const child = await agent.ctx.get('subagents')!.startContinuable({
-                        provider: 'spawn',
-                        label: args.description,
-                        request,
-                        signal,
-                      });
+                      void child.result.catch(() => {});
                       const ids = children.get(agent) ?? [];
                       ids.push(child.childId);
                       children.set(agent, ids);
                       return `started subagent ${child.childId}; use send_message to continue it`;
                     }
-                    const outcome = await settleRun(
-                      await agent.ctx
-                        .get('subagents')!
-                        .start('spawn', { ...request, label: args.description, signal }),
-                    );
-                    if (outcome.status !== 'completed')
-                      throw new Error(outcome.detail ?? `Subagent ${outcome.status}`);
-                    return outcome.result ?? '';
+                    // Activation signals cover admission only; foreground calls own later cancellation.
+                    let cleanup: Promise<void> | undefined;
+                    const dispose = () => (cleanup ??= child.dispose());
+                    const cancel = () => {
+                      void dispose().catch(() => {});
+                    };
+                    signal.addEventListener('abort', cancel, { once: true });
+                    try {
+                      if (signal.aborted) cancel();
+                      const outcome = await child.result;
+                      if (outcome.stopReason !== 'completed')
+                        throw new Error(outcome.diagnostic ?? `Subagent ${outcome.stopReason}`);
+                      return outcome.output
+                        .filter((block) => block.type === 'text')
+                        .map((block) => block.text)
+                        .join('');
+                    } finally {
+                      signal.removeEventListener('abort', cancel);
+                      await dispose();
+                    }
                   }),
                 );
               },

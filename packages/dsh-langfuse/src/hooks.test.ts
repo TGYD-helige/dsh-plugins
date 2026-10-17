@@ -1,6 +1,5 @@
 import { Context } from '@deepseek-ai/cordis';
-import * as HookProtocolInvariant from '@deepseek-ai/dsh-hook-protocol/invariant';
-import InvariantRegistry, { InvariantError } from '@deepseek-ai/dsh-invariants';
+import type {} from '@deepseek-ai/dsh-hook-protocol';
 import { SessionStore } from '@deepseek-ai/dsh-session';
 import { expect, it, vi } from 'vitest';
 import { appendHookEvent, type HookInvoked } from './hooks.js';
@@ -92,69 +91,6 @@ it('contains invalid data and session append failures without changing producer 
   }
 });
 
-it('respects the installed upstream hook invariant and contains rejected telemetry', async () => {
-  const ctx = new Context();
-  new SessionStore(ctx);
-  new InvariantRegistry(ctx);
-  await ctx.plugin(HookProtocolInvariant);
-  const session = ctx.sessions.create();
-  const observed: Array<{ type: string; data: unknown }> = [];
-  ctx.on('session/event', (_session, event) => observed.push(event));
-  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
-  const identity = {
-    turn: 0,
-    point: 'BeforeAgent',
-    handlerId: 'validator',
-    invocationId: 'custom',
-  };
-  try {
-    session.append('turn/start', { turn: 0 });
-    for (const dialect of ['gemini', 'company-validator']) {
-      expect(appendHookEvent(session, 'hook/invoked', { ...identity, dialect })).toBe(false);
-      expect(error).toHaveBeenLastCalledWith(
-        '[dsh-langfuse] hook reporting failed:',
-        expect.objectContaining({
-          packageName: '@deepseek-ai/dsh-hook-protocol',
-          message: expect.stringContaining('unknown dialect'),
-        }),
-      );
-    }
-    for (const dialect of ['claude-code', 'codex']) {
-      const run = { ...identity, invocationId: dialect };
-      expect(appendHookEvent(session, 'hook/invoked', { ...run, dialect })).toBe(true);
-      expect(
-        appendHookEvent(session, 'hook/result', {
-          ...run,
-          decision: 'pass',
-          outcome: 'success',
-          exitCode: 0,
-          durationMs: 1,
-        }),
-      ).toBe(true);
-    }
-    expect(appendHookEvent(session, 'hook/invoked', { ...identity, dialect: 'codex' })).toBe(true);
-    session.append('turn/end', { turn: 0, reason: { kind: 'completed' } });
-    const late = { ...identity, decision: 'pass', outcome: 'cancelled' as const, durationMs: 1 };
-    expect(appendHookEvent(session, 'hook/result', late)).toBe(false);
-    expect(error.mock.calls.at(-1)?.[1]).toBeInstanceOf(InvariantError);
-    expect(error.mock.calls.at(-1)?.[1]).toMatchObject({
-      message: expect.stringContaining('outside any open turn'),
-    });
-    expect(appendHookEvent(session, 'hook/invoked', { ...identity, dialect: 'codex' })).toBe(false);
-    session.append('turn/start', { turn: 1 });
-    expect(appendHookEvent(session, 'hook/result', late)).toBe(false);
-    expect(error.mock.calls.at(-1)?.[1]).toMatchObject({
-      message: expect.stringContaining('open turn is 1'),
-    });
-    expect(observed.filter((event) => event.type === 'hook/invoked')).toHaveLength(3);
-    expect(observed.filter((event) => event.type === 'hook/result')).toHaveLength(2);
-    expect(session.seq).toBe(8); // Three turn records and five accepted hook records only.
-  } finally {
-    error.mockRestore();
-    await ctx.fiber.dispose();
-  }
-});
-
 it('rejects malformed optional tool and result fields without appending', async () => {
   const ctx = new Context();
   new SessionStore(ctx);
@@ -184,6 +120,38 @@ it('rejects malformed optional tool and result fields without appending', async 
     expect(error).toHaveBeenCalledWith('[dsh-langfuse] hook reporting failed:', expect.any(Error));
   } finally {
     error.mockRestore();
+    await ctx.fiber.dispose();
+  }
+});
+
+it('publishes custom hook results after their originating turn closes on DSH 0.2.1', async () => {
+  const ctx = new Context();
+  new SessionStore(ctx);
+  const session = ctx.sessions.create();
+  const observed: Array<{ type: string; data: unknown }> = [];
+  ctx.on('session/event', (_session, event) => observed.push(event));
+  const identity = { turn: 0, point: 'BeforeAgent', handlerId: 'custom', invocationId: 'run-1' };
+  try {
+    session.append('turn/start', { turn: 0 });
+    expect(
+      appendHookEvent(session, 'hook/invoked', { ...identity, dialect: 'company-validator' }),
+    ).toBe(true);
+    session.append('turn/end', { turn: 0, reason: { kind: 'completed' } });
+    expect(
+      appendHookEvent(session, 'hook/result', {
+        ...identity,
+        decision: 'pass',
+        outcome: 'cancelled',
+        durationMs: 1,
+      }),
+    ).toBe(true);
+    expect(observed.map((event) => event.type)).toEqual([
+      'turn/start',
+      'hook/invoked',
+      'turn/end',
+      'hook/result',
+    ]);
+  } finally {
     await ctx.fiber.dispose();
   }
 });
