@@ -14,42 +14,13 @@ dsh plugin --profile my-agent add @amaster.ai/dsh-a2a
 
 ## Native inbox execution
 
-`inbox.enabled: true` opts into durable native DSH input instead of request-serialized execution. **This requires the unreleased upstream native inbox capability (`ctx.agents.nativeInboxVersion === 1`); the tested `0.2.0-rc.2` runtime does not provide it.** Startup rejects unsupported factories before opening a backend. Legacy execution remains the default.
+`inbox.enabled: true` uses the official DSH inbox (`Agent.send`) for ordinary `next-turn` input and `next-step` steering. Tested with the unmodified npm runtime `0.2.1-rc.2`; no core patch is required. The queue and its durable projection belong to DSH. The plugin only materializes messages, attaches A2A task identities, and translates execution events.
 
-In this mode, ordinary `SendMessage` / `SendStreamingMessage` calls enter the DSH inbox before their initial task response is published. Nonblocking sends return a submitted task after durable admission. A context owns one agent, while tasks retain separate message identities, streams, and terminal states. A completed unit of work settles `completed`; use the same context with a new task for later work. Disconnecting an HTTP client does not cancel execution. Task snapshots, polling, and subscriptions use the standard A2A operations.
+Standard `SendMessage` / `SendStreamingMessage`, task queries, cancellation and subscriptions remain the wire interface. The negotiated [inbox extension](../../docs/protocol/inbox-v1.md) forwards `target` and `wakeup` to DSH. `wakeup: false` leaves an idle driver parked; it does not prevent an active driver from consuming pending input. A later real waking message releases pending input.
 
-The optional [inbox extension](../../docs/protocol/inbox-v1.md) selects parked admission (`wakeup: false`) or next-step steering (`target: next-step`). Steering must address the currently active task. It cannot pull an unrelated task's input into the active model step.
+The same-process `a2aInbox` service exposes `resolve(contextId)`, `content(message, contextId)`, `enqueue(taskId, message, { target?, wakeup? })`, and `cancel(taskId)`. There is no separate pause, wake-only, resume, or retained-task restart operation. Cancellation is terminal and removes that task's pending input. Other tasks' input is retained according to official DSH cancellation semantics, and may wait for the next waking message. Clearing a context discards all its pending work.
 
-The same-process `a2aInbox` service implements the exported `A2aInbox` interface:
-
-```ts
-const inbox = ctx.get('a2aInbox') as A2aInbox;
-const agent = await inbox.resolve(contextId);
-const blocks = await inbox.content(message, contextId);
-await inbox.enqueue(taskId, message); // Host follow-up with explicit task ownership.
-await inbox.pause(contextId);
-await inbox.wake(contextId); // Leaves a persisted pause intact.
-await inbox.wake(contextId, { resume: true }); // Explicitly unpauses existing work.
-await inbox.cancel(taskId, { retainInbox: true }); // Terminal task; pending input stays parked.
-```
-
-`pause` cancels active tasks while retaining their unconsumed input and other queued tasks; resumed input from a canceled task gets a fresh task identity. `CancelTask` remains terminal and removes that task's pending input, retaining other tasks' input. The service's explicit retention option parks the context; resuming retained input creates a new task when its former owner is terminal. `a2aTasks.clearContext` discards pending work even when idle. Plugin unload preserves the native inbox and drains its session writes. For restart recovery, configure durable DSH session persistence and a Redis or GCS TaskStore, then call `wake` for the contexts the host chooses to restore. `SubscribeToTask` observes recovered work without submitting a wake message.
-
-In native mode, host settlement hooks submit follow-ups through `a2aInbox.enqueue(taskId, message)`; it binds and persists the task identity before enqueueing. Raw `Agent.send` / `followup` inputs without A2A attribution are rejected rather than assigned to the most recent hook.
-
-`a2a/before-followup` validates admission; use `a2a/before-assembly` for per-input runtime state. The latter runs after the model-step batch is selected, before prompt assembly, and receives the same `A2aTurnContext` fields. Request headers are process-local: restored inputs receive `requestHeaders: undefined`. Persist replay-safe metadata in the message, never credentials in the queue. Admission observers remain non-vetoing.
-
-Recovery only restores an interrupted claim without a committed `user/message`; it never replays committed model input or promises exactly-once tool effects. A task with committed input, no remaining pending input, and no durable terminal A2A checkpoint becomes failed on recovery, including when the turn ended before the process stopped. The host can then decide what to do next. Keep file parts on persistent storage with `uploadsDir` or `a2aFileMaterializer` when queued inputs must survive host or machine restarts. The memory TaskStore and temporary upload default do not provide that durability. In-process task handles remain until context clear or plugin unload; long-lived hosts should clear finished contexts.
-
-Run the real loop / A2A HTTP / JSONL recovery checks against a prepared upstream checkout:
-
-```bash
-DSH_SOURCE_ROOT=/absolute/path/to/deepseek-harness node .github/scripts/check-native-inbox.mjs
-```
-
-The Integration workflow runs this suite without secrets, including on fork PRs, against a pinned upstream source checkout plus the checked-in native inbox source companion. It verifies insertion during an active turn, FIFO execution, independent task completion, and exactly one user-message commit per input.
-
-The checkout needs its installed dependencies and `pnpm run build:native-system`; model responses are scripted, so this check needs no gateway or model credentials. The upstream source companion is required before native mode can be released; no dependency artifact patch is installed by this plugin.
+`a2a/before-followup` validates admission; `a2a/before-step` runs at the official pre-step boundary, after system-prompt assembly and before model execution. It cannot change the already assembled system prompt. Original request headers remain process-local. DSH persistence restores its own pending projection; the plugin does not replay splice logs or recover consumed claims. Graceful disposal follows the official runtime's cancellation behavior. Durable A2A task snapshots still require a Redis or GCS TaskStore; an in-memory store is sufficient without restart requirements.
 
 ## Configuration
 
