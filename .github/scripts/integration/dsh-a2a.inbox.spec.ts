@@ -401,6 +401,29 @@ it('restores official pending ownership before concurrent waking sends after a c
   expect(messages.slice(0, 2).map(event => event.data.id)).toEqual(ids);
 });
 
+it('fails every consumed task owner if a recovered mixed batch fails before pre-step', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'official-inbox-mixed-'));
+  const restoredRoot = root + '-restored';
+  cleanups.push(() => rm(root, { recursive: true, force: true }));
+  cleanups.push(() => rm(restoredRoot, { recursive: true, force: true }));
+  const first = await boot({ root, script: ['hang'] });
+  const active = await first.send('active');
+  await expect.poll(() => first.adapter.requests.length).toBe(1);
+  await first.send('steering', { target: 'next-step' }, active.id);
+  const ordinary = await first.send('ordinary', { wakeup: false });
+  const original = await first.inbox.resolve('native-test');
+  await first.ctx.parallel('session/flush', original.session);
+  await cp(root, restoredRoot, { recursive: true });
+  const backend = new MemoryTaskStore();
+  for (const task of [active, ordinary]) await backend.save(await first.store.load(task.id, new ServerCallContext()), new ServerCallContext());
+  await first.bridge.dispose();
+  const second = await boot({ root: restoredRoot, backend });
+  second.ctx.systemPrompt.assemble = async () => { throw new Error('assembly failed'); };
+  await second.send('trigger');
+  for (const task of [active, ordinary]) await expect.poll(async () => (await second.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_FAILED');
+  expect(second.adapter.requests).toHaveLength(0);
+});
+
 it('reports a cold interrupted task as failed without replaying consumed input', async () => {
   const root = await mkdtemp(join(tmpdir(), 'official-inbox-interrupted-'));
   const restoredRoot = root + '-restored';

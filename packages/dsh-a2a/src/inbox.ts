@@ -103,6 +103,7 @@ interface ContextRun {
   // shortcut: settled handles live until context clear/unload; reclaim once task delivery exposes a drain acknowledgment.
   tasks: Map<string, TaskRun>;
   active?: TaskRun;
+  claimed: Set<TaskRun>;
   turnStart?: SessionEvent;
   admissions: Set<AbortController>;
   admissionTail: Promise<void>;
@@ -131,6 +132,7 @@ export class NativeInbox implements A2aInbox {
       if (!run || message.source.kind !== 'a2a') return;
       const task = run.tasks.get(message.source.taskId);
       if (task && !task.settled) {
+        run.claimed.add(task);
         if (!run.active) this.select(run, task);
         if (run.active === task) {
           const selectedAt = Date.now();
@@ -189,6 +191,7 @@ export class NativeInbox implements A2aInbox {
         const run: ContextRun = {
           entry,
           tasks: new Map(),
+          claimed: new Set(),
           admissions: new Set(),
           admissionTail: Promise.resolve(),
         };
@@ -639,8 +642,13 @@ export class NativeInbox implements A2aInbox {
       const deferred = detail.messages.filter(
         (message) => message.source.kind === 'a2a' && message.source.taskId !== taskId,
       );
-      for (const message of deferred.slice().reverse())
+      for (const message of deferred.slice().reverse()) {
         detail.agent.inbox.prepend('next-turn', message);
+        if (message.source.kind === 'a2a') {
+          const task = run.tasks.get(message.source.taskId);
+          if (task) run.claimed.delete(task);
+        }
+      }
       for (let index = detail.messages.length - 1; index >= 0; index--)
         if (deferred.includes(detail.messages[index]!)) detail.messages.splice(index, 1);
     }
@@ -691,10 +699,22 @@ export class NativeInbox implements A2aInbox {
     const run = this.contexts.get(session.id);
     if (!run) return false;
     if (event.type === 'turn/start') {
+      run.claimed.clear();
       run.turnStart = event;
       return true;
     }
     const task = run.active;
+    if (event.type === 'turn/end') {
+      if (!this.stopping && ['error', 'blocked', 'aborted'].includes(event.data.reason.kind))
+        for (const owner of run.claimed)
+          if (owner !== task && !owner.settled)
+            this.fail(
+              owner,
+              session.id,
+              new Error('Selected input was interrupted before its task step.'),
+            );
+      run.claimed.clear();
+    }
     if (!task) return true;
     if (task.settled) {
       if (event.type === 'turn/end') run.active = undefined;
