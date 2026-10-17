@@ -379,6 +379,7 @@ function spanToObservation(span) {
   }
   return {
     id: span.spanId,
+    traceId: span.traceId,
     parentObservationId: span.parentSpanId || null,
     name: span.name,
     type: (otlpAttr(span, 'langfuse.observation.type') ?? 'span').toUpperCase(),

@@ -49,6 +49,7 @@ const mocks = vi.hoisted(() => {
     readonly attributes: Record<string, unknown> = {};
     readonly otelSpan = {
       spanContext: () => this,
+      addLink: vi.fn(),
       setAttribute: (key: string, value: unknown) => {
         this.attributes[key] = value;
       },
@@ -366,6 +367,83 @@ describe('dsh-langfuse plugin', () => {
     expect(mocks.isolatedProviders).toEqual([mocks.providers[0]]);
   });
 
+  it('keeps admission, controls, execution and terminal outcomes in one trace per native task', async () => {
+    await setup({
+      ...enabledConfig,
+      publicKey: 'public-inbox-test',
+      secretKey: 'secret-inbox-test',
+    });
+    const session = sessionOf('queue');
+    const event = (phase: string, taskId?: string, taskIds?: string[]) =>
+      ctx.emit('a2a/inbox', {
+        phase,
+        contextId: 'queue',
+        at: 3000,
+        pending: 1,
+        taskId,
+        taskIds,
+        ...(taskId
+          ? {
+              messageId: `message-${taskId}`,
+              nativeMessageId: `native-${taskId}`,
+              input: `request-${taskId}`,
+              target: 'next-turn' as const,
+              queuedAt: 1000,
+              selectedAt: 2000,
+              turn: 1,
+              step: 1,
+            }
+          : {}),
+      });
+    event('resolved');
+    event('admitted', 'run');
+    event('admitted', 'cancel');
+    event('paused', undefined, ['run', 'cancel']);
+    event('canceled', 'cancel');
+    event('resume', undefined, ['run']);
+    ctx.emit('session/event', session, turnStart(1));
+    event('selected', 'run');
+    event('prepared', 'run');
+    ctx.emit('session/event', session, userMessage('request-run'));
+    ctx.emit('session/event', session, turnEnd(1));
+    const running = mocks.roots.find(
+      (root) => root.attributes['langfuse.trace.input'] === 'request-run',
+    )!;
+    const canceled = mocks.roots.find(
+      (root) => root.attributes['langfuse.trace.input'] === 'request-cancel',
+    )!;
+    expect(mocks.roots).toHaveLength(2);
+    expect(running.ended).toBe(0);
+    expect(canceled.ended).toBe(1);
+    expect(canceled.spans.map((span) => span.name)).toEqual([
+      'inbox:admitted',
+      'inbox:paused',
+      'inbox:canceled',
+    ]);
+    expect(running.spans.map((span) => span.name)).toEqual([
+      'inbox:admitted',
+      'inbox:paused',
+      'inbox:resume',
+      'agent:turn',
+    ]);
+    expect(running.spans.at(-1)?.spans[0].name).toBe('inbox:prepare');
+    ctx.emit('session/event', session, turnStart(2));
+    event('selected', 'run');
+    event('prepared', 'run');
+    event('completed', 'run');
+    expect(running.ended).toBe(0);
+    ctx.emit('session/event', session, turnEnd(2));
+    expect(running.spans.filter((span) => span.name === 'agent:turn')).toHaveLength(2);
+    expect(running.ended).toBe(1);
+    event('resume', undefined, ['run']);
+    event('completed', 'run');
+    expect(mocks.roots).toHaveLength(2);
+    expect(running.ended).toBe(1);
+    expect(running.updates).toContainEqual(
+      expect.objectContaining({ metadata: expect.objectContaining({ taskState: 'completed' }) }),
+    );
+  });
+
   it('binds native inbox trace context after selection and before its first input', async () => {
     await setup({
       ...enabledConfig,
@@ -396,16 +474,22 @@ describe('dsh-langfuse plugin', () => {
     inbox('prepared');
     ctx.emit('session/event', session, userMessage('hello'));
     ctx.emit('session/event', session, turnEnd(1));
-    const execution = mocks.roots.find((root) => root.name === 'dsh-turn')!;
-    expect(execution.parentContext).toMatchObject({
-      traceId: '1'.repeat(32),
-      spanId: '2'.repeat(16),
+    const execution = mocks.roots[0];
+    expect(execution.otelSpan.addLink).toHaveBeenCalledWith({
+      context: expect.objectContaining({
+        traceId: '1'.repeat(32),
+        spanId: '2'.repeat(16),
+      }),
     });
     expect(execution.attributes['user.id']).toBe('alice');
-    expect(execution.updates).toContainEqual(
-      expect.objectContaining({ metadata: expect.objectContaining({ taskId: 'task-a' }) }),
-    );
-    expect(execution.spans.find((span) => span.name === 'inbox:prepare')?.ended).toBe(1);
+    expect(execution.body.metadata).toMatchObject({ taskId: 'task-a' });
+    expect(
+      execution.spans
+        .find((span) => span.name === 'agent:turn')
+        ?.spans.find((span) => span.name === 'inbox:prepare')?.ended,
+    ).toBe(1);
+    expect(execution.ended).toBe(0);
+    inbox('completed');
     expect(execution.ended).toBe(1);
     expect(mocks.roots.some((root) => root.name === 'inbox:wait')).toBe(false);
     expect(execution.updates).toContainEqual(
@@ -439,9 +523,10 @@ describe('dsh-langfuse plugin', () => {
       };
       ctx.emit('a2a/inbox', { ...detail, phase: 'admitted' });
       ctx.emit('a2a/inbox', { ...detail, phase: 'selected' });
-      const admitted = mocks.roots.find((root) => root.name === 'inbox:admitted')!;
+      const task = mocks.roots[0];
+      const admitted = task.spans.find((span) => span.name === 'inbox:admitted')!;
       expect(mocks.roots.some((root) => root.name === 'inbox:wait')).toBe(false);
-      expect(admitted.attributes['langfuse.trace.input']).toBe(
+      expect(task.attributes['langfuse.trace.input']).toBe(
         captureContent ? detail.input : undefined,
       );
       expect(admitted.updates).toContainEqual(
@@ -504,7 +589,8 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit('session/event', session, turnEnd(1));
       expect(mocks.roots).toHaveLength(1);
       const root = mocks.roots[0];
-      const span = root.spans.find((span) => span.name === 'inbox:steering')!;
+      const turn = root.spans.find((span) => span.name === 'agent:turn')!;
+      const span = turn.spans.find((span) => span.name === 'inbox:steering')!;
       expect(span.body.input).toBe(captureContent ? steering.input : undefined);
       expect(span.body.metadata).toMatchObject({
         taskId: 'task-a',
@@ -517,7 +603,7 @@ describe('dsh-langfuse plugin', () => {
       expect(span.ended).toBe(1);
       expect(root.updates).toContainEqual(
         expect.objectContaining({
-          metadata: expect.objectContaining({ waitMs: 1000, a2aMessageIds: ['first', 'guide'] }),
+          metadata: expect.objectContaining({ a2aMessageIds: ['first', 'guide'] }),
         }),
       );
       expect(root.attributes['langfuse.trace.input']).toBe(
@@ -555,19 +641,20 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit('a2a/inbox', { ...detail, phase: 'selected' });
       ctx.emit('a2a/inbox', { ...detail, phase });
       ctx.emit('session/event', session, turnEnd(turn));
+      ctx.emit('a2a/inbox', { ...detail, phase: turn === 1 ? 'failed' : 'completed' });
     }
-    const roots = mocks.roots.filter((root) => root.name === 'dsh-turn');
+    const roots = mocks.roots.filter((root) => root.name === 'a2a-task');
     expect(roots).toHaveLength(2);
     expect(roots[0].attributes['langfuse.trace.input']).toBe('request-1');
-    expect(roots[0].spans[0].updates).toContainEqual(expect.objectContaining({ level: 'ERROR' }));
+    expect(
+      roots[0].spans.find((span) => span.name === 'agent:turn')!.spans[0].updates,
+    ).toContainEqual(expect.objectContaining({ level: 'ERROR' }));
     expect(roots[1].updates).toContainEqual(
       expect.objectContaining({
-        metadata: {
-          taskId: 'task-2',
-          waitMs: 1000,
+        metadata: expect.objectContaining({
           a2aMessageIds: ['input-2'],
           nativeMessageIds: ['native-2'],
-        },
+        }),
       }),
     );
     expect(roots.every((root) => root.ended === 1)).toBe(true);

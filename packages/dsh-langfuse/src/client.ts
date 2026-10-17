@@ -293,12 +293,17 @@ export class LangfuseReporter {
     metadata?: Record<string, unknown>;
     context?: LangfuseTraceContext;
     startTime?: Date;
+    traceId?: string;
   }): LangfuseSpan | null {
     const tracing = this.tracing;
     const api = this.api;
     if (!tracing || !api) return null;
     try {
-      const parent = parentContext(input.context?.traceparent);
+      const externalParent = parentContext(input.context?.traceparent);
+      const parent =
+        externalParent === NO_PARENT && input.traceId
+          ? { traceId: input.traceId, spanId: '0000000000000001', traceFlags: 1 }
+          : externalParent;
       input = this.mask(input);
       const root = api.context.with(api.ROOT_CONTEXT, () =>
         tracing.startObservation(
@@ -309,17 +314,36 @@ export class LangfuseReporter {
       );
       this.stampTraceContext(root, {
         sessionId: input.sessionId,
-        traceName: parent === NO_PARENT ? input.name : undefined,
+        traceName: externalParent === NO_PARENT ? input.name : undefined,
         userId: input.context?.userId ?? this.config.userId,
         tags: input.context?.tags ?? this.config.tags,
       });
       // External traces retain their owner's trace name and trace-level IO.
-      if (parent === NO_PARENT) this.roots.add(root);
-      else root.otelSpan.setAttribute(tracing.LangfuseOtelSpanAttributes.IS_APP_ROOT, false);
+      if (externalParent === NO_PARENT) {
+        this.roots.add(root);
+        root.otelSpan.setAttribute(tracing.LangfuseOtelSpanAttributes.IS_APP_ROOT, true);
+      } else root.otelSpan.setAttribute(tracing.LangfuseOtelSpanAttributes.IS_APP_ROOT, false);
       return root;
     } catch (error) {
       console.error('[dsh-langfuse] trace creation failed:', error);
       return null;
+    }
+  }
+
+  /** A running task keeps its trace identity; late host context is a link. */
+  updateContext(span: Observation | null, context: LangfuseTraceContext): void {
+    if (!span) return;
+    try {
+      const previous = this.traceContext.get(span);
+      this.stampTraceContext(span, {
+        ...previous,
+        userId: context.userId ?? previous?.userId,
+        tags: context.tags ?? previous?.tags,
+      });
+      const parent = parentContext(context.traceparent);
+      if (parent !== NO_PARENT) span.otelSpan.addLink({ context: parent });
+    } catch (error) {
+      console.error('[dsh-langfuse] context update failed:', error);
     }
   }
 

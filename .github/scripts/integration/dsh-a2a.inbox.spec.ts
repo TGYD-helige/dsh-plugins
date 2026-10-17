@@ -135,12 +135,14 @@ it.each([true, false])('records steering in the active turn while ordinary input
   expect(seen).toEqual([[1, 1, 'first'], [1, 2, steeringText], [2, 1, 'later']]);
   await f.ctx.parallel('session/flush', agent.session);
   const observations = capturedToObservations(captured);
-  const roots = observations.filter(observation => observation.name === 'dsh-turn');
+  const roots = observations.filter(observation => observation.name === 'a2a-task');
   expect(roots).toHaveLength(2);
   expect(observations.some(observation => observation.name === 'inbox:wait')).toBe(false);
   const steering = observations.find(observation => observation.name === 'inbox:steering');
   expect(steering.metadata).toMatchObject({ taskId: first.id, messageId: 'steer', target: 'next-step', turn: '1', step: '2' });
-  expect(steering.parentObservationId).toBe(roots.find(root => root.metadata.taskId === first.id).id);
+  const turnSpan = observations.find(observation => observation.name === 'agent:turn' && observation.metadata.taskId === first.id);
+  expect(turnSpan.parentObservationId).toBe(roots.find(root => root.metadata.taskId === first.id).id);
+  expect(steering.parentObservationId).toBe(turnSpan.id);
   expect(steering.input).toBe(captureContent ? steeringText : undefined);
   expect(Number(steering.metadata.waitMs)).toBeGreaterThanOrEqual(0);
   if (!captureContent) expect(JSON.stringify(captured)).not.toContain(steeringText);
@@ -609,12 +611,20 @@ it.each([true, false])('exports readable inbox lifecycle through the real SDK wi
   for (const phase of ['admitted', 'paused', 'canceled', 'resume', 'prepare']) {
     expect(observations.some(observation => observation.name === `inbox:${phase}`)).toBe(true);
   }
-  const roots = observations.filter(observation => observation.name === 'dsh-turn');
-  expect(roots.map(root => root.metadata.taskId)).toEqual([first.id, failed.id, second.id]);
-  expect(roots.every(root => root.parentObservationId === '2222222222222222')).toBe(true);
+  const roots = observations.filter(observation => observation.name === 'a2a-task');
+  expect(roots.map(root => root.metadata.taskId).sort()).toEqual([first.id, failed.id, second.id, canceled.id].sort());
+  expect(roots.map(root => root.metadata.taskState).sort()).toEqual(['completed', 'completed', 'failed', 'canceled'].sort());
+  const turns = observations.filter(observation => observation.name === 'agent:turn');
+  expect(turns).toHaveLength(3);
+  expect(turns.every(turn => roots.some(root => root.id === turn.parentObservationId && root.traceId === turn.traceId))).toBe(true);
+  for (const root of roots.filter(root => root.metadata.taskId !== canceled.id)) {
+    expect(captured.find(span => span.spanId === root.id).links).toEqual(expect.arrayContaining([expect.objectContaining({ traceId: '11111111111111111111111111111111', spanId: '2222222222222222' })]));
+  }
+  const canceledRoot = roots.find(root => root.metadata.taskId === canceled.id);
+  expect(observations.filter(observation => observation.parentObservationId === canceledRoot.id).map(observation => observation.name)).toEqual(['inbox:admitted', 'inbox:paused', 'inbox:canceled']);
   expect(observations.filter(observation => observation.type === 'GENERATION')).toHaveLength(2);
   expect(observations.some(observation => observation.name === 'inbox:wait')).toBe(false);
-  expect(roots.every(root => Number(root.metadata.waitMs) >= 20)).toBe(true);
+  expect(roots.filter(root => root.metadata.taskId !== canceled.id).every(root => Number(root.metadata.waitMs) >= 20)).toBe(true);
   const preparations = observations.filter(observation => observation.name === 'inbox:prepare');
   expect(preparations).toHaveLength(3);
   for (const preparation of preparations) {
@@ -625,7 +635,7 @@ it.each([true, false])('exports readable inbox lifecycle through the real SDK wi
   }
   const hooks = observations.filter(observation => observation.name === 'hook:BeforeAgent');
   expect(hooks).toHaveLength(3);
-  expect(hooks.every(hook => roots.some(root => root.id === hook.parentObservationId))).toBe(true);
+  expect(hooks.every(hook => turns.some(turn => turn.id === hook.parentObservationId))).toBe(true);
   expect(observations.every(observation => observation.sessionId === 'native-test' && observation.endTime)).toBe(true);
   expect(JSON.stringify(captured)).not.toContain('secret-inbox-test');
   if (captureContent) {
@@ -646,6 +656,7 @@ it('exports recovered inbox identity and queue waiting across a durable restart'
   cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
   const langfuseUrl = `http://127.0.0.1:${collector.address().port}`;
   const first = await boot({ root, langfuseUrl });
+  first.ctx.emit('langfuse/context', 'native-test', { traceparent: '00-11111111111111111111111111111111-2222222222222222-01' });
   const task = await first.send('restored-input', { wakeup: false });
   await first.inbox.pause('native-test');
   await first.bridge.dispose();
@@ -660,7 +671,11 @@ it('exports recovered inbox identity and queue waiting across a durable restart'
   const observations = capturedToObservations(captured);
   expect(observations.find(observation => observation.name === 'inbox:restored')?.metadata).toMatchObject({ taskId: task.id, messageId: 'restored-input' });
   expect(observations.some(observation => observation.name === 'inbox:wait')).toBe(false);
-  const turn = observations.find(observation => observation.name === 'dsh-turn');
+  const roots = observations.filter(observation => observation.name === 'a2a-task');
+  expect(roots).toHaveLength(2);
+  expect(new Set(roots.map(root => root.traceId)).size).toBe(1);
+  expect(roots.map(root => root.metadata.taskState)).toEqual(['suspended', 'completed']);
+  const turn = observations.find(observation => observation.name === 'agent:turn');
   expect(turn.metadata.taskId).toBe(task.id);
   expect(Number(turn.metadata.waitMs)).toBeGreaterThanOrEqual(0);
   const preparation = captured.find(span => span.name === 'inbox:prepare');
@@ -670,6 +685,65 @@ it('exports recovered inbox identity and queue waiting across a durable restart'
   expect(Number(BigInt(preparation.endTimeUnixNano) - BigInt(preparation.startTimeUnixNano)) / 1e6).toBeGreaterThanOrEqual(20);
 });
 
+
+it('keeps multiple turns and queue controls inside their owning task traces', async () => {
+  const captured: unknown[] = [];
+  const collector = await startFakeIngestion(captured);
+  cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
+  const f = await boot({ langfuseUrl: `http://127.0.0.1:${collector.address().port}` });
+  const task = await f.send('one', { wakeup: false });
+  await f.send('two', { wakeup: false }, task.id);
+  await f.inbox.wake('native-test');
+  const agent = await f.inbox.resolve('native-test');
+  await agent.whenIdle();
+  await f.completed(task.id);
+  const cleared = await f.send('clear-me', { wakeup: false });
+  await f.inbox.clear('native-test');
+  await f.ctx.parallel('session/flush', agent.session);
+  const observations = capturedToObservations(captured);
+  const roots = observations.filter(observation => observation.name === 'a2a-task');
+  expect(roots).toHaveLength(2);
+  const completed = roots.find(root => root.metadata.taskId === task.id);
+  expect(completed.metadata.taskState).toBe('completed');
+  expect(observations.filter(observation => observation.name === 'agent:turn' && observation.parentObservationId === completed.id)).toHaveLength(2);
+  expect(observations.filter(observation => observation.name === 'inbox:completed')).toHaveLength(1);
+  const canceled = roots.find(root => root.metadata.taskId === cleared.id);
+  expect(canceled.metadata.taskState).toBe('canceled');
+  expect(observations.filter(observation => observation.parentObservationId === canceled.id).map(observation => observation.name)).toEqual(['inbox:admitted', 'inbox:cleared']);
+  expect(roots.every(root => root.endTime)).toBe(true);
+});
+
+it('keeps active cancellation and retained replacement in distinct linked task traces', async () => {
+  const captured: unknown[] = [];
+  const collector = await startFakeIngestion(captured);
+  cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
+  const f = await boot({ langfuseUrl: `http://127.0.0.1:${collector.address().port}`, script: ['hang', textResponse('replacement'), textResponse('ordinary')] });
+  const active = await f.send('active');
+  await expect.poll(() => f.adapter.requests.length).toBe(1);
+  const ordinary = await f.send('ordinary');
+  await f.send('steering', { target: 'next-step' }, active.id);
+  await f.inbox.cancel(active.id, { retainInbox: true });
+  const agent = await f.inbox.resolve('native-test');
+  await agent.whenIdle();
+  const resumed = await f.inbox.wake('native-test', { resume: true });
+  await agent.whenIdle();
+  for (const id of resumed) await f.completed(id);
+  await f.completed(ordinary.id);
+  await f.ctx.parallel('session/flush', agent.session);
+  const observations = capturedToObservations(captured);
+  const roots = observations.filter(observation => observation.name === 'a2a-task');
+  expect(roots).toHaveLength(3);
+  const canceled = roots.find(root => root.metadata.taskId === active.id);
+  expect(canceled.metadata.taskState).toBe('canceled');
+  expect(observations.filter(observation => observation.parentObservationId === canceled.id).map(observation => observation.name)).toEqual(expect.arrayContaining(['inbox:admitted', 'inbox:paused', 'agent:turn', 'inbox:canceled']));
+  const turn = observations.find(observation => observation.name === 'agent:turn' && observation.parentObservationId === canceled.id);
+  const raw = captured.find(span => span.spanId === canceled.id);
+  expect(BigInt(raw.endTimeUnixNano)).toBeGreaterThanOrEqual(BigInt(turn.endTime));
+  const replacement = roots.find(root => root.metadata.taskId === resumed[0]);
+  expect(JSON.parse(replacement.metadata.referenceTaskIds)).toContain(active.id);
+  expect(observations.filter(observation => observation.parentObservationId === replacement.id).map(observation => observation.name)).toEqual(expect.arrayContaining(['inbox:reassigned', 'inbox:resume', 'agent:turn', 'inbox:completed']));
+  expect(new Set(roots.map(root => root.traceId)).size).toBe(3);
+});
 
 it('rediscovers late inbox traces and filters admissions through the Langfuse read-back API', async () => {
   const queries: URLSearchParams[] = [];
@@ -754,12 +828,17 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable i
         const waitMs = Number(root?.metadata?.waitMs);
         if (!Number.isFinite(waitMs) || waitMs < 0) problems.push('missing queue wait on execution root');
         if (root?.input !== prompts[index] || root?.output !== replies[index + 1]) problems.push('missing readable turn conversation');
-        if (!observations.some(observation => observation.name === 'inbox:prepare' && observation.parentObservationId === root?.id)) problems.push('missing preparation child');
-        const generations = observations.filter(observation => observation.type === 'GENERATION' && observation.parentObservationId === root?.id);
+        const turn = observations.find(observation => observation.name === 'agent:turn' && observation.parentObservationId === root?.id);
+        if (!turn?.endTime || root?.metadata?.taskState !== 'completed') problems.push('missing completed lifecycle and ended turn');
+        for (const phase of ['admitted', 'paused', 'resume', 'completed']) {
+          if (!observations.some(observation => observation.name === `inbox:${phase}` && observation.parentObservationId === root?.id)) problems.push(`missing task child ${phase}`);
+        }
+        if (!observations.some(observation => observation.name === 'inbox:prepare' && observation.parentObservationId === turn?.id)) problems.push('missing preparation child');
+        const generations = observations.filter(observation => observation.type === 'GENERATION' && observation.parentObservationId === turn?.id);
         if (generations.length !== (index === 0 ? 2 : 1)) problems.push('wrong number of model steps');
         const steering = observations.find(observation => observation.name === 'inbox:steering');
         if (index === 0) {
-          if (!steering?.endTime || steering.parentObservationId !== root?.id || steering.input !== steeringText ||
+          if (!steering?.endTime || steering.parentObservationId !== turn?.id || steering.input !== steeringText ||
             steering.metadata?.taskId !== tasks[0].id || steering.metadata?.messageId !== steeringId ||
             steering.metadata?.target !== 'next-step' || Number(steering.metadata?.turn) !== 1 || Number(steering.metadata?.step) !== 2) problems.push('missing steering content/ownership/application step');
           if (!generations.some(generation => JSON.stringify(generation.input ?? '').includes(steeringId))) problems.push('steering never reached the model request');
@@ -770,4 +849,13 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable i
     expect(result.ok, result.state).toBe(true);
     console.log(`Langfuse inbox ${contextId}: ${result.state}`);
   }));
+  const cancellation = await runVerification({ baseUrl, publicKey, secretKey, fromStartTime, toStartTime, codeword: canceled.id, observationName: 'inbox:canceled',
+    evaluate(observations) {
+      const root = observations.find(observation => observation.name === 'dsh-inbox' && observation.metadata?.taskId === canceled.id);
+      const phases = observations.filter(observation => observation.parentObservationId === root?.id).map(observation => observation.name);
+      return root?.endTime && root.metadata?.taskState === 'canceled' && ['inbox:admitted', 'inbox:paused', 'inbox:canceled'].every(phase => phases.includes(phase)) && !observations.some(observation => observation.type === 'GENERATION' || observation.name === 'agent:turn') ? [] : ['missing complete queued cancellation lifecycle'];
+    },
+  });
+  expect(cancellation.ok, cancellation.state).toBe(true);
+  console.log(`Langfuse canceled inbox ${contextId}: ${cancellation.state}`);
 }, 6 * 60_000);

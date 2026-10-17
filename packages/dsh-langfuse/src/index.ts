@@ -16,6 +16,8 @@
  *   (`turn/start` opens a root span — in the v5 SDK the root observation IS
  *   the trace — the turn's first `user/message` sets the input, `turn/end`
  *   stamps the end reason and ends the root, which is what exports it).
+ * - Native A2A inbox tasks own a trace spanning admission through task termination;
+ *   agent turns and queue controls are children of that task.
  * - subagent child sessions (`session/created` with `header.parentSession`)
  *   ride the parent's trace: a `subagent` **span** opened under the enclosing
  *   delegation tool span, the child's generations/tool spans nested under it,
@@ -29,6 +31,7 @@
  * @module dsh-langfuse
  */
 
+import { createHash } from 'node:crypto';
 import type { Context, Events } from '@deepseek-ai/cordis';
 import type {
   ContentBlock,
@@ -64,6 +67,7 @@ interface A2aInboxEvent {
   taskId?: string;
   taskIds?: string[];
   messageId?: string;
+  referenceTaskIds?: string[];
   nativeMessageId?: string;
   queuedAt?: number;
   selectedAt?: number;
@@ -150,6 +154,7 @@ interface HookObservation {
 
 /** Per-session open turn trace. */
 interface SessionTrace {
+  taskKey?: string;
   trace: NonNullable<ObservationHandle>;
   /** Whether the trace input was set — the turn's first `user/message` wins. */
   hasInput: boolean;
@@ -157,6 +162,21 @@ interface SessionTrace {
   lastAssistantText?: string;
   hadErrors?: boolean;
   turn?: number;
+}
+
+interface InboxTaskTrace {
+  key: string;
+  contextId: string;
+  taskId: string;
+  trace: ObservationHandle;
+  hasInput: boolean;
+  messageIds: Set<string>;
+  nativeMessageIds: Set<string>;
+  selectedAt?: number;
+  waitMs?: number;
+  lastOutput?: string;
+  openTurns: number;
+  end?: { phase: string; at: number; output: unknown; level: ObservationLevel };
 }
 
 /**
@@ -326,6 +346,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   const nativeInboxes = new Set<string>();
   const pendingTurns = new Map<string, { turn: number; startTime: Date }>();
   const inboxInputs = new Map<string, A2aInboxEvent[]>();
+  const inboxTasks = new Map<string, InboxTaskTrace>();
   const children = new Map<string, ChildSession>();
   const completedTurns = new Map<
     string,
@@ -423,6 +444,108 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     return reporter.openTrace({ name: config.traceName, sessionId, metadata, context, startTime });
   }
 
+  const inboxKey = (contextId: string, taskId: string) => JSON.stringify([contextId, taskId]);
+
+  function taskTrace(event: A2aInboxEvent): InboxTaskTrace | undefined {
+    if (!event.taskId) return;
+    const key = inboxKey(event.contextId, event.taskId);
+    let task = inboxTasks.get(key);
+    if (!task) {
+      const context = traceContexts.get(event.contextId);
+      traceContexts.delete(event.contextId);
+      task = {
+        key,
+        contextId: event.contextId,
+        taskId: event.taskId,
+        trace: reporter.openTrace({
+          name: config.traceName === 'dsh-turn' ? 'a2a-task' : config.traceName,
+          sessionId: event.contextId,
+          metadata: { taskId: event.taskId, taskState: 'queued' },
+          traceId: createHash('sha256').update(key).digest('hex').slice(0, 32),
+          startTime: new Date(event.queuedAt ?? event.at),
+        }),
+        hasInput: false,
+        messageIds: new Set(),
+        nativeMessageIds: new Set(),
+        openTurns: 0,
+      };
+      if (context) reporter.updateContext(task.trace, context);
+      inboxTasks.set(key, task);
+    }
+    if (event.messageId) task.messageIds.add(event.messageId);
+    if (event.nativeMessageId) task.nativeMessageIds.add(event.nativeMessageId);
+    if (!task.hasInput && config.captureContent && event.input) {
+      reporter.updateSpan(task.trace, { input: event.input });
+      task.hasInput = true;
+    }
+    reporter.updateSpan(task.trace, {
+      metadata: {
+        referenceTaskIds: event.referenceTaskIds?.length ? event.referenceTaskIds : undefined,
+        a2aMessageIds: [...task.messageIds],
+        nativeMessageIds: [...task.nativeMessageIds],
+      },
+    });
+    return task;
+  }
+
+  function closeTask(task: InboxTaskTrace, endedAt = new Date()): void {
+    if (!task.end || task.openTurns) return;
+    const end = task.end;
+    if (inboxInputs.get(task.contextId)?.[0]?.taskId === task.taskId)
+      inboxInputs.delete(task.contextId);
+    if (inboxTasks.get(task.key) === task) inboxTasks.delete(task.key);
+    afterMedia(
+      task.trace,
+      (at) =>
+        reporter.endSpan(
+          task.trace,
+          {
+            output:
+              end.phase === 'completed' && config.captureContent && task.lastOutput !== undefined
+                ? task.lastOutput
+                : end.output,
+            level: end.level,
+            metadata: { taskState: end.phase },
+          },
+          at,
+        ),
+      new Date(Math.max(end.at, endedAt.getTime())),
+    );
+  }
+
+  function endTurn(
+    state: SessionTrace,
+    update: Parameters<LangfuseReporter['endSpan']>[1] = {},
+    endedAt?: Date,
+  ): void {
+    const task = state.taskKey ? inboxTasks.get(state.taskKey) : undefined;
+    if (task && state.lastAssistantText !== undefined) task.lastOutput = state.lastAssistantText;
+    afterMedia(
+      state.trace,
+      (at) => {
+        reporter.endSpan(state.trace, update, at);
+        if (task) {
+          task.openTurns--;
+          closeTask(task, at);
+        }
+      },
+      endedAt,
+    );
+  }
+
+  function suspendTasks(contextId?: string): void {
+    for (const task of [...inboxTasks.values()]) {
+      if (contextId !== undefined && task.contextId !== contextId) continue;
+      task.end ??= {
+        phase: 'suspended',
+        at: Date.now(),
+        output: { state: 'suspended' },
+        level: 'DEFAULT',
+      };
+      closeTask(task);
+    }
+  }
+
   function rootSessionId(sessionId: string | undefined): string | undefined {
     while (sessionId && children.has(sessionId))
       sessionId = children.get(sessionId)?.parentSessionId;
@@ -464,6 +587,27 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     if (existing) return existing.trace;
     const pending = id ? pendingTurns.get(id) : undefined;
     const turn = pending?.turn;
+    if (id && nativeInboxes.has(id)) {
+      const selected = inboxInputs.get(id)?.[0];
+      const task = selected ? taskTrace(selected) : undefined;
+      if (!task || task.end) return null;
+      const context = traceContexts.get(id);
+      if (context) {
+        reporter.updateContext(task.trace, context);
+        traceContexts.delete(id);
+      }
+      const trace = reporter.startSpan(task.trace, {
+        name: 'agent:turn',
+        metadata: { turn, taskId: task.taskId },
+        startTime: pending?.startTime,
+      });
+      pendingTurns.delete(id);
+      if (trace) {
+        task.openTurns++;
+        sessions.set(id, { trace, hasInput: turn === undefined, turn, taskKey: task.key });
+      }
+      return trace;
+    }
     const trace = openTrace(id, turn === undefined ? undefined : { turn }, pending?.startTime);
     if (id) pendingTurns.delete(id);
     // hasInput starts true: one-offs never take a turn's first-message input.
@@ -512,6 +656,15 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         agentStatus: event.agentStatus,
       };
       if (event.phase === 'selected') {
+        const task = taskTrace(event);
+        if (task && task.selectedAt === undefined) {
+          task.selectedAt = event.selectedAt ?? event.at;
+          task.waitMs = waitMs;
+        }
+        if (task)
+          reporter.updateSpan(task.trace, {
+            metadata: { taskState: 'running', waitMs: task.waitMs },
+          });
         const inputs = inboxInputs.get(id) ?? [];
         if (!inputs.some((input) => input.nativeMessageId === event.nativeMessageId))
           inputs.push(event);
@@ -561,14 +714,43 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         );
         return;
       }
-      const operation = reporter.openTrace({
-        name: `inbox:${event.phase}`,
-        startTime: new Date(event.at),
-        sessionId: id,
-        metadata,
-      });
-      reporter.updateSpan(operation, { input });
-      reporter.endSpan(operation, { output }, new Date(event.at));
+      const tasks = event.taskId
+        ? [
+            ['completed', 'failed', 'canceled'].includes(event.phase)
+              ? inboxTasks.get(inboxKey(id, event.taskId))
+              : taskTrace(event),
+          ].filter((task): task is InboxTaskTrace => !!task)
+        : [...inboxTasks.values()].filter(
+            (task) =>
+              task.contextId === id &&
+              !task.end &&
+              (event.taskIds === undefined || event.taskIds.includes(task.taskId)),
+          );
+      for (const task of tasks) {
+        if (task.end) continue;
+        const details = { ...metadata, taskId: task.taskId };
+        const operation = reporter.startSpan(task.trace, {
+          name: `inbox:${event.phase}`,
+          input,
+          startTime: new Date(event.at),
+          metadata: details,
+        });
+        reporter.endSpan(operation, { output }, new Date(event.at));
+        const phase = event.phase === 'cleared' ? 'canceled' : event.phase;
+        if (['completed', 'failed', 'canceled'].includes(phase)) {
+          task.end = {
+            phase,
+            at: event.at,
+            output: { ...output, state: phase },
+            level: phase === 'failed' ? 'ERROR' : phase === 'canceled' ? 'WARNING' : 'DEFAULT',
+          };
+          closeTask(task, new Date(event.at));
+        } else
+          reporter.updateSpan(task.trace, {
+            metadata: { taskState: event.phase === 'paused' ? 'paused' : undefined },
+          });
+      }
+      if (event.phase === 'disposed') suspendTasks(id);
       if (event.phase === 'disposed' || event.phase === 'cleared') {
         nativeInboxes.delete(id);
         inboxInputs.delete(id);
@@ -643,8 +825,8 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   });
 
   // ------------------------------------------------------------------
-  // Trace lifecycle: one trace per turn (top-level sessions only — child
-  // sessions ride the parent's trace under their subagent span).
+  // Turn lifecycle: native tasks keep their root across turns; other sessions
+  // open one trace per turn. Subagents stay under their parent's trace.
   // ------------------------------------------------------------------
   ctx.on('session/event', (session, event) => {
     const sessionId: string = session.id;
@@ -811,7 +993,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         // keep what it already recorded.
         closeHooks(sessionId, true);
         const stale = sessions.get(sessionId);
-        if (stale) afterMedia(stale.trace, (endedAt) => reporter.endSpan(stale.trace, {}, endedAt));
+        if (stale) endTurn(stale);
         inboxInputs.delete(sessionId);
         if (nativeInboxes.has(sessionId)) {
           sessions.delete(sessionId);
@@ -843,37 +1025,30 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         if (state) {
           sessions.delete(sessionId);
           rememberTurn(sessionId, event.data.turn, state.trace, state.trace);
-          // The turn's final answer becomes the trace's output; ending the
-          // root span is what exports the trace (v5 exports spans on end).
-          afterMedia(state.trace, (endedAt) =>
-            reporter.endSpan(
-              state.trace,
-              {
-                output: state.lastAssistantText,
-                level:
-                  event.data.reason.kind === 'error'
-                    ? 'ERROR'
-                    : ['aborted', 'blocked', 'max-tokens', 'interrupted'].includes(
-                          event.data.reason.kind,
-                        )
-                      ? 'WARNING'
-                      : 'DEFAULT',
-                statusMessage:
-                  event.data.reason.kind === 'error'
-                    ? contentMessage(config, event.data.reason.error.message)
-                    : undefined,
-                metadata: {
-                  turn: event.data.turn,
-                  endReason: event.data.reason.kind,
-                  ...(state.hadErrors ? { hadErrors: true } : {}),
-                  ...(event.data.reason.kind === 'error'
-                    ? { errorCode: event.data.reason.error.code }
-                    : {}),
-                },
-              },
-              endedAt,
-            ),
-          );
+          // Native task roots stay open until the A2A terminal signal.
+          endTurn(state, {
+            output: state.lastAssistantText,
+            level:
+              event.data.reason.kind === 'error'
+                ? 'ERROR'
+                : ['aborted', 'blocked', 'max-tokens', 'interrupted'].includes(
+                      event.data.reason.kind,
+                    )
+                  ? 'WARNING'
+                  : 'DEFAULT',
+            statusMessage:
+              event.data.reason.kind === 'error'
+                ? contentMessage(config, event.data.reason.error.message)
+                : undefined,
+            metadata: {
+              turn: event.data.turn,
+              endReason: event.data.reason.kind,
+              ...(state.hadErrors ? { hadErrors: true } : {}),
+              ...(event.data.reason.kind === 'error'
+                ? { errorCode: event.data.reason.error.code }
+                : {}),
+            },
+          });
         }
         break;
       }
@@ -897,7 +1072,8 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     // End an abandoned root (crash-orphaned turn or between-turns one-off
     // trace) — v5 spans only export on end, so dropping it open would lose
     // everything it recorded.
-    if (state) afterMedia(state.trace, (endedAt) => reporter.endSpan(state.trace, {}, endedAt));
+    if (state) endTurn(state);
+    suspendTasks(sessionId);
     // Children: keep the entry — background/continuable subagents dispose
     // their session BEFORE subagent/end fires, and the span's close must ride
     // subagent/end (disposing first would either leak the span or close it
@@ -1229,12 +1405,15 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       // End every tracked observation still open before shutting the exporter
       // down — v5 spans only export on end, so unloading mid-turn (profile
       // reload) would otherwise silently drop them.
-      for (const state of sessions.values()) reporter.endSpan(state.trace, {}, endedAt);
+      for (const state of sessions.values()) endTurn(state, {}, endedAt);
+      suspendTasks();
+      await drainMedia();
       for (const child of children.values()) reporter.endSpan(child.span, {}, endedAt);
       sessions.clear();
       pendingTurns.clear();
       nativeInboxes.clear();
       inboxInputs.clear();
+      inboxTasks.clear();
       completedTurns.clear();
       traceContexts.clear();
       children.clear();

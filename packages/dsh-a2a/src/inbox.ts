@@ -36,6 +36,7 @@ export interface A2aInboxEvent {
   taskId?: string;
   taskIds?: string[];
   messageId?: string;
+  referenceTaskIds?: string[];
   nativeMessageId?: string;
   queuedAt?: number;
   selectedAt?: number;
@@ -276,9 +277,14 @@ export class NativeInbox implements A2aInbox {
           agentStatus: run.entry.handle.agent.status,
           taskIds: [
             ...new Set(
-              pending.flatMap((message) =>
-                message.source.kind === 'a2a' ? [message.source.taskId] : [],
-              ),
+              [...run.tasks.values()]
+                .filter((task) => !task.settled)
+                .map((task) => task.task.id)
+                .concat(
+                  pending.flatMap((message) =>
+                    message.source.kind === 'a2a' ? [message.source.taskId] : [],
+                  ),
+                ),
             ),
           ],
           ...fields,
@@ -307,6 +313,7 @@ export class NativeInbox implements A2aInbox {
         position: position < 0 ? undefined : position + 1,
         taskId: message.source.taskId,
         messageId: original.messageId,
+        referenceTaskIds: original.referenceTaskIds,
         nativeMessageId: message.id,
         queuedAt: message.source.queuedAt,
         ...fields,
@@ -329,10 +336,19 @@ export class NativeInbox implements A2aInbox {
   }
 
   private task(task: Task, bus: ExecutionEventBus, context: ServerCallContext): TaskRun {
-    let finish!: () => void;
+    let complete!: () => void;
+    let finished = false;
     const done = new Promise<void>((resolve) => {
-      finish = resolve;
+      complete = resolve;
     });
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      const phase = this.outcome(task);
+      const run = this.contexts.get(task.contextId);
+      if (phase && run) this.observe(phase, run, { taskId: task.id });
+      complete();
+    };
     return {
       task,
       translator: new SessionTranslator(task.id, task.contextId),
@@ -421,6 +437,16 @@ export class NativeInbox implements A2aInbox {
     if (!snapshot || this.terminal(snapshot)) return;
     const run = await this.context(snapshot.contextId);
     if (!run.tasks.has(taskId)) this.restoreTask(run, snapshot, context);
+  }
+
+  private outcome(task: Task): 'completed' | 'failed' | 'canceled' | undefined {
+    if (task.status?.state === TaskState.TASK_STATE_COMPLETED) return 'completed';
+    if (task.status?.state === TaskState.TASK_STATE_CANCELED) return 'canceled';
+    if (
+      task.status?.state === TaskState.TASK_STATE_FAILED ||
+      task.status?.state === TaskState.TASK_STATE_REJECTED
+    )
+      return 'failed';
   }
 
   private terminal(task: Task): boolean {
@@ -584,6 +610,7 @@ export class NativeInbox implements A2aInbox {
       bus.publish(AgentEvent.task(snapshot));
       bus.publish(terminalStatusUpdate(taskId, contextId, 'failed', text));
       if (task) {
+        task.task.status = snapshot.status;
         task.settled = true;
         task.controller.abort();
         task.finish();
@@ -898,14 +925,17 @@ export class NativeInbox implements A2aInbox {
         original.referenceTaskIds = [...new Set([...original.referenceTaskIds, oldId])];
         replacement.history.push(original);
         await this.checkpoint(replacement, context);
-        run.entry.handle.agent.inbox.replace(message.id, {
+        this.observe(this.outcome(task)!, run, { taskId: oldId });
+        const replacementInput = {
           ...message,
           source: {
             ...message.source,
             taskId: id,
             message: JSON.stringify(Message.toJSON(original)),
           },
-        });
+        };
+        run.entry.handle.agent.inbox.replace(message.id, replacementInput);
+        this.observeInput('reassigned', run, replacementInput);
         task = replacement;
       }
       tasks.add(id);
@@ -981,6 +1011,7 @@ export class NativeInbox implements A2aInbox {
     if (options.retainInbox) {
       run.paused = true;
       (run.entry.handle.agent.inbox as DurableInbox).setPaused(true);
+      this.observe('paused', run);
     } else {
       for (const message of this.pending(run))
         if (message.source.kind === 'a2a' && message.source.taskId === taskId)
@@ -1006,7 +1037,6 @@ export class NativeInbox implements A2aInbox {
         await this.checkpoint(structuredClone(task.task), task.context);
       }
     } finally {
-      this.observe('canceled', run, { taskId });
       task.bus.publish(task.final);
       task.finish();
     }
@@ -1017,11 +1047,24 @@ export class NativeInbox implements A2aInbox {
     await this.resolving.get(contextId);
     const run = this.contexts.get(contextId);
     if (!run) return;
+    const taskIds = [
+      ...new Set(
+        [...run.tasks.values()]
+          .filter((task) => !task.settled)
+          .map((task) => task.task.id)
+          .concat(
+            this.pending(run).flatMap((message) =>
+              message.source.kind === 'a2a' ? [message.source.taskId] : [],
+            ),
+          ),
+      ),
+    ];
     run.paused = true;
     for (const admission of run.admissions) admission.abort();
     run.entry.handle.agent.inbox.clear();
     run.entry.handle.agent.cancel({ kind: 'user' });
     await run.entry.handle.agent.whenIdle();
+    this.observe('cleared', run, { taskIds });
     for (const task of run.tasks.values()) {
       if (!task.settled)
         task.bus.publish(
@@ -1032,13 +1075,13 @@ export class NativeInbox implements A2aInbox {
       task.finish();
     }
     await this.flush(run.entry.handle.agent.session);
-    this.observe('cleared', run);
     this.contexts.delete(contextId);
   }
 
   onDisposed(session: Session): void {
     const run = this.contexts.get(session.id);
     if (!run) return;
+    this.observe('disposed', run);
     for (const admission of run.admissions) admission.abort();
     for (const task of run.tasks.values()) {
       // Disposal interrupts transport ownership; retained durable input keeps its task state.
@@ -1046,7 +1089,6 @@ export class NativeInbox implements A2aInbox {
       task.controller.abort();
       task.finish();
     }
-    this.observe('disposed', run);
     this.contexts.delete(session.id);
   }
 
@@ -1078,6 +1120,7 @@ export class NativeInbox implements A2aInbox {
         } catch (error) {
           failures.push(error);
         } finally {
+          this.observe('disposed', run);
           for (const task of run.tasks.values()) {
             task.controller.abort();
             task.finish();
