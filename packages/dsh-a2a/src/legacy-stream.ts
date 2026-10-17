@@ -70,7 +70,7 @@ export function legacyStreamHandler(requestHandler: A2ARequestHandler): RequestH
         };
         if (!first.done && write(first.value)) return;
         for await (const event of stream) {
-          if (res.destroyed) break;
+          if (res.destroyed) continue; // Keep the SDK consuming results after its client leaves.
           if (write(event)) return;
         }
         // A cold subscription has no live bus: the SDK ends after the snapshot.

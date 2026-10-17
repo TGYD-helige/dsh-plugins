@@ -19,9 +19,11 @@ import {
   A2A_PROTOCOL_VERSION,
   AGENT_CARD_PATH,
   type AgentCard,
+  type AgentExtension,
   type AgentInterface,
   type Message,
   type StreamResponse,
+  type Task,
   TaskState,
 } from '@a2a-js/sdk';
 import { duplicateInterfacesForLegacy } from '@a2a-js/sdk/compat/v0_3';
@@ -31,6 +33,8 @@ import {
   type AgentExecutor,
   DefaultExecutionEventBus,
   DefaultRequestHandler,
+  ExecutionEventQueue,
+  ResultManager,
   ServerCallContext,
   STATE_HEADERS_KEY,
   type TaskStore,
@@ -40,6 +44,7 @@ import express, { type RequestHandler } from 'express';
 import { legacyStreamHandler } from './legacy-stream.js';
 
 export interface A2aServerOptions {
+  extensions?: AgentExtension[];
   host: string;
   port: number;
   basePath: string;
@@ -55,9 +60,16 @@ export interface A2aServerOptions {
   heartbeat?: { enabled: boolean; intervalMs: number };
   approvalGuard?: (message: Message) => undefined | (() => void);
   beforeWorkingTaskMessage?: (message: Message, requestHeaders: unknown) => Promise<void>;
+  beforeMessage?: (
+    message: Message,
+    context: ServerCallContext,
+  ) => Promise<undefined | (() => void)>;
+  beforeTask?: (taskId: string, context: ServerCallContext) => Promise<void>;
 }
 
 export interface A2aServer {
+  /** Reattach persistence and task subscriptions without admitting another message. */
+  restoreTask(task: Task, context: ServerCallContext): DefaultExecutionEventBus;
   /** The bound port (differs from options.port when 0). */
   port: number;
   close(): Promise<void>;
@@ -106,7 +118,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     capabilities: {
       streaming: true,
       pushNotifications: false,
-      extensions: [],
+      extensions: options.extensions ?? [],
       extendedAgentCard: false,
     },
     securitySchemes: {},
@@ -245,12 +257,23 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     }
   };
   const requestHandler = new (class extends DefaultRequestHandler {
+    private async beforeMessage(message: Message | undefined, context: ServerCallContext) {
+      if (!message) return;
+      try {
+        return await options.beforeMessage?.(message, context);
+      } catch (error) {
+        throw new RequestMalformedError(error instanceof Error ? error.message : String(error));
+      }
+    }
     override async sendMessage(...args: Parameters<DefaultRequestHandler['sendMessage']>) {
       const release = guardApproval(args[0].message);
+      let releaseAdmission: undefined | (() => void);
       try {
         if (!release) await beforeWorkingTaskMessage(args[0].message, args[1]);
+        if (!release) releaseAdmission = await this.beforeMessage(args[0].message, args[1]);
         return await approvalReply.run(Boolean(release), () => super.sendMessage(...args));
       } finally {
+        releaseAdmission?.();
         release?.();
       }
     }
@@ -259,8 +282,10 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       ...args: Parameters<DefaultRequestHandler['sendMessageStream']>
     ) {
       const release = guardApproval(args[0].message);
+      let releaseAdmission: undefined | (() => void);
       try {
         if (!release) await beforeWorkingTaskMessage(args[0].message, args[1]);
+        if (!release) releaseAdmission = await this.beforeMessage(args[0].message, args[1]);
         const stream = observeTask(super.sendMessageStream(...args));
         try {
           if (release) {
@@ -272,13 +297,20 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
           if (release) await stream.return(undefined);
         }
       } finally {
+        releaseAdmission?.();
         release?.();
       }
+    }
+
+    override async cancelTask(...args: Parameters<DefaultRequestHandler['cancelTask']>) {
+      await options.beforeTask?.(args[0].id, args[1]);
+      return super.cancelTask(...args);
     }
 
     override async *resubscribe(
       ...args: Parameters<DefaultRequestHandler['resubscribe']>
     ): AsyncGenerator<StreamResponse, void, undefined> {
+      await options.beforeTask?.(args[0].id, args[1]);
       const task = taskBuses.get(args[0].id);
       if (!task) {
         yield* observeTask(super.resubscribe(...args));
@@ -517,6 +549,21 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
   });
 
   return {
+    restoreTask(task: Task, context: ServerCallContext) {
+      const bus = busManager.createOrGetByTaskId(task.id);
+      const queue = new ExecutionEventQueue(bus);
+      const result = new ResultManager(options.taskStore, context);
+      void (async () => {
+        try {
+          for await (const event of queue.events()) await result.processEvent(event);
+        } catch (error) {
+          console.error('[dsh-a2a] restored task persistence failed:', error);
+        } finally {
+          queue.stop();
+        }
+      })();
+      return bus;
+    },
     port: (server.address() as AddressInfo).port,
     close: () =>
       new Promise<void>((resolve) => {

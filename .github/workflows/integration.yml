@@ -171,6 +171,50 @@ jobs:
         run: |
           echo "::warning::DSH_INTEGRATION_BASE_URL or DSH_INTEGRATION_API_KEY secret not set — skipping Stage B."
 
+  native-inbox:
+    name: E2E (dsh-a2a.inbox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile=false
+
+      # shortcut: native inbox is unreleased; replace this source checkout and
+      # companion patch with a published runtime once its capability ships.
+      # No installed dependency artifacts are modified. The base leg needs no secrets.
+      - uses: actions/checkout@v7
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: 687f282e8625c6b8d11ff58211a90524be2e4317
+          path: .native-inbox-upstream
+          persist-credentials: false
+      - name: Apply native inbox source companion
+        run: git -C .native-inbox-upstream apply --unidiff-zero "$GITHUB_WORKSPACE/.github/scripts/integration/fixtures/native-inbox.patch"
+      - name: Prepare source runtime
+        working-directory: .native-inbox-upstream
+        run: |
+          npm exec --yes --package=pnpm@11.28.5 -- pnpm install --frozen-lockfile --ignore-scripts
+          npm exec --yes --package=pnpm@11.28.5 -- pnpm run build:native-system
+      - name: Verify queue insertion over A2A HTTP and JSONL
+        env:
+          DSH_SOURCE_ROOT: ${{ github.workspace }}/.native-inbox-upstream
+        run: node .github/scripts/check-native-inbox.mjs
+
+      - name: Verify real Langfuse inbox ingestion
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          DSH_SOURCE_ROOT: ${{ github.workspace }}/.native-inbox-upstream
+          DSH_INBOX_LANGFUSE_LIVE: 'true'
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
+        run: node .github/scripts/check-native-inbox.mjs
+
   scenario-backends:
     name: E2E (${{ matrix.package }}-${{ matrix.provider }})
     needs: detect

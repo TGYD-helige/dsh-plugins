@@ -50,8 +50,30 @@ import { displayBlocks } from './media.js';
 export type { LangfuseTraceContext } from './client.js';
 export { appendHookEvent, type HookInvoked, type HookResult } from './hooks.js';
 
+/** Optional protocol telemetry; no dependency on the A2A plugin. */
+interface A2aInboxEvent {
+  phase: string;
+  contextId: string;
+  at: number;
+  pending: number;
+  target?: 'next-turn' | 'next-step';
+  input?: string;
+  position?: number;
+  paused?: boolean;
+  agentStatus?: string;
+  taskId?: string;
+  taskIds?: string[];
+  messageId?: string;
+  nativeMessageId?: string;
+  queuedAt?: number;
+  selectedAt?: number;
+  turn?: number;
+  step?: number;
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Events {
+    'a2a/inbox'(detail: A2aInboxEvent): void;
     /** Bind standard labels/parent context before a session's next trace starts. */
     'langfuse/context': (sessionId: string, context: LangfuseTraceContext) => void;
   }
@@ -301,6 +323,9 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
 
   const reporter = new LangfuseReporter(config);
   const sessions = new Map<string, SessionTrace>();
+  const nativeInboxes = new Set<string>();
+  const pendingTurns = new Map<string, { turn: number; startTime: Date }>();
+  const inboxInputs = new Map<string, A2aInboxEvent[]>();
   const children = new Map<string, ChildSession>();
   const completedTurns = new Map<
     string,
@@ -388,10 +413,14 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     });
   });
 
-  function openTrace(sessionId: string | undefined, metadata?: Record<string, unknown>) {
+  function openTrace(
+    sessionId: string | undefined,
+    metadata?: Record<string, unknown>,
+    startTime?: Date,
+  ) {
     const context = sessionId ? traceContexts.get(sessionId) : undefined;
     if (sessionId) traceContexts.delete(sessionId);
-    return reporter.openTrace({ name: config.traceName, sessionId, metadata, context });
+    return reporter.openTrace({ name: config.traceName, sessionId, metadata, context, startTime });
   }
 
   function rootSessionId(sessionId: string | undefined): string | undefined {
@@ -433,9 +462,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     const id = rootSessionId(sessionId);
     const existing = id ? sessions.get(id) : undefined;
     if (existing) return existing.trace;
-    const trace = openTrace(id);
+    const pending = id ? pendingTurns.get(id) : undefined;
+    const turn = pending?.turn;
+    const trace = openTrace(id, turn === undefined ? undefined : { turn }, pending?.startTime);
+    if (id) pendingTurns.delete(id);
     // hasInput starts true: one-offs never take a turn's first-message input.
-    if (trace && id) sessions.set(id, { trace, hasInput: true });
+    if (trace && id) sessions.set(id, { trace, hasInput: turn === undefined, turn });
     return trace;
   }
 
@@ -447,6 +479,104 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     const child = sessionId ? children.get(sessionId) : undefined;
     return child?.span ?? traceFor(sessionId);
   }
+
+  ctx.on('a2a/inbox', (event) => {
+    try {
+      const id = event.contextId;
+      nativeInboxes.add(id);
+      if (event.phase === 'resolved') return;
+      const metadata = {
+        taskId: event.taskId,
+        taskIds: event.taskIds,
+        messageId: event.messageId,
+        nativeMessageId: event.nativeMessageId,
+        pending: event.pending,
+        target: event.target,
+        position: event.position,
+        paused: event.paused,
+        agentStatus: event.agentStatus,
+        turn: event.turn,
+        step: event.step,
+      };
+      const input = config.captureContent ? event.input : undefined;
+      const waitMs =
+        event.queuedAt === undefined
+          ? undefined
+          : Math.max(0, (event.selectedAt ?? event.at) - event.queuedAt);
+      const output = {
+        state: event.phase,
+        target: event.target,
+        position: event.position,
+        pending: event.pending,
+        paused: event.paused,
+        agentStatus: event.agentStatus,
+      };
+      if (event.phase === 'selected') {
+        const inputs = inboxInputs.get(id) ?? [];
+        if (!inputs.some((input) => input.nativeMessageId === event.nativeMessageId))
+          inputs.push(event);
+        inboxInputs.set(id, inputs);
+        return;
+      }
+      if (['prepared', 'prepare-failed', 'prepare-aborted'].includes(event.phase)) {
+        const parent = parentFor(id);
+        const inputs = inboxInputs.get(id) ?? [event];
+        const first = inputs[0];
+        const turnWaitMs =
+          first.queuedAt === undefined
+            ? undefined
+            : Math.max(0, (first.selectedAt ?? first.at) - first.queuedAt);
+        reporter.updateSpan(parent, {
+          input: sessions.get(id)?.hasInput ? undefined : input,
+          metadata: {
+            taskId: event.taskId,
+            waitMs: turnWaitMs,
+            a2aMessageIds: inputs.map((input) => input.messageId),
+            nativeMessageIds: inputs.map((input) => input.nativeMessageId),
+          },
+        });
+        const prepare = reporter.startSpan(parent, {
+          name: event.target === 'next-step' ? 'inbox:steering' : 'inbox:prepare',
+          input,
+          startTime: new Date(event.selectedAt ?? event.at),
+          metadata: {
+            ...metadata,
+            waitMs,
+            prepareMs:
+              event.selectedAt === undefined ? undefined : Math.max(0, event.at - event.selectedAt),
+          },
+        });
+        reporter.endSpan(
+          prepare,
+          {
+            output,
+            level:
+              event.phase === 'prepare-failed'
+                ? 'ERROR'
+                : event.phase === 'prepare-aborted'
+                  ? 'WARNING'
+                  : 'DEFAULT',
+          },
+          new Date(event.at),
+        );
+        return;
+      }
+      const operation = reporter.openTrace({
+        name: `inbox:${event.phase}`,
+        startTime: new Date(event.at),
+        sessionId: id,
+        metadata,
+      });
+      reporter.updateSpan(operation, { input });
+      reporter.endSpan(operation, { output }, new Date(event.at));
+      if (event.phase === 'disposed' || event.phase === 'cleared') {
+        nativeInboxes.delete(id);
+        inboxInputs.delete(id);
+      }
+    } catch (error) {
+      console.error('[dsh-langfuse] inbox reporting failed:', error);
+    }
+  });
 
   // ------------------------------------------------------------------
   // Subagent child sessions: session/created precedes both subagent/start
@@ -533,7 +663,9 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       const previous = pending.get(key);
       if (previous?.root) reporter.endSpan(previous.root, { level: 'WARNING' });
       const child = children.get(sessionId);
-      const inTurn = child ? child.turn === data.turn : sessions.get(sessionId)?.turn === data.turn;
+      const inTurn = child
+        ? child.turn === data.turn
+        : (sessions.get(sessionId)?.turn ?? pendingTurns.get(sessionId)?.turn) === data.turn;
       const completed =
         data.invocationId && !inTurn
           ? completedTurns.get(JSON.stringify([sessionId, data.turn]))
@@ -680,6 +812,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         closeHooks(sessionId, true);
         const stale = sessions.get(sessionId);
         if (stale) afterMedia(stale.trace, (endedAt) => reporter.endSpan(stale.trace, {}, endedAt));
+        inboxInputs.delete(sessionId);
+        if (nativeInboxes.has(sessionId)) {
+          sessions.delete(sessionId);
+          pendingTurns.set(sessionId, { turn: event.data.turn, startTime: new Date(event.time) });
+          break;
+        }
         const trace = openTrace(sessionId, { turn: event.data.turn });
         if (trace) sessions.set(sessionId, { trace, hasInput: false, turn: event.data.turn });
         break;
@@ -700,6 +838,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         break;
       }
       case 'turn/end': {
+        if (pendingTurns.has(sessionId)) traceFor(sessionId);
         const state = sessions.get(sessionId);
         if (state) {
           sessions.delete(sessionId);
@@ -747,6 +886,9 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     const state = sessions.get(sessionId);
     sessions.delete(sessionId);
     traceContexts.delete(sessionId);
+    pendingTurns.delete(sessionId);
+    nativeInboxes.delete(sessionId);
+    inboxInputs.delete(sessionId);
     for (const [key, completed] of completedTurns) {
       if (completed.sessionId === sessionId) completedTurns.delete(key);
     }
@@ -1090,6 +1232,9 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       for (const state of sessions.values()) reporter.endSpan(state.trace, {}, endedAt);
       for (const child of children.values()) reporter.endSpan(child.span, {}, endedAt);
       sessions.clear();
+      pendingTurns.clear();
+      nativeInboxes.clear();
+      inboxInputs.clear();
       completedTurns.clear();
       traceContexts.clear();
       children.clear();

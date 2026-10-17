@@ -32,6 +32,11 @@ export class DshAgentExecutor implements AgentExecutor {
   ) {}
 
   async execute(requestContext: RequestContext, eventBus: ExecutionEventBus): Promise<void> {
+    if (this.bridge.inbox && !this.bridge.validateApprovalMessage(requestContext.userMessage)) {
+      return this.bridge.trackExecution(requestContext.contextId, () =>
+        this.bridge.inbox!.execute(requestContext, eventBus),
+      );
+    }
     if (this.bridge.isClearing(requestContext.contextId)) {
       this.suppressTask?.(requestContext.taskId);
     }
@@ -96,7 +101,9 @@ export class DshAgentExecutor implements AgentExecutor {
     // canceled statusUpdate via the translator — a harmless duplicate); the
     // published event moves the persisted shell to canceled through the
     // handler's ResultManager either way.
-    const contextId = this.bridge.cancel(taskId) ?? '';
+    const contextId =
+      (this.bridge.inbox ? await this.bridge.inbox.cancel(taskId) : this.bridge.cancel(taskId)) ??
+      '';
     eventBus.publish(
       terminalStatusUpdate(taskId, contextId, 'canceled', 'Task canceled by request.'),
     );
