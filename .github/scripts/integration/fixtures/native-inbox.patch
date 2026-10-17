@@ -1,0 +1,128 @@
+diff --git a/packages/core/agent-loop/src/agent.ts b/packages/core/agent-loop/src/agent.ts
+index adf2e33d..4a3b60ab 100644
+--- a/packages/core/agent-loop/src/agent.ts
++++ b/packages/core/agent-loop/src/agent.ts
+@@ -162,0 +163,4 @@ export class ReactLoopAgent implements Agent {
++  wake(): void {
++    if (this.inbox.hasPending) this.wakeDriver(this.phase.kind !== 'idle' && this.phase.abort.signal.aborted)
++  }
++
+@@ -214,0 +219 @@ export class ReactLoopAgent implements Agent {
++    if (this.inbox.paused) return
+@@ -271,0 +277,2 @@ export class ReactLoopAgent implements Agent {
++    await this.dispatch.serial('agent/before-assembly', { messages: claimed, ...position, signal })
++    signal.throwIfAborted()
+diff --git a/packages/core/agent-loop/src/inbox.ts b/packages/core/agent-loop/src/inbox.ts
+index ef00887a..3df03721 100644
+--- a/packages/core/agent-loop/src/inbox.ts
++++ b/packages/core/agent-loop/src/inbox.ts
+@@ -21,0 +22 @@ export const inboxProjectionSchema = z.object({
++  paused: z.boolean().optional(),
+@@ -31,0 +33 @@ export const inboxProjectionDefinition = {
++    if (event.type === 'agent/inbox/paused') return { ...state, paused: event.data.paused }
+@@ -51,2 +53,2 @@ export const inboxProjectionDefinition = {
+-        ? { 'next-turn': next, 'next-step': state['next-step'] }
+-        : { 'next-turn': state['next-turn'], 'next-step': next }
++        ? { ...state, 'next-turn': next, 'next-step': state['next-step'] }
++        : { ...state, 'next-turn': state['next-turn'], 'next-step': next }
+@@ -64 +66 @@ export const inboxProjectionDefinition = {
+-  stateVersion: 1,
++  stateVersion: 2,
+@@ -91 +93,8 @@ export class ReactLoopInbox implements InboxContract {
+-  /** Whether either pending-message list contains work. */
++  /** Durable pause intent, restored with the inbox projection. */
++  get paused(): boolean { return this.current().paused === true }
++
++  setPaused(paused: boolean): void {
++    if (paused !== this.paused) this.session.append('agent/inbox/paused', { paused })
++  }
++
++  /** Whether either pending-message list contains runnable work. */
+@@ -94 +103 @@ export class ReactLoopInbox implements InboxContract {
+-    return state['next-turn'].length > 0 || state['next-step'].length > 0
++    return state.paused !== true && (state['next-turn'].length > 0 || state['next-step'].length > 0)
+@@ -98,0 +108 @@ export class ReactLoopInbox implements InboxContract {
++    this.setPaused(false)
+diff --git a/packages/core/agent-loop/src/index.ts b/packages/core/agent-loop/src/index.ts
+index ca4532af..eca55d77 100644
+--- a/packages/core/agent-loop/src/index.ts
++++ b/packages/core/agent-loop/src/index.ts
+@@ -341,0 +342 @@ export class AgentLoop extends Service implements AgentFactory {
++  readonly nativeInboxVersion: 1 = 1
+@@ -504,0 +506 @@ export class AgentLoop extends Service implements AgentFactory {
++    keepInboxOnDispose = false,
+@@ -564 +566 @@ export class AgentLoop extends Service implements AgentFactory {
+-          machine.cancel({ kind: 'disposed' })
++          machine.cancel({ kind: 'disposed' }, { keepInbox: keepInboxOnDispose })
+@@ -782,0 +785 @@ export class AgentLoop extends Service implements AgentFactory {
++        options.keepInboxOnDispose,
+@@ -799,0 +803 @@ export class AgentLoop extends Service implements AgentFactory {
++    keepInboxOnDispose = false,
+@@ -805 +809 @@ export class AgentLoop extends Service implements AgentFactory {
+-      prepared = this.prepare(ownerCtx, id, agentOptions, session, signal, stored?.handle, parentAgent)
++      prepared = this.prepare(ownerCtx, id, agentOptions, session, signal, stored?.handle, parentAgent, keepInboxOnDispose)
+@@ -917,0 +922 @@ export class AgentLoop extends Service implements AgentFactory {
++          options.keepInboxOnDispose,
+diff --git a/packages/core/agent/src/index.ts b/packages/core/agent/src/index.ts
+index dd8d09e6..f7691945 100644
+--- a/packages/core/agent/src/index.ts
++++ b/packages/core/agent/src/index.ts
+@@ -63,0 +64,2 @@ export interface CreateAgentOptions {
++  /** Preserve pending inbox input during owner or factory teardown; defaults false. */
++  readonly keepInboxOnDispose?: boolean
+@@ -125,0 +128,2 @@ export interface ResumeAgentOptions {
++  /** Preserve pending inbox input during owner or factory teardown; defaults false. */
++  readonly keepInboxOnDispose?: boolean
+@@ -171,0 +176,2 @@ export interface AgentFactory {
++  /** Version 1 supports wake, awaited pre-assembly, durable pause, and retained disposal. */
++  readonly nativeInboxVersion?: 1
+@@ -245,0 +252,3 @@ export class AgentRegistry extends Service {
++  /** Native inbox semantics supplied by the installed factory. @returns zero when unsupported, otherwise the supported capability version. */
++  get nativeInboxVersion(): 0 | 1 { return this.factory?.target.nativeInboxVersion ?? 0 }
++
+diff --git a/packages/core/agent/src/runtime-types.ts b/packages/core/agent/src/runtime-types.ts
+index 0fa89afc..3640250d 100644
+--- a/packages/core/agent/src/runtime-types.ts
++++ b/packages/core/agent/src/runtime-types.ts
+@@ -48,0 +49,4 @@ export interface Inbox {
++  /** Durable pause intent. A paused inbox accepts input but never wakes its driver. */
++  readonly paused?: boolean | undefined
++  /** Persist pause intent without inserting input or waking the driver. @param paused - whether future wakes remain parked. */
++  setPaused?(paused: boolean): void
+@@ -215,0 +220,7 @@ declare module './types.ts' {
++    /**
++     * Drive pending inbox input without inserting a message. An empty inbox is a
++     * no-op. Optional because alternative drivers may not implement durable wake.
++     * A wake during aborted activity is deferred until quiescence; disposed
++     * activity never wakes again.
++     */
++    wake?(): void
+@@ -308,0 +320,11 @@ declare module '@deepseek-ai/cordis' {
++    /**
++     * Await selected input preparation before system-prompt assembly.
++     * Rejection aborts the step without committing user messages.
++     * @param payload.agent - the agent assembling its prompt.
++     * @param payload.messages - the batch selected for this step.
++     * @param payload.turn - the open turn.
++     * @param payload.step - the proposed step.
++     * @param payload.signal - cancellation of the active turn.
++     * @mode serial
++     */
++    'agent/before-assembly'(this: Scoped<Agent>, payload: { agent: Agent; messages: UserMessage[]; turn: number; step: number; signal: AbortSignal }): Promise<void> | void
+diff --git a/packages/core/agent/src/types.ts b/packages/core/agent/src/types.ts
+index 5cbc81df..a792fc69 100644
+--- a/packages/core/agent/src/types.ts
++++ b/packages/core/agent/src/types.ts
+@@ -42,0 +43 @@ export interface InboxState {
++  readonly paused?: boolean | undefined
+@@ -53,0 +55 @@ export interface InboxWireState {
++  readonly paused?: boolean | undefined
+@@ -90,0 +93,2 @@ declare module '@deepseek-ai/dsh-session/types' {
++    /** Durable inbox pause intent; queued input remains parked across restore until explicitly resumed. */
++    'agent/inbox/paused': { paused: boolean }
+diff --git a/packages/core/session/src/known-event-types.ts b/packages/core/session/src/known-event-types.ts
+index a0f5c177..86be04aa 100644
+--- a/packages/core/session/src/known-event-types.ts
++++ b/packages/core/session/src/known-event-types.ts
+@@ -23,0 +24 @@ export const KNOWN_SESSION_EVENT_TYPES: ReadonlySet<string> = new Set([
++  'agent/inbox/paused',

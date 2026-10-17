@@ -31,6 +31,8 @@ export function sanitizeTask(task: Task): Task {
 
 /** TaskStore with the optional lifecycle our backends add. */
 export interface ManagedTaskStore extends TaskStore {
+  /** Durable admission checkpoint even when task state has not changed. */
+  checkpoint?(task: Task, context: ServerCallContext): Promise<void>;
   init?(): Promise<void>;
   delete(taskId: string, context: ServerCallContext): Promise<void>;
   close?(): Promise<void>;
@@ -81,6 +83,8 @@ export class MemoryTaskStore implements ManagedTaskStore {
 export class SanitizedTaskStore implements ManagedTaskStore {
   private readonly lastState = new Map<string, TaskState>();
   private readonly writes = new Map<string, Promise<void>>();
+  // Terminal task ids stay guarded until unload, like deleted-id tombstones.
+  private readonly terminalStates = new Map<string, TaskState>();
   private readonly liveHistory = new Map<string, { scope: string; history: Task['history'] }>();
   // ponytail: deleted ids stay tombstoned until plugin unload; use expiring ids if clear volume grows.
   private readonly deleted = new Set<string>();
@@ -92,6 +96,11 @@ export class SanitizedTaskStore implements ManagedTaskStore {
   }
 
   async close(): Promise<void> {
+    let pending: Promise<void>[];
+    do {
+      pending = [...this.writes.values()];
+      await Promise.all(pending);
+    } while ([...this.writes.values()].some((write) => !pending.includes(write)));
     this.liveHistory.clear();
     await this.inner.close?.();
   }
@@ -110,8 +119,25 @@ export class SanitizedTaskStore implements ManagedTaskStore {
     this.writes.delete(taskId);
   }
 
-  async save(task: Task, context: ServerCallContext): Promise<void> {
+  checkpoint(task: Task, context: ServerCallContext): Promise<void> {
+    return this.save(task, context, true);
+  }
+
+  async save(task: Task, context: ServerCallContext, checkpoint = false): Promise<void> {
     if (this.deleted.has(task.id)) return;
+    const state = task.status?.state;
+    const terminal = this.terminalStates.get(task.id);
+    if (terminal !== undefined && state !== terminal) return;
+    if (
+      state !== undefined &&
+      [
+        TaskState.TASK_STATE_COMPLETED,
+        TaskState.TASK_STATE_CANCELED,
+        TaskState.TASK_STATE_FAILED,
+        TaskState.TASK_STATE_REJECTED,
+      ].includes(state)
+    )
+      this.terminalStates.set(task.id, state);
     const history = structuredClone(task.history ?? []);
     const current = task.status?.message;
     if (task.status?.state === TaskState.TASK_STATE_WORKING && current) {
@@ -139,26 +165,32 @@ export class SanitizedTaskStore implements ManagedTaskStore {
       if (index >= 0) history[index] = final;
       else history.push(final);
     }
-    this.liveHistory.set(task.id, {
-      scope: scopeOf(context),
-      history,
-    });
-    const state = task.status?.state;
-    if (state !== undefined && this.lastState.get(task.id) === state) return;
+    const previousHistory = this.liveHistory.get(task.id);
+    const live = { scope: scopeOf(context), history };
+    this.liveHistory.set(task.id, live);
+    if (!checkpoint && state !== undefined && this.lastState.get(task.id) === state) return;
     const write = (this.writes.get(task.id) ?? Promise.resolve()).then(() =>
       this.inner.save(sanitizeTask({ ...task, history }), context),
     );
-    this.writes.set(
-      task.id,
-      write.catch(() => {}),
-    );
-    await write;
+    const tail = write.catch(() => {});
+    this.writes.set(task.id, tail);
+    try {
+      await write;
+    } catch (error) {
+      if (this.liveHistory.get(task.id) === live) {
+        if (previousHistory) this.liveHistory.set(task.id, previousHistory);
+        else this.liveHistory.delete(task.id);
+      }
+      throw error;
+    }
     if (state === TaskState.TASK_STATE_WORKING || state === TaskState.TASK_STATE_SUBMITTED) {
       this.lastState.set(task.id, state);
     } else {
-      this.lastState.delete(task.id);
-      this.writes.delete(task.id);
-      this.liveHistory.delete(task.id);
+      if (this.writes.get(task.id) === tail) {
+        this.lastState.delete(task.id);
+        this.writes.delete(task.id);
+        this.liveHistory.delete(task.id);
+      }
     }
   }
 

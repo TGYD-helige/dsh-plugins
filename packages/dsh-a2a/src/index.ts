@@ -23,6 +23,7 @@ import type {} from '@deepseek-ai/dsh-user-approval/types';
 import Schema from '@deepseek-ai/schemastery';
 import { A2aBridge } from './bridge.js';
 import { DshAgentExecutor } from './executor.js';
+import { INBOX_EXTENSION, NativeInbox } from './inbox.js';
 import { startA2aServer } from './server.js';
 import { GcsTaskStore } from './stores/gcs.js';
 import { RedisTaskStore } from './stores/redis.js';
@@ -31,6 +32,8 @@ import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
 export type { A2aApproval, A2aApprovalCodec, A2aApprovalReply } from './approval.js';
 export { defaultApprovalCodec } from './approval.js';
 export type { A2aFileMaterializer } from './content.js';
+export type { A2aInbox } from './inbox.js';
+export { INBOX_EXTENSION } from './inbox.js';
 export type { SubagentToolSource } from './translator.js';
 
 /** Event emitted when one A2A user message enters the dsh inbox. */
@@ -89,6 +92,9 @@ export const name = 'dsh-a2a';
 export const inject = ['agents'];
 
 export const Config = Schema.object({
+  inbox: Schema.object({ enabled: Schema.boolean().default(false) }).description(
+    'Use durable native inbox execution (requires the upstream native inbox capability).',
+  ),
   enabled: Schema.boolean().default(false),
   host: Schema.string().default('127.0.0.1'),
   port: Schema.natural().default(41241),
@@ -145,6 +151,7 @@ export const Config = Schema.object({
 });
 
 export interface A2aPluginConfig {
+  inbox?: { enabled: boolean };
   enabled: boolean;
   host: string;
   port: number;
@@ -197,7 +204,9 @@ export function apply(
     });
 
     const store = createTaskStore(config);
+    const inbox = config.inbox?.enabled ? new NativeInbox(ctx, bridge, store) : undefined;
     await store.init?.();
+    if (inbox) ctx.provide('a2aInbox', inbox);
 
     ctx.provide('a2aTasks', {
       async clearContext(contextId: string, tenant = ''): Promise<string[]> {
@@ -228,6 +237,16 @@ export function apply(
 
     const executor = new DshAgentExecutor(bridge, (taskId) => store.suppress(taskId));
     const server = await startA2aServer({
+      extensions: inbox
+        ? [
+            {
+              uri: INBOX_EXTENSION,
+              description: 'Native inbox steering and parked admission',
+              required: false,
+              params: undefined,
+            },
+          ]
+        : [],
       host: config.host,
       port: config.port,
       basePath: config.basePath,
@@ -240,11 +259,16 @@ export function apply(
       },
       executor,
       taskStore: store,
+      beforeMessage: inbox
+        ? (message, context) => inbox.beforeMessage(message, context)
+        : undefined,
+      beforeTask: inbox ? (taskId, context) => inbox.beforeTask(taskId, context) : undefined,
       approvalGuard: (message) => bridge.reserveApprovalMessage(message),
       beforeWorkingTaskMessage: (message, headers) =>
         bridge.beforeWorkingTaskMessage(message, headers),
     });
     serverPort = server.port;
+    if (inbox) inbox.server = server;
 
     console.log(
       `[dsh-a2a] A2A endpoint: http://${config.host}:${server.port}${config.basePath}/ ` +
@@ -252,9 +276,20 @@ export function apply(
     );
 
     return async () => {
-      await server.close();
-      await bridge.dispose();
-      await store.close?.();
+      const failures: unknown[] = [];
+      for (const cleanup of [
+        () => inbox?.shutdown(),
+        () => server.close(),
+        () => bridge.dispose(),
+        () => store.close?.(),
+      ]) {
+        try {
+          await cleanup();
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      if (failures.length) throw new AggregateError(failures, 'A2A shutdown failed.');
     };
   }
 }

@@ -282,6 +282,20 @@ describe('SanitizedTaskStore', () => {
     expect(saved.artifacts).toHaveLength(1);
   });
 
+  it('persists queued admission checkpoints without a state transition', async () => {
+    const backend = new MemoryTaskStore();
+    const store = new SanitizedTaskStore(backend);
+    const submitted = task(TaskState.TASK_STATE_SUBMITTED);
+    await store.save(submitted, ctx);
+    const second = { ...submitted.history[0], messageId: 'queued-second' };
+    await store.checkpoint({ ...submitted, history: [...submitted.history, second] }, ctx);
+    const restored = new SanitizedTaskStore(backend);
+    expect((await restored.load('t1', ctx))?.history.map((message) => message.messageId)).toEqual([
+      'm1',
+      'queued-second',
+    ]);
+  });
+
   it('returns running history to a resubscriber', async () => {
     const store = new SanitizedTaskStore(new MemoryTaskStore());
     await store.save(task(TaskState.TASK_STATE_SUBMITTED), ctx);
@@ -348,6 +362,65 @@ describe('SanitizedTaskStore', () => {
     expect((await store.load('t1', missing))?.history?.map((message) => message.messageId)).toEqual(
       ['m1'],
     );
+  });
+
+  it('does not let late SDK saves reopen a terminal task', async () => {
+    const store = new SanitizedTaskStore(inner);
+    await store.checkpoint(task(TaskState.TASK_STATE_CANCELED), ctx);
+    await store.save(task(TaskState.TASK_STATE_WORKING), ctx);
+    await store.save(task(TaskState.TASK_STATE_COMPLETED), ctx);
+    expect(inner.saved.map((entry) => entry.status?.state)).toEqual([
+      TaskState.TASK_STATE_CANCELED,
+    ]);
+  });
+
+  it('keeps the later terminal write registered until backend shutdown drains it', async () => {
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const secondGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    inner.save
+      .mockImplementationOnce(async () => firstGate)
+      .mockImplementationOnce(async () => secondGate);
+    const store = new SanitizedTaskStore(inner);
+    const first = store.save(task(TaskState.TASK_STATE_CANCELED), ctx);
+    await vi.waitFor(() => expect(inner.save).toHaveBeenCalledOnce());
+    const second = store.save(task(TaskState.TASK_STATE_CANCELED), ctx);
+    releaseFirst();
+    await first;
+    await vi.waitFor(() => expect(inner.save).toHaveBeenCalledTimes(2));
+    const closed = store.close();
+    try {
+      await Promise.resolve();
+      expect(inner.close).not.toHaveBeenCalled();
+    } finally {
+      releaseSecond();
+      await Promise.all([second, closed]);
+    }
+  });
+
+  it('drains pending writes before closing the backend', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    inner.save.mockImplementationOnce(async () => gate);
+    const store = new SanitizedTaskStore(inner);
+    const pending = store.save(task(TaskState.TASK_STATE_WORKING), ctx);
+    await vi.waitFor(() => expect(inner.save).toHaveBeenCalledOnce());
+    const closed = store.close();
+    try {
+      await Promise.resolve();
+      expect(inner.close).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await Promise.all([pending, closed]);
+    }
+    expect(inner.close).toHaveBeenCalledOnce();
   });
 
   it('passes init/close/load through to the inner store', async () => {
