@@ -48,6 +48,7 @@ const mocks = vi.hoisted(() => {
     /** Raw OTEL attributes stamped on the span (e.g. the session.id key). */
     readonly attributes: Record<string, unknown> = {};
     readonly otelSpan = {
+      spanContext: () => this,
       setAttribute: (key: string, value: unknown) => {
         this.attributes[key] = value;
       },
@@ -121,6 +122,8 @@ vi.mock('@langfuse/tracing', () => ({
     opts?: { asType?: string; parentSpanContext?: unknown },
   ) => {
     if (mocks.state.failCreate) throw new Error('ingestion down');
+    if (opts?.parentSpanContext instanceof mocks.MockObservation)
+      return opts.parentSpanContext.startObservation(name, attrs, opts);
     const root = new mocks.MockObservation(name, attrs ?? {}, opts?.asType ?? 'span');
     root.attributes['langfuse.internal.is_app_root'] = true;
     root.parentContext = opts?.parentSpanContext;
@@ -361,6 +364,99 @@ describe('dsh-langfuse plugin', () => {
     // The processor is wired into an isolated provider (never the global one).
     expect(mocks.providers[0].config.spanProcessors).toEqual([mocks.processors[0]]);
     expect(mocks.isolatedProviders).toEqual([mocks.providers[0]]);
+  });
+
+  it('binds native inbox trace context after selection and before its first input', async () => {
+    await setup({
+      ...enabledConfig,
+      publicKey: 'public-inbox-test',
+      secretKey: 'secret-inbox-test',
+    });
+    const session = sessionOf('native');
+    const inbox = (phase: string) =>
+      ctx.emit('a2a/inbox', {
+        phase,
+        contextId: 'native',
+        taskId: 'task-a',
+        messageId: 'input-a',
+        nativeMessageId: 'native-a',
+        at: 3000,
+        queuedAt: 1000,
+        selectedAt: 2000,
+        pending: 0,
+        turn: 1,
+        step: 1,
+      });
+    inbox('resolved');
+    ctx.emit('session/event', session, turnStart(1));
+    expect(mocks.roots).toHaveLength(0);
+    inbox('selected');
+    const traceparent = '00-11111111111111111111111111111111-2222222222222222-01';
+    ctx.emit('langfuse/context', 'native', { traceparent, userId: 'alice' });
+    inbox('prepared');
+    ctx.emit('session/event', session, userMessage('hello'));
+    ctx.emit('session/event', session, turnEnd(1));
+    const execution = mocks.roots.find((root) => root.name === 'dsh-turn')!;
+    expect(execution.parentContext).toMatchObject({
+      traceId: '1'.repeat(32),
+      spanId: '2'.repeat(16),
+    });
+    expect(execution.attributes['user.id']).toBe('alice');
+    expect(execution.updates).toContainEqual(
+      expect.objectContaining({ metadata: expect.objectContaining({ taskId: 'task-a' }) }),
+    );
+    expect(execution.spans.find((span) => span.name === 'inbox:prepare')?.ended).toBe(1);
+    expect(execution.ended).toBe(1);
+    const waiting = mocks.roots.find((root) => root.name === 'inbox:wait')!;
+    expect(waiting.body.metadata).toMatchObject({
+      taskId: 'task-a',
+      messageId: 'input-a',
+      waitMs: 1000,
+    });
+    expect(waiting.ended).toBe(1);
+  });
+
+  it('records native preparation failures and starts the next turn with fresh attribution', async () => {
+    await setup({
+      ...enabledConfig,
+      publicKey: 'public-inbox-test',
+      secretKey: 'secret-inbox-test',
+    });
+    const session = sessionOf('native');
+    ctx.emit('a2a/inbox', { phase: 'resolved', contextId: 'native', at: 1000, pending: 0 });
+    for (const [turn, phase] of [
+      [1, 'prepare-failed'],
+      [2, 'prepared'],
+    ] as const) {
+      ctx.emit('session/event', session, turnStart(turn));
+      const detail = {
+        contextId: 'native',
+        at: 3000,
+        selectedAt: 2000,
+        queuedAt: 1000,
+        pending: 0,
+        turn,
+        taskId: `task-${turn}`,
+        messageId: `input-${turn}`,
+        nativeMessageId: `native-${turn}`,
+      };
+      ctx.emit('a2a/inbox', { ...detail, phase: 'selected' });
+      ctx.emit('a2a/inbox', { ...detail, phase });
+      ctx.emit('session/event', session, turnEnd(turn));
+    }
+    const roots = mocks.roots.filter((root) => root.name === 'dsh-turn');
+    expect(roots).toHaveLength(2);
+    expect(roots[0].spans[0].updates).toContainEqual(expect.objectContaining({ level: 'ERROR' }));
+    expect(roots[1].updates).toContainEqual(
+      expect.objectContaining({
+        metadata: {
+          taskId: 'task-2',
+          a2aMessageIds: ['input-2'],
+          nativeMessageIds: ['native-2'],
+        },
+      }),
+    );
+    expect(roots.every((root) => root.ended === 1)).toBe(true);
   });
 
   describe('trace lifecycle', () => {

@@ -23,12 +23,28 @@ import { agentTextMessage, SessionTranslator, terminalStatusUpdate } from './tra
 export const INBOX_EXTENSION =
   'https://github.com/TGYD-helige/dsh-plugins/blob/main/docs/protocol/inbox-v1.md';
 
+export interface A2aInboxEvent {
+  phase: string;
+  contextId: string;
+  at: number;
+  pending: number;
+  taskId?: string;
+  taskIds?: string[];
+  messageId?: string;
+  nativeMessageId?: string;
+  queuedAt?: number;
+  selectedAt?: number;
+  turn?: number;
+  step?: number;
+}
+
 interface InboxSource {
   kind: 'a2a';
   taskId: string;
   /** JSON encoding removes protobuf optional undefined fields before durable admission. */
   message: string;
   target: InboxTarget;
+  queuedAt?: number;
 }
 
 declare module '@deepseek-ai/dsh-llm/types' {
@@ -43,6 +59,9 @@ declare module '@deepseek-ai/dsh-session/types' {
 }
 declare module '@deepseek-ai/cordis' {
   interface Events {
+    /** Metadata-only native inbox lifecycle; observer failures never affect execution. */
+    'a2a/inbox'(detail: A2aInboxEvent): void;
+
     // TODO(verify): upstream packages/core/agent/src/runtime-types.ts, native inbox capability.
     'agent/before-assembly'(detail: {
       agent: Agent;
@@ -230,11 +249,57 @@ export class NativeInbox implements A2aInbox {
             agent.inbox.prepend(message.source.target, message);
         }
         await this.flush(agent.session);
+        this.observe('resolved', run);
+        for (const message of this.pending(run)) this.observeInput('restored', run, message);
         return run;
       })().finally(() => this.resolving.delete(contextId));
       this.resolving.set(contextId, creating);
     }
     return creating;
+  }
+
+  private observe(phase: string, run: ContextRun, fields: Partial<A2aInboxEvent> = {}): void {
+    try {
+      const pending = this.pending(run);
+      void this.ctx
+        .parallel('a2a/inbox', {
+          phase,
+          contextId: run.entry.sessionId,
+          at: Date.now(),
+          pending: pending.length,
+          taskIds: [
+            ...new Set(
+              pending.flatMap((message) =>
+                message.source.kind === 'a2a' ? [message.source.taskId] : [],
+              ),
+            ),
+          ],
+          ...fields,
+        })
+        .catch((error: unknown) => console.error('[dsh-a2a] inbox observer failed:', error));
+    } catch (error) {
+      console.error('[dsh-a2a] inbox observer failed:', error);
+    }
+  }
+
+  private observeInput(
+    phase: string,
+    run: ContextRun,
+    message: UserMessage,
+    fields: Partial<A2aInboxEvent> = {},
+  ): void {
+    try {
+      if (message.source.kind !== 'a2a') return;
+      this.observe(phase, run, {
+        taskId: message.source.taskId,
+        messageId: Message.fromJSON(JSON.parse(message.source.message)).messageId,
+        nativeMessageId: message.id,
+        queuedAt: message.source.queuedAt,
+        ...fields,
+      });
+    } catch (error) {
+      console.error('[dsh-a2a] inbox observer failed:', error);
+    }
   }
 
   private flush(session: Session): Promise<void> {
@@ -387,6 +452,7 @@ export class NativeInbox implements A2aInbox {
           taskId: task.task.id,
           message: JSON.stringify(Message.toJSON(a2aMessage)),
           target,
+          queuedAt: Date.now(),
         },
       });
       await this.ctx.serial('a2a/before-followup', {
@@ -414,6 +480,7 @@ export class NativeInbox implements A2aInbox {
       task.headers.set(message.id, headers);
       run.entry.handle.agent.send(message, target, false);
       await this.flush(run.entry.handle.agent.session);
+      this.observeInput('admitted', run, message);
       void this.ctx
         .parallel('a2a/message-admitted', {
           contextId: run.entry.sessionId,
@@ -526,7 +593,13 @@ export class NativeInbox implements A2aInbox {
     (run.entry.handle.agent as Agent & { wake(): void }).wake();
   }
 
-  private async prepare(detail: { agent: Agent; messages: UserMessage[]; signal: AbortSignal }) {
+  private async prepare(detail: {
+    agent: Agent;
+    messages: UserMessage[];
+    signal: AbortSignal;
+    turn?: number;
+    step?: number;
+  }) {
     const run = this.contexts.get(detail.agent.session.id);
     if (!run) return;
     if (this.stopping || run.paused) throw new Error('Inbox is paused.');
@@ -565,17 +638,31 @@ export class NativeInbox implements A2aInbox {
         this.publish(task, run.turnStart);
         run.turnStart = undefined;
       }
-      await this.flush(detail.agent.session);
-      await this.ctx.serial('a2a/before-assembly', {
-        agent: detail.agent,
-        contextId: detail.agent.session.id,
-        taskId: task.task.id,
-        a2aMessage: Message.fromJSON(JSON.parse(message.source.message)),
-        dshMessageId: message.id,
-        requestHeaders: task.headers.get(message.id),
-        signal: detail.signal,
-      });
-      detail.signal.throwIfAborted();
+      const selectedAt = Date.now();
+      const timing = { selectedAt, turn: detail.turn, step: detail.step };
+      this.observeInput('selected', run, message, timing);
+      try {
+        await this.flush(detail.agent.session);
+        await this.ctx.serial('a2a/before-assembly', {
+          agent: detail.agent,
+          contextId: detail.agent.session.id,
+          taskId: task.task.id,
+          a2aMessage: Message.fromJSON(JSON.parse(message.source.message)),
+          dshMessageId: message.id,
+          requestHeaders: task.headers.get(message.id),
+          signal: detail.signal,
+        });
+        detail.signal.throwIfAborted();
+      } catch (error) {
+        this.observeInput(
+          detail.signal.aborted ? 'prepare-aborted' : 'prepare-failed',
+          run,
+          message,
+          timing,
+        );
+        throw error;
+      }
+      this.observeInput('prepared', run, message, timing);
     }
   }
 
@@ -720,6 +807,7 @@ export class NativeInbox implements A2aInbox {
     run.paused = true;
     for (const admission of run.admissions) admission.abort();
     (run.entry.handle.agent.inbox as DurableInbox).setPaused(true);
+    this.observe('paused', run);
     for (const task of run.tasks.values())
       if (!task.settled && task.task.status?.state === TaskState.TASK_STATE_WORKING)
         await this.cancel(task.task.id, { retainInbox: true });
@@ -837,6 +925,7 @@ export class NativeInbox implements A2aInbox {
       (run.entry.handle.agent.inbox as DurableInbox).setPaused(false);
     }
     await this.flush(run.entry.handle.agent.session);
+    this.observe(options.resume ? 'resume' : 'wake', run);
     if (tasks.size) this.drive(run);
     return [...tasks];
   }
@@ -903,6 +992,7 @@ export class NativeInbox implements A2aInbox {
         await this.checkpoint(structuredClone(task.task), task.context);
       }
     } finally {
+      this.observe('canceled', run, { taskId });
       task.bus.publish(task.final);
       task.finish();
     }
@@ -928,6 +1018,7 @@ export class NativeInbox implements A2aInbox {
       task.finish();
     }
     await this.flush(run.entry.handle.agent.session);
+    this.observe('cleared', run);
     this.contexts.delete(contextId);
   }
 
@@ -941,6 +1032,7 @@ export class NativeInbox implements A2aInbox {
       task.controller.abort();
       task.finish();
     }
+    this.observe('disposed', run);
     this.contexts.delete(session.id);
   }
 

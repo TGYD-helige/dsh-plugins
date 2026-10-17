@@ -32,7 +32,7 @@ import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
 export type { A2aApproval, A2aApprovalCodec, A2aApprovalReply } from './approval.js';
 export { defaultApprovalCodec } from './approval.js';
 export type { A2aFileMaterializer } from './content.js';
-export type { A2aInbox } from './inbox.js';
+export type { A2aInbox, A2aInboxEvent } from './inbox.js';
 export { INBOX_EXTENSION } from './inbox.js';
 export type { SubagentToolSource } from './translator.js';
 

@@ -12,6 +12,14 @@ Langfuse observability for [DeepSeek Harness (dsh)](https://github.com/deepseek-
 - structured reasoning in generation output, optional image display, inherited user/tags, and final turn severity
 - optional W3C parent context supplied per session, without adopting the host's ambient OTEL context
 
+## Native A2A inbox
+
+With `dsh-a2a` in native inbox mode and this plugin enabled, reporting is automatic; no extra setting is required. Inbox operations export metadata-only `inbox:admitted`, `inbox:restored`, `inbox:paused`, `inbox:wake`, `inbox:resume`, `inbox:canceled`, `inbox:cleared`, and `inbox:disposed` observations. They share the context's Langfuse session ID and carry task/message IDs and pending counts. `inbox:wait` spans cover admission to selection, including downtime after durable recovery; older inputs without a stored timestamp omit this span.
+
+Each execution keeps its normal turn trace, generations, tools, and hooks. `inbox:prepare` spans sit under that trace, with preparation failures marked `ERROR` and cancellation marked `WARNING`. The turn root includes `taskId`, `a2aMessageIds`, and `nativeMessageIds`. Set `langfuse/context` in `a2a/before-assembly` **before emitting hooks or other execution observations** to bind the current turn's external parent and user. Queue/control observations use independent roots so they never consume the next turn's context.
+
+Inbox observations never include request headers or message content. Normal execution content follows `captureContent`; reporting failures never fail or cancel the task. The source-runtime Integration leg verifies real SDK OTLP export against a local collector without Langfuse credentials.
+
 ## Install
 
 ```sh

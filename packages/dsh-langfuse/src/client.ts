@@ -292,6 +292,7 @@ export class LangfuseReporter {
     sessionId?: string;
     metadata?: Record<string, unknown>;
     context?: LangfuseTraceContext;
+    startTime?: Date;
   }): LangfuseSpan | null {
     const tracing = this.tracing;
     const api = this.api;
@@ -303,7 +304,7 @@ export class LangfuseReporter {
         tracing.startObservation(
           input.name,
           { metadata: input.metadata },
-          { parentSpanContext: parent },
+          { parentSpanContext: parent, startTime: input.startTime },
         ),
       );
       this.stampTraceContext(root, {
@@ -392,7 +393,13 @@ export class LangfuseReporter {
   /** Open a span (one per tool dispatch, or a nested detail span) under any observation parent. */
   startSpan(
     parent: Observation | null,
-    input: { name: string; input?: unknown; metadata?: Record<string, unknown>; asType?: 'tool' },
+    input: {
+      name: string;
+      input?: unknown;
+      metadata?: Record<string, unknown>;
+      asType?: 'tool';
+      startTime?: Date;
+    },
   ): LangfuseSpan | null {
     const api = this.api;
     if (!parent || !api) return null;
@@ -403,9 +410,14 @@ export class LangfuseReporter {
         metadata: input.metadata,
       };
       const span = api.context.with(api.ROOT_CONTEXT, () =>
-        input.asType === 'tool'
-          ? parent.startObservation(input.name, attributes, { asType: 'tool' })
-          : parent.startObservation(input.name, attributes),
+        input.startTime && this.tracing
+          ? this.tracing.startObservation(input.name, attributes, {
+              parentSpanContext: parent.otelSpan.spanContext(),
+              startTime: input.startTime,
+            })
+          : input.asType === 'tool'
+            ? parent.startObservation(input.name, attributes, { asType: 'tool' })
+            : parent.startObservation(input.name, attributes),
       );
       this.stampTraceContext(span, this.traceContext.get(parent));
       return span;

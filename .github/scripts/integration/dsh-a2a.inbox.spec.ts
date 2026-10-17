@@ -14,6 +14,8 @@ import ToolRuntime from '@deepseek-ai/dsh-tools';
 import AgentRegistry from '@deepseek-ai/dsh-agent';
 import AgentLoop from '@deepseek-ai/dsh-agent-loop';
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl';
+import * as Langfuse from '../../../packages/dsh-langfuse/src/index.js';
+import { startFakeIngestion, capturedToObservations } from './lib/langfuse-shared.mjs';
 import { A2aBridge } from '../../../packages/dsh-a2a/src/bridge.js';
 import { NativeInbox, INBOX_EXTENSION } from '../../../packages/dsh-a2a/src/inbox.js';
 import { DshAgentExecutor } from '../../../packages/dsh-a2a/src/executor.js';
@@ -27,12 +29,13 @@ const { MockAdapter, textResponse } = await import(`${process.env.DSH_SOURCE_ROO
 const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const dispose of cleanups.splice(0).reverse()) await dispose(); });
 
-async function boot(options: { root?: string; store?: SanitizedTaskStore; backend?: MemoryTaskStore; script?: unknown[] } = {}) {
+async function boot(options: { root?: string; store?: SanitizedTaskStore; backend?: MemoryTaskStore; script?: unknown[]; langfuseUrl?: string } = {}) {
   const ctx = new Context();
   cleanups.push(() => ctx.fiber.dispose());
   for (const plugin of [LlmRuntime, SessionStore, SessionProjectionRegistry, SystemPrompt, ToolRuntime, AgentRegistry]) await ctx.plugin(plugin);
   if (options.root) await ctx.plugin(JsonlSessionPersistence, { root: options.root, compression: 'none' });
   await ctx.plugin(AgentLoop, { agents: [] });
+  if (options.langfuseUrl) await ctx.plugin(Langfuse, { enabled: true, publicKey: 'public-inbox-test', secretKey: 'secret-inbox-test', baseUrl: options.langfuseUrl, captureContent: false });
   const adapter = new MockAdapter(options.script ?? Array.from({ length: 8 }, () => textResponse('ok')));
   ctx.llm.registerAdapter(['mock'], adapter);
   const bridge = new A2aBridge(ctx, { cwd: '/tmp', agentOptions: { provider: 'mock', model: 'mock' } });
@@ -53,8 +56,8 @@ async function boot(options: { root?: string; store?: SanitizedTaskStore; backen
     method: 'POST', headers: { 'content-type': 'application/json', 'A2A-Version': '1.0', ...(extensions ? { 'A2A-Extensions': INBOX_EXTENSION } : {}) },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
   })).json();
-  const send = async (id: string, controls: Record<string, unknown> = {}, taskId?: string) => {
-    const response = await rpc('SendMessage', { message: { messageId: id, role: 'ROLE_USER', contextId: 'native-test', taskId, parts: [{ text: id }], metadata: { [INBOX_EXTENSION]: controls } }, configuration: { returnImmediately: true } });
+  const send = async (id: string, controls: Record<string, unknown> = {}, taskId?: string, text = id) => {
+    const response = await rpc('SendMessage', { message: { messageId: id, role: 'ROLE_USER', contextId: 'native-test', taskId, parts: [{ text }], metadata: { [INBOX_EXTENSION]: controls } }, configuration: { returnImmediately: true } });
     expect(response.error).toBeUndefined();
     return response.result.task;
   };
@@ -180,6 +183,7 @@ it('keeps canceled task terminal while retained input resumes under a fresh task
 it('rejects a failing admission observer only as telemetry and keeps successful input runnable', async () => {
   const f = await boot();
   f.ctx.on('a2a/message-admitted', () => { throw new Error('observer failed'); });
+  f.ctx.on('a2a/inbox', () => { throw new Error('inbox observer failed'); });
   const task = await f.send('one', { wakeup: false });
   await f.inbox.wake('native-test');
   await (await f.inbox.resolve('native-test')).whenIdle();
@@ -549,4 +553,92 @@ it('does not expose rejected admission history and accepts a retry after a check
   await agent.whenIdle();
   await f.completed(task.id);
   expect(agent.session.snapshotEvents().filter(e => e.type === 'user/message').map(e => e.data.content[0].text)).toEqual(['one', 'retry']);
+});
+
+
+it('exports native inbox lifecycle and attributed turn traces through the real Langfuse SDK', async () => {
+  const captured: unknown[] = [];
+  const collector = await startFakeIngestion(captured);
+  cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
+  const f = await boot({ langfuseUrl: `http://127.0.0.1:${collector.address().port}` });
+  const traceparent = '00-11111111111111111111111111111111-2222222222222222-01';
+  f.ctx.on('a2a/before-assembly', async detail => {
+    f.ctx.emit('langfuse/context', detail.contextId, { traceparent, userId: 'inbox-user' });
+    const turn = detail.agent.session.snapshotEvents().filter(event => event.type === 'turn/start').at(-1).data.turn;
+    const hook = { turn, point: 'BeforeAgent', handlerId: 'prepare', invocationId: detail.dshMessageId };
+    Langfuse.appendHookEvent(detail.agent.session, 'hook/invoked', { ...hook, dialect: 'test' });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    Langfuse.appendHookEvent(detail.agent.session, 'hook/result', { ...hook, decision: 'pass', outcome: 'success', durationMs: 20 });
+    if (detail.a2aMessage.messageId === 'failed') throw new Error('preparation failed');
+  });
+  const first = await f.send('first', { wakeup: false }, undefined, 'private-first');
+  const failed = await f.send('failed', { wakeup: false }, undefined, 'private-failed');
+  const second = await f.send('second', { wakeup: false }, undefined, 'private-second');
+  const canceled = await f.send('canceled', { wakeup: false }, undefined, 'private-canceled');
+  await f.inbox.pause('native-test');
+  await f.inbox.cancel(canceled.id);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await f.inbox.wake('native-test', { resume: true });
+  const agent = await f.inbox.resolve('native-test');
+  await agent.whenIdle();
+  await f.completed(first.id);
+  await f.completed(second.id);
+  expect((await f.rpc('GetTask', { id: failed.id })).result.status.state).toBe('TASK_STATE_FAILED');
+  await f.ctx.parallel('session/flush', agent.session);
+  const observations = capturedToObservations(captured);
+  for (const phase of ['admitted', 'paused', 'canceled', 'resume', 'wait', 'prepare']) {
+    expect(observations.some(observation => observation.name === `inbox:${phase}`)).toBe(true);
+  }
+  const roots = observations.filter(observation => observation.name === 'dsh-turn');
+  expect(roots.map(root => root.metadata.taskId)).toEqual([first.id, failed.id, second.id]);
+  expect(roots.every(root => root.parentObservationId === '2222222222222222')).toBe(true);
+  expect(observations.filter(observation => observation.type === 'GENERATION')).toHaveLength(2);
+  const waits = observations.filter(observation => observation.name === 'inbox:wait');
+  expect(waits).toHaveLength(3);
+  expect(waits.every(wait => Number(wait.metadata.waitMs) >= 20)).toBe(true);
+  for (const wait of [...waits, ...observations.filter(observation => observation.name === 'inbox:prepare')]) {
+    const raw = captured.find(span => span.spanId === wait.id);
+    if (wait.name === 'inbox:prepare') {
+      const parent = captured.find(span => span.spanId === wait.parentObservationId);
+      expect(BigInt(parent.startTimeUnixNano)).toBeLessThanOrEqual(BigInt(raw.startTimeUnixNano));
+    }
+    expect(Number(BigInt(raw.endTimeUnixNano) - BigInt(raw.startTimeUnixNano)) / 1e6).toBeCloseTo(Number(wait.metadata.waitMs ?? wait.metadata.prepareMs), 0);
+  }
+  const hooks = observations.filter(observation => observation.name === 'hook:BeforeAgent');
+  expect(hooks).toHaveLength(3);
+  expect(hooks.every(hook => roots.some(root => root.id === hook.parentObservationId))).toBe(true);
+  expect(observations.every(observation => observation.sessionId === 'native-test' && observation.endTime)).toBe(true);
+  expect(JSON.stringify(captured)).not.toMatch(/private-first|private-second|private-canceled|private-failed|secret-inbox-test/);
+});
+
+
+it('exports recovered inbox identity and queue waiting across a durable restart', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'a2a-inbox-observability-'));
+  cleanups.push(() => rm(root, { recursive: true, force: true }));
+  const captured: unknown[] = [];
+  const collector = await startFakeIngestion(captured);
+  cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
+  const langfuseUrl = `http://127.0.0.1:${collector.address().port}`;
+  const first = await boot({ root, langfuseUrl });
+  const task = await first.send('restored-input', { wakeup: false });
+  await first.inbox.pause('native-test');
+  await first.bridge.dispose();
+  await first.ctx.fiber.dispose();
+  const second = await boot({ root, langfuseUrl, backend: first.backend });
+  second.ctx.on('a2a/before-assembly', async () => { await new Promise(resolve => setTimeout(resolve, 20)); });
+  const agent = await second.inbox.resolve('native-test');
+  await second.inbox.wake('native-test', { resume: true });
+  await agent.whenIdle();
+  await second.completed(task.id);
+  await second.ctx.parallel('session/flush', agent.session);
+  const observations = capturedToObservations(captured);
+  expect(observations.find(observation => observation.name === 'inbox:restored')?.metadata).toMatchObject({ taskId: task.id, messageId: 'restored-input' });
+  expect(observations.find(observation => observation.name === 'inbox:wait')?.metadata).toMatchObject({ taskId: task.id, messageId: 'restored-input' });
+  const turn = observations.find(observation => observation.name === 'dsh-turn');
+  expect(turn.metadata.taskId).toBe(task.id);
+  const preparation = captured.find(span => span.name === 'inbox:prepare');
+  const parent = captured.find(span => span.spanId === turn.id);
+  expect(BigInt(parent.startTimeUnixNano)).toBeLessThanOrEqual(BigInt(preparation.startTimeUnixNano));
+  expect(BigInt(parent.endTimeUnixNano)).toBeGreaterThanOrEqual(BigInt(preparation.endTimeUnixNano));
+  expect(Number(BigInt(preparation.endTimeUnixNano) - BigInt(preparation.startTimeUnixNano)) / 1e6).toBeGreaterThanOrEqual(20);
 });
