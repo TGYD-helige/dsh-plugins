@@ -25,6 +25,7 @@ import { A2aBridge } from './bridge.js';
 import { DshAgentExecutor } from './executor.js';
 import { INBOX_EXTENSION, NativeInbox } from './inbox.js';
 import { startA2aServer } from './server.js';
+import { FilesystemTaskStore } from './stores/filesystem.js';
 import { GcsTaskStore } from './stores/gcs.js';
 import { RedisTaskStore } from './stores/redis.js';
 import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
@@ -135,9 +136,11 @@ export const Config = Schema.object({
    */
   taskStore: Schema.union([
     Schema.const('memory'),
+    Schema.const('filesystem'),
     Schema.const('redis'),
     Schema.const('gcs'),
   ]).default('memory'),
+  filesystem: Schema.object({ root: Schema.string().default('') }),
   redis: Schema.object({
     url: Schema.string().role('secret').default('redis://127.0.0.1:6379'),
     keyPrefix: Schema.string().default('a2a'),
@@ -162,7 +165,8 @@ export interface A2aPluginConfig {
   subagentTools: { enabled: boolean };
   agent: { provider: string; model: string; preset: string };
   card: { name: string; description: string; version: string; publicUrl: string };
-  taskStore: 'memory' | 'redis' | 'gcs';
+  taskStore: 'memory' | 'filesystem' | 'redis' | 'gcs';
+  filesystem?: { root: string };
   redis: { url: string; keyPrefix: string; ttlSeconds: number };
   gcs: { bucket: string; prefix: string; keyFilename: string };
 }
@@ -296,6 +300,10 @@ export function apply(
 
 function createTaskStore(config: A2aPluginConfig): SanitizedTaskStore {
   switch (config.taskStore) {
+    case 'filesystem':
+      return new SanitizedTaskStore(
+        new FilesystemTaskStore({ root: config.filesystem?.root ?? '' }),
+      );
     case 'redis':
       return new SanitizedTaskStore(new RedisTaskStore(config.redis));
     case 'gcs':

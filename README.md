@@ -42,6 +42,8 @@ dsh is in developer preview and **will** break compatibility between releases. P
 
 `dsh-a2a` inbox execution additionally tests the unmodified official DSH `0.2.1-rc.2` npm runtime. Its agent peer floor is `>=0.2.0-rc.2 || >=0.2.1-alpha.1`, for the public send/claim/pre-step interfaces. Queueing uses `Agent.send`; no core patch is required.
 
+`dsh-a2a`'s optional Goal integration consumes `@deepseek-ai/dsh-goal >=0.2.1-rc.2` and preserves official Goal round validation (tested with the Goal service and round driver at `0.2.1-rc.2`).
+
 `dsh-a2a`'s approval bridge has an optional `@deepseek-ai/dsh-user-approval` peer floor of `>=0.1.6-alpha.2 || >=0.1.7-alpha.1 || >=0.2.0-rc.1` (tested at `0.2.0-rc.2`).
 
 `dsh-a2a` requires `@deepseek-ai/dsh-session >=0.2.0-rc.1`: optional subagent tool streaming uses the session lifecycle offset to distinguish newly created children from restored sessions, preventing false delegation attribution. Other dsh peer floors remain unchanged apart from the agent floor above.
@@ -100,7 +102,9 @@ All plugins are **disabled by default** and configured through the standard dsh 
         host: 127.0.0.1   # no auth built in — keep loopback or front with a proxy
         port: 41241
         cwd: /srv/agent-workspaces
-        taskStore: redis  # memory | redis | gcs — A2A task state only
+        taskStore: redis  # memory | filesystem | redis | gcs — A2A task state only
+        filesystem:
+          root: /srv/dsh/a2a-tasks
         redis:
           url: redis://127.0.0.1:6379
         gcs:
