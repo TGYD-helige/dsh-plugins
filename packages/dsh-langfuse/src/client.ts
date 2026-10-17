@@ -292,33 +292,58 @@ export class LangfuseReporter {
     sessionId?: string;
     metadata?: Record<string, unknown>;
     context?: LangfuseTraceContext;
+    startTime?: Date;
+    traceId?: string;
   }): LangfuseSpan | null {
     const tracing = this.tracing;
     const api = this.api;
     if (!tracing || !api) return null;
     try {
-      const parent = parentContext(input.context?.traceparent);
+      const externalParent = parentContext(input.context?.traceparent);
+      const parent =
+        externalParent === NO_PARENT && input.traceId
+          ? { traceId: input.traceId, spanId: '0000000000000001', traceFlags: 1 }
+          : externalParent;
       input = this.mask(input);
       const root = api.context.with(api.ROOT_CONTEXT, () =>
         tracing.startObservation(
           input.name,
           { metadata: input.metadata },
-          { parentSpanContext: parent },
+          { parentSpanContext: parent, startTime: input.startTime },
         ),
       );
       this.stampTraceContext(root, {
         sessionId: input.sessionId,
-        traceName: parent === NO_PARENT ? input.name : undefined,
+        traceName: externalParent === NO_PARENT ? input.name : undefined,
         userId: input.context?.userId ?? this.config.userId,
         tags: input.context?.tags ?? this.config.tags,
       });
       // External traces retain their owner's trace name and trace-level IO.
-      if (parent === NO_PARENT) this.roots.add(root);
-      else root.otelSpan.setAttribute(tracing.LangfuseOtelSpanAttributes.IS_APP_ROOT, false);
+      if (externalParent === NO_PARENT) {
+        this.roots.add(root);
+        root.otelSpan.setAttribute(tracing.LangfuseOtelSpanAttributes.IS_APP_ROOT, true);
+      } else root.otelSpan.setAttribute(tracing.LangfuseOtelSpanAttributes.IS_APP_ROOT, false);
       return root;
     } catch (error) {
       console.error('[dsh-langfuse] trace creation failed:', error);
       return null;
+    }
+  }
+
+  /** A running task keeps its trace identity; late host context is a link. */
+  updateContext(span: Observation | null, context: LangfuseTraceContext): void {
+    if (!span) return;
+    try {
+      const previous = this.traceContext.get(span);
+      this.stampTraceContext(span, {
+        ...previous,
+        userId: context.userId ?? previous?.userId,
+        tags: context.tags ?? previous?.tags,
+      });
+      const parent = parentContext(context.traceparent);
+      if (parent !== NO_PARENT) span.otelSpan.addLink({ context: parent });
+    } catch (error) {
+      console.error('[dsh-langfuse] context update failed:', error);
     }
   }
 
@@ -392,7 +417,13 @@ export class LangfuseReporter {
   /** Open a span (one per tool dispatch, or a nested detail span) under any observation parent. */
   startSpan(
     parent: Observation | null,
-    input: { name: string; input?: unknown; metadata?: Record<string, unknown>; asType?: 'tool' },
+    input: {
+      name: string;
+      input?: unknown;
+      metadata?: Record<string, unknown>;
+      asType?: 'tool';
+      startTime?: Date;
+    },
   ): LangfuseSpan | null {
     const api = this.api;
     if (!parent || !api) return null;
@@ -403,9 +434,14 @@ export class LangfuseReporter {
         metadata: input.metadata,
       };
       const span = api.context.with(api.ROOT_CONTEXT, () =>
-        input.asType === 'tool'
-          ? parent.startObservation(input.name, attributes, { asType: 'tool' })
-          : parent.startObservation(input.name, attributes),
+        input.startTime && this.tracing
+          ? this.tracing.startObservation(input.name, attributes, {
+              parentSpanContext: parent.otelSpan.spanContext(),
+              startTime: input.startTime,
+            })
+          : input.asType === 'tool'
+            ? parent.startObservation(input.name, attributes, { asType: 'tool' })
+            : parent.startObservation(input.name, attributes),
       );
       this.stampTraceContext(span, this.traceContext.get(parent));
       return span;

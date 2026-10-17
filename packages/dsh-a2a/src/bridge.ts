@@ -15,6 +15,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
 import { type Message, TaskState } from '@a2a-js/sdk';
 import { AgentEvent, type AgentExecutionEvent, type ExecutionEventBus } from '@a2a-js/sdk/server';
 import type { Context } from '@deepseek-ai/cordis';
@@ -43,6 +44,7 @@ import {
   defaultApprovalCodec,
 } from './approval.js';
 import { type A2aFileMaterializer, buildMessageContent, uploadsDir } from './content.js';
+import type { NativeInbox } from './inbox.js';
 import type { A2aTurnContext, A2aWorkingTaskMessageContext } from './index.js';
 import { agentTextMessage, SessionTranslator, terminalStatusUpdate } from './translator.js';
 
@@ -111,6 +113,7 @@ interface PendingApproval {
 }
 
 export class A2aBridge {
+  inbox?: NativeInbox;
   private readonly tasks = new Map<string, TaskEntry>(); // taskId → entry
   private readonly bySession = new Map<string, TaskEntry>(); // sessionId (== contextId) → entry
   private readonly clearing = new Set<string>();
@@ -219,8 +222,9 @@ export class A2aBridge {
   private async ensureTaskInner(
     taskId: string,
     contextId: string,
+    clearing = false,
   ): Promise<{ entry: TaskEntry; freshTask: boolean }> {
-    if (this.clearing.has(contextId)) throw new Error('Context is being cleared.');
+    if (this.clearing.has(contextId) && !clearing) throw new Error('Context is being cleared.');
     const existing = this.tasks.get(taskId);
     if (existing) return { entry: existing, freshTask: false };
 
@@ -294,12 +298,18 @@ export class A2aBridge {
       | undefined;
     const persisted = await persistence?.stat(sessionId);
     const handle = persisted
-      ? await this.ctx.agents.resume({ resumeSessionId: sessionId, agentOptions, setup })
+      ? await this.ctx.agents.resume({
+          resumeSessionId: sessionId,
+          agentOptions,
+          setup,
+          ...(this.inbox ? { keepInboxOnDispose: true } : {}),
+        })
       : await this.ctx.agents.create({
           sessionId,
           meta: { cwd: this.options.cwd, ...(agentPreset ? { agentPreset } : {}) },
           agentOptions,
           setup,
+          ...(this.inbox ? { keepInboxOnDispose: true } : {}),
         });
     const entry: TaskEntry = {
       taskId,
@@ -416,6 +426,27 @@ export class A2aBridge {
 
   async waitForTurn(entry: TaskEntry): Promise<void> {
     await Promise.allSettled([...entry.running]);
+  }
+
+  /** The native inbox selects task ownership before assembling its first prompt. */
+  bindInboxTask(
+    entry: TaskEntry,
+    taskId: string,
+    translator: SessionTranslator,
+    bus: ExecutionEventBus,
+    completion: Promise<void>,
+    controller: AbortController,
+  ): void {
+    this.tasks.delete(entry.taskId);
+    entry.taskId = taskId;
+    entry.translator = translator;
+    entry.bus = bus;
+    entry.interrupted = false;
+    entry.settlementAbort = controller;
+    entry.running.clear();
+    entry.running.add(completion);
+    void completion.then(() => entry.running.delete(completion));
+    this.tasks.set(taskId, entry);
   }
 
   /** Inspect a message for a live task before the SDK starts its next request. */
@@ -631,9 +662,18 @@ export class A2aBridge {
     if (this.clearing.has(contextId)) throw new Error('Context is already being cleared.');
     this.clearing.add(contextId);
     try {
+      await this.inbox?.clear(contextId);
       await Promise.allSettled([...(this.creating.get(contextId) ?? [])]);
+      if (this.inbox && !this.bySession.has(contextId)) {
+        const persistence = this.ctx.get('sessionPersistence') as
+          | { stat(id: SessionId): Promise<unknown> }
+          | undefined;
+        if (await persistence?.stat(SessionId(contextId)))
+          await this.ensureTaskInner(randomUUID(), contextId, true);
+      }
       const entry = this.bySession.get(contextId);
       if (entry) {
+        entry.handle.agent.inbox?.clear();
         const active = entry.turnActive || entry.running.size > 0;
         this.settleEntry(entry, 'Context cleared.');
         if (active) {
@@ -677,6 +717,11 @@ export class A2aBridge {
 
   /** Dispose every owned agent (plugin unload / server shutdown). */
   async dispose(): Promise<void> {
+    try {
+      await this.inbox?.shutdown();
+    } catch (error) {
+      console.error('[dsh-a2a] native inbox shutdown failed:', error);
+    }
     const entries = [...this.tasks.values()];
     this.tasks.clear();
     this.bySession.clear();
@@ -720,6 +765,14 @@ export class A2aBridge {
       this.asked.set(session.id as string, queue);
     }
     if (event.type === 'turn/start') entry.turnActive = true;
+    if (this.inbox?.onSessionEvent(session, event)) {
+      if (event.type === 'turn/end') {
+        this.withdrawApprovals(entry);
+        this.asked.delete(session.id as string);
+        entry.turnActive = false;
+      }
+      return;
+    }
     // No-throw seam: translation errors must never reach the agent loop. The
     // turn/end waiter still resolves below, so a poisoned event cannot hang
     // an in-flight execute() either.
@@ -820,6 +873,7 @@ export class A2aBridge {
    * `assistant/message` events). Same no-throw seam as the session feed.
    */
   private onAssistantStream(agent: Agent, frame: AssistantStreamFrame): void {
+    if (this.inbox?.onAssistantStream(agent, frame)) return;
     const entry = this.bySession.get(agent.session.id as string);
     if (!entry || entry.staleTurn) return;
     try {
@@ -830,6 +884,7 @@ export class A2aBridge {
   }
 
   private onSessionDisposed(session: Session): void {
+    this.inbox?.onDisposed(session);
     this.children.delete(session);
     const entry = this.bySession.get(session.id as string);
     if (!entry) return;
