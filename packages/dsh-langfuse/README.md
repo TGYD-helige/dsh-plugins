@@ -95,6 +95,8 @@ Custom bridges use the same `hook/invoked` and `hook/result` session records. Th
 
 Import `appendHookEvent`, `HookInvoked`, and `HookResult` from `@amaster.ai/dsh-langfuse`. This typed writer uses the real `session.append` publication path without redeclaring `SessionEventMap`. Its TypeScript adaptation allows custom payloads despite the optional upstream `dsh-hook-protocol` type augmentation; it does not widen that package's runtime contract, runner, or bridge APIs. The writer validates fields, catches append failures, logs `[dsh-langfuse]`, and returns a boolean; telemetry success must never control a hook's decision.
 
+**DSH 0.2.1-rc.2.** The upstream hook invariant companion and `dsh-invariants` package are no longer part of this runtime. Custom dialects and delayed results are accepted through the session publication seam; the plugin still validates hook records and contains append failures.
+
 **Runtime compatibility boundary (verified with `dsh-hook-protocol@0.2.0-rc.2`).** When its invariant companion is registered and enabled through `dsh-invariants`, it rejects dialects other than `claude-code`/`codex`, invocations outside an open turn, and results after their turn closes or while another turn is open. A type assertion cannot bypass these pre-commit checks. `appendHookEvent` returns `false` for rejected records; they are not committed or published and produce no Langfuse hook observation.
 
 | Runtime composition | Claude Code/Codex pairs in the open turn | Custom dialects | Detached invocations / late results |

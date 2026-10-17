@@ -626,13 +626,12 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHoo
 
   let hookPatch = '';
   if (hook) {
-    const version = envOr(process.env.DSH_CLI_VERSION, '0.2.0-rc.2');
+    const version = envOr(process.env.DSH_CLI_VERSION, '0.2.1-rc.2');
     run(dsh, [
       'plugin', '--profile', 'headless', 'add',
       `@deepseek-ai/dsh-hooks-codex@${version}`,
       `@deepseek-ai/dsh-hook-protocol@${version}`,
       `@deepseek-ai/dsh-shell@${version}`,
-      `@deepseek-ai/dsh-invariants@${version}`,
     ], { cwd: workDir, env: dshHomeEnv });
     copyFileSync(new URL('./hook-script.mjs', import.meta.url), join(workDir, 'hook-script.mjs'));
     const hookConfigPath = join(workDir, 'hooks.json');
