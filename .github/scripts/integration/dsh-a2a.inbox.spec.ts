@@ -1,4 +1,6 @@
 /** Real loop, A2A HTTP, and JSONL restart; only model responses are scripted. */
+import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,7 +17,7 @@ import AgentRegistry from '@deepseek-ai/dsh-agent';
 import AgentLoop from '@deepseek-ai/dsh-agent-loop';
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl';
 import * as Langfuse from '../../../packages/dsh-langfuse/src/index.js';
-import { startFakeIngestion, capturedToObservations } from './lib/langfuse-shared.mjs';
+import { startFakeIngestion, capturedToObservations, runVerification } from './lib/langfuse-shared.mjs';
 import { A2aBridge } from '../../../packages/dsh-a2a/src/bridge.js';
 import { NativeInbox, INBOX_EXTENSION } from '../../../packages/dsh-a2a/src/inbox.js';
 import { DshAgentExecutor } from '../../../packages/dsh-a2a/src/executor.js';
@@ -29,13 +31,13 @@ const { MockAdapter, textResponse } = await import(`${process.env.DSH_SOURCE_ROO
 const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const dispose of cleanups.splice(0).reverse()) await dispose(); });
 
-async function boot(options: { root?: string; store?: SanitizedTaskStore; backend?: MemoryTaskStore; script?: unknown[]; langfuseUrl?: string } = {}) {
+async function boot(options: { root?: string; store?: SanitizedTaskStore; backend?: MemoryTaskStore; script?: unknown[]; langfuseUrl?: string; langfuse?: Langfuse.LangfusePluginConfig; contextId?: string } = {}) {
   const ctx = new Context();
   cleanups.push(() => ctx.fiber.dispose());
   for (const plugin of [LlmRuntime, SessionStore, SessionProjectionRegistry, SystemPrompt, ToolRuntime, AgentRegistry]) await ctx.plugin(plugin);
   if (options.root) await ctx.plugin(JsonlSessionPersistence, { root: options.root, compression: 'none' });
   await ctx.plugin(AgentLoop, { agents: [] });
-  if (options.langfuseUrl) await ctx.plugin(Langfuse, { enabled: true, publicKey: 'public-inbox-test', secretKey: 'secret-inbox-test', baseUrl: options.langfuseUrl, captureContent: false });
+  if (options.langfuse || options.langfuseUrl) await ctx.plugin(Langfuse, options.langfuse ?? { enabled: true, publicKey: 'public-inbox-test', secretKey: 'secret-inbox-test', baseUrl: options.langfuseUrl, captureContent: false });
   const adapter = new MockAdapter(options.script ?? Array.from({ length: 8 }, () => textResponse('ok')));
   ctx.llm.registerAdapter(['mock'], adapter);
   const bridge = new A2aBridge(ctx, { cwd: '/tmp', agentOptions: { provider: 'mock', model: 'mock' } });
@@ -52,12 +54,13 @@ async function boot(options: { root?: string; store?: SanitizedTaskStore; backen
   inbox.server = server;
   cleanups.push(() => server.close());
   cleanups.push(() => bridge.dispose());
+  const contextId = options.contextId ?? 'native-test';
   const rpc = async (method: string, params: unknown, extensions = true) => (await fetch(`http://127.0.0.1:${server.port}/a2a/`, {
     method: 'POST', headers: { 'content-type': 'application/json', 'A2A-Version': '1.0', ...(extensions ? { 'A2A-Extensions': INBOX_EXTENSION } : {}) },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
   })).json();
   const send = async (id: string, controls: Record<string, unknown> = {}, taskId?: string, text = id) => {
-    const response = await rpc('SendMessage', { message: { messageId: id, role: 'ROLE_USER', contextId: 'native-test', taskId, parts: [{ text }], metadata: { [INBOX_EXTENSION]: controls } }, configuration: { returnImmediately: true } });
+    const response = await rpc('SendMessage', { message: { messageId: id, role: 'ROLE_USER', contextId, taskId, parts: [{ text }], metadata: { [INBOX_EXTENSION]: controls } }, configuration: { returnImmediately: true } });
     expect(response.error).toBeUndefined();
     return response.result.task;
   };
@@ -642,3 +645,78 @@ it('exports recovered inbox identity and queue waiting across a durable restart'
   expect(BigInt(parent.endTimeUnixNano)).toBeGreaterThanOrEqual(BigInt(preparation.endTimeUnixNano));
   expect(Number(BigInt(preparation.endTimeUnixNano) - BigInt(preparation.startTimeUnixNano)) / 1e6).toBeGreaterThanOrEqual(20);
 });
+
+
+it('discovers inbox waits and scripted generations through the Langfuse read-back API', async () => {
+  const queries: URLSearchParams[] = [];
+  const server = createServer((request, response) => {
+    const query = new URL(request.url!, 'http://localhost').searchParams;
+    queries.push(query);
+    const name = query.get('name') ?? 'llm-call';
+    response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+      data: [{ id: 'observation', traceId: 'trace', name, metadata: { messageId: 'inbox-api-marker' } }],
+      meta: { totalPages: 1 },
+    }));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  cleanups.push(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  for (const observationName of [undefined, 'inbox:wait']) {
+    const result = await runVerification({ baseUrl, publicKey: 'test-public', secretKey: 'test-secret',
+      fromStartTime: new Date(0).toISOString(), toStartTime: new Date().toISOString(),
+      codeword: 'inbox-api-marker', model: 'mock', observationName,
+      evaluate: observations => observations.length === 1 ? [] : ['missing observation'],
+    });
+    expect(result.ok, result.state).toBe(true);
+  }
+  expect(queries[0].get('model')).toBe('mock');
+  expect(queries[0].get('type')).toBe('GENERATION');
+  expect(queries[2].get('name')).toBe('inbox:wait');
+  expect(queries[2].has('model')).toBe(false);
+});
+
+it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable inbox traces in the real Langfuse project', async () => {
+  const { LANGFUSE_PUBLIC_KEY: publicKey, LANGFUSE_SECRET_KEY: secretKey, LANGFUSE_BASE_URL: baseUrl } = process.env;
+  expect(publicKey && secretKey && baseUrl, 'Live inbox verification requires LANGFUSE_* credentials and URL').toBeTruthy();
+  const runId = process.env.GITHUB_RUN_ID ?? Date.now().toString();
+  const attempt = process.env.GITHUB_RUN_ATTEMPT ?? '1';
+  const contextId = `ci-inbox-${runId}-${attempt}-${randomUUID()}`;
+  const fromStartTime = new Date(Date.now() - 60_000).toISOString();
+  const f = await boot({ contextId, langfuse: { enabled: true, publicKey, secretKey, baseUrl,
+    traceName: 'dsh-inbox', captureContent: true, environment: 'ci',
+    release: process.env.GITHUB_SHA ?? 'local',
+    tags: ['ci', 'scenario:inbox', `run:${runId}`, `attempt:${attempt}`],
+  } });
+  const inputs = [`${contextId}-first`, `${contextId}-second`];
+  const tasks = [];
+  for (const input of inputs) tasks.push(await f.send(input, { wakeup: false }));
+  const canceled = await f.send(`${contextId}-canceled`, { wakeup: false });
+  await f.inbox.pause(contextId);
+  await f.inbox.cancel(canceled.id);
+  await f.inbox.wake(contextId, { resume: true });
+  const agent = await f.inbox.resolve(contextId);
+  await agent.whenIdle();
+  for (const task of tasks) await f.completed(task.id);
+  await f.ctx.parallel('session/flush', agent.session);
+  const toStartTime = new Date(Date.now() + 60_000).toISOString();
+  await Promise.all(inputs.flatMap((codeword, index) => [undefined, 'inbox:wait'].map(async observationName => {
+      const result = await runVerification({ baseUrl, publicKey, secretKey, fromStartTime, toStartTime,
+        codeword, model: 'mock', observationName,
+        evaluate(observations) {
+          const root = observations.find(observation => observation.name === (observationName ?? 'dsh-inbox'));
+          const problems = [];
+          if (!root?.endTime || root.metadata?.taskId !== tasks[index].id) problems.push('missing ended task-attributed root');
+          if (observationName) {
+            const waitMs = Number(root?.metadata?.waitMs);
+            if (root?.metadata?.messageId !== codeword || !Number.isFinite(waitMs) || waitMs < 0) problems.push('missing queue identity/timing');
+          } else {
+            if (!observations.some(observation => observation.name === 'inbox:prepare' && observation.parentObservationId === root?.id)) problems.push('missing preparation child');
+            if (!observations.some(observation => observation.type === 'GENERATION' && observation.parentObservationId === root?.id)) problems.push('missing generation child');
+          }
+          return problems;
+        },
+      });
+      expect(result.ok, result.state).toBe(true);
+      console.log(`Langfuse inbox ${contextId}: ${result.state}`);
+  })));
+}, 6 * 60_000);

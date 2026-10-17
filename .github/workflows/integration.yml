@@ -186,7 +186,7 @@ jobs:
 
       # shortcut: native inbox is unreleased; replace this source checkout and
       # companion patch with a published runtime once its capability ships.
-      # No installed dependency artifacts are modified. This leg needs no secrets.
+      # No installed dependency artifacts are modified. The base leg needs no secrets.
       - uses: actions/checkout@v7
         with:
           repository: deepseek-ai/deepseek-harness
@@ -203,6 +203,16 @@ jobs:
       - name: Verify queue insertion over A2A HTTP and JSONL
         env:
           DSH_SOURCE_ROOT: ${{ github.workspace }}/.native-inbox-upstream
+        run: node .github/scripts/check-native-inbox.mjs
+
+      - name: Verify real Langfuse inbox ingestion
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          DSH_SOURCE_ROOT: ${{ github.workspace }}/.native-inbox-upstream
+          DSH_INBOX_LANGFUSE_LIVE: 'true'
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
         run: node .github/scripts/check-native-inbox.mjs
 
   scenario-backends:
