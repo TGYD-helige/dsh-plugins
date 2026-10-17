@@ -416,6 +416,57 @@ describe('dsh-langfuse plugin', () => {
     expect(waiting.ended).toBe(1);
   });
 
+  it.each([true, false])(
+    'reports readable inbox input/outcome with captureContent=%s',
+    async (captureContent) => {
+      await setup({
+        ...enabledConfig,
+        publicKey: 'public-inbox-test',
+        secretKey: 'secret-inbox-test',
+        captureContent,
+      });
+      const detail = {
+        contextId: 'queue',
+        taskId: 'task-1',
+        messageId: 'message-1',
+        nativeMessageId: 'native-1',
+        at: 3000,
+        queuedAt: 1000,
+        selectedAt: 3000,
+        pending: 2,
+        target: 'next-turn' as const,
+        position: 2,
+        paused: true,
+        agentStatus: 'idle',
+        input: 'Summarize the queued report',
+      };
+      ctx.emit('a2a/inbox', { ...detail, phase: 'admitted' });
+      ctx.emit('a2a/inbox', { ...detail, phase: 'selected' });
+      const admitted = mocks.roots.find((root) => root.name === 'inbox:admitted')!;
+      const waiting = mocks.roots.find((root) => root.name === 'inbox:wait')!;
+      expect(admitted.attributes['langfuse.trace.input']).toBe(
+        captureContent ? detail.input : undefined,
+      );
+      expect(admitted.updates).toContainEqual(
+        expect.objectContaining({
+          output: expect.objectContaining({
+            state: 'admitted',
+            target: 'next-turn',
+            position: 2,
+            pending: 2,
+            paused: true,
+          }),
+        }),
+      );
+      expect(waiting.updates).toContainEqual(
+        expect.objectContaining({
+          output: expect.objectContaining({ state: 'selected', waitMs: 2000 }),
+        }),
+      );
+      if (!captureContent) expect(JSON.stringify(mocks.roots)).not.toContain(detail.input);
+    },
+  );
+
   it('records native preparation failures and starts the next turn with fresh attribution', async () => {
     await setup({
       ...enabledConfig,
@@ -436,6 +487,7 @@ describe('dsh-langfuse plugin', () => {
         queuedAt: 1000,
         pending: 0,
         turn,
+        input: `request-${turn}`,
         taskId: `task-${turn}`,
         messageId: `input-${turn}`,
         nativeMessageId: `native-${turn}`,
@@ -446,6 +498,7 @@ describe('dsh-langfuse plugin', () => {
     }
     const roots = mocks.roots.filter((root) => root.name === 'dsh-turn');
     expect(roots).toHaveLength(2);
+    expect(roots[0].attributes['langfuse.trace.input']).toBe('request-1');
     expect(roots[0].spans[0].updates).toContainEqual(expect.objectContaining({ level: 'ERROR' }));
     expect(roots[1].updates).toContainEqual(
       expect.objectContaining({

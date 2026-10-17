@@ -559,11 +559,11 @@ it('does not expose rejected admission history and accepts a retry after a check
 });
 
 
-it('exports native inbox lifecycle and attributed turn traces through the real Langfuse SDK', async () => {
+it.each([true, false])('exports readable inbox lifecycle through the real SDK with captureContent=%s', async captureContent => {
   const captured: unknown[] = [];
   const collector = await startFakeIngestion(captured);
   cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
-  const f = await boot({ langfuseUrl: `http://127.0.0.1:${collector.address().port}` });
+  const f = await boot({ langfuse: { enabled: true, publicKey: 'public-inbox-test', secretKey: 'secret-inbox-test', baseUrl: `http://127.0.0.1:${collector.address().port}`, captureContent } });
   const traceparent = '00-11111111111111111111111111111111-2222222222222222-01';
   f.ctx.on('a2a/before-assembly', async detail => {
     f.ctx.emit('langfuse/context', detail.contextId, { traceparent, userId: 'inbox-user' });
@@ -611,7 +611,14 @@ it('exports native inbox lifecycle and attributed turn traces through the real L
   expect(hooks).toHaveLength(3);
   expect(hooks.every(hook => roots.some(root => root.id === hook.parentObservationId))).toBe(true);
   expect(observations.every(observation => observation.sessionId === 'native-test' && observation.endTime)).toBe(true);
-  expect(JSON.stringify(captured)).not.toMatch(/private-first|private-second|private-canceled|private-failed|secret-inbox-test/);
+  expect(JSON.stringify(captured)).not.toContain('secret-inbox-test');
+  if (captureContent) {
+    expect(waits.map(wait => wait.input)).toEqual(['private-first', 'private-failed', 'private-second']);
+    expect(observations.find(observation => observation.name === 'inbox:admitted')?.output).toMatchObject({ state: 'admitted', pending: 1, target: 'next-turn', position: 1 });
+    expect(waits.every(wait => wait.output?.state === 'selected')).toBe(true);
+  } else {
+    expect(JSON.stringify(captured)).not.toMatch(/private-first|private-second|private-canceled|private-failed/);
+  }
 });
 
 
@@ -682,15 +689,20 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable i
   const attempt = process.env.GITHUB_RUN_ATTEMPT ?? '1';
   const contextId = `ci-inbox-${runId}-${attempt}-${randomUUID()}`;
   const fromStartTime = new Date(Date.now() - 60_000).toISOString();
-  const f = await boot({ contextId, langfuse: { enabled: true, publicKey, secretKey, baseUrl,
+  const replies = ['发布前检查待办：\n1. 构建项目\n2. 运行测试\n3. 检查发布说明', '按补充要求调整：\n1. 运行测试\n2. 构建项目'];
+  const f = await boot({ contextId, script: replies.map(reply => textResponse(reply)), langfuse: { enabled: true, publicKey, secretKey, baseUrl,
     traceName: 'dsh-inbox', captureContent: true, environment: 'ci',
     release: process.env.GITHUB_SHA ?? 'local',
     tags: ['ci', 'scenario:inbox', `run:${runId}`, `attempt:${attempt}`],
   } });
   const inputs = [`${contextId}-first`, `${contextId}-second`];
+  const prompts = [
+    `请为发布前检查列出三项待办：构建、测试、检查发布说明。先不要执行命令。\n测试编号：${inputs[0]}`,
+    `补充上一条要求：只保留构建和测试，并把测试排在第一位。\n测试编号：${inputs[1]}`,
+  ];
   const tasks = [];
-  for (const input of inputs) tasks.push(await f.send(input, { wakeup: false }));
-  const canceled = await f.send(`${contextId}-canceled`, { wakeup: false });
+  for (const [index, input] of inputs.entries()) tasks.push(await f.send(input, { wakeup: false }, undefined, prompts[index]));
+  const canceled = await f.send(`${contextId}-canceled`, { wakeup: false }, undefined, '这条排队输入将在执行前取消，不应进入模型请求。');
   await f.inbox.pause(contextId);
   await f.inbox.cancel(canceled.id);
   await f.inbox.wake(contextId, { resume: true });
@@ -708,8 +720,12 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable i
           if (!root?.endTime || root.metadata?.taskId !== tasks[index].id) problems.push('missing ended task-attributed root');
           if (observationName) {
             const waitMs = Number(root?.metadata?.waitMs);
+            if (root?.input !== prompts[index]) problems.push('missing readable queue input');
+            if (root?.output?.state !== 'selected') problems.push('missing queue selection outcome');
+            if (root?.metadata?.target !== 'next-turn') problems.push('missing queue target');
             if (root?.metadata?.messageId !== codeword || !Number.isFinite(waitMs) || waitMs < 0) problems.push('missing queue identity/timing');
           } else {
+            if (root?.input !== prompts[index] || root?.output !== replies[index]) problems.push('missing readable turn conversation');
             if (!observations.some(observation => observation.name === 'inbox:prepare' && observation.parentObservationId === root?.id)) problems.push('missing preparation child');
             if (!observations.some(observation => observation.type === 'GENERATION' && observation.parentObservationId === root?.id)) problems.push('missing generation child');
           }

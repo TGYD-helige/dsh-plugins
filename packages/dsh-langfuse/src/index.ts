@@ -50,12 +50,17 @@ import { displayBlocks } from './media.js';
 export type { LangfuseTraceContext } from './client.js';
 export { appendHookEvent, type HookInvoked, type HookResult } from './hooks.js';
 
-/** Optional protocol telemetry; no dependency on the A2A plugin or request payloads. */
+/** Optional protocol telemetry; no dependency on the A2A plugin. */
 interface A2aInboxEvent {
   phase: string;
   contextId: string;
   at: number;
   pending: number;
+  target?: 'next-turn' | 'next-step';
+  input?: string;
+  position?: number;
+  paused?: boolean;
+  agentStatus?: string;
   taskId?: string;
   taskIds?: string[];
   messageId?: string;
@@ -486,8 +491,21 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         messageId: event.messageId,
         nativeMessageId: event.nativeMessageId,
         pending: event.pending,
+        target: event.target,
+        position: event.position,
+        paused: event.paused,
+        agentStatus: event.agentStatus,
         turn: event.turn,
         step: event.step,
+      };
+      const input = config.captureContent ? event.input : undefined;
+      const output = {
+        state: event.phase,
+        target: event.target,
+        position: event.position,
+        pending: event.pending,
+        paused: event.paused,
+        agentStatus: event.agentStatus,
       };
       if (event.phase === 'selected') {
         const inputs = inboxInputs.get(id) ?? [];
@@ -502,7 +520,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
             metadata: { ...metadata, waitMs },
             startTime: new Date(event.queuedAt),
           });
-          reporter.endSpan(wait, {}, new Date(event.selectedAt ?? event.at));
+          reporter.updateSpan(wait, { input });
+          reporter.endSpan(
+            wait,
+            { output: { ...output, waitMs } },
+            new Date(event.selectedAt ?? event.at),
+          );
         }
         return;
       }
@@ -510,6 +533,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         const parent = parentFor(id);
         const inputs = inboxInputs.get(id) ?? [event];
         reporter.updateSpan(parent, {
+          input: sessions.get(id)?.hasInput ? undefined : input,
           metadata: {
             taskId: event.taskId,
             a2aMessageIds: inputs.map((input) => input.messageId),
@@ -518,6 +542,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         });
         const prepare = reporter.startSpan(parent, {
           name: 'inbox:prepare',
+          input,
           startTime: new Date(event.selectedAt ?? event.at),
           metadata: {
             ...metadata,
@@ -528,6 +553,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         reporter.endSpan(
           prepare,
           {
+            output,
             level:
               event.phase === 'prepare-failed'
                 ? 'ERROR'
@@ -545,7 +571,8 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         sessionId: id,
         metadata,
       });
-      reporter.endSpan(operation, {}, new Date(event.at));
+      reporter.updateSpan(operation, { input });
+      reporter.endSpan(operation, { output }, new Date(event.at));
       if (event.phase === 'disposed' || event.phase === 'cleared') {
         nativeInboxes.delete(id);
         inboxInputs.delete(id);

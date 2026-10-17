@@ -28,6 +28,11 @@ export interface A2aInboxEvent {
   contextId: string;
   at: number;
   pending: number;
+  target?: 'next-turn' | 'next-step';
+  input?: string;
+  position?: number;
+  paused?: boolean;
+  agentStatus?: string;
   taskId?: string;
   taskIds?: string[];
   messageId?: string;
@@ -59,7 +64,7 @@ declare module '@deepseek-ai/dsh-session/types' {
 }
 declare module '@deepseek-ai/cordis' {
   interface Events {
-    /** Metadata-only native inbox lifecycle; observer failures never affect execution. */
+    /** Native inbox lifecycle; content consumers must honor their capture settings. */
     'a2a/inbox'(detail: A2aInboxEvent): void;
 
     // TODO(verify): upstream packages/core/agent/src/runtime-types.ts, native inbox capability.
@@ -267,6 +272,8 @@ export class NativeInbox implements A2aInbox {
           contextId: run.entry.sessionId,
           at: Date.now(),
           pending: pending.length,
+          paused: run.paused,
+          agentStatus: run.entry.handle.agent.status,
           taskIds: [
             ...new Set(
               pending.flatMap((message) =>
@@ -290,9 +297,16 @@ export class NativeInbox implements A2aInbox {
   ): void {
     try {
       if (message.source.kind !== 'a2a') return;
+      const original = Message.fromJSON(JSON.parse(message.source.message));
+      const position = this.pending(run).findIndex((input) => input.id === message.id);
       this.observe(phase, run, {
+        target: message.source.target,
+        input: original.parts
+          .flatMap((part) => (part.content?.$case === 'text' ? [part.content.value] : []))
+          .join('\n'),
+        position: position < 0 ? undefined : position + 1,
         taskId: message.source.taskId,
-        messageId: Message.fromJSON(JSON.parse(message.source.message)).messageId,
+        messageId: original.messageId,
         nativeMessageId: message.id,
         queuedAt: message.source.queuedAt,
         ...fields,
