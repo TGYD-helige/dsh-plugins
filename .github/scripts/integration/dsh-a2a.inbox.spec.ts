@@ -107,8 +107,11 @@ it('cold-restores paused A2A inputs from JSONL and resumes the original tasks wi
   expect(restored.session.snapshotEvents().filter(e => e.type === 'user/message').map(e => e.data.id)).toEqual(ids);
 });
 
-it('steers the active task at its next step while an ordinary message waits for another turn', async () => {
-  const f = await boot();
+it.each([true, false])('records steering in the active turn while ordinary input waits with captureContent=%s', async captureContent => {
+  const captured: unknown[] = [];
+  const collector = await startFakeIngestion(captured);
+  cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
+  const f = await boot({ langfuse: { enabled: true, publicKey: 'public-inbox-test', secretKey: 'secret-inbox-test', baseUrl: `http://127.0.0.1:${collector.address().port}`, captureContent } });
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   f.ctx.on('agent/request', async (detail, next) => { if (detail.turn === 1 && detail.step === 1) await gate; return next(); });
@@ -116,8 +119,10 @@ it('steers the active task at its next step while an ordinary message waits for 
   const agent = await f.inbox.resolve('native-test');
   await expect.poll(() => agent.status).toBe('running');
   const ordinary = await f.send('later');
-  await f.send('steer', { target: 'next-step' }, first.id);
-  release();
+  const steeringText = 'Do not publish; only build and test';
+  try {
+    await f.send('steer', { target: 'next-step' }, first.id, steeringText);
+  } finally { release(); }
   await agent.whenIdle();
   await f.completed(first.id);
   await f.completed(ordinary.id);
@@ -127,7 +132,19 @@ it('steers the active task at its next step while an ordinary message waits for 
     if (event.type === 'step/start') { turn = event.data.turn; step = event.data.step; }
     if (event.type === 'user/message') seen.push([turn, step, event.data.content[0].text]);
   }
-  expect(seen).toEqual([[1, 1, 'first'], [1, 2, 'steer'], [2, 1, 'later']]);
+  expect(seen).toEqual([[1, 1, 'first'], [1, 2, steeringText], [2, 1, 'later']]);
+  await f.ctx.parallel('session/flush', agent.session);
+  const observations = capturedToObservations(captured);
+  const roots = observations.filter(observation => observation.name === 'dsh-turn');
+  expect(roots).toHaveLength(2);
+  expect(observations.some(observation => observation.name === 'inbox:wait')).toBe(false);
+  const steering = observations.find(observation => observation.name === 'inbox:steering');
+  expect(steering.metadata).toMatchObject({ taskId: first.id, messageId: 'steer', target: 'next-step', turn: '1', step: '2' });
+  expect(steering.parentObservationId).toBe(roots.find(root => root.metadata.taskId === first.id).id);
+  expect(steering.input).toBe(captureContent ? steeringText : undefined);
+  expect(Number(steering.metadata.waitMs)).toBeGreaterThanOrEqual(0);
+  if (!captureContent) expect(JSON.stringify(captured)).not.toContain(steeringText);
+
 });
 
 it('requires extension negotiation and rejects inactive steering without losing queued inputs', async () => {
@@ -589,23 +606,22 @@ it.each([true, false])('exports readable inbox lifecycle through the real SDK wi
   expect((await f.rpc('GetTask', { id: failed.id })).result.status.state).toBe('TASK_STATE_FAILED');
   await f.ctx.parallel('session/flush', agent.session);
   const observations = capturedToObservations(captured);
-  for (const phase of ['admitted', 'paused', 'canceled', 'resume', 'wait', 'prepare']) {
+  for (const phase of ['admitted', 'paused', 'canceled', 'resume', 'prepare']) {
     expect(observations.some(observation => observation.name === `inbox:${phase}`)).toBe(true);
   }
   const roots = observations.filter(observation => observation.name === 'dsh-turn');
   expect(roots.map(root => root.metadata.taskId)).toEqual([first.id, failed.id, second.id]);
   expect(roots.every(root => root.parentObservationId === '2222222222222222')).toBe(true);
   expect(observations.filter(observation => observation.type === 'GENERATION')).toHaveLength(2);
-  const waits = observations.filter(observation => observation.name === 'inbox:wait');
-  expect(waits).toHaveLength(3);
-  expect(waits.every(wait => Number(wait.metadata.waitMs) >= 20)).toBe(true);
-  for (const wait of [...waits, ...observations.filter(observation => observation.name === 'inbox:prepare')]) {
-    const raw = captured.find(span => span.spanId === wait.id);
-    if (wait.name === 'inbox:prepare') {
-      const parent = captured.find(span => span.spanId === wait.parentObservationId);
-      expect(BigInt(parent.startTimeUnixNano)).toBeLessThanOrEqual(BigInt(raw.startTimeUnixNano));
-    }
-    expect(Number(BigInt(raw.endTimeUnixNano) - BigInt(raw.startTimeUnixNano)) / 1e6).toBeCloseTo(Number(wait.metadata.waitMs ?? wait.metadata.prepareMs), 0);
+  expect(observations.some(observation => observation.name === 'inbox:wait')).toBe(false);
+  expect(roots.every(root => Number(root.metadata.waitMs) >= 20)).toBe(true);
+  const preparations = observations.filter(observation => observation.name === 'inbox:prepare');
+  expect(preparations).toHaveLength(3);
+  for (const preparation of preparations) {
+    const raw = captured.find(span => span.spanId === preparation.id);
+    const parent = captured.find(span => span.spanId === preparation.parentObservationId);
+    expect(BigInt(parent.startTimeUnixNano)).toBeLessThanOrEqual(BigInt(raw.startTimeUnixNano));
+    expect(Number(BigInt(raw.endTimeUnixNano) - BigInt(raw.startTimeUnixNano)) / 1e6).toBeCloseTo(Number(preparation.metadata.prepareMs), 0);
   }
   const hooks = observations.filter(observation => observation.name === 'hook:BeforeAgent');
   expect(hooks).toHaveLength(3);
@@ -613,9 +629,9 @@ it.each([true, false])('exports readable inbox lifecycle through the real SDK wi
   expect(observations.every(observation => observation.sessionId === 'native-test' && observation.endTime)).toBe(true);
   expect(JSON.stringify(captured)).not.toContain('secret-inbox-test');
   if (captureContent) {
-    expect(waits.map(wait => wait.input)).toEqual(['private-first', 'private-failed', 'private-second']);
+    expect(preparations.map(preparation => preparation.input)).toEqual(['private-first', 'private-failed', 'private-second']);
     expect(observations.find(observation => observation.name === 'inbox:admitted')?.output).toMatchObject({ state: 'admitted', pending: 1, target: 'next-turn', position: 1 });
-    expect(waits.every(wait => wait.output?.state === 'selected')).toBe(true);
+    expect(preparations.map(preparation => preparation.output?.state)).toEqual(['prepared', 'prepare-failed', 'prepared']);
   } else {
     expect(JSON.stringify(captured)).not.toMatch(/private-first|private-second|private-canceled|private-failed/);
   }
@@ -643,9 +659,10 @@ it('exports recovered inbox identity and queue waiting across a durable restart'
   await second.ctx.parallel('session/flush', agent.session);
   const observations = capturedToObservations(captured);
   expect(observations.find(observation => observation.name === 'inbox:restored')?.metadata).toMatchObject({ taskId: task.id, messageId: 'restored-input' });
-  expect(observations.find(observation => observation.name === 'inbox:wait')?.metadata).toMatchObject({ taskId: task.id, messageId: 'restored-input' });
+  expect(observations.some(observation => observation.name === 'inbox:wait')).toBe(false);
   const turn = observations.find(observation => observation.name === 'dsh-turn');
   expect(turn.metadata.taskId).toBe(task.id);
+  expect(Number(turn.metadata.waitMs)).toBeGreaterThanOrEqual(0);
   const preparation = captured.find(span => span.name === 'inbox:prepare');
   const parent = captured.find(span => span.spanId === turn.id);
   expect(BigInt(parent.startTimeUnixNano)).toBeLessThanOrEqual(BigInt(preparation.startTimeUnixNano));
@@ -654,7 +671,7 @@ it('exports recovered inbox identity and queue waiting across a durable restart'
 });
 
 
-it('discovers inbox waits and scripted generations through the Langfuse read-back API', async () => {
+it('discovers inbox admissions and scripted generations through the Langfuse read-back API', async () => {
   const queries: URLSearchParams[] = [];
   const server = createServer((request, response) => {
     const query = new URL(request.url!, 'http://localhost').searchParams;
@@ -668,7 +685,7 @@ it('discovers inbox waits and scripted generations through the Langfuse read-bac
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   cleanups.push(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
-  for (const observationName of [undefined, 'inbox:wait']) {
+  for (const observationName of [undefined, 'inbox:admitted']) {
     const result = await runVerification({ baseUrl, publicKey: 'test-public', secretKey: 'test-secret',
       fromStartTime: new Date(0).toISOString(), toStartTime: new Date().toISOString(),
       codeword: 'inbox-api-marker', model: 'mock', observationName,
@@ -678,7 +695,7 @@ it('discovers inbox waits and scripted generations through the Langfuse read-bac
   }
   expect(queries[0].get('model')).toBe('mock');
   expect(queries[0].get('type')).toBe('GENERATION');
-  expect(queries[2].get('name')).toBe('inbox:wait');
+  expect(queries[2].get('name')).toBe('inbox:admitted');
   expect(queries[2].has('model')).toBe(false);
 });
 
@@ -689,7 +706,7 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable i
   const attempt = process.env.GITHUB_RUN_ATTEMPT ?? '1';
   const contextId = `ci-inbox-${runId}-${attempt}-${randomUUID()}`;
   const fromStartTime = new Date(Date.now() - 60_000).toISOString();
-  const replies = ['发布前检查待办：\n1. 构建项目\n2. 运行测试\n3. 检查发布说明', '按补充要求调整：\n1. 运行测试\n2. 构建项目'];
+  const replies = ['发布前检查待办：\n1. 构建项目\n2. 运行测试\n3. 检查发布说明', '已遵循运行中的引导：只列构建和测试，不执行发布。\n1. 构建项目\n2. 运行测试', '按补充要求调整：\n1. 运行测试\n2. 构建项目'];
   const f = await boot({ contextId, script: replies.map(reply => textResponse(reply)), langfuse: { enabled: true, publicKey, secretKey, baseUrl,
     traceName: 'dsh-inbox', captureContent: true, environment: 'ci',
     release: process.env.GITHUB_SHA ?? 'local',
@@ -705,34 +722,49 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable i
   const canceled = await f.send(`${contextId}-canceled`, { wakeup: false }, undefined, '这条排队输入将在执行前取消，不应进入模型请求。');
   await f.inbox.pause(contextId);
   await f.inbox.cancel(canceled.id);
-  await f.inbox.wake(contextId, { resume: true });
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let requested = false;
+  f.ctx.on('agent/request', async (detail, next) => {
+    if (detail.turn === 1 && detail.step === 1) { requested = true; await gate; }
+    return next();
+  });
+  const steeringId = `${contextId}-steering`;
+  const steeringText = `运行中引导：不要发布，只保留构建和测试；当前任务继续，不另起一轮。\n测试编号：${steeringId}`;
   const agent = await f.inbox.resolve(contextId);
+  try {
+    await f.inbox.wake(contextId, { resume: true });
+    await expect.poll(() => requested).toBe(true);
+    await f.send(steeringId, { target: 'next-step' }, tasks[0].id, steeringText);
+  } finally { release(); }
   await agent.whenIdle();
   for (const task of tasks) await f.completed(task.id);
   await f.ctx.parallel('session/flush', agent.session);
   const toStartTime = new Date(Date.now() + 60_000).toISOString();
-  await Promise.all(inputs.flatMap((codeword, index) => [undefined, 'inbox:wait'].map(async observationName => {
-      const result = await runVerification({ baseUrl, publicKey, secretKey, fromStartTime, toStartTime,
-        codeword, model: 'mock', observationName,
-        evaluate(observations) {
-          const root = observations.find(observation => observation.name === (observationName ?? 'dsh-inbox'));
-          const problems = [];
-          if (!root?.endTime || root.metadata?.taskId !== tasks[index].id) problems.push('missing ended task-attributed root');
-          if (observationName) {
-            const waitMs = Number(root?.metadata?.waitMs);
-            if (root?.input !== prompts[index]) problems.push('missing readable queue input');
-            if (root?.output?.state !== 'selected') problems.push('missing queue selection outcome');
-            if (root?.metadata?.target !== 'next-turn') problems.push('missing queue target');
-            if (root?.metadata?.messageId !== codeword || !Number.isFinite(waitMs) || waitMs < 0) problems.push('missing queue identity/timing');
-          } else {
-            if (root?.input !== prompts[index] || root?.output !== replies[index]) problems.push('missing readable turn conversation');
-            if (!observations.some(observation => observation.name === 'inbox:prepare' && observation.parentObservationId === root?.id)) problems.push('missing preparation child');
-            if (!observations.some(observation => observation.type === 'GENERATION' && observation.parentObservationId === root?.id)) problems.push('missing generation child');
-          }
-          return problems;
-        },
-      });
-      expect(result.ok, result.state).toBe(true);
-      console.log(`Langfuse inbox ${contextId}: ${result.state}`);
-  })));
+  await Promise.all(inputs.map(async (codeword, index) => {
+    const result = await runVerification({ baseUrl, publicKey, secretKey, fromStartTime, toStartTime,
+      codeword, model: 'mock',
+      evaluate(observations) {
+        const root = observations.find(observation => observation.name === 'dsh-inbox');
+        const problems = [];
+        if (!root?.endTime || root.metadata?.taskId !== tasks[index].id) problems.push('missing ended task-attributed root');
+        const waitMs = Number(root?.metadata?.waitMs);
+        if (!Number.isFinite(waitMs) || waitMs < 0) problems.push('missing queue wait on execution root');
+        if (root?.input !== prompts[index] || root?.output !== replies[index + 1]) problems.push('missing readable turn conversation');
+        if (!observations.some(observation => observation.name === 'inbox:prepare' && observation.parentObservationId === root?.id)) problems.push('missing preparation child');
+        const generations = observations.filter(observation => observation.type === 'GENERATION' && observation.parentObservationId === root?.id);
+        if (generations.length !== (index === 0 ? 2 : 1)) problems.push('wrong number of model steps');
+        const steering = observations.find(observation => observation.name === 'inbox:steering');
+        if (index === 0) {
+          if (!steering?.endTime || steering.parentObservationId !== root?.id || steering.input !== steeringText ||
+            steering.metadata?.taskId !== tasks[0].id || steering.metadata?.messageId !== steeringId ||
+            steering.metadata?.target !== 'next-step' || Number(steering.metadata?.turn) !== 1 || Number(steering.metadata?.step) !== 2) problems.push('missing steering content/ownership/application step');
+          if (!generations.some(generation => JSON.stringify(generation.input ?? '').includes(steeringId))) problems.push('steering never reached the model request');
+        } else if (steering) problems.push('steering leaked into the next turn');
+        return problems;
+      },
+    });
+    expect(result.ok, result.state).toBe(true);
+    console.log(`Langfuse inbox ${contextId}: ${result.state}`);
+  }));
 }, 6 * 60_000);

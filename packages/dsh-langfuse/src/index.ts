@@ -499,6 +499,10 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         step: event.step,
       };
       const input = config.captureContent ? event.input : undefined;
+      const waitMs =
+        event.queuedAt === undefined
+          ? undefined
+          : Math.max(0, (event.selectedAt ?? event.at) - event.queuedAt);
       const output = {
         state: event.phase,
         target: event.target,
@@ -512,40 +516,32 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         if (!inputs.some((input) => input.nativeMessageId === event.nativeMessageId))
           inputs.push(event);
         inboxInputs.set(id, inputs);
-        if (event.queuedAt !== undefined) {
-          const waitMs = Math.max(0, (event.selectedAt ?? event.at) - event.queuedAt);
-          const wait = reporter.openTrace({
-            name: 'inbox:wait',
-            sessionId: id,
-            metadata: { ...metadata, waitMs },
-            startTime: new Date(event.queuedAt),
-          });
-          reporter.updateSpan(wait, { input });
-          reporter.endSpan(
-            wait,
-            { output: { ...output, waitMs } },
-            new Date(event.selectedAt ?? event.at),
-          );
-        }
         return;
       }
       if (['prepared', 'prepare-failed', 'prepare-aborted'].includes(event.phase)) {
         const parent = parentFor(id);
         const inputs = inboxInputs.get(id) ?? [event];
+        const first = inputs[0];
+        const turnWaitMs =
+          first.queuedAt === undefined
+            ? undefined
+            : Math.max(0, (first.selectedAt ?? first.at) - first.queuedAt);
         reporter.updateSpan(parent, {
           input: sessions.get(id)?.hasInput ? undefined : input,
           metadata: {
             taskId: event.taskId,
+            waitMs: turnWaitMs,
             a2aMessageIds: inputs.map((input) => input.messageId),
             nativeMessageIds: inputs.map((input) => input.nativeMessageId),
           },
         });
         const prepare = reporter.startSpan(parent, {
-          name: 'inbox:prepare',
+          name: event.target === 'next-step' ? 'inbox:steering' : 'inbox:prepare',
           input,
           startTime: new Date(event.selectedAt ?? event.at),
           metadata: {
             ...metadata,
+            waitMs,
             prepareMs:
               event.selectedAt === undefined ? undefined : Math.max(0, event.at - event.selectedAt),
           },

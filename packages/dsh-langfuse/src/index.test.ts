@@ -407,13 +407,10 @@ describe('dsh-langfuse plugin', () => {
     );
     expect(execution.spans.find((span) => span.name === 'inbox:prepare')?.ended).toBe(1);
     expect(execution.ended).toBe(1);
-    const waiting = mocks.roots.find((root) => root.name === 'inbox:wait')!;
-    expect(waiting.body.metadata).toMatchObject({
-      taskId: 'task-a',
-      messageId: 'input-a',
-      waitMs: 1000,
-    });
-    expect(waiting.ended).toBe(1);
+    expect(mocks.roots.some((root) => root.name === 'inbox:wait')).toBe(false);
+    expect(execution.updates).toContainEqual(
+      expect.objectContaining({ metadata: expect.objectContaining({ waitMs: 1000 }) }),
+    );
   });
 
   it.each([true, false])(
@@ -443,7 +440,7 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit('a2a/inbox', { ...detail, phase: 'admitted' });
       ctx.emit('a2a/inbox', { ...detail, phase: 'selected' });
       const admitted = mocks.roots.find((root) => root.name === 'inbox:admitted')!;
-      const waiting = mocks.roots.find((root) => root.name === 'inbox:wait')!;
+      expect(mocks.roots.some((root) => root.name === 'inbox:wait')).toBe(false);
       expect(admitted.attributes['langfuse.trace.input']).toBe(
         captureContent ? detail.input : undefined,
       );
@@ -458,12 +455,75 @@ describe('dsh-langfuse plugin', () => {
           }),
         }),
       );
-      expect(waiting.updates).toContainEqual(
+      if (!captureContent) expect(JSON.stringify(mocks.roots)).not.toContain(detail.input);
+    },
+  );
+
+  it.each([true, false])(
+    'nests steering under the active turn and keeps its queue wait with captureContent=%s',
+    async (captureContent) => {
+      await setup({
+        ...enabledConfig,
+        publicKey: 'public-inbox-test',
+        secretKey: 'secret-inbox-test',
+        captureContent,
+      });
+      const session = sessionOf('native');
+      const original = {
+        contextId: 'native',
+        phase: 'resolved',
+        pending: 0,
+        at: 1000,
+        taskId: 'task-a',
+        messageId: 'first',
+        nativeMessageId: 'native-first',
+        target: 'next-turn' as const,
+        queuedAt: 1000,
+        selectedAt: 2000,
+        turn: 1,
+        step: 1,
+        input: 'Original request',
+      };
+      ctx.emit('a2a/inbox', original);
+      ctx.emit('session/event', session, turnStart(1));
+      ctx.emit('a2a/inbox', { ...original, phase: 'selected', at: 2000 });
+      ctx.emit('a2a/inbox', { ...original, phase: 'prepared', at: 2100 });
+      ctx.emit('session/event', session, userMessage('Original request'));
+      const steering = {
+        ...original,
+        target: 'next-step' as const,
+        messageId: 'guide',
+        nativeMessageId: 'native-guide',
+        queuedAt: 2200,
+        selectedAt: 3000,
+        step: 2,
+        input: 'Do not publish; only build and test',
+      };
+      ctx.emit('a2a/inbox', { ...steering, phase: 'selected', at: 3000 });
+      ctx.emit('a2a/inbox', { ...steering, phase: 'prepared', at: 3100 });
+      ctx.emit('session/event', session, turnEnd(1));
+      expect(mocks.roots).toHaveLength(1);
+      const root = mocks.roots[0];
+      const span = root.spans.find((span) => span.name === 'inbox:steering')!;
+      expect(span.body.input).toBe(captureContent ? steering.input : undefined);
+      expect(span.body.metadata).toMatchObject({
+        taskId: 'task-a',
+        messageId: 'guide',
+        target: 'next-step',
+        turn: 1,
+        step: 2,
+        waitMs: 800,
+      });
+      expect(span.ended).toBe(1);
+      expect(root.updates).toContainEqual(
         expect.objectContaining({
-          output: expect.objectContaining({ state: 'selected', waitMs: 2000 }),
+          metadata: expect.objectContaining({ waitMs: 1000, a2aMessageIds: ['first', 'guide'] }),
         }),
       );
-      if (!captureContent) expect(JSON.stringify(mocks.roots)).not.toContain(detail.input);
+      expect(root.attributes['langfuse.trace.input']).toBe(
+        captureContent ? 'Original request' : undefined,
+      );
+      if (!captureContent) expect(JSON.stringify(root)).not.toContain(steering.input);
     },
   );
 
@@ -504,6 +564,7 @@ describe('dsh-langfuse plugin', () => {
       expect.objectContaining({
         metadata: {
           taskId: 'task-2',
+          waitMs: 1000,
           a2aMessageIds: ['input-2'],
           nativeMessageIds: ['native-2'],
         },
