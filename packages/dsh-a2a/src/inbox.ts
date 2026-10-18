@@ -9,12 +9,13 @@ import {
   ServerCallContext,
   STATE_HEADERS_KEY,
 } from '@a2a-js/sdk/server';
-import type { Context } from '@deepseek-ai/cordis';
+import type { Context, FiberState } from '@deepseek-ai/cordis';
 import type { Agent, AssistantStreamFrame, InboxTarget } from '@deepseek-ai/dsh-agent';
 import type { GoalMessageSource } from '@deepseek-ai/dsh-goal';
 import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm/types';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
+import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence';
 import type { A2aBridge, TaskEntry } from './bridge.js';
 import type { A2aTurnContext } from './index.js';
 import type { A2aServer } from './server.js';
@@ -43,6 +44,8 @@ export interface A2aInboxEvent {
   turn?: number;
   step?: number;
 }
+
+const RETAINED_INPUTS = `${INBOX_EXTENSION}#retained-inputs`;
 
 interface InboxSource {
   kind: 'a2a';
@@ -116,6 +119,7 @@ interface ContextRun {
   admissionTail: Promise<void>;
   promotions: Map<string, Promise<void>>;
   rolledBack: Set<string>;
+  retained: Record<InboxTarget, UserMessage[]>;
 }
 
 export class NativeInbox implements A2aInbox {
@@ -125,13 +129,32 @@ export class NativeInbox implements A2aInbox {
   private shutdownPromise?: Promise<void>;
   private readonly preadmitted = new WeakMap<ServerCallContext, Set<string>>();
   server?: A2aServer;
+  private readonly persistence?: SessionPersistence;
 
   constructor(
     private readonly ctx: Context,
     private readonly bridge: A2aBridge,
     private readonly store: ManagedTaskStore,
+    private readonly retainPending = false,
   ) {
     bridge.inbox = this;
+    this.persistence = ctx.get('sessionPersistence');
+    if (retainPending)
+      ctx.on('session/event', (session, event) => {
+        const run = this.contexts.get(session.id);
+        if (!run || event.type !== 'agent/inbox/spliced' || this.stopping || this.unloading())
+          return;
+        try {
+          const splice = event.data;
+          run.retained[splice.target].splice(
+            splice.start,
+            splice.removedCount ?? 0,
+            ...structuredClone(splice.inserted),
+          );
+        } catch (error) {
+          console.error('[dsh-a2a] failed to track pending inbox:', error);
+        }
+      });
     ctx.on('agent/pre-step', async (detail, next) => {
       await this.prepare(detail);
       return next();
@@ -174,6 +197,17 @@ export class NativeInbox implements A2aInbox {
         }
       }
     });
+  }
+
+  private unloading(): boolean {
+    // Cordis publishes FiberState as a const enum, without a runtime export.
+    const unloading: FiberState = 5;
+    for (let fiber = this.ctx.fiber; ; ) {
+      if (fiber.uid === null || fiber.state === unloading) return true;
+      const parent = fiber.parent.fiber;
+      if (parent === fiber) return false;
+      fiber = parent;
+    }
   }
 
   content(message: Message, contextId: string) {
@@ -346,9 +380,17 @@ export class NativeInbox implements A2aInbox {
       if (event.type !== 'agent/inbox/spliced') continue;
       for (const message of event.data.inserted) {
         if (message.source.kind !== 'a2a' || !message.source.promotedFrom) continue;
+        const previous = transfers.get(message.id);
         transfers.set(message.id, {
           message: message as UserMessage & { source: InboxSource },
-          placed: event.data.target === message.source.target,
+          // A completed transfer stays complete after later public queue edits.
+          placed:
+            event.data.target === message.source.target ||
+            !!(
+              previous?.placed &&
+              previous.message.source.taskId === message.source.taskId &&
+              previous.message.source.promotionId === message.source.promotionId
+            ),
         });
       }
     }
@@ -381,6 +423,61 @@ export class NativeInbox implements A2aInbox {
     }
   }
 
+  private async recoverRetained(run: ContextRun, context: ServerCallContext): Promise<void> {
+    if (!this.retainPending) return;
+    const agent = run.entry.handle.agent;
+    const committed = new Set(
+      agent.session
+        .snapshotEvents()
+        .flatMap((event) => (event.type === 'user/message' ? [event.data.id] : [])),
+    );
+    const snapshots: Task[] = [];
+    const inputs: Array<{ position: number; target: InboxTarget; message: UserMessage }> = [];
+    let pageToken = '';
+    do {
+      const page = await this.store.list(
+        {
+          tenant: '',
+          contextId: agent.session.id,
+          pageSize: 100,
+          pageToken,
+          status: TaskState.TASK_STATE_UNSPECIFIED,
+          statusTimestampAfter: undefined,
+        },
+        context,
+      );
+      for (const task of page.tasks) {
+        const retained = task.metadata?.[RETAINED_INPUTS];
+        if (typeof retained !== 'string') continue;
+        snapshots.push(task);
+        if (this.terminal(task)) continue;
+        for (const input of JSON.parse(retained) as typeof inputs) {
+          const { message } = input;
+          if (message.source.kind !== 'a2a' || message.source.taskId !== task.id)
+            throw new Error('Retained input has invalid task ownership.');
+          if (!committed.has(message.id)) inputs.push(input);
+        }
+      }
+      pageToken = page.nextPageToken;
+    } while (pageToken);
+    for (const { message, target } of inputs.sort((a, b) => a.position - b.position)) {
+      if (message.source.kind !== 'a2a') continue;
+      const existing = this.pending(run).find((pending) => pending.id === message.id);
+      if (existing) {
+        agent.inbox.replace(message.id, message);
+        const destination = target === 'next-step' ? agent.inbox.nextStep : agent.inbox.nextTurn;
+        if (!destination.some((pending) => pending.id === message.id))
+          this.moveInput(agent, message, target);
+      } else agent.inbox.append(target, message);
+    }
+    if (!snapshots.length) return;
+    await this.flush(agent.session);
+    for (const task of snapshots) {
+      delete task.metadata![RETAINED_INPUTS];
+      await this.checkpoint(task, context);
+    }
+  }
+
   private context(contextId: string, context = new ServerCallContext()): Promise<ContextRun> {
     if (this.stopping) return Promise.reject(new Error('Native inbox is unloading.'));
     const existing = this.contexts.get(contextId);
@@ -397,7 +494,9 @@ export class NativeInbox implements A2aInbox {
           admissionTail: Promise.resolve(),
           promotions: new Map(),
           rolledBack: new Set(),
+          retained: { 'next-step': [], 'next-turn': [] },
         };
+        await this.recoverRetained(run, context);
         await this.recoverPromotions(run, context);
         const snapshots = new Map<string, Task>();
         for (const message of this.pending(run)) {
@@ -410,6 +509,10 @@ export class NativeInbox implements A2aInbox {
         }
         await this.flush(entry.handle.agent.session);
         for (const snapshot of snapshots.values()) this.restoreTask(run, snapshot, context);
+        run.retained = structuredClone({
+          'next-step': [...entry.handle.agent.inbox.nextStep],
+          'next-turn': [...entry.handle.agent.inbox.nextTurn],
+        });
         this.contexts.set(contextId, run);
         this.observe('resolved', run);
         for (const message of this.pending(run)) this.observeInput('restored', run, message);
@@ -422,7 +525,10 @@ export class NativeInbox implements A2aInbox {
 
   private observe(phase: string, run: ContextRun, fields: Partial<A2aInboxEvent> = {}): void {
     try {
-      const pending = this.pending(run);
+      const pending =
+        this.stopping && this.retainPending
+          ? [...run.retained['next-step'], ...run.retained['next-turn']]
+          : this.pending(run);
       void this.ctx
         .parallel('a2a/inbox', {
           phase,
@@ -759,7 +865,7 @@ export class NativeInbox implements A2aInbox {
       await task.done;
       if (task.bus !== bus && task.final) bus.publish(task.final);
     } catch (error) {
-      if (task?.settled) return;
+      if (task?.settled || (this.stopping && this.retainPending)) return;
       if (task && !ownsTask) {
         bus.publish(AgentEvent.task(structuredClone(task.task)));
         return;
@@ -1168,6 +1274,7 @@ export class NativeInbox implements A2aInbox {
       ),
     ];
     for (const admission of run.admissions) admission.abort();
+    run.retained = { 'next-step': [], 'next-turn': [] };
     run.entry.handle.agent.inbox.clear();
     run.entry.handle.agent.cancel({ kind: 'user' });
     await run.entry.handle.agent.whenIdle();
@@ -1187,7 +1294,7 @@ export class NativeInbox implements A2aInbox {
 
   onDisposed(session: Session): void {
     const run = this.contexts.get(session.id);
-    if (!run) return;
+    if (!run || (this.retainPending && this.stopping)) return;
     for (const admission of run.admissions) admission.abort();
     for (const task of run.tasks.values()) {
       if (!task.settled) {
@@ -1217,7 +1324,7 @@ export class NativeInbox implements A2aInbox {
       for (const run of this.contexts.values()) {
         for (const admission of run.admissions) admission.abort();
         try {
-          run.entry.handle.agent.cancel({ kind: 'disposed' });
+          run.entry.handle.agent.cancel({ kind: 'disposed' }, { keepInbox: this.retainPending });
         } catch (error) {
           failures.push(error);
         }
@@ -1227,13 +1334,54 @@ export class NativeInbox implements A2aInbox {
           failures.push(error);
         }
         try {
-          await this.flush(run.entry.handle.agent.session);
+          // The persistence barrier tolerates writers already closed by parallel core teardown.
+          if (this.retainPending && this.persistence) await this.persistence.flush();
+          else await this.flush(run.entry.handle.agent.session);
         } catch (error) {
           failures.push(error);
         } finally {
           for (const task of run.tasks.values()) {
             try {
-              if (!task.settled) await this.cancelTask(run, task);
+              if (!task.settled) {
+                if (this.retainPending) {
+                  const committed = new Set(
+                    run.entry.handle.agent.session
+                      .snapshotEvents()
+                      .flatMap((event) => (event.type === 'user/message' ? [event.data.id] : [])),
+                  );
+                  let position = 0;
+                  const pending = (['next-step', 'next-turn'] as const).flatMap((target) =>
+                    run.retained[target].flatMap((message) => {
+                      const input = { message, target, position: position++ };
+                      return message.source.kind === 'a2a' &&
+                        message.source.taskId === task.task.id &&
+                        !committed.has(message.id)
+                        ? [input]
+                        : [];
+                    }),
+                  );
+                  if (pending.length) {
+                    task.task.metadata = {
+                      ...task.task.metadata,
+                      [RETAINED_INPUTS]: JSON.stringify(pending),
+                    };
+                    await this.checkpoint(structuredClone(task.task), task.context);
+                  } else {
+                    task.final = terminalStatusUpdate(
+                      task.task.id,
+                      run.entry.sessionId,
+                      'failed',
+                      'Host stopped; active input will not be replayed.',
+                    );
+                    if (task.final.kind === 'statusUpdate')
+                      task.task.status = task.final.data.status;
+                    await this.checkpoint(structuredClone(task.task), task.context);
+                    task.bus.publish(task.final);
+                  }
+                  task.settled = true;
+                  task.controller.abort();
+                } else await this.cancelTask(run, task);
+              }
             } catch (error) {
               failures.push(error);
             }

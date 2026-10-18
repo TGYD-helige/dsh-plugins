@@ -52,6 +52,14 @@ describe('dsh-a2a plugin', () => {
     }
   });
 
+  it('requires explicit pending retention on host shutdown', () => {
+    expect(Config({}).inbox).toEqual({ enabled: false, shutdown: 'cancel' });
+    expect(Config({ inbox: { enabled: true, shutdown: 'retain-pending' } }).inbox.shutdown).toBe(
+      'retain-pending',
+    );
+    expect(() => Config({ inbox: { shutdown: 'replay' as never } })).toThrow();
+  });
+
   it('does nothing when disabled', () => {
     const result = apply(ctx, config({ enabled: false }));
     expect(result).toBeUndefined();

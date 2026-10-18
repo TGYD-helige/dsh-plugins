@@ -142,6 +142,8 @@ The logical message id rides in `metadata.id`; message rows use a deterministic 
 
 **Native inbox mode is opt-in and uses the official DSH APIs**; it is tested with the unmodified `0.2.1-rc.2` npm runtime. See [native inbox execution](packages/dsh-a2a/README.md#native-inbox-execution) for queueing, steering, pause/recovery semantics and the runtime integration checks.
 
+Opt into `inbox: { enabled: true, shutdown: retain-pending }` to retain unclaimed A2A steering and future turns across graceful host restarts. Retain both the session persistence and TaskStore storage; hosts still discover and wake eligible work. Explicit cancellation and context clearing remain terminal. See [the shutdown contract](packages/dsh-a2a/README.md#graceful-host-shutdown).
+
 A2A task snapshots are separate from the full conversation log: `dsh-a2a` ships pluggable `TaskStore` backends — in-memory (default), filesystem (private atomic JSON snapshots), Redis (task JSON + TTL), and GCS (gzipped task JSON). The snapshots retain A2A history and artifacts at task-state transitions; `dsh-storage` separately records the full conversation. Streamed text deltas stay in process until the next state change, so token-rate events never reach Redis or GCS. Redis and GCS keys are scoped to the A2A tenant and user; older unscoped records require migration or expiry.
 
 ## Security
