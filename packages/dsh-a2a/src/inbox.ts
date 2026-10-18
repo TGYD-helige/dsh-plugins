@@ -9,7 +9,7 @@ import {
   ServerCallContext,
   STATE_HEADERS_KEY,
 } from '@a2a-js/sdk/server';
-import type { Context } from '@deepseek-ai/cordis';
+import type { Context, FiberState } from '@deepseek-ai/cordis';
 import type { Agent, AssistantStreamFrame, InboxTarget } from '@deepseek-ai/dsh-agent';
 import type { GoalMessageSource } from '@deepseek-ai/dsh-goal';
 import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
@@ -119,7 +119,7 @@ interface ContextRun {
   admissionTail: Promise<void>;
   promotions: Map<string, Promise<void>>;
   rolledBack: Set<string>;
-  retained: UserMessage[];
+  retained: Record<InboxTarget, UserMessage[]>;
 }
 
 export class NativeInbox implements A2aInbox {
@@ -139,6 +139,22 @@ export class NativeInbox implements A2aInbox {
   ) {
     bridge.inbox = this;
     this.persistence = ctx.get('sessionPersistence');
+    if (retainPending)
+      ctx.on('session/event', (session, event) => {
+        const run = this.contexts.get(session.id);
+        if (!run || event.type !== 'agent/inbox/spliced' || this.stopping || this.unloading())
+          return;
+        try {
+          const splice = event.data;
+          run.retained[splice.target].splice(
+            splice.start,
+            splice.removedCount ?? 0,
+            ...structuredClone(splice.inserted),
+          );
+        } catch (error) {
+          console.error('[dsh-a2a] failed to track pending inbox:', error);
+        }
+      });
     ctx.on('agent/pre-step', async (detail, next) => {
       await this.prepare(detail);
       return next();
@@ -170,7 +186,6 @@ export class NativeInbox implements A2aInbox {
     ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
       const run = this.contexts.get(agent.session.id);
       if (!run) return;
-      run.retained = run.retained.filter((input) => input.id !== message.id);
       const task = this.owner(run, message);
       if (task && !task.settled) {
         run.claimed.add(task);
@@ -182,6 +197,17 @@ export class NativeInbox implements A2aInbox {
         }
       }
     });
+  }
+
+  private unloading(): boolean {
+    // Cordis publishes FiberState as a const enum, without a runtime export.
+    const unloading: FiberState = 5;
+    for (let fiber = this.ctx.fiber; ; ) {
+      if (fiber.uid === null || fiber.state === unloading) return true;
+      const parent = fiber.parent.fiber;
+      if (parent === fiber) return false;
+      fiber = parent;
+    }
   }
 
   content(message: Message, contextId: string) {
@@ -294,7 +320,6 @@ export class NativeInbox implements A2aInbox {
       if (!agent.inbox.replace(message.id, promoted))
         throw new Error('Queued input has already been claimed.');
       this.moveInput(agent, promoted, 'next-step');
-      run.retained = this.pending(run);
       try {
         await this.flush(agent.session);
       } catch (error) {
@@ -314,7 +339,6 @@ export class NativeInbox implements A2aInbox {
             this.moveInput(agent, rollback, 'next-turn');
           } else agent.inbox.append('next-turn', rollback);
         } else if (live) agent.inbox.remove(message.id);
-        if (live) run.retained = this.pending(run);
         target.task.history = target.task.history.filter(
           (item) => item.messageId !== original.messageId,
         );
@@ -338,7 +362,6 @@ export class NativeInbox implements A2aInbox {
       } finally {
         await this.cancel(source.task.id);
       }
-      run.retained = this.pending(run);
       this.observeInput('promoted', run, promoted);
     } finally {
       target.pendingRequests--;
@@ -357,9 +380,17 @@ export class NativeInbox implements A2aInbox {
       if (event.type !== 'agent/inbox/spliced') continue;
       for (const message of event.data.inserted) {
         if (message.source.kind !== 'a2a' || !message.source.promotedFrom) continue;
+        const previous = transfers.get(message.id);
         transfers.set(message.id, {
           message: message as UserMessage & { source: InboxSource },
-          placed: event.data.target === message.source.target,
+          // A completed transfer stays complete after later public queue edits.
+          placed:
+            event.data.target === message.source.target ||
+            !!(
+              previous?.placed &&
+              previous.message.source.taskId === message.source.taskId &&
+              previous.message.source.promotionId === message.source.promotionId
+            ),
         });
       }
     }
@@ -401,7 +432,7 @@ export class NativeInbox implements A2aInbox {
         .flatMap((event) => (event.type === 'user/message' ? [event.data.id] : [])),
     );
     const snapshots: Task[] = [];
-    const inputs: Array<{ position: number; message: UserMessage }> = [];
+    const inputs: Array<{ position: number; target: InboxTarget; message: UserMessage }> = [];
     let pageToken = '';
     do {
       const page = await this.store.list(
@@ -429,16 +460,15 @@ export class NativeInbox implements A2aInbox {
       }
       pageToken = page.nextPageToken;
     } while (pageToken);
-    for (const { message } of inputs.sort((a, b) => a.position - b.position)) {
+    for (const { message, target } of inputs.sort((a, b) => a.position - b.position)) {
       if (message.source.kind !== 'a2a') continue;
       const existing = this.pending(run).find((pending) => pending.id === message.id);
       if (existing) {
         agent.inbox.replace(message.id, message);
-        const destination =
-          message.source.target === 'next-step' ? agent.inbox.nextStep : agent.inbox.nextTurn;
+        const destination = target === 'next-step' ? agent.inbox.nextStep : agent.inbox.nextTurn;
         if (!destination.some((pending) => pending.id === message.id))
-          this.moveInput(agent, message, message.source.target);
-      } else agent.inbox.append(message.source.target, message);
+          this.moveInput(agent, message, target);
+      } else agent.inbox.append(target, message);
     }
     if (!snapshots.length) return;
     await this.flush(agent.session);
@@ -464,7 +494,7 @@ export class NativeInbox implements A2aInbox {
           admissionTail: Promise.resolve(),
           promotions: new Map(),
           rolledBack: new Set(),
-          retained: [],
+          retained: { 'next-step': [], 'next-turn': [] },
         };
         await this.recoverRetained(run, context);
         await this.recoverPromotions(run, context);
@@ -479,7 +509,10 @@ export class NativeInbox implements A2aInbox {
         }
         await this.flush(entry.handle.agent.session);
         for (const snapshot of snapshots.values()) this.restoreTask(run, snapshot, context);
-        run.retained = this.pending(run);
+        run.retained = structuredClone({
+          'next-step': [...entry.handle.agent.inbox.nextStep],
+          'next-turn': [...entry.handle.agent.inbox.nextTurn],
+        });
         this.contexts.set(contextId, run);
         this.observe('resolved', run);
         for (const message of this.pending(run)) this.observeInput('restored', run, message);
@@ -492,7 +525,10 @@ export class NativeInbox implements A2aInbox {
 
   private observe(phase: string, run: ContextRun, fields: Partial<A2aInboxEvent> = {}): void {
     try {
-      const pending = this.stopping && this.retainPending ? run.retained : this.pending(run);
+      const pending =
+        this.stopping && this.retainPending
+          ? [...run.retained['next-step'], ...run.retained['next-turn']]
+          : this.pending(run);
       void this.ctx
         .parallel('a2a/inbox', {
           phase,
@@ -755,7 +791,6 @@ export class NativeInbox implements A2aInbox {
       task.headers.set(message.id, headers);
       accepted?.();
       run.entry.handle.agent.send(message, target, wakeup);
-      run.retained = this.pending(run);
       this.observeInput('admitted', run, message);
       await this.flush(run.entry.handle.agent.session);
       void this.ctx
@@ -976,7 +1011,6 @@ export class NativeInbox implements A2aInbox {
       for (let index = detail.messages.length - 1; index >= 0; index--)
         if (deferred.includes(detail.messages[index]!)) detail.messages.splice(index, 1);
     }
-    run.retained = this.pending(run);
     for (const message of detail.messages) {
       const task = this.owner(run, message);
       if (!task && message.source.kind !== 'a2a') continue;
@@ -1172,9 +1206,6 @@ export class NativeInbox implements A2aInbox {
   }
 
   private discard(run: ContextRun, taskId: string): void {
-    run.retained = run.retained.filter(
-      (message) => message.source.kind !== 'a2a' || message.source.taskId !== taskId,
-    );
     for (const message of this.pending(run))
       if (message.source.kind === 'a2a' && message.source.taskId === taskId)
         run.entry.handle.agent.inbox.remove(message.id);
@@ -1243,7 +1274,7 @@ export class NativeInbox implements A2aInbox {
       ),
     ];
     for (const admission of run.admissions) admission.abort();
-    run.retained = [];
+    run.retained = { 'next-step': [], 'next-turn': [] };
     run.entry.handle.agent.inbox.clear();
     run.entry.handle.agent.cancel({ kind: 'user' });
     await run.entry.handle.agent.whenIdle();
@@ -1318,12 +1349,16 @@ export class NativeInbox implements A2aInbox {
                       .snapshotEvents()
                       .flatMap((event) => (event.type === 'user/message' ? [event.data.id] : [])),
                   );
-                  const pending = run.retained.flatMap((message, position) =>
-                    message.source.kind === 'a2a' &&
-                    message.source.taskId === task.task.id &&
-                    !committed.has(message.id)
-                      ? [{ message, position }]
-                      : [],
+                  let position = 0;
+                  const pending = (['next-step', 'next-turn'] as const).flatMap((target) =>
+                    run.retained[target].flatMap((message) => {
+                      const input = { message, target, position: position++ };
+                      return message.source.kind === 'a2a' &&
+                        message.source.taskId === task.task.id &&
+                        !committed.has(message.id)
+                        ? [input]
+                        : [];
+                    }),
                   );
                   if (pending.length) {
                     task.task.metadata = {

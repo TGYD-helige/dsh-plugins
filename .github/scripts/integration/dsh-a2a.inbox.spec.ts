@@ -1108,7 +1108,8 @@ describe('graceful retention', () => {
     const adapter = new MockAdapter(script);
     ctx.llm.registerAdapter(['mock'], adapter);
     const port = await freePort();
-    await ctx.plugin(A2aPlugin, A2aPlugin.Config({ enabled: true, port, inbox: { enabled: true, shutdown: shutdown ?? 'retain-pending' }, taskStore: 'filesystem', filesystem: { root: join(root, 'tasks') }, agent: { provider: 'mock', model: 'mock' } }));
+    const plugin = ctx.plugin(A2aPlugin, A2aPlugin.Config({ enabled: true, port, inbox: { enabled: true, shutdown: shutdown ?? 'retain-pending' }, taskStore: 'filesystem', filesystem: { root: join(root, 'tasks') }, agent: { provider: 'mock', model: 'mock' } }));
+    await plugin;
     const rpc = async (method: string, params: unknown) => (await fetch(`http://127.0.0.1:${port}/a2a/`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'A2A-Version': '1.0', 'A2A-Extensions': INBOX_EXTENSION },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
@@ -1118,7 +1119,7 @@ describe('graceful retention', () => {
       expect(result.error).toBeUndefined();
       return result.result.task;
     };
-    return { ctx, adapter, rpc, send, inbox: ctx.a2aInbox };
+    return { ctx, adapter, rpc, send, inbox: ctx.a2aInbox, plugin };
   }
 
   it('retains unclaimed steering and independent turns through public plugin disposal', async () => {
@@ -1147,6 +1148,72 @@ describe('graceful retention', () => {
     expect(messages.slice(1, 3).map(e => JSON.parse(e.data.source.message).messageId)).toEqual(['steer', 'future']);
   });
 
+
+  it.each(['replace', 'splice', 'remove', 'move', 'promoted-move', 'promoted-remove'] as const)('preserves public inbox %s changes across graceful restart', async action => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-public-edit-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const first = await host(root);
+    const active = await first.send('active');
+    await expect.poll(() => first.adapter.requests.length).toBe(1);
+    await first.send('steer', { target: 'next-step' }, active.id);
+    await first.send('first', { wakeup: false });
+    await first.send('second', { wakeup: false });
+    const agent = await first.inbox.resolve('graceful');
+    await expect.poll(() => agent.inbox.nextTurn.length).toBe(2);
+    if (action === 'promoted-move' || action === 'promoted-remove') {
+      const original = agent.inbox.nextTurn[0];
+      await first.inbox.promote('graceful', original.id, active.id);
+      const index = agent.inbox.nextStep.findIndex(m => m.id === original.id);
+      const [message] = agent.inbox.splice('next-step', index, 1, []);
+      agent.inbox.append('next-turn', message);
+      if (action === 'promoted-remove') agent.inbox.remove(message.id);
+    } else if (action === 'replace') {
+      const original = agent.inbox.nextTurn[0];
+      agent.inbox.replace(original.id, { ...original, content: [{ type: 'text', text: 'edited' }],
+        source: { ...original.source, applicationIdentity: { tenant: 'test-tenant', billing: 'edited-owner' } } });
+    } else if (action === 'splice') {
+      agent.inbox.splice('next-turn', 0, 2, [...agent.inbox.nextTurn].reverse());
+    } else if (action === 'move') {
+      const [message] = agent.inbox.splice('next-turn', 0, 1, []);
+      agent.inbox.append('next-step', message);
+    } else agent.inbox.remove(agent.inbox.nextStep[0].id);
+    await first.ctx.parallel('session/flush', agent.session);
+    const expected = structuredClone({ step: agent.inbox.nextStep, turn: agent.inbox.nextTurn });
+    await first.ctx.fiber.dispose();
+    const second = await host(root);
+    const restored = await second.inbox.resolve('graceful');
+    expect({ step: restored.inbox.nextStep, turn: restored.inbox.nextTurn }).toEqual(expected);
+  });
+
+  it('freezes edited input before shutdown checkpoints await storage', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-retention-freeze-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const first = await host(root);
+    await first.send('parked', { wakeup: false });
+    const agent = await first.inbox.resolve('graceful');
+    await expect.poll(() => agent.inbox.nextTurn.length).toBe(1);
+    const original = agent.inbox.nextTurn[0];
+    agent.inbox.replace(original.id, { ...original, content: [{ type: 'text', text: 'final edit' }] });
+    await first.ctx.parallel('session/flush', agent.session);
+    let release!: () => void;
+    let blocked = false;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const flush = first.ctx.sessionPersistence.flush.bind(first.ctx.sessionPersistence);
+    const barrier = vi.spyOn(first.ctx.sessionPersistence, 'flush').mockImplementationOnce(async () => {
+      blocked = true;
+      await gate;
+      await flush();
+    });
+    const stopping = first.plugin.dispose();
+    try {
+      await expect.poll(() => blocked).toBe(true);
+      agent.inbox.replace(original.id, { ...original, content: [{ type: 'text', text: 'late cleanup edit' }] });
+    } finally { release(); }
+    try { await stopping; } finally { barrier.mockRestore(); }
+    const second = await host(root);
+    const restored = await second.inbox.resolve('graceful');
+    expect(restored.inbox.nextTurn.map(m => m.content[0].text)).toEqual(['final edit']);
+  });
 
   it.each(['cancel', 'clear'] as const)('does not resurrect input after explicit %s', async action => {
     const root = await mkdtemp(join(tmpdir(), 'a2a-graceful-terminal-'));
