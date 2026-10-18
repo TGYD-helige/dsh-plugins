@@ -50,19 +50,19 @@ Retention stops the current execution, checkpoints pending input in task snapsho
 
 On `a2aInbox.resolve(contextId)`, the plugin restores retained ownership before allowing new input, excludes IDs already committed as `user/message`, and drains the retention checkpoint only after the restored session is durable. Explicit `CancelTask`, `a2aInbox.cancel()` and context clearing remain terminal. Claims already handed to the active execution are not retained, and external tool effects are not exactly-once. The host still owns startup discovery and an attributed waking input; merely resolving a context does not wake it. Persistence/checkpoint errors are reported through the existing shutdown error path; the host must not treat a failed checkpoint as a durable restart barrier.
 
-The dedicated `E2E (dsh-a2a graceful retention / issue-78)` job covers public plugin disposal, a real SIGTERM child process, repeated restarts, promotion/checkpoint races and terminal cancellation. It also reports recovered tasks to Langfuse and verifies their task/turn/generation ancestry through the real Observations API on same-repository CI.
+The dedicated `E2E (dsh-a2a graceful retention)` job covers public plugin disposal, a real SIGTERM child process, repeated restarts, promotion/checkpoint races and terminal cancellation. It also reports recovered tasks to Langfuse and verifies their task/turn/generation ancestry through the real Observations API on same-repository CI.
 
 ```sh
-node .github/scripts/check-inbox.mjs -t issue-78
-DSH_ISSUE78_LANGFUSE_LIVE=true node .github/scripts/check-inbox.mjs -t 'issue-78.*reports gracefully recovered'
+node .github/scripts/check-inbox.mjs -t 'graceful retention'
+DSH_GRACEFUL_RETENTION_LANGFUSE_LIVE=true node .github/scripts/check-inbox.mjs -t 'graceful retention.*reports gracefully recovered'
 ```
 
-The dedicated `E2E (dsh-a2a native ownership / issue-75)` integration job runs these regressions with unmodified npm DSH and scripted model responses. Its Langfuse scenario verifies Goal rounds and promoted input under the original task trace, canceled source ownership, and execution restored after SIGKILL. Same-repository CI also sends the scenario to the configured real Langfuse project and polls its Observations API; fork PRs use the local collector without credentials.
+The dedicated `E2E (dsh-a2a native ownership)` integration job runs these regressions with unmodified npm DSH and scripted model responses. Its Langfuse scenario verifies Goal rounds and promoted input under the original task trace, canceled source ownership, and execution restored after SIGKILL. Same-repository CI also sends the scenario to the configured real Langfuse project and polls its Observations API; fork PRs use the local collector without credentials.
 
 ```sh
-node .github/scripts/check-inbox.mjs -t issue-75
+node .github/scripts/check-inbox.mjs -t 'native ownership'
 # With LANGFUSE_BASE_URL, LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY configured:
-DSH_ISSUE75_LANGFUSE_LIVE=true node .github/scripts/check-inbox.mjs -t 'issue-75.*reports Goal continuation'
+DSH_NATIVE_OWNERSHIP_LANGFUSE_LIVE=true node .github/scripts/check-inbox.mjs -t 'native ownership.*reports Goal continuation'
 ```
 
 ## Configuration

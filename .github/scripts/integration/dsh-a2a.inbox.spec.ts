@@ -91,7 +91,7 @@ async function boot(options: { root?: string; store?: SanitizedTaskStore; backen
     expect(response.error).toBeUndefined();
     return response.result.task;
   };
-  const completed = async (id: string) => { await expect.poll(async () => (await rpc('GetTask', { id })).result.status.state, { timeout: options.langfuse && process.env.DSH_ISSUE75_LANGFUSE_LIVE === 'true' ? 15_000 : 1_000 }).toBe('TASK_STATE_COMPLETED'); };
+  const completed = async (id: string) => { await expect.poll(async () => (await rpc('GetTask', { id })).result.status.state, { timeout: options.langfuse && process.env.DSH_NATIVE_OWNERSHIP_LANGFUSE_LIVE === 'true' ? 15_000 : 1_000 }).toBe('TASK_STATE_COMPLETED'); };
   return { ctx, adapter, bridge, inbox, store, backend, server, rpc, send, completed };
 }
 
@@ -637,7 +637,7 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable i
   console.log(`Langfuse canceled inbox ${contextId}: ${cancellation.state}`);
 }, 6 * 60_000);
 
-describe('issue-75 native ownership', () => {
+describe('native ownership', () => {
 it('keeps the original task stream open for reserved Goal continuations', async () => {
   const f = await boot({ script: [
     () => {
@@ -945,18 +945,18 @@ it('retains independent ownership across permanent session checkpoint failure an
 });
 
 it('reports Goal continuation, promotion and local recovery to Langfuse', async () => {
-  const live = process.env.DSH_ISSUE75_LANGFUSE_LIVE === 'true';
+  const live = process.env.DSH_NATIVE_OWNERSHIP_LANGFUSE_LIVE === 'true';
   const captured: unknown[] = [];
   const collector = live ? undefined : await startFakeIngestion(captured);
   if (collector) cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
   const { LANGFUSE_PUBLIC_KEY: publicKey, LANGFUSE_SECRET_KEY: secretKey, LANGFUSE_BASE_URL: baseUrl } = process.env;
-  if (live) expect(publicKey && secretKey && baseUrl, 'Issue #75 live E2E requires LANGFUSE_*').toBeTruthy();
-  const marker = `ci-issue75-${process.env.GITHUB_RUN_ID ?? Date.now()}-${randomUUID()}`;
+  if (live) expect(publicKey && secretKey && baseUrl, 'Native ownership live E2E requires LANGFUSE_*').toBeTruthy();
+  const marker = `ci-native-ownership-${process.env.GITHUB_RUN_ID ?? Date.now()}-${randomUUID()}`;
   const fromStartTime = new Date(Date.now() - 60_000).toISOString();
   const telemetry = { enabled: true, publicKey: live ? publicKey : 'test', secretKey: live ? secretKey : 'test',
     baseUrl: live ? baseUrl : `http://127.0.0.1:${collector!.address().port}`, captureContent: true,
-    traceName: 'dsh-inbox-issue75', environment: 'ci', release: process.env.GITHUB_SHA ?? 'local',
-    tags: ['ci', 'scenario:issue-75', marker] };
+    traceName: 'dsh-inbox-native-ownership', environment: 'ci', release: process.env.GITHUB_SHA ?? 'local',
+    tags: ['ci', 'scenario:native-ownership', marker] };
   const f = await boot({ contextId: marker, langfuse: telemetry, script: [
     () => { f.ctx.goals.create(f.ctx.agents.get(marker)!, { objective: marker }); return textResponse('working'); },
     textResponse('steered'),
@@ -998,7 +998,7 @@ it('reports Goal continuation, promotion and local recovery to Langfuse', async 
   expect(restored.adapter.requests).toHaveLength(3);
 
   function evaluate(observations, id, state, turns, generations) {
-    const root = observations.find(o => o.name === 'dsh-inbox-issue75' && o.metadata?.taskId === id);
+    const root = observations.find(o => o.name === 'dsh-inbox-native-ownership' && o.metadata?.taskId === id);
     const children = observations.filter(o => o.name === 'agent:turn' && o.parentObservationId === root?.id);
     const calls = observations.filter(o => o.type === 'GENERATION' && children.some(turn => turn.id === o.parentObservationId));
     const problems = [];
@@ -1016,7 +1016,7 @@ it('reports Goal continuation, promotion and local recovery to Langfuse', async 
         observationName: `inbox:${state}`, model: 'mock',
         evaluate: observations => evaluate(observations, id, state, turns, generations) });
       expect(result.ok, result.state).toBe(true);
-      console.log(`Langfuse issue-75 ${id}: ${result.state}`);
+      console.log(`Langfuse native ownership ${id}: ${result.state}`);
     }
   }
 }, 900_000);
@@ -1097,7 +1097,7 @@ it('cancels the active driver while a claimed promotion is waiting for storage',
 });
 
 
-describe('issue-78 graceful retention', () => {
+describe('graceful retention', () => {
   async function host(root: string, script: Array<StreamChunk[] | 'hang'> = ['hang'], shutdown?: 'cancel', telemetry?: Langfuse.LangfusePluginConfig) {
     const ctx = new Context();
     cleanups.push(() => ctx.fiber.dispose());
@@ -1272,16 +1272,16 @@ describe('issue-78 graceful retention', () => {
   });
 
   it('reports gracefully recovered work to Langfuse', async () => {
-    const live = process.env.DSH_ISSUE78_LANGFUSE_LIVE === 'true';
+    const live = process.env.DSH_GRACEFUL_RETENTION_LANGFUSE_LIVE === 'true';
     const captured: unknown[] = [];
     const collector = live ? undefined : await startFakeIngestion(captured);
     if (collector) cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
     const { LANGFUSE_PUBLIC_KEY: publicKey, LANGFUSE_SECRET_KEY: secretKey, LANGFUSE_BASE_URL: baseUrl } = process.env;
-    if (live) expect(publicKey && secretKey && baseUrl, 'Issue #78 live E2E requires LANGFUSE_*').toBeTruthy();
+    if (live) expect(publicKey && secretKey && baseUrl, 'Graceful retention live E2E requires LANGFUSE_*').toBeTruthy();
     const fromStartTime = new Date(Date.now() - 60_000).toISOString();
     const telemetry = { enabled: true, publicKey: live ? publicKey : 'test', secretKey: live ? secretKey : 'test',
       baseUrl: live ? baseUrl : `http://127.0.0.1:${collector!.address().port}`, captureContent: true,
-      traceName: 'dsh-inbox-issue78', environment: 'ci', release: process.env.GITHUB_SHA ?? 'local', tags: ['ci', 'scenario:issue-78'] };
+      traceName: 'dsh-inbox-graceful-retention', environment: 'ci', release: process.env.GITHUB_SHA ?? 'local', tags: ['ci', 'scenario:graceful-retention'] };
     const root = await mkdtemp(join(tmpdir(), 'a2a-graceful-langfuse-'));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const first = await host(root);
@@ -1298,7 +1298,7 @@ describe('issue-78 graceful retention', () => {
     await second.ctx.parallel('session/flush', agent.session);
     for (const task of [active, future]) {
       const evaluate = observations => {
-        const root = observations.find(o => o.name === 'dsh-inbox-issue78' && o.metadata?.taskId === task.id);
+        const root = observations.find(o => o.name === 'dsh-inbox-graceful-retention' && o.metadata?.taskId === task.id);
         const turns = observations.filter(o => o.name === 'agent:turn' && o.parentObservationId === root?.id);
         const calls = observations.filter(o => o.type === 'GENERATION' && turns.some(t => t.id === o.parentObservationId));
         return root?.endTime && root.metadata?.taskState === 'completed' && turns.length === 1 && calls.length === 1 && calls[0].endTime ? [] : ['missing ended recovery task/turn/generation'];
@@ -1309,7 +1309,7 @@ describe('issue-78 graceful retention', () => {
           toStartTime: new Date(Date.now() + 60_000).toISOString(), codeword: task.id,
           observationName: 'inbox:completed', model: 'mock', evaluate });
         expect(result.ok, result.state).toBe(true);
-        console.log(`Langfuse issue-78 ${task.id}: ${result.state}`);
+        console.log(`Langfuse graceful retention ${task.id}: ${result.state}`);
       }
     }
   }, 900_000);

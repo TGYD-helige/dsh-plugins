@@ -185,7 +185,7 @@ jobs:
       - run: pnpm install --frozen-lockfile=false
 
       - name: Verify queue insertion over A2A HTTP and JSONL
-        run: node .github/scripts/check-inbox.mjs -t '^(?!.*issue-(75|78))'
+        run: node .github/scripts/check-inbox.mjs -t '^(?!.*(native ownership|graceful retention))'
 
       - name: Verify real Langfuse inbox ingestion
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -194,10 +194,10 @@ jobs:
           LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
           LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
           LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
-        run: node .github/scripts/check-inbox.mjs -t '^(?!.*issue-(75|78))'
+        run: node .github/scripts/check-inbox.mjs -t '^(?!.*(native ownership|graceful retention))'
 
   native-ownership:
-    name: E2E (dsh-a2a native ownership / issue-75)
+    name: E2E (dsh-a2a native ownership)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -210,19 +210,19 @@ jobs:
       - run: pnpm install --frozen-lockfile=false
 
       - name: Verify Goal ownership, local crash recovery and queued-task promotion
-        run: node .github/scripts/check-inbox.mjs -t 'issue-75'
+        run: node .github/scripts/check-inbox.mjs -t 'native ownership'
 
       - name: Report native ownership E2E to Langfuse and verify ingestion
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
-          DSH_ISSUE75_LANGFUSE_LIVE: 'true'
+          DSH_NATIVE_OWNERSHIP_LANGFUSE_LIVE: 'true'
           LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
           LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
           LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
-        run: node .github/scripts/check-inbox.mjs -t 'issue-75.*reports Goal continuation'
+        run: node .github/scripts/check-inbox.mjs -t 'native ownership.*reports Goal continuation'
 
   graceful-retention:
-    name: E2E (dsh-a2a graceful retention / issue-78)
+    name: E2E (dsh-a2a graceful retention)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -235,16 +235,16 @@ jobs:
       - run: pnpm install --frozen-lockfile=false
 
       - name: Verify graceful restart, SIGTERM, cancellation and promotion races
-        run: node .github/scripts/check-inbox.mjs -t 'issue-78'
+        run: node .github/scripts/check-inbox.mjs -t 'graceful retention'
 
       - name: Report graceful recovery E2E to Langfuse and verify ingestion
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
-          DSH_ISSUE78_LANGFUSE_LIVE: 'true'
+          DSH_GRACEFUL_RETENTION_LANGFUSE_LIVE: 'true'
           LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
           LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
           LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
-        run: node .github/scripts/check-inbox.mjs -t 'issue-78.*reports gracefully recovered'
+        run: node .github/scripts/check-inbox.mjs -t 'graceful retention.*reports gracefully recovered'
 
   scenario-backends:
     name: E2E (${{ matrix.package }}-${{ matrix.provider }})
