@@ -1294,7 +1294,7 @@ describe('issue-78 graceful retention', () => {
     const second = await host(root, Array.from({ length: 4 }, () => textResponse('done')), undefined, telemetry);
     const agent = await second.inbox.resolve('graceful');
     await second.send('wake');
-    for (const task of [active, future]) await expect.poll(async () => (await second.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_COMPLETED');
+    for (const task of [active, future]) await expect.poll(async () => (await second.rpc('GetTask', { id: task.id })).result.status.state, { timeout: live ? 15_000 : 1_000 }).toBe('TASK_STATE_COMPLETED');
     await second.ctx.parallel('session/flush', agent.session);
     for (const task of [active, future]) {
       const evaluate = observations => {
