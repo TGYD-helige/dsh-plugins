@@ -20,7 +20,7 @@ Standard `SendMessage` / `SendStreamingMessage`, task queries, cancellation and 
 
 The same-process `a2aInbox` service exposes `resolve(contextId)`, `content(message, contextId)`, `enqueue(taskId, message, { target?, wakeup? })`, `promote(contextId, nativeMessageId, activeTaskId)`, and `cancel(taskId)`. There is no separate pause, wake-only, resume, or retained-task restart operation. Cancellation is terminal and removes that task's pending input. Other tasks' input is retained according to official DSH cancellation semantics, and may wait for the next waking message. Clearing a context discards all its pending work.
 
-`a2a/before-followup` validates admission; `a2a/before-step` runs at the official pre-step boundary, after system-prompt assembly and before model execution. It cannot change the already assembled system prompt. Original request headers remain process-local. DSH persistence restores its own pending projection; the plugin does not replay splice logs or recover consumed claims. Graceful disposal follows the official runtime's cancellation behavior. Durable A2A task snapshots require a filesystem, Redis or GCS TaskStore; an in-memory store is sufficient without restart requirements.
+`a2a/before-followup` validates admission; `a2a/before-step` runs at the official pre-step boundary, after system-prompt assembly and before model execution. It cannot change the already assembled system prompt. Original request headers remain process-local. DSH persistence restores its own pending projection; the plugin does not replay splice logs or recover consumed claims. Graceful disposal cancels tasks by default; `inbox.shutdown: retain-pending` opts into the retention policy below. Durable A2A task snapshots require a filesystem, Redis or GCS TaskStore; an in-memory store is sufficient without restart requirements.
 
 ### Goal rounds
 
@@ -40,7 +40,22 @@ Only an unclaimed, single-message independent task in the same context can be pr
 
 Select `taskStore: filesystem` with `filesystem.root` pointing at a retained directory, and separately enable durable DSH session persistence. Keep queued file materialization on retained storage as well. Each task snapshot is scoped by tenant and user, written to a private temporary file and atomically renamed; no additional service is needed. Use one host writer per directory. Files have no automatic expiry; context clearing deletes task snapshots.
 
-After a crash, the host discovers sessions, calls `a2aInbox.resolve(contextId)` and supplies a real attributed waking input through the normal API. Restored unclaimed inputs keep their original task ownership. Startup scanning and scheduling remain host responsibilities. Explicit cancellation stays terminal and discards only the canceled task's input. This does not promise exactly-once external side effects, replay of consumed input, or graceful-unload retention beyond the official DSH lifecycle.
+After a crash, the host discovers sessions, calls `a2aInbox.resolve(contextId)` and supplies a real attributed waking input through the normal API. Restored unclaimed inputs keep their original task ownership. Startup scanning and scheduling remain host responsibilities. Explicit cancellation stays terminal and discards only the canceled task's input. This does not promise exactly-once external side effects, replay of consumed input, or replay of the interrupted active model call.
+
+### Graceful host shutdown
+
+Set `inbox: { enabled: true, shutdown: retain-pending }` on both sides of a restart to retain unclaimed A2A `next-step` and `next-turn` input. Keep durable session persistence, the TaskStore and materialized files on retained storage. This is a host configuration policy, not wire metadata. The default `shutdown: cancel` keeps the existing terminal-on-unload behavior.
+
+Retention stops the current execution, checkpoints pending input in task snapshot metadata with its order and original native/A2A identities, then closes live request/subscription streams. The extra checkpoint survives the core's later inbox-clearing disposal. A task with pending input stays nonterminal for recovery; an interrupted task with no pending input becomes failed. Reconnect subscriptions after restart: streams are not replayed or carried across processes.
+
+On `a2aInbox.resolve(contextId)`, the plugin restores retained ownership before allowing new input, excludes IDs already committed as `user/message`, and drains the retention checkpoint only after the restored session is durable. Explicit `CancelTask`, `a2aInbox.cancel()` and context clearing remain terminal. Claims already handed to the active execution are not retained, and external tool effects are not exactly-once. The host still owns startup discovery and an attributed waking input; merely resolving a context does not wake it. Persistence/checkpoint errors are reported through the existing shutdown error path; the host must not treat a failed checkpoint as a durable restart barrier.
+
+The dedicated `E2E (dsh-a2a graceful retention / issue-78)` job covers public plugin disposal, a real SIGTERM child process, repeated restarts, promotion/checkpoint races and terminal cancellation. It also reports recovered tasks to Langfuse and verifies their task/turn/generation ancestry through the real Observations API on same-repository CI.
+
+```sh
+node .github/scripts/check-inbox.mjs -t issue-78
+DSH_ISSUE78_LANGFUSE_LIVE=true node .github/scripts/check-inbox.mjs -t 'issue-78.*reports gracefully recovered'
+```
 
 The dedicated `E2E (dsh-a2a native ownership / issue-75)` integration job runs these regressions with unmodified npm DSH and scripted model responses. Its Langfuse scenario verifies Goal rounds and promoted input under the original task trace, canceled source ownership, and execution restored after SIGKILL. Same-repository CI also sends the scenario to the configured real Langfuse project and polls its Observations API; fork PRs use the local collector without credentials.
 

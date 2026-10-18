@@ -93,9 +93,12 @@ export const name = 'dsh-a2a';
 export const inject = ['agents'];
 
 export const Config = Schema.object({
-  inbox: Schema.object({ enabled: Schema.boolean().default(false) }).description(
-    'Use the official DSH inbox for queued turns and steering.',
-  ),
+  inbox: Schema.object({
+    enabled: Schema.boolean().default(false),
+    shutdown: Schema.union([Schema.const('cancel'), Schema.const('retain-pending')]).default(
+      'cancel',
+    ),
+  }).description('Use the official DSH inbox for queued turns and steering.'),
   enabled: Schema.boolean().default(false),
   host: Schema.string().default('127.0.0.1'),
   port: Schema.natural().default(41241),
@@ -154,7 +157,7 @@ export const Config = Schema.object({
 });
 
 export interface A2aPluginConfig {
-  inbox?: { enabled: boolean };
+  inbox?: { enabled: boolean; shutdown?: 'cancel' | 'retain-pending' };
   enabled: boolean;
   host: string;
   port: number;
@@ -208,7 +211,9 @@ export function apply(
     });
 
     const store = createTaskStore(config);
-    const inbox = config.inbox?.enabled ? new NativeInbox(ctx, bridge, store) : undefined;
+    const inbox = config.inbox?.enabled
+      ? new NativeInbox(ctx, bridge, store, config.inbox.shutdown === 'retain-pending')
+      : undefined;
     await store.init?.();
     if (inbox) ctx.provide('a2aInbox', inbox);
 

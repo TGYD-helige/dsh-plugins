@@ -44,6 +44,8 @@ export interface A2aInboxEvent {
   step?: number;
 }
 
+const RETAINED_INPUTS = `${INBOX_EXTENSION}#retained-inputs`;
+
 interface InboxSource {
   kind: 'a2a';
   taskId: string;
@@ -116,6 +118,7 @@ interface ContextRun {
   admissionTail: Promise<void>;
   promotions: Map<string, Promise<void>>;
   rolledBack: Set<string>;
+  retained: UserMessage[];
 }
 
 export class NativeInbox implements A2aInbox {
@@ -130,6 +133,7 @@ export class NativeInbox implements A2aInbox {
     private readonly ctx: Context,
     private readonly bridge: A2aBridge,
     private readonly store: ManagedTaskStore,
+    private readonly retainPending = false,
   ) {
     bridge.inbox = this;
     ctx.on('agent/pre-step', async (detail, next) => {
@@ -163,6 +167,7 @@ export class NativeInbox implements A2aInbox {
     ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
       const run = this.contexts.get(agent.session.id);
       if (!run) return;
+      run.retained = run.retained.filter((input) => input.id !== message.id);
       const task = this.owner(run, message);
       if (task && !task.settled) {
         run.claimed.add(task);
@@ -286,6 +291,7 @@ export class NativeInbox implements A2aInbox {
       if (!agent.inbox.replace(message.id, promoted))
         throw new Error('Queued input has already been claimed.');
       this.moveInput(agent, promoted, 'next-step');
+      run.retained = this.pending(run);
       try {
         await this.flush(agent.session);
       } catch (error) {
@@ -305,6 +311,7 @@ export class NativeInbox implements A2aInbox {
             this.moveInput(agent, rollback, 'next-turn');
           } else agent.inbox.append('next-turn', rollback);
         } else if (live) agent.inbox.remove(message.id);
+        if (live) run.retained = this.pending(run);
         target.task.history = target.task.history.filter(
           (item) => item.messageId !== original.messageId,
         );
@@ -328,6 +335,7 @@ export class NativeInbox implements A2aInbox {
       } finally {
         await this.cancel(source.task.id);
       }
+      run.retained = this.pending(run);
       this.observeInput('promoted', run, promoted);
     } finally {
       target.pendingRequests--;
@@ -381,6 +389,62 @@ export class NativeInbox implements A2aInbox {
     }
   }
 
+  private async recoverRetained(run: ContextRun, context: ServerCallContext): Promise<void> {
+    if (!this.retainPending) return;
+    const agent = run.entry.handle.agent;
+    const committed = new Set(
+      agent.session
+        .snapshotEvents()
+        .flatMap((event) => (event.type === 'user/message' ? [event.data.id] : [])),
+    );
+    const snapshots: Task[] = [];
+    const inputs: Array<{ position: number; message: UserMessage }> = [];
+    let pageToken = '';
+    do {
+      const page = await this.store.list(
+        {
+          tenant: '',
+          contextId: agent.session.id,
+          pageSize: 100,
+          pageToken,
+          status: TaskState.TASK_STATE_UNSPECIFIED,
+          statusTimestampAfter: undefined,
+        },
+        context,
+      );
+      for (const task of page.tasks) {
+        const retained = task.metadata?.[RETAINED_INPUTS];
+        if (typeof retained !== 'string') continue;
+        snapshots.push(task);
+        if (this.terminal(task)) continue;
+        for (const input of JSON.parse(retained) as typeof inputs) {
+          const { message } = input;
+          if (message.source.kind !== 'a2a' || message.source.taskId !== task.id)
+            throw new Error('Retained input has invalid task ownership.');
+          if (!committed.has(message.id)) inputs.push(input);
+        }
+      }
+      pageToken = page.nextPageToken;
+    } while (pageToken);
+    for (const { message } of inputs.sort((a, b) => a.position - b.position)) {
+      if (message.source.kind !== 'a2a') continue;
+      const existing = this.pending(run).find((pending) => pending.id === message.id);
+      if (existing) {
+        agent.inbox.replace(message.id, message);
+        const destination =
+          message.source.target === 'next-step' ? agent.inbox.nextStep : agent.inbox.nextTurn;
+        if (!destination.some((pending) => pending.id === message.id))
+          this.moveInput(agent, message, message.source.target);
+      } else agent.inbox.append(message.source.target, message);
+    }
+    if (!snapshots.length) return;
+    await this.flush(agent.session);
+    for (const task of snapshots) {
+      delete task.metadata![RETAINED_INPUTS];
+      await this.checkpoint(task, context);
+    }
+  }
+
   private context(contextId: string, context = new ServerCallContext()): Promise<ContextRun> {
     if (this.stopping) return Promise.reject(new Error('Native inbox is unloading.'));
     const existing = this.contexts.get(contextId);
@@ -397,7 +461,9 @@ export class NativeInbox implements A2aInbox {
           admissionTail: Promise.resolve(),
           promotions: new Map(),
           rolledBack: new Set(),
+          retained: [],
         };
+        await this.recoverRetained(run, context);
         await this.recoverPromotions(run, context);
         const snapshots = new Map<string, Task>();
         for (const message of this.pending(run)) {
@@ -410,6 +476,7 @@ export class NativeInbox implements A2aInbox {
         }
         await this.flush(entry.handle.agent.session);
         for (const snapshot of snapshots.values()) this.restoreTask(run, snapshot, context);
+        run.retained = this.pending(run);
         this.contexts.set(contextId, run);
         this.observe('resolved', run);
         for (const message of this.pending(run)) this.observeInput('restored', run, message);
@@ -685,6 +752,7 @@ export class NativeInbox implements A2aInbox {
       task.headers.set(message.id, headers);
       accepted?.();
       run.entry.handle.agent.send(message, target, wakeup);
+      run.retained = this.pending(run);
       this.observeInput('admitted', run, message);
       await this.flush(run.entry.handle.agent.session);
       void this.ctx
@@ -759,7 +827,7 @@ export class NativeInbox implements A2aInbox {
       await task.done;
       if (task.bus !== bus && task.final) bus.publish(task.final);
     } catch (error) {
-      if (task?.settled) return;
+      if (task?.settled || (this.stopping && this.retainPending)) return;
       if (task && !ownsTask) {
         bus.publish(AgentEvent.task(structuredClone(task.task)));
         return;
@@ -905,6 +973,7 @@ export class NativeInbox implements A2aInbox {
       for (let index = detail.messages.length - 1; index >= 0; index--)
         if (deferred.includes(detail.messages[index]!)) detail.messages.splice(index, 1);
     }
+    run.retained = this.pending(run);
     for (const message of detail.messages) {
       const task = this.owner(run, message);
       if (!task && message.source.kind !== 'a2a') continue;
@@ -1100,6 +1169,9 @@ export class NativeInbox implements A2aInbox {
   }
 
   private discard(run: ContextRun, taskId: string): void {
+    run.retained = run.retained.filter(
+      (message) => message.source.kind !== 'a2a' || message.source.taskId !== taskId,
+    );
     for (const message of this.pending(run))
       if (message.source.kind === 'a2a' && message.source.taskId === taskId)
         run.entry.handle.agent.inbox.remove(message.id);
@@ -1168,6 +1240,7 @@ export class NativeInbox implements A2aInbox {
       ),
     ];
     for (const admission of run.admissions) admission.abort();
+    run.retained = [];
     run.entry.handle.agent.inbox.clear();
     run.entry.handle.agent.cancel({ kind: 'user' });
     await run.entry.handle.agent.whenIdle();
@@ -1187,7 +1260,7 @@ export class NativeInbox implements A2aInbox {
 
   onDisposed(session: Session): void {
     const run = this.contexts.get(session.id);
-    if (!run) return;
+    if (!run || (this.retainPending && this.stopping)) return;
     for (const admission of run.admissions) admission.abort();
     for (const task of run.tasks.values()) {
       if (!task.settled) {
@@ -1217,7 +1290,7 @@ export class NativeInbox implements A2aInbox {
       for (const run of this.contexts.values()) {
         for (const admission of run.admissions) admission.abort();
         try {
-          run.entry.handle.agent.cancel({ kind: 'disposed' });
+          run.entry.handle.agent.cancel({ kind: 'disposed' }, { keepInbox: this.retainPending });
         } catch (error) {
           failures.push(error);
         }
@@ -1233,7 +1306,42 @@ export class NativeInbox implements A2aInbox {
         } finally {
           for (const task of run.tasks.values()) {
             try {
-              if (!task.settled) await this.cancelTask(run, task);
+              if (!task.settled) {
+                if (this.retainPending) {
+                  const committed = new Set(
+                    run.entry.handle.agent.session
+                      .snapshotEvents()
+                      .flatMap((event) => (event.type === 'user/message' ? [event.data.id] : [])),
+                  );
+                  const pending = run.retained.flatMap((message, position) =>
+                    message.source.kind === 'a2a' &&
+                    message.source.taskId === task.task.id &&
+                    !committed.has(message.id)
+                      ? [{ message, position }]
+                      : [],
+                  );
+                  if (pending.length) {
+                    task.task.metadata = {
+                      ...task.task.metadata,
+                      [RETAINED_INPUTS]: JSON.stringify(pending),
+                    };
+                    await this.checkpoint(structuredClone(task.task), task.context);
+                  } else {
+                    task.final = terminalStatusUpdate(
+                      task.task.id,
+                      run.entry.sessionId,
+                      'failed',
+                      'Host stopped; active input will not be replayed.',
+                    );
+                    if (task.final.kind === 'statusUpdate')
+                      task.task.status = task.final.data.status;
+                    await this.checkpoint(structuredClone(task.task), task.context);
+                    task.bus.publish(task.final);
+                  }
+                  task.settled = true;
+                  task.controller.abort();
+                } else await this.cancelTask(run, task);
+              }
             } catch (error) {
               failures.push(error);
             }

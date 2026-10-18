@@ -18,6 +18,8 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
 import AgentRegistry from '@deepseek-ai/dsh-agent';
 import AgentLoop from '@deepseek-ai/dsh-agent-loop';
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl';
+import * as A2aPlugin from '../../../packages/dsh-a2a/src/index.js';
+import { freePort } from './lib/a2a-shared.mjs';
 import * as Langfuse from '../../../packages/dsh-langfuse/src/index.js';
 import { startFakeIngestion, capturedToObservations, runVerification } from './lib/langfuse-shared.mjs';
 import { A2aBridge } from '../../../packages/dsh-a2a/src/bridge.js';
@@ -1092,4 +1094,255 @@ it('cancels the active driver while a claimed promotion is waiting for storage',
   } finally { finish(); await promotion; }
 });
 
+});
+
+
+describe('issue-78 graceful retention', () => {
+  async function host(root: string, script: Array<StreamChunk[] | 'hang'> = ['hang'], shutdown?: 'cancel', telemetry?: Langfuse.LangfusePluginConfig) {
+    const ctx = new Context();
+    cleanups.push(() => ctx.fiber.dispose());
+    for (const plugin of [LlmRuntime, SessionStore, SessionProjectionRegistry, SystemPrompt, ToolRuntime, AgentRegistry]) await ctx.plugin(plugin);
+    await ctx.plugin(JsonlSessionPersistence, { root: join(root, 'sessions'), compression: 'none' });
+    await ctx.plugin(AgentLoop, { agents: [] });
+    if (telemetry) await ctx.plugin(Langfuse, telemetry);
+    const adapter = new MockAdapter(script);
+    ctx.llm.registerAdapter(['mock'], adapter);
+    const port = await freePort();
+    await ctx.plugin(A2aPlugin, A2aPlugin.Config({ enabled: true, port, inbox: { enabled: true, shutdown: shutdown ?? 'retain-pending' }, taskStore: 'filesystem', filesystem: { root: join(root, 'tasks') }, agent: { provider: 'mock', model: 'mock' } }));
+    const rpc = async (method: string, params: unknown) => (await fetch(`http://127.0.0.1:${port}/a2a/`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'A2A-Version': '1.0', 'A2A-Extensions': INBOX_EXTENSION },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    })).json();
+    const send = async (id: string, controls: Record<string, unknown> = {}, taskId?: string) => {
+      const result = await rpc('SendMessage', { message: { messageId: id, role: 'ROLE_USER', contextId: 'graceful', taskId, parts: [{ text: id }], metadata: { [INBOX_EXTENSION]: controls } }, configuration: { returnImmediately: true } });
+      expect(result.error).toBeUndefined();
+      return result.result.task;
+    };
+    return { ctx, adapter, rpc, send, inbox: ctx.a2aInbox };
+  }
+
+  it('retains unclaimed steering and independent turns through public plugin disposal', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-graceful-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const first = await host(root);
+    const active = await first.send('active');
+    await expect.poll(() => first.adapter.requests.length).toBe(1);
+    await first.send('steer', { target: 'next-step' }, active.id);
+    const future = await first.send('future', { wakeup: false });
+    const original = await first.inbox.resolve('graceful');
+    await expect.poll(() => original.inbox.nextTurn.length).toBe(1);
+    await first.ctx.parallel('session/flush', original.session);
+    const ids = [...original.inbox.nextStep, ...original.inbox.nextTurn].map(m => m.id);
+    await first.ctx.fiber.dispose();
+    const second = await host(root, Array.from({ length: 4 }, () => textResponse('done')));
+    const agent = await second.inbox.resolve('graceful');
+    expect([...agent.inbox.nextStep, ...agent.inbox.nextTurn].map(m => m.id)).toEqual(ids);
+    expect((await second.rpc('GetTask', { id: active.id })).result.status.state).not.toBe('TASK_STATE_CANCELED');
+    expect((await second.rpc('GetTask', { id: future.id })).result.status.state).not.toBe('TASK_STATE_CANCELED');
+    await second.send('wake');
+    await expect.poll(() => agent.session.snapshotEvents().filter(e => e.type === 'user/message').length).toBe(4);
+    const messages = agent.session.snapshotEvents().filter(e => e.type === 'user/message');
+    expect(messages.map(e => e.data.content[0].text)).toEqual(['active', 'steer', 'future', 'wake']);
+    expect(messages.slice(1, 3).map(e => e.data.id)).toEqual(ids);
+    expect(messages.slice(1, 3).map(e => JSON.parse(e.data.source.message).messageId)).toEqual(['steer', 'future']);
+  });
+
+
+  it.each(['cancel', 'clear'] as const)('does not resurrect input after explicit %s', async action => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-graceful-terminal-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const first = await host(root);
+    const active = await first.send('active');
+    await expect.poll(() => first.adapter.requests.length).toBe(1);
+    await first.send('steer', { target: 'next-step' }, active.id);
+    const future = await first.send('future', { wakeup: false });
+    const agent = await first.inbox.resolve('graceful');
+    await expect.poll(() => agent.inbox.nextTurn.length).toBe(1);
+    if (action === 'cancel') {
+      await first.rpc('CancelTask', { id: active.id });
+      await first.rpc('CancelTask', { id: future.id });
+    } else await first.ctx.a2aTasks.clearContext('graceful');
+    await first.ctx.fiber.dispose();
+    const second = await host(root);
+    const restored = await second.inbox.resolve('graceful');
+    expect([...restored.inbox.nextStep, ...restored.inbox.nextTurn]).toEqual([]);
+    if (action === 'cancel') for (const task of [active, future])
+      expect((await second.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_CANCELED');
+    expect(second.adapter.requests).toHaveLength(0);
+  });
+
+  it('keeps default shutdown terminal and never replays a consumed active call', async () => {
+    for (const shutdown of ['cancel', undefined] as const) {
+      const root = await mkdtemp(join(tmpdir(), 'a2a-graceful-active-'));
+      cleanups.push(() => rm(root, { recursive: true, force: true }));
+      const first = await host(root, ['hang'], shutdown);
+      const active = await first.send('active');
+      await expect.poll(() => first.adapter.requests.length).toBe(1);
+      const agent = await first.inbox.resolve('graceful');
+      await first.ctx.parallel('session/flush', agent.session);
+      if (shutdown === 'cancel') {
+        await first.send('future', { wakeup: false });
+        await expect.poll(() => agent.inbox.nextTurn.length).toBe(1);
+      }
+      await first.ctx.fiber.dispose();
+      const second = await host(root);
+      const restored = await second.inbox.resolve('graceful');
+      expect([...restored.inbox.nextStep, ...restored.inbox.nextTurn]).toEqual([]);
+      expect((await second.rpc('GetTask', { id: active.id })).result.status.state).toBe(shutdown === 'cancel' ? 'TASK_STATE_CANCELED' : 'TASK_STATE_FAILED');
+      expect(second.adapter.requests).toHaveLength(0);
+    }
+  });
+
+  it('retains an independent input deferred from a mixed recovered batch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-graceful-deferred-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const first = await host(root);
+    const active = await first.send('active');
+    await expect.poll(() => first.adapter.requests.length).toBe(1);
+    await first.send('steer', { target: 'next-step' }, active.id);
+    const future = await first.send('future', { wakeup: false });
+    await expect.poll(async () => (await first.inbox.resolve('graceful')).inbox.nextTurn.length).toBe(1);
+    await first.ctx.fiber.dispose();
+    const second = await host(root);
+    const before = await second.inbox.resolve('graceful');
+    expect(before.inbox.nextStep.map(m => m.content[0].text)).toEqual(['steer']);
+    expect(before.inbox.nextTurn.map(m => m.content[0].text)).toEqual(['future']);
+    await second.send('wake-2');
+    await expect.poll(() => second.adapter.requests.length).toBe(1);
+    const selected = await second.inbox.resolve('graceful');
+    expect(selected.inbox.nextTurn.map(m => m.content[0].text)).toContain('future');
+    await second.ctx.fiber.dispose();
+    const third = await host(root, Array.from({ length: 4 }, () => textResponse('done')));
+    const recovered = await third.inbox.resolve('graceful');
+    expect(recovered.inbox.nextTurn.map(m => m.content[0].text)).toContain('future');
+    await third.send('wake-3');
+    await expect.poll(async () => (await third.rpc('GetTask', { id: future.id })).result.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(recovered.session.snapshotEvents().filter(e => e.type === 'user/message' && e.data.content[0].text === 'future')).toHaveLength(1);
+  });
+
+  it('retains transferred ownership when shutdown interrupts a promotion checkpoint', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-graceful-promotion-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const first = await host(root);
+    const active = await first.send('active');
+    await expect.poll(() => first.adapter.requests.length).toBe(1);
+    const former = await first.send('promote', { wakeup: false });
+    const agent = await first.inbox.resolve('graceful');
+    await expect.poll(() => agent.inbox.nextTurn.length).toBe(1);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let blocked = false;
+    first.ctx.on('session/flush', async session => {
+      if (session === agent.session && agent.inbox.nextStep.length && !blocked) { blocked = true; await gate; }
+    });
+    const promoting = first.inbox.promote('graceful', agent.inbox.nextTurn[0].id, active.id);
+    const result = promoting.catch(error => error);
+    await expect.poll(() => blocked).toBe(true);
+    const stopping = first.ctx.fiber.dispose();
+    release();
+    await result;
+    await stopping;
+    const second = await host(root, Array.from({ length: 3 }, () => textResponse('done')));
+    const restored = await second.inbox.resolve('graceful');
+    expect(restored.inbox.nextStep.map(m => m.source.taskId)).toEqual([active.id]);
+    await second.send('wake');
+    await expect.poll(async () => (await second.rpc('GetTask', { id: active.id })).result.status.state).toBe('TASK_STATE_COMPLETED');
+    expect((await second.rpc('GetTask', { id: former.id })).result.status.state).toMatch(/CANCELED|FAILED/);
+    expect(restored.session.snapshotEvents().filter(e => e.type === 'user/message' && e.data.content[0].text === 'promote')).toHaveLength(1);
+  });
+
+  it('reports gracefully recovered work to Langfuse', async () => {
+    const live = process.env.DSH_ISSUE78_LANGFUSE_LIVE === 'true';
+    const captured: unknown[] = [];
+    const collector = live ? undefined : await startFakeIngestion(captured);
+    if (collector) cleanups.push(() => new Promise<void>((resolve, reject) => collector.close(error => error ? reject(error) : resolve())));
+    const { LANGFUSE_PUBLIC_KEY: publicKey, LANGFUSE_SECRET_KEY: secretKey, LANGFUSE_BASE_URL: baseUrl } = process.env;
+    if (live) expect(publicKey && secretKey && baseUrl, 'Issue #78 live E2E requires LANGFUSE_*').toBeTruthy();
+    const fromStartTime = new Date(Date.now() - 60_000).toISOString();
+    const telemetry = { enabled: true, publicKey: live ? publicKey : 'test', secretKey: live ? secretKey : 'test',
+      baseUrl: live ? baseUrl : `http://127.0.0.1:${collector!.address().port}`, captureContent: true,
+      traceName: 'dsh-inbox-issue78', environment: 'ci', release: process.env.GITHUB_SHA ?? 'local', tags: ['ci', 'scenario:issue-78'] };
+    const root = await mkdtemp(join(tmpdir(), 'a2a-graceful-langfuse-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const first = await host(root);
+    const active = await first.send('active');
+    await expect.poll(() => first.adapter.requests.length).toBe(1);
+    await first.send('steer', { target: 'next-step' }, active.id);
+    const future = await first.send('future', { wakeup: false });
+    await expect.poll(async () => (await first.inbox.resolve('graceful')).inbox.nextTurn.length).toBe(1);
+    await first.ctx.fiber.dispose();
+    const second = await host(root, Array.from({ length: 4 }, () => textResponse('done')), undefined, telemetry);
+    const agent = await second.inbox.resolve('graceful');
+    await second.send('wake');
+    for (const task of [active, future]) await expect.poll(async () => (await second.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_COMPLETED');
+    await second.ctx.parallel('session/flush', agent.session);
+    for (const task of [active, future]) {
+      const evaluate = observations => {
+        const root = observations.find(o => o.name === 'dsh-inbox-issue78' && o.metadata?.taskId === task.id);
+        const turns = observations.filter(o => o.name === 'agent:turn' && o.parentObservationId === root?.id);
+        const calls = observations.filter(o => o.type === 'GENERATION' && turns.some(t => t.id === o.parentObservationId));
+        return root?.endTime && root.metadata?.taskState === 'completed' && turns.length === 1 && calls.length === 1 && calls[0].endTime ? [] : ['missing ended recovery task/turn/generation'];
+      };
+      if (!live) expect(evaluate(capturedToObservations(captured))).toEqual([]);
+      else {
+        const result = await runVerification({ baseUrl, publicKey, secretKey, fromStartTime,
+          toStartTime: new Date(Date.now() + 60_000).toISOString(), codeword: task.id,
+          observationName: 'inbox:completed', model: 'mock', evaluate });
+        expect(result.ok, result.state).toBe(true);
+        console.log(`Langfuse issue-78 ${task.id}: ${result.state}`);
+      }
+    }
+  }, 900_000);
+
+  it.skipIf(!process.env.A2A_GRACEFUL_ROOT)('graceful child fixture checkpoints SIGTERM', async () => {
+    const root = process.env.A2A_GRACEFUL_ROOT!;
+    const first = await host(root);
+    const active = await first.send('active');
+    await expect.poll(() => first.adapter.requests.length).toBe(1);
+    const promoted = await first.send('promoted', { wakeup: false });
+    const agent = await first.inbox.resolve('graceful');
+    await expect.poll(() => agent.inbox.nextTurn.length).toBe(1);
+    await first.inbox.promote('graceful', agent.inbox.nextTurn[0].id, active.id);
+    const future = await first.send('future', { wakeup: false });
+    await expect.poll(() => agent.inbox.nextTurn.length).toBe(1);
+    await first.ctx.parallel('session/flush', agent.session);
+    const ids = [...agent.inbox.nextStep, ...agent.inbox.nextTurn].map(m => m.id);
+    await writeFile(join(root, 'graceful-admitted.json'), JSON.stringify({ active, promoted, future, ids }));
+    const stopped = new Promise<void>((resolve, reject) => {
+      process.once('SIGTERM', () => { void first.ctx.fiber.dispose().then(resolve, reject); });
+    });
+    process.kill(process.pid, 'SIGTERM');
+    await stopped;
+  });
+
+  it('recovers promoted and future input after SIGTERM and a second graceful restart', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-graceful-child-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const child = spawnSync(process.execPath, [fileURLToPath(new URL('../check-inbox.mjs', import.meta.url)), '-t', 'graceful child fixture'], {
+      env: { ...process.env, A2A_GRACEFUL_ROOT: root }, encoding: 'utf8', timeout: 10000,
+    });
+    expect(child.error, child.stdout + child.stderr).toBeUndefined();
+    expect(child.status, child.stdout + child.stderr).toBe(0);
+    const admitted = JSON.parse(await readFile(join(root, 'graceful-admitted.json'), 'utf8'));
+    const second = await host(root);
+    const restored = await second.inbox.resolve('graceful');
+    expect([...restored.inbox.nextStep, ...restored.inbox.nextTurn].map(m => m.id)).toEqual(admitted.ids);
+    await second.ctx.fiber.dispose();
+    const third = await host(root, Array.from({ length: 4 }, () => textResponse('done')));
+    const agent = await third.inbox.resolve('graceful');
+    expect([...agent.inbox.nextStep, ...agent.inbox.nextTurn].map(m => m.id)).toEqual(admitted.ids);
+    await third.send('wake');
+    await expect.poll(async () => (await third.rpc('GetTask', { id: admitted.future.id })).result.status.state).toBe('TASK_STATE_COMPLETED');
+    expect((await third.rpc('GetTask', { id: admitted.active.id })).result.status.state).toBe('TASK_STATE_COMPLETED');
+    expect((await third.rpc('GetTask', { id: admitted.promoted.id })).result.status.state).toBe('TASK_STATE_CANCELED');
+    const messages = agent.session.snapshotEvents().filter(e => e.type === 'user/message');
+    expect(messages.map(e => e.data.content[0].text)).toEqual(['active', 'promoted', 'future', 'wake']);
+    expect(messages.slice(1, 3).map(e => e.data.id)).toEqual(admitted.ids);
+    expect(messages.slice(1, 3).map(e => JSON.parse(e.data.source.message).messageId)).toEqual(['promoted', 'future']);
+    await third.ctx.fiber.dispose();
+    const fourth = await host(root);
+    const empty = await fourth.inbox.resolve('graceful');
+    expect([...empty.inbox.nextStep, ...empty.inbox.nextTurn]).toEqual([]);
+    expect(fourth.adapter.requests).toHaveLength(0);
+  });
 });
