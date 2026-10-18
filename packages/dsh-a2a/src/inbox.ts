@@ -15,6 +15,7 @@ import type { GoalMessageSource } from '@deepseek-ai/dsh-goal';
 import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
 import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm/types';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
+import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence';
 import type { A2aBridge, TaskEntry } from './bridge.js';
 import type { A2aTurnContext } from './index.js';
 import type { A2aServer } from './server.js';
@@ -128,6 +129,7 @@ export class NativeInbox implements A2aInbox {
   private shutdownPromise?: Promise<void>;
   private readonly preadmitted = new WeakMap<ServerCallContext, Set<string>>();
   server?: A2aServer;
+  private readonly persistence?: SessionPersistence;
 
   constructor(
     private readonly ctx: Context,
@@ -136,6 +138,7 @@ export class NativeInbox implements A2aInbox {
     private readonly retainPending = false,
   ) {
     bridge.inbox = this;
+    this.persistence = ctx.get('sessionPersistence');
     ctx.on('agent/pre-step', async (detail, next) => {
       await this.prepare(detail);
       return next();
@@ -489,7 +492,7 @@ export class NativeInbox implements A2aInbox {
 
   private observe(phase: string, run: ContextRun, fields: Partial<A2aInboxEvent> = {}): void {
     try {
-      const pending = this.pending(run);
+      const pending = this.stopping && this.retainPending ? run.retained : this.pending(run);
       void this.ctx
         .parallel('a2a/inbox', {
           phase,
@@ -1300,7 +1303,9 @@ export class NativeInbox implements A2aInbox {
           failures.push(error);
         }
         try {
-          await this.flush(run.entry.handle.agent.session);
+          // The persistence barrier tolerates writers already closed by parallel core teardown.
+          if (this.retainPending && this.persistence) await this.persistence.flush();
+          else await this.flush(run.entry.handle.agent.session);
         } catch (error) {
           failures.push(error);
         } finally {

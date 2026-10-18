@@ -5,7 +5,7 @@ import { createServer } from 'node:http';
 import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Context } from '@deepseek-ai/cordis';
@@ -91,7 +91,7 @@ async function boot(options: { root?: string; store?: SanitizedTaskStore; backen
     expect(response.error).toBeUndefined();
     return response.result.task;
   };
-  const completed = async (id: string) => { await expect.poll(async () => (await rpc('GetTask', { id })).result.status.state).toBe('TASK_STATE_COMPLETED'); };
+  const completed = async (id: string) => { await expect.poll(async () => (await rpc('GetTask', { id })).result.status.state, { timeout: options.langfuse && process.env.DSH_ISSUE75_LANGFUSE_LIVE === 'true' ? 15_000 : 1_000 }).toBe('TASK_STATE_COMPLETED'); };
   return { ctx, adapter, bridge, inbox, store, backend, server, rpc, send, completed };
 }
 
@@ -1169,6 +1169,26 @@ describe('issue-78 graceful retention', () => {
     if (action === 'cancel') for (const task of [active, future])
       expect((await second.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_CANCELED');
     expect(second.adapter.requests).toHaveLength(0);
+  });
+
+  it('uses the persistence barrier when event listeners unload before the inbox', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-graceful-barrier-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const first = await host(root);
+    await first.send('parked', { wakeup: false });
+    const agent = await first.inbox.resolve('graceful');
+    await expect.poll(() => agent.inbox.nextTurn.length).toBe(1);
+    await first.ctx.parallel('session/flush', agent.session);
+    // This listener models a late durability hook whose owner has already unloaded.
+    first.ctx.on('session/flush', () => { throw new Error('session event owner already unloaded'); });
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await first.ctx.fiber.dispose();
+      expect(errors.mock.calls.filter(args => String(args[0]).includes('[dsh-a2a]'))).toEqual([]);
+    } finally { errors.mockRestore(); }
+    const second = await host(root);
+    const restored = await second.inbox.resolve('graceful');
+    expect(restored.inbox.nextTurn.map(m => m.content[0].text)).toEqual(['parked']);
   });
 
   it('keeps default shutdown terminal and never replays a consumed active call', async () => {
