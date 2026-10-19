@@ -16,7 +16,7 @@ dsh plugin --profile my-agent add @amaster.ai/dsh-a2a
 
 `inbox.enabled: true` uses the official DSH inbox (`Agent.send`) for ordinary `next-turn` input and `next-step` steering. Tested with the unmodified npm runtime `0.2.1-rc.2`; no core patch is required. The queue and its durable projection belong to DSH. The plugin only materializes messages, attaches A2A task identities, and translates execution events.
 
-Standard `SendMessage` / `SendStreamingMessage`, task queries, cancellation and subscriptions remain the wire interface. The negotiated [inbox extension](../../docs/protocol/inbox-v1.md) forwards `target` and `wakeup` to DSH. `wakeup: false` leaves an idle driver parked; it does not prevent an active driver from consuming pending input. A later real waking message releases pending input.
+Standard `SendMessage` / `SendStreamingMessage`, task queries, cancellation and subscriptions remain the wire interface. The negotiated inbox extension forwards `target` and `wakeup` to DSH. `wakeup: false` leaves an idle driver parked; it does not prevent an active driver from consuming pending input. A later real waking message releases pending input.
 
 The same-process `a2aInbox` service exposes `resolve(contextId)`, `content(message, contextId)`, `enqueue(taskId, message, { target?, wakeup? })`, `promote(contextId, nativeMessageId, activeTaskId)`, and `cancel(taskId)`. There is no separate pause, wake-only, resume, or retained-task restart operation. Cancellation is terminal and removes that task's pending input. Other tasks' input is retained according to official DSH cancellation semantics, and may wait for the next waking message. Clearing a context discards all its pending work.
 
