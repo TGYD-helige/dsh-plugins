@@ -1080,6 +1080,24 @@ export class NativeInbox implements A2aInbox {
       return true;
     }
     try {
+      if (event.type === 'user/message' && event.data.source.kind === 'a2a') {
+        // Commit on the task bus before subsequent assistant deltas, not on admission.
+        const status = {
+          state: TaskState.TASK_STATE_WORKING,
+          message: { ...this.protocolMessage(run, task, event.data), taskId: task.task.id },
+          timestamp: new Date().toISOString(),
+        };
+        task.task.status = status;
+        task.bus.publish(
+          AgentEvent.statusUpdate({
+            taskId: task.task.id,
+            contextId: session.id,
+            status,
+            metadata: { dshAgent: { kind: 'user-message' } },
+          }),
+        );
+        return true;
+      }
       if (event.type !== 'turn/end') {
         this.publish(task, event);
         return true;
