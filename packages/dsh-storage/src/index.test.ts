@@ -15,6 +15,9 @@ vi.mock('./backends/database.js', () => ({
     readMessages = vi.fn(async () => [] as any[]);
     upsertMessage = vi.fn(async () => {});
     upsertSession = vi.fn(async () => {});
+    observeSession = vi.fn(async () => {});
+    readSessionMetadata = vi.fn(async () => null);
+    updateSessionMetadata = vi.fn(async () => {});
     archiveSession = vi.fn(async (): Promise<string | null> => 'history-1');
     close = vi.fn(async () => {});
     constructor(public config: unknown) {
@@ -662,4 +665,36 @@ describe('dsh-storage plugin', () => {
     // Final state is the newest snapshot, never an older one landing last.
     expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(2);
   });
+});
+
+it('mirrors title/activity and exposes empty-session metadata without clearing it on archive', async () => {
+  const ctx = new Context();
+  apply(ctx, enabledConfig);
+  const backend = backends.instances.at(-1);
+  const api = ctx.get('dshStorage') as import('./index.js').DshStorageService;
+  await api.observeSession({ sessionId: 'empty', at: new Date(1700000000000) });
+  await api.updateSessionMetadata('empty', { title: 'Manual' });
+  await api.readSessionMetadata('empty');
+  ctx.events.emit('session/event', { id: 'empty' }, ev('session/title', { title: 'Auto' }));
+  await ctx.events.parallel('session/flush', { id: 'empty' });
+  expect(backend.observeSession).toHaveBeenLastCalledWith({
+    sessionId: 'empty',
+    at: new Date(1700000000000),
+    title: 'Auto',
+  });
+  expect(backend.updateSessionMetadata).toHaveBeenCalledWith('empty', { title: 'Manual' });
+  expect(backend.readSessionMetadata).toHaveBeenCalledWith('empty');
+  await api.archiveSession('empty');
+  expect(backend.updateSessionMetadata).toHaveBeenCalledTimes(1);
+  backend.observeSession.mockRejectedValueOnce(new Error('db down'));
+  await expect(api.observeSession({ sessionId: 'empty', at: new Date() })).rejects.toThrow(
+    'db down',
+  );
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  backend.observeSession.mockRejectedValueOnce(new Error('db down'));
+  ctx.events.emit('session/event', { id: 'empty' }, userEvent('test'));
+  await ctx.events.parallel('session/flush', { id: 'empty' });
+  expect(error).toHaveBeenCalled();
+  error.mockRestore();
+  await ctx.fiber.dispose();
 });

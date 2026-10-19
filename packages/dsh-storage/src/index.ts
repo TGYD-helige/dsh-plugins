@@ -23,7 +23,14 @@ import type {} from '@deepseek-ai/dsh-session';
 import Schema from '@deepseek-ai/schemastery';
 import { DatabaseBackend, type DatabaseProvider } from './backends/database.js';
 import { mergeToolResult, projectEvent, usageSampleOf } from './projector.js';
-import type { MessageRow, SessionRow, StorageBackend } from './types.js';
+import type {
+  MessageRow,
+  SessionMetadata,
+  SessionMetadataUpdate,
+  SessionObservation,
+  SessionRow,
+  StorageBackend,
+} from './types.js';
 
 export const name = 'dsh-storage';
 
@@ -50,6 +57,9 @@ export interface StoragePluginConfig {
 /** Explicit write API for a consumer's session-clear flow. */
 export interface DshStorageService {
   archiveSession(sessionId: string): Promise<string | null>;
+  observeSession(row: SessionObservation): Promise<void>;
+  readSessionMetadata(sessionId: string): Promise<SessionMetadata | null>;
+  updateSessionMetadata(sessionId: string, update: SessionMetadataUpdate): Promise<void>;
 }
 
 /** Per-session live rollup used to maintain the session row. */
@@ -193,22 +203,36 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     };
   });
 
+  function explicit<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    const result = (chains.get(sessionId) ?? started).then(operation);
+    const settled = result.then(
+      () => {},
+      () => {},
+    );
+    chains.set(sessionId, settled);
+    track(settled);
+    void settled.then(() => {
+      if (chains.get(sessionId) === settled) chains.delete(sessionId);
+    });
+    return result;
+  }
+
   ctx.provide('dshStorage', {
-    archiveSession(sessionId: string): Promise<string | null> {
-      // Join the same per-session chain as event writes, then discard the old
-      // in-memory rollup only after the database transaction commits.
-      const archived = (chains.get(sessionId) ?? started).then(async () => {
+    archiveSession(sessionId: string) {
+      return explicit(sessionId, async () => {
         const id = await backends[0].archiveSession(sessionId);
         sessions.delete(sessionId);
         return id;
       });
-      const settled = archived.then(
-        () => {},
-        () => {},
-      );
-      chains.set(sessionId, settled);
-      track(settled);
-      return archived;
+    },
+    observeSession(row: SessionObservation) {
+      return explicit(row.sessionId, () => backends[0].observeSession(row));
+    },
+    readSessionMetadata(sessionId: string) {
+      return explicit(sessionId, () => backends[0].readSessionMetadata(sessionId));
+    },
+    updateSessionMetadata(sessionId: string, update: SessionMetadataUpdate) {
+      return explicit(sessionId, () => backends[0].updateSessionMetadata(sessionId, update));
     },
   } satisfies DshStorageService);
 
@@ -302,6 +326,15 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
           ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
         };
         await fanout((backend) => backend.upsertSession(sessionRow));
+        await fanout((backend) =>
+          backend.observeSession({
+            sessionId,
+            at: new Date(event.time ?? Date.now()),
+            ...(event?.type === 'session/title' && typeof event.data?.title === 'string'
+              ? { title: event.data.title }
+              : {}),
+          }),
+        );
       }
     });
   });

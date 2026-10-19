@@ -15,7 +15,14 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { createHash } from 'node:crypto';
-import type { MessageRow, SessionRow, StorageBackend } from '../types.js';
+import type {
+  MessageRow,
+  SessionMetadata,
+  SessionMetadataUpdate,
+  SessionObservation,
+  SessionRow,
+  StorageBackend,
+} from '../types.js';
 
 export type DatabaseProvider = 'mysql' | 'postgresql' | 'sqlite' | 'sqlserver';
 
@@ -298,6 +305,71 @@ export class DatabaseBackend implements StorageBackend {
       }
       return history.id;
     });
+  }
+
+  async observeSession(row: SessionObservation): Promise<void> {
+    if (!this.prisma) throw new Error('dsh-storage database is not initialized');
+    if (
+      !row.sessionId ||
+      row.sessionId.length > 100 ||
+      (row.title?.length ?? 0) > 255 ||
+      !Number.isFinite(row.at.getTime())
+    )
+      throw new Error('Invalid session metadata');
+    try {
+      await this.prisma.aiSession.upsert({
+        where: { id: pk(`session ${row.sessionId}`) },
+        create: {
+          id: pk(`session ${row.sessionId}`),
+          sessionId: row.sessionId,
+          title: row.title ?? '',
+          createdAt: row.at,
+          updatedAt: row.at,
+        },
+        update: {},
+      });
+    } catch (error) {
+      // Prisma emulates upsert on MySQL/SQL Server; another writer may win creation.
+      if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'P2002')
+        throw error;
+    }
+    if (row.title !== undefined)
+      await this.prisma.aiSession.updateMany({
+        where: {
+          id: pk(`session ${row.sessionId}`),
+          titleEdited: false,
+          updatedAt: { lte: row.at },
+        },
+        data: { title: row.title, updatedAt: row.at },
+      });
+    await this.prisma.aiSession.updateMany({
+      where: { id: pk(`session ${row.sessionId}`), updatedAt: { lt: row.at } },
+      data: { updatedAt: row.at },
+    });
+  }
+
+  async readSessionMetadata(sessionId: string): Promise<SessionMetadata | null> {
+    if (!this.prisma) throw new Error('dsh-storage database is not initialized');
+    return this.prisma.aiSession.findUnique({ where: { id: pk(`session ${sessionId}`) } });
+  }
+
+  async updateSessionMetadata(sessionId: string, update: SessionMetadataUpdate): Promise<void> {
+    if (!this.prisma) throw new Error('dsh-storage database is not initialized');
+    if (
+      update.title !== undefined &&
+      (typeof update.title !== 'string' || update.title.length > 255)
+    )
+      throw new Error('Invalid session title');
+    if (update.archived !== undefined && typeof update.archived !== 'boolean')
+      throw new Error('Invalid session archive state');
+    const result = await this.prisma.aiSession.updateMany({
+      where: { id: pk(`session ${sessionId}`) },
+      data: {
+        ...(update.title !== undefined ? { title: update.title, titleEdited: true } : {}),
+        ...(update.archived !== undefined ? { archived: update.archived } : {}),
+      },
+    });
+    if (result.count === 0) throw new Error('Session unavailable');
   }
 
   async close(): Promise<void> {

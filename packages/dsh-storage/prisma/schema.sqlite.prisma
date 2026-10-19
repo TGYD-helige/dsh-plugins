@@ -64,3 +64,18 @@ model AiChatHistory {
   @@index([deletedAt], map: "idx_chat_history_deleted")
   @@map("ai_chat_histories")
 }
+
+/// Stable session directory; clearing messages only archives history segments.
+model AiSession {
+  id          String   @id
+  sessionId   String   @map("session_id")
+  title       String   @default("")
+  titleEdited Boolean  @default(false) @map("title_edited")
+  archived    Boolean  @default(false)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @default(now()) @map("updated_at")
+
+  @@index([sessionId], map: "idx_ai_sessions_session")
+  @@index([updatedAt], map: "idx_ai_sessions_updated")
+  @@map("ai_sessions")
+}

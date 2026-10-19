@@ -7,6 +7,11 @@ const prismaMock = vi.hoisted(() => {
   const instances: any[] = [];
   class PrismaClient {
     aiMessage = { upsert: vi.fn(), findMany: vi.fn(), aggregate: vi.fn(), updateMany: vi.fn() };
+    aiSession = {
+      upsert: vi.fn(),
+      findUnique: vi.fn(),
+      updateMany: vi.fn(async () => ({ count: 1 })),
+    };
     aiChatHistory = { findFirst: vi.fn(), create: vi.fn(), update: vi.fn() };
     $transaction = vi.fn(async (run: (client: PrismaClient) => Promise<unknown>) => run(this));
     $connect = vi.fn(async () => {});
@@ -451,4 +456,112 @@ describe('DatabaseBackend', () => {
     await backend.close();
     expect(prisma.$disconnect).toHaveBeenCalledTimes(1);
   });
+});
+
+it('keeps session metadata separate from history segments and preserves manual titles', async () => {
+  vi.spyOn(DatabaseBackend.prototype as any, 'loadClient').mockResolvedValue(
+    prismaMock.PrismaClient,
+  );
+  const backend = new DatabaseBackend(baseConfig);
+  await backend.init();
+  const prisma = prismaMock.instances.at(-1);
+  const at = new Date('2026-10-19T00:00:00Z');
+  await backend.observeSession({ sessionId: 's1', at, title: 'Automatic title' });
+  expect(prisma.aiSession.upsert).toHaveBeenCalledWith({
+    where: { id: createHash('sha256').update('session s1').digest('hex').slice(0, 36) },
+    create: {
+      id: createHash('sha256').update('session s1').digest('hex').slice(0, 36),
+      sessionId: 's1',
+      title: 'Automatic title',
+      createdAt: at,
+      updatedAt: at,
+    },
+    update: {},
+  });
+  expect(prisma.aiSession.updateMany).toHaveBeenCalledWith({
+    where: {
+      id: createHash('sha256').update('session s1').digest('hex').slice(0, 36),
+      titleEdited: false,
+      updatedAt: { lte: at },
+    },
+    data: { title: 'Automatic title', updatedAt: at },
+  });
+  expect(prisma.aiSession.updateMany).toHaveBeenCalledWith({
+    where: {
+      id: createHash('sha256').update('session s1').digest('hex').slice(0, 36),
+      updatedAt: { lt: at },
+    },
+    data: { updatedAt: at },
+  });
+  await backend.updateSessionMetadata('s1', { title: 'My title', archived: true });
+  expect(prisma.aiSession.updateMany).toHaveBeenCalledWith({
+    where: { id: createHash('sha256').update('session s1').digest('hex').slice(0, 36) },
+    data: { title: 'My title', titleEdited: true, archived: true },
+  });
+  prisma.aiSession.findUnique.mockResolvedValue({
+    sessionId: 's1',
+    title: 'My title',
+    archived: true,
+  });
+  expect(await backend.readSessionMetadata('s1')).toMatchObject({
+    title: 'My title',
+    archived: true,
+  });
+  expect(prisma.aiSession.findUnique).toHaveBeenCalledWith({
+    where: { id: createHash('sha256').update('session s1').digest('hex').slice(0, 36) },
+  });
+  expect(prisma.aiChatHistory.create).not.toHaveBeenCalled();
+});
+
+it('keeps the newest automatic title when two writers observe events out of order', async () => {
+  vi.spyOn(DatabaseBackend.prototype as any, 'loadClient').mockResolvedValue(
+    prismaMock.PrismaClient,
+  );
+  const backend = new DatabaseBackend(baseConfig);
+  await backend.init();
+  const prisma = prismaMock.instances.at(-1);
+  const state = { title: '', updatedAt: new Date(0), titleEdited: false };
+  let newerWritten!: () => void;
+  const newer = new Promise<void>((resolve) => {
+    newerWritten = resolve;
+  });
+  const t1 = new Date(1000),
+    t2 = new Date(2000);
+  prisma.aiSession.updateMany.mockImplementation(async ({ where, data }: any) => {
+    if (data.title === 'Old') await newer;
+    const matches =
+      (!where.updatedAt?.lte || state.updatedAt <= where.updatedAt.lte) &&
+      (!where.updatedAt?.lt || state.updatedAt < where.updatedAt.lt) &&
+      (where.titleEdited === undefined || state.titleEdited === where.titleEdited);
+    if (matches) Object.assign(state, data);
+    if (data.title === 'New') newerWritten();
+    return { count: matches ? 1 : 0 };
+  });
+  await Promise.all([
+    backend.observeSession({ sessionId: 's', at: t1, title: 'Old' }),
+    backend.observeSession({ sessionId: 's', at: t2, title: 'New' }),
+  ]);
+  expect(state).toMatchObject({ title: 'New', updatedAt: t2 });
+});
+
+it('uses different keys for case-distinct IDs and only tolerates a concurrent insert conflict', async () => {
+  vi.spyOn(DatabaseBackend.prototype as any, 'loadClient').mockResolvedValue(
+    prismaMock.PrismaClient,
+  );
+  const backend = new DatabaseBackend(baseConfig);
+  await backend.init();
+  const prisma = prismaMock.instances.at(-1);
+  prisma.aiSession.upsert.mockRejectedValueOnce({ code: 'P2002' });
+  await backend.observeSession({ sessionId: 'AbCd12345678', at: new Date() });
+  await backend.observeSession({ sessionId: 'abCd12345678', at: new Date() });
+  const calls = prisma.aiSession.upsert.mock.calls;
+  expect(calls.at(-1)[0].where.id).not.toBe(calls.at(-2)[0].where.id);
+  prisma.aiSession.upsert.mockRejectedValueOnce(new Error('db down'));
+  await expect(backend.observeSession({ sessionId: 's', at: new Date() })).rejects.toThrow(
+    'db down',
+  );
+  prisma.aiSession.updateMany.mockResolvedValueOnce({ count: 0 });
+  await expect(backend.updateSessionMetadata('missing', { archived: true })).rejects.toThrow(
+    'unavailable',
+  );
 });

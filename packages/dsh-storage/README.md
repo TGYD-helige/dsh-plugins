@@ -2,7 +2,7 @@
 
 ![dsh-storage preview](preview.png)
 
-Session storage mirror for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness): projects the `session/event` stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`, same tables as the source project) without replacing dsh's local persistence — local files stay authoritative, this is a mirror.
+Session storage mirror for [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness): projects the `session/event` stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories` / `ai_sessions`, same tables as the source project) without replacing dsh's local persistence — local files stay authoritative, this is a mirror.
 
 Use it when a dsh profile needs durable, queryable session data in an existing relational database while preserving the runtime's local session store as the source of truth.
 
@@ -48,6 +48,7 @@ npx prisma db push --schema node_modules/@amaster.ai/dsh-storage/prisma/schema.m
 
 ## Data model
 
+- **`ai_sessions`** — a stable session directory, independent of history segments. Each row has `session_id`, `title`, `title_edited`, `archived`, `created_at`, and `updated_at` (last observed activity). Its `id` is the first 36 hex characters of SHA-256(`"session " + sessionId`), so case-distinct session IDs remain distinct on case-insensitive databases. Application ownership and list permissions stay with the consumer.
 - **`ai_messages`** — user and model rows, with `thoughts`, `tokens`, `tool_calls`, `agent_id`, `metadata` JSON columns and soft-delete. A `tool/result` updates the matching model row's `tool_calls` entry by call ID; it does not create a `type=tool` row.
 - **`ai_chat_histories`** — per-session rollup (message count, total tokens, first/last message timestamps).
 
@@ -62,6 +63,25 @@ When an assistant message contains dsh `reasoning` blocks, `thoughts` is an arra
 SQL Server note: Prisma's sqlserver connector has no `Json` type, so its variant maps the JSON columns to text — the backend serializes them on write automatically (SQL Server's `ISJSON` / `JSON_VALUE` still query the text as JSON).
 
 Mirroring is a no-throw seam: backend errors are logged with a `[dsh-storage]` prefix and never escape into the agent loop.
+
+## Session metadata
+
+Upgrade the database schema **before** upgrading the plugin. Standalone databases use the shipped Prisma schema; applications that own their schema must register the equivalent model in their own migration system. The plugin does not run DDL or scan/backfill all legacy messages. Existing message/history rows remain untouched; consumers can seed directory entries from their historical session IDs before enabling their conversation list.
+
+Message, title, usage, and turn-end events create/update `ai_sessions`. Observed activity is monotonic; an older event cannot overwrite a newer title. Automatic `session/title` events update only titles that have not been manually edited. `archiveSession()` still archives a message segment, and leaves the directory row intact.
+
+Explicit metadata calls on `ctx.get('dshStorage')` reject on storage failure (unlike event mirroring, which logs errors):
+
+```ts
+const storage = ctx.get('dshStorage');
+// Also creates an empty session, without inventing a chat message.
+await storage.observeSession({ sessionId, at: new Date() });
+await storage.updateSessionMetadata(sessionId, { title: 'My conversation' });
+await storage.updateSessionMetadata(sessionId, { archived: true });
+const metadata = await storage.readSessionMetadata(sessionId); // null if absent
+```
+
+`updateSessionMetadata` requires an existing row. A manual title is protected from later automatic title events, including after a restart. Directory archive/restore only changes metadata; the caller must stop or reject task admission as appropriate. TaskStore, native inbox, and the authoritative session event log remain separate; this table does not restore running tasks or pending work after loss of the local run directory.
 
 ## Archive a session
 

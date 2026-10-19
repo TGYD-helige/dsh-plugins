@@ -52,5 +52,27 @@ export interface StorageBackend {
   upsertSession(row: SessionRow): Promise<void>;
   /** Move active messages into a queryable history row; null when already empty. */
   archiveSession(sessionId: string): Promise<string | null>;
+  observeSession(row: SessionObservation): Promise<void>;
+  readSessionMetadata(sessionId: string): Promise<SessionMetadata | null>;
+  updateSessionMetadata(sessionId: string, update: SessionMetadataUpdate): Promise<void>;
   close?(): Promise<void>;
+}
+
+/** Stable directory row, independent of message/history segment lifetime. */
+export interface SessionMetadata {
+  sessionId: string;
+  title: string;
+  titleEdited: boolean;
+  archived: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+export interface SessionObservation {
+  sessionId: string;
+  at: Date;
+  title?: string;
+}
+export interface SessionMetadataUpdate {
+  title?: string;
+  archived?: boolean;
 }

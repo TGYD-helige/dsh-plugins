@@ -256,6 +256,23 @@ async function backendOnlyLeg(dbProvider) {
   const { mergeToolResult } = await import(pkgUrl('lib/projector.js').href);
   const backend = new DatabaseBackend({ provider: dbProvider, url });
   await backend.init();
+  // Stable directory entries do not require messages and use case-sensitive identities.
+  const t1 = new Date(1700000000100), t2 = new Date(1700000000900);
+  await Promise.all([
+    backend.observeSession({ sessionId: 'empty', at: t1 }),
+    backend.observeSession({ sessionId: 'empty', at: t2 }),
+  ]);
+  await backend.observeSession({ sessionId: 'Case', at: t1, title: 'Upper' });
+  await backend.observeSession({ sessionId: 'case', at: t1, title: 'Lower' });
+  assert((await backend.readSessionMetadata('Case'))?.title === 'Upper', 'case-distinct metadata collided');
+  assert((await backend.readSessionMetadata('case'))?.title === 'Lower', 'case-distinct metadata collided');
+  await backend.observeSession({ sessionId: 's1', at: t2, title: 'New' });
+  await backend.observeSession({ sessionId: 's1', at: t1, title: 'Old' });
+  assert((await backend.readSessionMetadata('s1'))?.title === 'New', 'out-of-order event regressed title');
+  await backend.updateSessionMetadata('s1', { title: 'Manual', archived: true });
+  await backend.observeSession({ sessionId: 's1', at: new Date(1700000002000), title: 'Automatic' });
+  assert((await backend.readSessionMetadata('s1'))?.title === 'Manual', 'automatic title replaced manual name');
+  assert((await backend.readSessionMetadata('s1'))?.archived === true, 'observation restored archived session');
   await backend.upsertMessage({
     id: 'm1',
     sessionId: 's1',
@@ -347,6 +364,7 @@ async function backendOnlyLeg(dbProvider) {
   assert(archiveId === sessions[0].id, 'archive did not retain the active rollup');
   assert(await backend.archiveSession('s1') === null, 'empty archive was not idempotent');
   assert(await backend.readSession('s1') === null, 'archived rollup was selected as active');
+  assert((await backend.readSessionMetadata('s1'))?.title === 'Manual', 'clearing history removed stable metadata');
   await backend.upsertMessage({
     id: 'm2', sessionId: 's1', historyId: null, type: 'user', content: 'after clear',
     createdAt: new Date(1700000002000),
@@ -361,6 +379,11 @@ async function backendOnlyLeg(dbProvider) {
 
   await prisma.$disconnect();
   await backend.close();
+  const reopened = new DatabaseBackend({ provider: dbProvider, url });
+  await reopened.init();
+  assert((await reopened.readSessionMetadata('s1'))?.title === 'Manual', 'metadata did not survive reopening');
+  assert((await reopened.readSessionMetadata('empty'))?.updatedAt.getTime() === t2.getTime(), 'empty directory activity regressed');
+  await reopened.close();
 
   console.log(`SCENARIO_OK ${dbProvider} (backend-only leg)`);
 }
