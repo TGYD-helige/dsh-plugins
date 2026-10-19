@@ -231,6 +231,14 @@ it('streams committed steering between replies while parked inputs retain FIFO o
     configuration: { returnImmediately: true },
   });
   expect(steering.error).toBeUndefined();
+  const pendingTask = (await f.rpc('GetTask', { id: active.id })).result;
+  expect(pendingTask.history.find(message => message.messageId === 'steer').metadata?.dshAgent?.inboxPending).toBe(true);
+  const attached = await fetch(`http://127.0.0.1:${f.server.port}/a2a/`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 13, method: 'tasks/resubscribe', params: { id: active.id } }),
+  });
+  const attachedResult = attached.text();
+
   const duplicate = await f.rpc('SendMessage', {
     message: { messageId: 'steer', role: 'ROLE_USER', contextId: 'native-test', taskId: active.id, parts,
       metadata: { [INBOX_EXTENSION]: { target: 'next-step' } } },
@@ -258,6 +266,16 @@ it('streams committed steering between replies while parked inputs retain FIFO o
   }
   const recovered = (await f.rpc('GetTask', { id: active.id })).result;
   expect(recovered.history.filter(message => message.messageId === 'steer')).toHaveLength(1);
+  expect(recovered.history.map(message => [message.role, message.parts[0]?.text])).toEqual([
+    ['ROLE_USER', 'active'], ['ROLE_AGENT', 'before'], ['ROLE_USER', 'steered input'], ['ROLE_AGENT', 'after'],
+  ]);
+  expect(recovered.status.message.parts[0].text).toBe('after');
+  expect(recovered.history.find(message => message.messageId === 'steer')).toMatchObject({ parts });
+  expect(recovered.history.find(message => message.messageId === 'steer').metadata?.dshAgent?.inboxPending).toBeUndefined();
+  const reconnectFrames = (await attachedResult).split('\n\n').filter(frame => frame.startsWith('data: ')).map(frame => JSON.parse(frame.slice(6)).result);
+  expect(reconnectFrames.find(event => event.kind === 'task').history.find(message => message.messageId === 'steer').metadata?.dshAgent?.inboxPending).toBe(true);
+  expect(reconnectFrames.filter(event => event.kind === 'status-update' && event.status.message?.messageId === 'steer')).toHaveLength(1);
+
 });
 
 it('persists completion when a legacy streaming send disconnects', async () => {
@@ -516,7 +534,7 @@ it('reports a cold interrupted task as failed without replaying consumed input',
   await first.ctx.parallel('session/flush', agent.session);
   await cp(root, restoredRoot, { recursive: true });
   const backend = new MemoryTaskStore();
-  await backend.save(await first.store.load(task.id, new ServerCallContext()), new ServerCallContext());
+  await backend.save(await first.backend.load(task.id, new ServerCallContext()), new ServerCallContext());
   await first.bridge.dispose();
   const second = await boot({ root: restoredRoot, backend });
   const subscription = await fetch(`http://127.0.0.1:${second.server.port}/a2a/`, { method: 'POST', headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' }, body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'SubscribeToTask', params: { id: task.id } }) });
@@ -524,6 +542,7 @@ it('reports a cold interrupted task as failed without replaying consumed input',
   await expect.poll(async () => (await second.rpc('GetTask', { id: task.id })).result.status.state).toBe('TASK_STATE_FAILED');
   expect(second.adapter.requests).toHaveLength(0);
   expect((await second.rpc('GetTask', { id: task.id })).result.history.filter(message => message.messageId === 'committed')).toHaveLength(1);
+  expect((await second.rpc('GetTask', { id: task.id })).result.history.find(message => message.messageId === 'committed').metadata?.dshAgent?.inboxPending).toBeUndefined();
 });
 
 it('fails the whole task when its first accepted turn fails with more owned input queued', async () => {

@@ -17,13 +17,51 @@
  */
 
 import { createHash } from 'node:crypto';
-import { type ListTasksRequest, type ListTasksResponse, type Task, TaskState } from '@a2a-js/sdk';
+import {
+  type ListTasksRequest,
+  type ListTasksResponse,
+  type Message,
+  Role,
+  type Task,
+  TaskState,
+} from '@a2a-js/sdk';
 import { resolveUserScope, type ServerCallContext, type TaskStore } from '@a2a-js/sdk/server';
+
+function inboxMetadata(message: Message): Record<string, unknown> {
+  const value = message.metadata?.dshAgent;
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+export function markInboxInputPending(message: Message): Message {
+  return {
+    ...message,
+    metadata: { ...message.metadata, dshAgent: { ...inboxMetadata(message), inboxPending: true } },
+  };
+}
+
+/** SDK status updates do not replace admitted history entries with the same ID. */
+export function commitInboxInput(history: Message[], message: Message): void {
+  const index = history.findIndex(
+    (item) => item.messageId === message.messageId && inboxMetadata(item).inboxPending === true,
+  );
+  if (index < 0) return;
+  const previous = history[index]!;
+  const dshAgent = { ...inboxMetadata(previous), ...inboxMetadata(message) };
+  delete dshAgent.inboxPending;
+  history.splice(index, 1);
+  history.push({
+    ...previous,
+    ...structuredClone(message),
+    metadata: { ...previous.metadata, ...message.metadata, dshAgent },
+  });
+}
 
 /** Omit an unfinished current message from a WORKING snapshot. */
 export function sanitizeTask(task: Task): Task {
   const current =
-    task.status?.state === TaskState.TASK_STATE_WORKING && task.status.message?.messageId;
+    task.status?.state === TaskState.TASK_STATE_WORKING &&
+    task.status.message?.role === Role.ROLE_AGENT &&
+    task.status.message.messageId;
   return current
     ? { ...task, history: task.history.filter((message) => message.messageId !== current) }
     : task;
@@ -140,7 +178,8 @@ export class SanitizedTaskStore implements ManagedTaskStore {
       this.terminalStates.set(task.id, state);
     const history = structuredClone(task.history ?? []);
     const current = task.status?.message;
-    if (task.status?.state === TaskState.TASK_STATE_WORKING && current) {
+    if (current?.role === Role.ROLE_USER) commitInboxInput(history, current);
+    if (task.status?.state === TaskState.TASK_STATE_WORKING && current?.role === Role.ROLE_AGENT) {
       const previous = this.liveHistory
         .get(task.id)
         ?.history.find((message) => message.messageId === current.messageId);

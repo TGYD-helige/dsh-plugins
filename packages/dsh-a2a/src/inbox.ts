@@ -19,7 +19,7 @@ import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence';
 import type { A2aBridge, TaskEntry } from './bridge.js';
 import type { A2aTurnContext } from './index.js';
 import type { A2aServer } from './server.js';
-import type { ManagedTaskStore } from './task-store.js';
+import { commitInboxInput, type ManagedTaskStore, markInboxInputPending } from './task-store.js';
 import { agentTextMessage, SessionTranslator, terminalStatusUpdate } from './translator.js';
 
 export const INBOX_EXTENSION =
@@ -315,7 +315,7 @@ export class NativeInbox implements A2aInbox {
     try {
       await this.checkpoint(target.task, target.context);
       if (!valid()) throw new Error('Promotion raced input consumption or task settlement.');
-      target.task.history = [...target.task.history, original];
+      target.task.history = [...target.task.history, markInboxInputPending(original)];
       target.headers.set(message.id, source.headers.get(message.id));
       if (!agent.inbox.replace(message.id, promoted))
         throw new Error('Queued input has already been claimed.');
@@ -406,7 +406,7 @@ export class NativeInbox implements A2aInbox {
           throw new Error('Promoted A2A task is not accessible.');
         const original = Message.fromJSON(JSON.parse(message.source.message));
         if (!recipient.history.some((item) => item.messageId === original.messageId)) {
-          recipient.history.push(original);
+          recipient.history.push(markInboxInputPending(original));
           await this.checkpoint(recipient, context);
         }
       }
@@ -784,7 +784,7 @@ export class NativeInbox implements A2aInbox {
       const history = saved?.history ?? task.task.history;
       const acceptedHistory = history.some((item) => item.messageId === a2aMessage.messageId)
         ? history
-        : [...history, a2aMessage];
+        : [...history, markInboxInputPending(a2aMessage)];
       await this.checkpoint({ ...task.task, history: acceptedHistory }, context);
       abort.signal.throwIfAborted();
       task.task.history = acceptedHistory;
@@ -894,6 +894,15 @@ export class NativeInbox implements A2aInbox {
   }
 
   private restoreTask(run: ContextRun, snapshot: Task, context: ServerCallContext): TaskRun {
+    for (const event of run.entry.handle.agent.session.snapshotEvents()) {
+      if (
+        event.type === 'user/message' &&
+        event.data.source.kind === 'a2a' &&
+        event.data.source.taskId === snapshot.id
+      )
+        commitInboxInput(snapshot.history, Message.fromJSON(JSON.parse(event.data.source.message)));
+    }
+
     if (!this.server) throw new Error('A2A task recovery requires the running server.');
     const bus = this.server.restoreTask(snapshot, context);
     const restored = this.task(snapshot, bus, context);
@@ -1087,6 +1096,8 @@ export class NativeInbox implements A2aInbox {
           message: { ...this.protocolMessage(run, task, event.data), taskId: task.task.id },
           timestamp: new Date().toISOString(),
         };
+        task.translator.handle(event);
+        commitInboxInput(task.task.history, status.message);
         task.task.status = status;
         task.bus.publish(
           AgentEvent.statusUpdate({

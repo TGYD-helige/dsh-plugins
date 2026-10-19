@@ -13,7 +13,7 @@
  *
  *   turn/start                         → statusUpdate(WORKING), ids rotate
  *   stream chunk (text-delta)          → statusUpdate(WORKING, text part),
- *                                        reusing the turn's messageId so
+ *                                        reusing the reply segment's messageId so
  *                                        clients aggregate deltas into one message
  *   stream chunk (reasoning-delta)     → statusUpdate(WORKING, thought metadata)
  *   assistant/message                  → no event; text + usage captured for the
@@ -127,12 +127,12 @@ export function terminalStatusUpdate(
 }
 
 export class SessionTranslator {
-  /** messageId shared by this turn's streamed text deltas (client-side aggregation key). */
+  /** Shared by streamed text deltas until the next committed input or turn. */
   private textMessageId = randomUUID();
   private thoughtMessageId = randomUUID();
-  /** Authoritative turn text, assembled from `assistant/message` events. */
+  /** Current reply segment, assembled from `assistant/message` events. */
   private turnText = '';
-  /** Fallback turn text, accumulated from `text-delta` chunks. */
+  /** Fallback reply segment, accumulated from `text-delta` chunks. */
   private deltaText = '';
   private sawAssistantMessage = false;
   private usage: TokenUsage | undefined;
@@ -157,6 +157,16 @@ export class SessionTranslator {
         this.sawAssistantMessage = false;
         this.usage = undefined;
         return [this.status(TaskState.TASK_STATE_WORKING, { kind: 'state-change' })];
+      }
+      case 'user/message': {
+        if (event.data.source.kind === 'a2a') {
+          this.textMessageId = randomUUID();
+          this.thoughtMessageId = randomUUID();
+          this.turnText = '';
+          this.deltaText = '';
+          this.sawAssistantMessage = false;
+        }
+        return [];
       }
       case 'assistant/message': {
         this.sawAssistantMessage = true;
