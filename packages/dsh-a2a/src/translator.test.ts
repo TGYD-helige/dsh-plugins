@@ -77,6 +77,61 @@ describe('SessionTranslator (A2A 1.0 model)', () => {
     expect(c[0].status?.message?.messageId).not.toBe(ma?.messageId);
   });
 
+  it('starts a fresh reply segment on committed A2A input while retaining turn usage', () => {
+    const t = new SessionTranslator('task1', 'ctx1');
+    t.handle(turnStart());
+    const before = updates(t.handleStreamFrame(textDelta('before')))[0].status!.message!;
+    const thought = updates(t.handleStreamFrame(reasoningDelta('old thought')))[0].status!.message!;
+    t.handle(assistantMessage('before', { inputTokens: 10, outputTokens: 2 }));
+    t.handle(
+      event('tool/call', {
+        turn: 1,
+        step: 1,
+        callId: 'c1',
+        name: 'read',
+        arguments: '{}',
+      } as never),
+    );
+    t.handle(
+      event('user/message', {
+        id: 'native-input',
+        role: 'user',
+        content: [{ type: 'text', text: 'steer' }],
+        source: { kind: 'a2a', taskId: 'task1', message: '{}', target: 'next-step' },
+      } as never),
+    );
+    const after = updates(t.handleStreamFrame(textDelta('after')))[0].status!.message!;
+    const nextThought = updates(t.handleStreamFrame(reasoningDelta('new thought')))[0].status!
+      .message!;
+    expect(after.messageId).not.toBe(before.messageId);
+    expect(nextThought.messageId).not.toBe(thought.messageId);
+    const result = updates(
+      t.handle(
+        event('tool/result', {
+          turn: 1,
+          step: 1,
+          message: {
+            id: 'result',
+            role: 'tool',
+            toolCallId: 'c1',
+            content: [{ type: 'text', text: 'file contents' }],
+            source: { kind: 'tool', callId: 'c1' },
+          },
+        } as never),
+      ),
+    )[0].status!.message!.parts[0];
+    expect(result.content?.$case === 'data' && result.content.value).toMatchObject({
+      callId: 'c1',
+      name: 'read',
+    });
+
+    t.handle(assistantMessage('after', { inputTokens: 20, outputTokens: 3 }));
+    const final = updates(t.handle(turnEnd({ kind: 'completed' })))[0];
+    expect(textPartOf(final.status?.message)).toBe('after');
+    expect(final.status?.message?.messageId).toBe(after.messageId);
+    expect(final.metadata?.usage).toEqual({ inputTokens: 30, outputTokens: 5 });
+  });
+
   it('routes reasoning deltas to a separate thought messageId', () => {
     const t = new SessionTranslator('task1', 'ctx1');
     t.handle(turnStart());

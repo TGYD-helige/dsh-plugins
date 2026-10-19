@@ -249,6 +249,39 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore()) {
 }
 
 describe('native A2A inbox', () => {
+  it('publishes only committed protocol inputs and keeps internal user messages private', async () => {
+    const f = harness();
+    const original = f.send('one', { parked: true });
+    await vi.waitFor(() => expect(f.agent.inbox.nextTurn).toHaveLength(1));
+    const userEvents = () =>
+      original.events.filter(
+        (event) =>
+          event.kind === 'statusUpdate' && event.data.status.message?.role === Role.ROLE_USER,
+      );
+    expect(userEvents()).toEqual([]);
+    f.ctx.on('a2a/before-step', () => {
+      for (const kind of ['hook', 'goal', 'runtime-context', 'subagent'])
+        f.agent.session.append(
+          'user/message',
+          {
+            id: kind,
+            role: 'user',
+            source: { kind },
+            content: [{ type: 'text', text: 'private model context' }],
+          } as never,
+          { surfaceOp: 'append' } as never,
+        );
+    });
+    f.agent.drive();
+    await original.execution;
+    expect(userEvents()).toHaveLength(1);
+    expect(userEvents()[0].data.status).toMatchObject({
+      state: TaskState.TASK_STATE_WORKING,
+      message: { messageId: 'one', taskId: 'task-one', role: Role.ROLE_USER },
+    });
+    expect(JSON.stringify(original.events)).not.toContain('private model context');
+  });
+
   it('removes owned input when the admission flush fails after send', async () => {
     const f = harness();
     f.ctx.on('session/flush', () => {
