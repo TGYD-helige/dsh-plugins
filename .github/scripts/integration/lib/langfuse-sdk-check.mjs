@@ -18,6 +18,7 @@ import {
   runVerification,
 } from './langfuse-shared.mjs';
 import { integrationModel } from './ci-shared.mjs';
+import { checkMetadataWire } from './langfuse-metadata-check.mjs';
 
 // Real SDK + local OTLP receiver: no gateway, Langfuse account, or harness boot.
 const require = createRequire(
@@ -395,6 +396,7 @@ try {
   assert.equal(hookObservations.length, 3, 'both hooks must export on the original root before session disposal');
   assert.doesNotMatch(JSON.stringify(captured.slice(hookOffset)), /PRIVATE/);
   await ctx.fiber.dispose();
+  await checkMetadataWire({ require, connection, captured });
   console.log('real Langfuse SDK / OTLP checks passed');
 } finally {
   if (hookWorkDir) rmSync(hookWorkDir, { recursive: true, force: true });

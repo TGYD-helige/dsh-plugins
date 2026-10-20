@@ -427,10 +427,15 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   }
 
   ctx.on('langfuse/context', (sessionId, context) => {
-    traceContexts.set(sessionId, {
-      ...context,
-      tags: context.tags ? [...context.tags] : undefined,
-    });
+    traceContexts.delete(sessionId);
+    try {
+      // Snapshot at submission, not trace creation: the host may reuse or
+      // mutate its request object before the next event opens the trace.
+      traceContexts.set(sessionId, reporter.mask(JSON.parse(JSON.stringify(context))));
+    } catch {
+      // Never include caller data or serialization errors in diagnostics.
+      console.error('[dsh-langfuse] invalid request context; ignoring context');
+    }
   });
 
   function openTrace(

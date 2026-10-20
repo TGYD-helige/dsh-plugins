@@ -371,7 +371,7 @@ function otlpJsonAttr(span, key) {
 
 function spanToObservation(span) {
   const metadataPrefix = 'langfuse.observation.metadata.';
-  const metadata = {};
+  const metadata = { ...otlpJsonAttr(span, 'langfuse.observation.metadata') };
   for (const entry of span.attributes ?? []) {
     if (entry.key.startsWith(metadataPrefix)) {
       metadata[entry.key.slice(metadataPrefix.length)] = otlpAttrValue(entry);
@@ -550,7 +550,7 @@ export async function startFakeIngestion(captured) {
 }
 
 /**
- * Run one leg to green: { tag, name, prompt, evaluate, hook?, toolHooks?, cancelHook? }. The marker file
+ * Run one leg to green: { tag, name, prompt, evaluate, hook?, toolHooks?, cancelHook?, metadata? }. The marker file
  * `${codeword}.txt` is written into the workspace and its name is the
  * codeword the leg verifies on. Failures log `::error::` and exit non-zero.
  */
@@ -563,7 +563,7 @@ export async function runScenario(opts) {
   }
 }
 
-async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHooks = false, cancelHook = false }) {
+async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHooks = false, cancelHook = false, metadata = false }) {
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-langfuse-${tag}-e2e`);
   mkdirSync(workDir, { recursive: true });
   const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
@@ -574,8 +574,8 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHoo
 
   const publicKey = envOr(process.env.LANGFUSE_PUBLIC_KEY, '');
   const secretKey = envOr(process.env.LANGFUSE_SECRET_KEY, '');
-  if ((hook || toolHooks || cancelHook) && (!publicKey || !secretKey)) {
-    throw new Error('hook E2E requires LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY');
+  if ((hook || toolHooks || cancelHook || metadata) && (!publicKey || !secretKey)) {
+    throw new Error('hook/metadata E2E requires LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY');
   }
   // A half-configured pair is a misconfiguration — never silently fake it.
   if (Boolean(publicKey) !== Boolean(secretKey)) {
@@ -648,13 +648,14 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHoo
 `;
   }
 
-  if (toolHooks || cancelHook) {
-    const bridge = cancelHook ? 'cancel-hook-bridge.mjs' : 'tool-hook-bridge.mjs';
+  if (toolHooks || cancelHook || metadata) {
+    const bridge = metadata ? 'metadata-context-bridge.mjs'
+      : cancelHook ? 'cancel-hook-bridge.mjs' : 'tool-hook-bridge.mjs';
     const fixtureDir = join(dshHome, 'profiles', 'headless', `${tag}-fixture`);
     mkdirSync(fixtureDir, { recursive: true });
     // An anonymous manifest excludes the loose fixture from DeepSeek's package inventory.
     writeFileSync(join(fixtureDir, 'package.json'), JSON.stringify({ private: true }));
-    for (const file of cancelHook ? [bridge] : [bridge, 'tool-hook-script.mjs']) {
+    for (const file of toolHooks ? [bridge, 'tool-hook-script.mjs'] : [bridge]) {
       copyFileSync(new URL(`./${file}`, import.meta.url), join(fixtureDir, file));
     }
     hookPatch = `
@@ -684,6 +685,7 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHoo
     environment: ci
     release: ${JSON.stringify(envOr(process.env.GITHUB_SHA, 'local'))}
     tags: ${JSON.stringify(['ci', `scenario:${tag}`, `run:${runId}`, `attempt:${runAttempt}`])}
+${metadata ? '    redactFields: ["password"]\n' : ''}
 
 - id: agent-default-model
   config:
