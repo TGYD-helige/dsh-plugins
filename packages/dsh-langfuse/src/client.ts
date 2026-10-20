@@ -58,7 +58,7 @@ export interface LangfuseTraceContext {
   userId?: string;
   tags?: string[];
   traceparent?: string;
-  /** JSON-serializable request dimensions inherited by every observation. */
+  /** Strict JSON request dimensions inherited by every observation; non-JSON values reject context. */
   metadata?: Record<string, unknown>;
 }
 

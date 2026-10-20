@@ -1176,6 +1176,73 @@ describe('dsh-langfuse plugin', () => {
             },
           }),
       },
+      ...[
+        { kind: 'NaN', createValue: () => Number.NaN },
+        { kind: 'positive Infinity', createValue: () => Number.POSITIVE_INFINITY },
+        { kind: 'negative Infinity', createValue: () => Number.NEGATIVE_INFINITY },
+        { kind: 'undefined', createValue: () => undefined },
+        { kind: 'function', createValue: () => () => 'not JSON' },
+        { kind: 'symbol', createValue: () => Symbol('not JSON') },
+        { kind: 'Date', createValue: () => new Date('2026-10-20T00:00:00.000Z') },
+        { kind: 'Map', createValue: () => new Map([['retained', true]]) },
+        { kind: 'Set', createValue: () => new Set(['retained']) },
+        { kind: 'custom toJSON', createValue: () => ({ toJSON: () => ({ coerced: true }) }) },
+      ].flatMap(({ kind, createValue }) => [
+        {
+          kind: `${kind} in nested object`,
+          secret: 'private-request-payload',
+          createMetadata: (secret: string) => ({
+            requestId: 'invalid-request',
+            nonJson: { nested: createValue() },
+            secret,
+          }),
+        },
+        {
+          kind: `${kind} in array`,
+          secret: 'private-request-payload',
+          createMetadata: (secret: string) => ({
+            requestId: 'invalid-request',
+            nonJson: [createValue()],
+            secret,
+          }),
+        },
+      ]),
+      {
+        kind: 'sparse array',
+        secret: 'private-request-payload',
+        createMetadata: (secret: string) => ({
+          requestId: 'invalid-request',
+          nonJson: Object.assign(new Array<unknown>(2), { 1: 'retained' }),
+          secret,
+        }),
+      },
+      {
+        kind: 'array with additional properties',
+        secret: 'private-request-payload',
+        createMetadata: (secret: string) => ({
+          requestId: 'invalid-request',
+          nonJson: Object.assign(['retained'], { omitted: true }),
+          secret,
+        }),
+      },
+      {
+        kind: 'symbol-keyed property',
+        secret: 'private-request-payload',
+        createMetadata: (secret: string) => ({
+          requestId: 'invalid-request',
+          nonJson: { [Symbol('omitted')]: 'retained' },
+          secret,
+        }),
+      },
+      {
+        kind: 'circular object',
+        secret: 'private-request-payload',
+        createMetadata: (secret: string) => {
+          const metadata: Record<string, unknown> = { requestId: 'invalid-request', secret };
+          metadata.nonJson = metadata;
+          return metadata;
+        },
+      },
     ])(
       'rejects non-JSON request metadata ($kind) without breaking execution or reusing stale context',
       async ({ secret, createMetadata }) => {
@@ -1215,6 +1282,133 @@ describe('dsh-langfuse plugin', () => {
         }
       },
     );
+
+    it('accepts ordinary JSON request metadata with shared noncircular references', async () => {
+      await setup();
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const shared = {
+          projectId: 'project-a',
+          values: [null, '', '007', 'false', true, false, 0, -2.5],
+          emptyObject: {},
+          emptyArray: [],
+          dictionary: Object.assign(Object.create(null) as Record<string, unknown>, {
+            region: 'west',
+          }),
+        };
+        const metadata = {
+          requestId: 'request-a',
+          first: shared,
+          second: shared,
+          groups: [shared, { nested: shared }],
+        };
+        const expected = structuredClone(metadata);
+        ctx.emit('langfuse/context', 's1', {
+          metadata,
+          userId: undefined,
+          tags: undefined,
+          traceparent: undefined,
+        });
+        shared.projectId = 'changed-after-binding';
+        shared.values.push('changed-after-binding');
+        ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+        await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
+        await dispatchTool(ctx, execOf(), async () => okResult());
+        ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+
+        const root = mocks.roots[0];
+        for (const observation of [root, root.generations[0], root.spans[0]]) {
+          expect(metadataOf(observation)).toMatchObject(expected);
+          expect(observation.ended).toBe(1);
+        }
+        expect(errors).not.toHaveBeenCalled();
+      } finally {
+        errors.mockRestore();
+      }
+    });
+
+    it('accepts undefined optional request context fields', async () => {
+      await setup({ ...enabledConfig, userId: 'default-owner', tags: ['default'] });
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        ctx.emit('langfuse/context', 's1', {
+          metadata: undefined,
+          userId: undefined,
+          tags: undefined,
+          traceparent: undefined,
+        });
+        ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+        await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
+        ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+
+        expect(mocks.roots[0].attributes['user.id']).toBe('default-owner');
+        expect(mocks.roots[0].attributes['langfuse.trace.tags']).toEqual(['default']);
+        expect(mocks.roots[0].generations[0].ended).toBe(1);
+        expect(errors).not.toHaveBeenCalled();
+      } finally {
+        errors.mockRestore();
+      }
+    });
+
+    it('ignores a context toJSON method that could replace validated metadata', async () => {
+      await setup();
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const toJSON = vi.fn(() => ({ metadata: { score: NaN } }));
+      const context = {
+        metadata: { requestId: 'request-a', score: 1 },
+        toJSON,
+      };
+      try {
+        expect(() => ctx.emit('langfuse/context', 's1', context)).not.toThrow();
+        ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+        await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
+        await dispatchTool(ctx, execOf(), async () => okResult());
+        ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+
+        const root = mocks.roots[0];
+        for (const observation of [root, root.generations[0], root.spans[0]]) {
+          expect(metadataOf(observation)).toMatchObject({ requestId: 'request-a', score: 1 });
+          expect(observation.ended).toBe(1);
+        }
+        expect(toJSON).not.toHaveBeenCalled();
+        expect(errors).not.toHaveBeenCalled();
+      } finally {
+        errors.mockRestore();
+      }
+    });
+
+    it('snapshots a JSON metadata getter once instead of validating and reading it twice', async () => {
+      await setup();
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+      let reads = 0;
+      const value = { projectId: 'before-binding' };
+      const metadata = Object.defineProperty({ requestId: 'request-a' }, 'resolved', {
+        enumerable: true,
+        get() {
+          reads++;
+          if (reads > 1) throw new Error('sk-lf-second-read-secret');
+          return value;
+        },
+      });
+      try {
+        expect(() => ctx.emit('langfuse/context', 's1', { metadata })).not.toThrow();
+        value.projectId = 'after-binding';
+        ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+        await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
+        ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+
+        expect(reads).toBe(1);
+        for (const observation of [mocks.roots[0], mocks.roots[0].generations[0]]) {
+          expect(metadataOf(observation)).toMatchObject({
+            requestId: 'request-a',
+            resolved: { projectId: 'before-binding' },
+          });
+        }
+        expect(errors).not.toHaveBeenCalled();
+      } finally {
+        errors.mockRestore();
+      }
+    });
 
     it('discards pending request metadata when its session is disposed', async () => {
       await setup();

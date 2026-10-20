@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { format } from 'node:util';
 import { apply as applyMetadataBridge } from './metadata-context-bridge.mjs';
 import { capturedToObservations, evaluateSubagentTrace } from './langfuse-shared.mjs';
 import { integrationModel } from './ci-shared.mjs';
@@ -88,7 +89,9 @@ export async function checkMetadataWire({ require, connection, captured }) {
         yield { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } };
         yield { type: 'finish', reason: { kind: 'stop' } };
       });
-      for await (const _ of stream) { /* drain the real waterfall */ }
+      const chunks = [];
+      for await (const chunk of stream) chunks.push(chunk);
+      return chunks;
     };
     const execute = (session, name, callId) => ctx.tools.execute({
       name, arguments: { path: marker }, callId, agent: { id: session.id },
@@ -173,6 +176,46 @@ export async function checkMetadataWire({ require, connection, captured }) {
     for (const observation of next) {
       assert.equal(observation.metadata?.requestId, undefined, 'request metadata is consumed once');
       assert.equal(observation.metadata?.projectId, undefined, 'request metadata must not leak to the next turn');
+    }
+
+    for (const [index, invalidValue] of [NaN, { nested: undefined }, [() => 'hidden']].entries()) {
+      const diagnostics = [];
+      const originalError = console.error;
+      try {
+        console.error = (...args) => diagnostics.push(format(...args));
+        ctx.emit('langfuse/context', first.id, {
+          userId: 'stale-owner', tags: ['stale-tag'],
+          metadata: { requestId: 'stale-request' },
+        });
+        assert.doesNotThrow(() => ctx.emit('langfuse/context', first.id, {
+          userId: 'invalid-owner', tags: ['invalid-tag'],
+          metadata: { invalidValue, privatePayload: 'invalid-metadata-private' },
+        }));
+      } finally {
+        console.error = originalError;
+      }
+      assert.ok(diagnostics.some((line) => line.startsWith('[dsh-langfuse]')),
+        'invalid metadata must emit a diagnostic');
+      assert.doesNotMatch(diagnostics.join('\n'), /invalid-metadata-private|invalid-owner|invalid-tag/);
+
+      const invalidOffset = captured.length;
+      const turn = index + 2;
+      first.append('turn/start', { turn });
+      const chunks = await streamFor(first);
+      assert.equal(chunks.find((chunk) => chunk.type === 'text-delta')?.text, 'metadata answer');
+      assert.equal(chunks.at(-1)?.reason?.kind, 'stop');
+      assert.equal((await execute(first, 'read', `invalid-context-${turn}`)).isError, false);
+      first.append('turn/end', { turn, reason: { kind: 'completed' } });
+      await ctx.parallel('session/flush', first);
+      const rejected = captured.slice(invalidOffset);
+      assert.equal(rejected.length, 4, 'a rejected context must still export the turn, model, request and tool');
+      for (const span of rejected) {
+        assert.ok(!span.attributes.some((attribute) => [
+          'user.id', 'langfuse.trace.tags', 'langfuse.observation.metadata',
+        ].includes(attribute.key)), 'invalid context must discard queued labels and metadata');
+      }
+      assert.doesNotMatch(JSON.stringify(rejected),
+        /stale-owner|stale-tag|stale-request|invalid-owner|invalid-tag|invalid-metadata-private/);
     }
   } finally {
     await ctx.fiber.dispose();
