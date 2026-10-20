@@ -134,6 +134,20 @@ export async function checkMetadataWire({ require, connection, captured }) {
     const firstRoot = observations.find((o) => o.name === 'dsh-turn' && o.sessionId === first.id);
     const firstTree = observations.filter((o) => o.traceId === firstRoot?.traceId);
     assert.deepEqual(evaluateMetadataTrace(firstTree, marker), []);
+    // The real API returns newest first. Resuming the same child via
+    // send_message adds a second subagent span under that tool; it must not
+    // be mistaken for the original delegation's child.
+    const delegation = firstTree.find((o) => o.name.startsWith('tool:subagent'));
+    const delegatedChild = firstTree.find((o) => o.name === 'subagent');
+    const resumedTree = [
+      { ...delegatedChild, id: 'resumed-child', parentObservationId: 'resume-tool' },
+      { ...delegation, id: 'resume-tool', name: 'tool:send_message' },
+      ...firstTree,
+    ];
+    assert.deepEqual(evaluateMetadataTrace(resumedTree, marker), []);
+    assert.ok(evaluateMetadataTrace(firstTree.map((o) =>
+      o.id === delegatedChild.id ? { ...o, parentObservationId: firstRoot.id } : o,
+    ), marker).length > 0, 'a child outside the delegation must still fail verification');
     const secondTree = observations.filter((o) => o.sessionId === second.id);
     assert.ok(secondTree.length >= 4, 'the overlapping session must export its own observations');
     for (const observation of secondTree) {

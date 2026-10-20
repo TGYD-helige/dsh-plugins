@@ -311,7 +311,10 @@ export function evaluateSubagentTrace(observations, codeword) {
     );
   }
 
-  const subSpan = spans.find((o) => o.name === 'subagent' || o.name?.startsWith('subagent:'));
+  const subSpan = spans.find((o) =>
+    (o.name === 'subagent' || o.name?.startsWith('subagent:')) &&
+    o.parentObservationId === delegation?.id,
+  );
   need(subSpan, 'missing "subagent" span');
   if (subSpan && delegation) {
     need(
