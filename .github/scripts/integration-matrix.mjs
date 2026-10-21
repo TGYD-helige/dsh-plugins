@@ -1,7 +1,7 @@
 /**
  * Integration matrix discovery: every `.github/scripts/integration/<pkg>.mjs`
- * becomes one base-leg entry (full dsh + LLM query; secrets reach only
- * same-repo runs, fork PRs self-skip Stage B). A
+ * becomes one base-leg entry (full dsh + LLM query; fork PRs require
+ * approval before secret-backed scenarios run). A
  * package may split its scenario into several legs as `<pkg>.<scenario>.mjs`
  * (e.g. dsh-langfuse.subagent.mjs) — the package key is the part before the
  * first dot and all of a package's legs share its tarball. A sibling

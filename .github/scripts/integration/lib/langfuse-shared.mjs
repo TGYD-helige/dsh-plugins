@@ -10,9 +10,8 @@
  *   ingested trace shows the expected shape — the data is really in Langfuse.
  * - fake mode (LANGFUSE_* absent): same boot against an in-process fake
  *   OTLP endpoint with in-memory assertions, so the leg still proves the
- *   plugin wiring without a Langfuse instance. Note fork PRs never reach
- *   these scripts at all — Stage B is gated on the DSH_INTEGRATION_* secrets,
- *   which forks don't receive; fake mode covers LANGFUSE-keyless same-repo
+ *   plugin wiring without a Langfuse instance. Fork PRs reach these scripts
+ *   after the protected environment approval. Fake mode covers LANGFUSE-keyless
  *   runs and local development for the base/subagent legs. The hook leg
  *   requires real Langfuse keys so a green result proves API read-back.
  * - tool-hooks leg: an E2E-only producer executes BeforeTool/AfterTool processes
@@ -41,7 +40,7 @@ import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'no
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { integrationModel, netEnv, requireEnv, run } from './ci-shared.mjs';
+import { integrationModel, integrationRevision, netEnv, requireEnv, run } from './ci-shared.mjs';
 
 // ---------------------------------------------------------------------------
 // Real-Langfuse verification (v1 Observations API — v2 observations is
@@ -686,7 +685,7 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHoo
     secretKey: ${pluginConnection.secretKey}
     baseUrl: ${pluginConnection.baseUrl}
     environment: ci
-    release: ${JSON.stringify(envOr(process.env.GITHUB_SHA, 'local'))}
+    release: ${JSON.stringify(integrationRevision())}
     tags: ${JSON.stringify(['ci', `scenario:${tag}`, `run:${runId}`, `attempt:${runAttempt}`])}
 ${metadata ? '    redactFields: ["password"]\n' : ''}
 

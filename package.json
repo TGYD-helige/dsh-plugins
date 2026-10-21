@@ -10,7 +10,7 @@
   "scripts": {
     "build": "pnpm -r run build",
     "typecheck": "pnpm -r run typecheck",
-    "test": "pnpm -r run test",
+    "test": "node --test .github/scripts/integration-workflow.test.mjs && pnpm -r run test",
     "test:sdk": "pnpm --filter @amaster.ai/dsh-langfuse build && node .github/scripts/integration/lib/langfuse-sdk-check.mjs",
     "lint": "biome check .",
     "lint:fix": "biome check --write ."
