@@ -329,6 +329,49 @@ function redactChunks(chunks: StreamChunk[], reporter: LangfuseReporter): Stream
   return output;
 }
 
+/** Validate and copy together: JSON.stringify silently rewrites non-JSON values. */
+function snapshotMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
+  const ancestors = new Set<object>();
+  function snapshot(value: unknown): unknown {
+    if (
+      value === null ||
+      typeof value === 'string' ||
+      typeof value === 'boolean' ||
+      (typeof value === 'number' && Number.isFinite(value))
+    )
+      return value;
+    if (typeof value !== 'object' || ancestors.has(value)) throw new TypeError('Invalid metadata');
+    const array = Array.isArray(value);
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== null && prototype !== (array ? Array.prototype : Object.prototype))
+      throw new TypeError('Invalid metadata');
+    ancestors.add(value);
+    let copy: unknown;
+    if (array) {
+      // Reject holes and extra properties instead of turning them into null or dropping them.
+      if (Reflect.ownKeys(value).length !== value.length + 1)
+        throw new TypeError('Invalid metadata');
+      copy = Array.from({ length: value.length }, (_, index) => {
+        if (!Object.hasOwn(value, index)) throw new TypeError('Invalid metadata');
+        return snapshot(value[index]);
+      });
+    } else {
+      copy = Object.fromEntries(
+        Reflect.ownKeys(value).map((key) => {
+          if (typeof key !== 'string' || !Object.prototype.propertyIsEnumerable.call(value, key))
+            throw new TypeError('Invalid metadata');
+          return [key, snapshot((value as Record<string, unknown>)[key])];
+        }),
+      );
+    }
+    ancestors.delete(value);
+    return copy;
+  }
+  if (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata))
+    throw new TypeError('Invalid metadata');
+  return snapshot(metadata) as Record<string, unknown>;
+}
+
 export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void> | void {
   if (!config.enabled || /^(false|0)$/i.test(process.env.LANGFUSE_TRACING_ENABLED ?? '')) return;
   config = {
@@ -427,10 +470,22 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   }
 
   ctx.on('langfuse/context', (sessionId, context) => {
-    traceContexts.set(sessionId, {
-      ...context,
-      tags: context.tags ? [...context.tags] : undefined,
-    });
+    traceContexts.delete(sessionId);
+    try {
+      // Snapshot at submission, not trace creation: the host may reuse or
+      // mutate its request object before the next event opens the trace.
+      const { userId, tags, traceparent, metadata } = context;
+      const snapshot = {
+        userId,
+        tags,
+        traceparent,
+        metadata: metadata === undefined ? undefined : snapshotMetadata(metadata),
+      };
+      traceContexts.set(sessionId, reporter.mask(JSON.parse(JSON.stringify(snapshot))));
+    } catch {
+      // Never include caller data or serialization errors in diagnostics.
+      console.error('[dsh-langfuse] invalid request context; ignoring context');
+    }
   });
 
   function openTrace(

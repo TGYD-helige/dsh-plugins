@@ -63,19 +63,31 @@ Text-only generation output remains a string. When reasoning or tool calls are p
 
 Root severity follows the final turn reason: errors are `ERROR`; cancellation, blocking, token limits, and interruptions are `WARNING`. A recovered intermediate generation/tool/hook/subagent error sets `hadErrors` metadata while a successful final turn remains `DEFAULT`. This keeps retry failures visible without treating recovery as a failed turn. Outstanding tools also close as `WARNING` at unload, including calls without an agent/session; late results still reach their original callers without repeated telemetry or media reads.
 
-## Per-request labels and distributed tracing
+## Per-request metadata, labels and distributed tracing
 
-Hosts can supply standard context before a session's next trace starts:
+Hosts can supply context before a session's next trace starts:
 
 ```ts
 ctx.emit('langfuse/context', session.id, {
   userId: 'user-123',
   tags: ['support', 'experiment-b'],
+  metadata: {
+    projectId: 'project-a',
+    requestId: 'request-123',
+    experiment: { name: 'retrieval', variant: 2 },
+    labels: ['interactive'],
+  },
   traceparent: '00-1234567890abcdef1234567890abcdef-1234567890abcdef-01',
 });
 ```
 
 The typed event is exported through this package's Cordis augmentation. Context is consumed once by the next turn trace (or an out-of-turn trace created first); send it again for another request. Labels override profile defaults for that trace and propagate through generations, tools, hooks, and nested subagents. Queued context is discarded when the session is disposed or the plugin unloads. Concurrent sessions have independent context; no process-global request environment is modified.
+
+`metadata` accepts a plain JSON object with arbitrary string keys and nested values: plain objects, dense arrays, finite numbers, booleans, null and strings (including empty strings). The event validates, snapshots and masks the context immediately, so later caller mutations cannot change it. Request metadata is carried by every observation; plugin-generated fields such as `turn`, `provider`, `toolName` and `taskId` take precedence on that observation. Existing credential masking and `redactFields` apply, and explicit metadata remains available when `captureContent: false`.
+
+Non-JSON metadata rejects the entire submitted context with a diagnostic, without interrupting the agent or retaining an earlier pending context. This includes non-finite numbers, undefined, functions, symbols, BigInt, circular references, throwing getters, class instances (including Date, Map and Set), sparse arrays, extra array properties, and symbol-keyed or non-enumerable object properties. Values are never silently converted or dropped, and custom `toJSON` functions are not invoked. Omitted optional context fields remain supported. For an existing A2A task, supplying new metadata replaces its request metadata for the task root and subsequently created turns and their descendants; already-created observations retain their context.
+
+The plugin preserves JSON types in its OTLP payload. Langfuse server APIs may normalize the stored values: for example, v3's read API parses a top-level metadata string `"123"` as the number `123`.
 
 Only explicit W3C version-00 parents with non-zero trace/span IDs are joined. Invalid headers log a prefixed diagnostic and start an independent trace. Without a header the plugin always starts an independent trace. Each observation is created inside native OTEL `ROOT_CONTEXT`: foreign spans and Langfuse baggage (user/tags/metadata) are excluded, while explicit parents and plugin labels are preserved. This scoped context does not replace the host's global provider or context manager. When joining an external trace, dsh's turn is an observation under the supplied parent; the SDK's automatic app-root claim is disabled and the external owner's trace name and trace-level IO stay intact.
 

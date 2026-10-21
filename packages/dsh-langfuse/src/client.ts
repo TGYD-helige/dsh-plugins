@@ -58,6 +58,8 @@ export interface LangfuseTraceContext {
   userId?: string;
   tags?: string[];
   traceparent?: string;
+  /** Strict JSON request dimensions inherited by every observation; non-JSON values reject context. */
+  metadata?: Record<string, unknown>;
 }
 
 /** Any observation that can parent a span (trace root span or nested span/generation). */
@@ -69,6 +71,7 @@ interface TraceContext {
   traceName?: string;
   userId?: string;
   tags?: string[];
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -283,6 +286,16 @@ export class LangfuseReporter {
     if (context.userId) observation.otelSpan.setAttribute('user.id', this.mask(context.userId));
     if (context.tags?.length)
       observation.otelSpan.setAttribute('langfuse.trace.tags', this.mask(context.tags));
+    if (context.metadata) {
+      // Langfuse merges the JSON object with observation.metadata.<key>
+      // attributes, giving the latter (our runtime facts) precedence. The
+      // object form also preserves null/empty strings that SDK v5's
+      // per-key serializer omits, without inheriting a parent's runtime facts.
+      // Do not also set trace.metadata: v4 gives it precedence over even
+      // observation-specific fields, which would undo that collision policy.
+      const metadata = JSON.stringify(this.mask(context.metadata));
+      observation.otelSpan.setAttribute('langfuse.observation.metadata', metadata);
+    }
     this.traceContext.set(observation, context);
   }
 
@@ -317,6 +330,7 @@ export class LangfuseReporter {
         traceName: externalParent === NO_PARENT ? input.name : undefined,
         userId: input.context?.userId ?? this.config.userId,
         tags: input.context?.tags ?? this.config.tags,
+        metadata: input.context?.metadata,
       });
       // External traces retain their owner's trace name and trace-level IO.
       if (externalParent === NO_PARENT) {
@@ -339,6 +353,7 @@ export class LangfuseReporter {
         ...previous,
         userId: context.userId ?? previous?.userId,
         tags: context.tags ?? previous?.tags,
+        metadata: context.metadata ?? previous?.metadata,
       });
       const parent = parentContext(context.traceparent);
       if (parent !== NO_PARENT) span.otelSpan.addLink({ context: parent });

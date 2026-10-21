@@ -307,6 +307,20 @@ const errResult = (message: string, code?: string): ToolExecutionResult => ({
 /** The most recent update recorded on an observation (v5 closes via update+end). */
 const lastUpdate = (obs: MockObservation): Record<string, unknown> => obs.updates.at(-1) ?? {};
 
+/** Langfuse ingestion merges the object attribute with native SDK metadata,
+ * with observation-specific fields taking precedence over the shared object. */
+const metadataOf = (obs: MockObservation): Record<string, unknown> =>
+  Object.assign(
+    JSON.parse((obs.attributes['langfuse.observation.metadata'] as string | undefined) ?? '{}'),
+    ...[obs.body, ...obs.updates].map((record) =>
+      Object.fromEntries(
+        Object.entries((record.metadata ?? {}) as Record<string, unknown>).filter(
+          ([, value]) => value !== undefined && value !== null && value !== '',
+        ),
+      ),
+    ),
+  );
+
 // ------------------------------------------------------------------ tests
 
 describe('dsh-langfuse plugin', () => {
@@ -1005,6 +1019,535 @@ describe('dsh-langfuse plugin', () => {
         traceId: 'fedcba0987654321fedcba0987654321',
         traceFlags: 0,
       });
+    });
+
+    it('propagates request metadata through model calls, tools and subagent observations', async () => {
+      await setup();
+      const context = {
+        userId: 'request-owner',
+        metadata: {
+          tenantId: 'tenant-a',
+          routing: { projectId: 'project-a' },
+          labels: ['request-a'],
+          attempt: 2,
+          interactive: true,
+          empty: '',
+          nullable: null,
+          numericString: '007',
+          booleanString: 'false',
+        },
+      };
+      ctx.emit('langfuse/context', 's1', context);
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () =>
+          streamOf(textDelta('delegating'), finishStop()),
+        ),
+      );
+      await dispatchTool(ctx, execOf({ name: 'subagent' }), async () => {
+        ctx.emit('session/created', childSessionOf('child', 's1'));
+        ctx.emit('subagent/start', subagentStart('child'));
+        await drain(
+          ctx.waterfall(
+            'llm/stream',
+            optionsOf({ sessionId: 'child' as GenerateOptions['sessionId'] }),
+            () => streamOf(textDelta('child answer'), finishStop()),
+          ),
+        );
+        await dispatchTool(ctx, execOf({ agent: agentOf('child') }), async () => okResult());
+        ctx.emit('subagent/end', subagentEnd('child', 'completed'));
+        return okResult();
+      });
+      ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+
+      const root = mocks.roots[0];
+      const generation = root.generations[0];
+      const delegation = root.spans[0];
+      const child = delegation.spans[0];
+      const childGeneration = child.generations[0];
+      expect(mocks.roots).toHaveLength(1);
+      for (const observation of [
+        root,
+        generation,
+        generation.spans[0],
+        delegation,
+        child,
+        childGeneration,
+        childGeneration.spans[0],
+        child.spans[0],
+      ]) {
+        expect(metadataOf(observation)).toMatchObject(context.metadata);
+      }
+    });
+
+    it('consumes request metadata once without leaking across concurrent sessions or turns', async () => {
+      await setup();
+      const first = sessionOf('s1');
+      const second = sessionOf('s2');
+      ctx.emit('langfuse/context', 's1', { metadata: { requestId: 'first' } });
+      ctx.emit('langfuse/context', 's2', { metadata: { requestId: 'second' } });
+      ctx.emit('session/event', first, turnStart(0));
+      ctx.emit('session/event', second, turnStart(0));
+      ctx.emit('langfuse/context', 's1', { metadata: { requestId: 'next' } });
+      await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
+      await drain(
+        ctx.waterfall(
+          'llm/stream',
+          optionsOf({ sessionId: 's2' as GenerateOptions['sessionId'] }),
+          () => streamOf(finishStop()),
+        ),
+      );
+      ctx.emit('session/event', first, turnEnd(0));
+      ctx.emit('session/event', first, turnStart(1));
+      ctx.emit('session/event', first, turnEnd(1));
+      ctx.emit('session/event', first, turnStart(2));
+      ctx.emit('session/event', first, turnEnd(2));
+      ctx.emit('session/event', second, turnEnd(0));
+
+      const [firstRoot, secondRoot, nextRoot, unboundRoot] = mocks.roots;
+      expect(metadataOf(firstRoot).requestId).toBe('first');
+      expect(metadataOf(firstRoot.generations[0]).requestId).toBe('first');
+      expect(metadataOf(secondRoot).requestId).toBe('second');
+      expect(metadataOf(secondRoot.generations[0]).requestId).toBe('second');
+      expect(metadataOf(nextRoot).requestId).toBe('next');
+      expect(metadataOf(unboundRoot)).not.toHaveProperty('requestId');
+    });
+
+    it('snapshots request metadata at binding and redacts nested fields and credential keys', async () => {
+      await setup({
+        ...enabledConfig,
+        publicKey: 'public-credential',
+        secretKey: 'private-credential',
+        redactFields: ['password'],
+      });
+      const metadata = {
+        nested: { projectId: 'before', Password: 'private-field' },
+        targets: [{ region: 'west' }],
+        note: 'credential: private-credential',
+        'sk-lf-metadata-key': 'visible',
+        extraCredential: 'sk-lf-other-credential',
+      };
+      const original = structuredClone(metadata);
+      ctx.emit('langfuse/context', 's1', { metadata });
+      expect(metadata).toEqual(original);
+      metadata.nested.projectId = 'after';
+      metadata.targets[0].region = 'east';
+      metadata.note = 'changed after binding';
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
+      ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+
+      for (const observation of [mocks.roots[0], mocks.roots[0].generations[0]]) {
+        expect(metadataOf(observation)).toMatchObject({
+          nested: { projectId: 'before', Password: '[REDACTED]' },
+          targets: [{ region: 'west' }],
+          note: 'credential: [REDACTED]',
+          '[REDACTED]': 'visible',
+          extraCredential: '[REDACTED]',
+        });
+        const exported = JSON.stringify(observation.attributes);
+        for (const secret of [
+          'private-field',
+          'private-credential',
+          'sk-lf-metadata-key',
+          'sk-lf-other-credential',
+        ]) {
+          expect(exported).not.toContain(secret);
+        }
+      }
+      expect(metadata.nested.Password).toBe('private-field');
+      expect(metadata['sk-lf-metadata-key']).toBe('visible');
+    });
+
+    it.each([
+      {
+        kind: 'BigInt',
+        secret: 'private-request-payload',
+        createMetadata: (secret: string) => ({ requestId: 'invalid-request', nonJson: 1n, secret }),
+      },
+      {
+        kind: 'throwing getter',
+        secret: 'sk-lf-getter-private',
+        createMetadata: (secret: string) =>
+          Object.defineProperty({ requestId: 'invalid-request', secret }, 'nonJson', {
+            enumerable: true,
+            get() {
+              throw new Error(secret);
+            },
+          }),
+      },
+      ...[
+        { kind: 'NaN', createValue: () => Number.NaN },
+        { kind: 'positive Infinity', createValue: () => Number.POSITIVE_INFINITY },
+        { kind: 'negative Infinity', createValue: () => Number.NEGATIVE_INFINITY },
+        { kind: 'undefined', createValue: () => undefined },
+        { kind: 'function', createValue: () => () => 'not JSON' },
+        { kind: 'symbol', createValue: () => Symbol('not JSON') },
+        { kind: 'Date', createValue: () => new Date('2026-10-20T00:00:00.000Z') },
+        { kind: 'Map', createValue: () => new Map([['retained', true]]) },
+        { kind: 'Set', createValue: () => new Set(['retained']) },
+        { kind: 'custom toJSON', createValue: () => ({ toJSON: () => ({ coerced: true }) }) },
+      ].flatMap(({ kind, createValue }) => [
+        {
+          kind: `${kind} in nested object`,
+          secret: 'private-request-payload',
+          createMetadata: (secret: string) => ({
+            requestId: 'invalid-request',
+            nonJson: { nested: createValue() },
+            secret,
+          }),
+        },
+        {
+          kind: `${kind} in array`,
+          secret: 'private-request-payload',
+          createMetadata: (secret: string) => ({
+            requestId: 'invalid-request',
+            nonJson: [createValue()],
+            secret,
+          }),
+        },
+      ]),
+      {
+        kind: 'sparse array',
+        secret: 'private-request-payload',
+        createMetadata: (secret: string) => ({
+          requestId: 'invalid-request',
+          nonJson: Object.assign(new Array<unknown>(2), { 1: 'retained' }),
+          secret,
+        }),
+      },
+      {
+        kind: 'array with additional properties',
+        secret: 'private-request-payload',
+        createMetadata: (secret: string) => ({
+          requestId: 'invalid-request',
+          nonJson: Object.assign(['retained'], { omitted: true }),
+          secret,
+        }),
+      },
+      {
+        kind: 'symbol-keyed property',
+        secret: 'private-request-payload',
+        createMetadata: (secret: string) => ({
+          requestId: 'invalid-request',
+          nonJson: { [Symbol('omitted')]: 'retained' },
+          secret,
+        }),
+      },
+      {
+        kind: 'circular object',
+        secret: 'private-request-payload',
+        createMetadata: (secret: string) => {
+          const metadata: Record<string, unknown> = { requestId: 'invalid-request', secret };
+          metadata.nonJson = metadata;
+          return metadata;
+        },
+      },
+    ])(
+      'rejects non-JSON request metadata ($kind) without breaking execution or reusing stale context',
+      async ({ secret, createMetadata }) => {
+        await setup();
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+          ctx.emit('langfuse/context', 's1', {
+            userId: 'previous-owner',
+            metadata: { requestId: 'previous-request' },
+          });
+          expect(() =>
+            ctx.emit('langfuse/context', 's1', {
+              metadata: createMetadata(secret),
+            }),
+          ).not.toThrow();
+          ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+          const chunks = [textDelta('completed'), finishStop()];
+          await expect(
+            drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks))),
+          ).resolves.toEqual(chunks);
+          const result = okResult();
+          expect(await dispatchTool(ctx, execOf(), async () => result)).toBe(result);
+          ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+
+          const root = mocks.roots[0];
+          for (const observation of [root, root.generations[0], root.spans[0]]) {
+            expect(metadataOf(observation)).not.toHaveProperty('requestId');
+            expect(metadataOf(observation)).not.toHaveProperty('nonJson');
+            expect(metadataOf(observation)).not.toHaveProperty('secret');
+            expect(observation.attributes).not.toHaveProperty('user.id');
+            expect(observation.ended).toBe(1);
+          }
+          expect(errors).toHaveBeenCalledWith(expect.stringContaining('[dsh-langfuse]'));
+          expect(errors.mock.calls.flat().map(String).join('\n')).not.toContain(secret);
+        } finally {
+          errors.mockRestore();
+        }
+      },
+    );
+
+    it('accepts ordinary JSON request metadata with shared noncircular references', async () => {
+      await setup();
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const shared = {
+          projectId: 'project-a',
+          values: [null, '', '007', 'false', true, false, 0, -2.5],
+          emptyObject: {},
+          emptyArray: [],
+          dictionary: Object.assign(Object.create(null) as Record<string, unknown>, {
+            region: 'west',
+          }),
+        };
+        const metadata = {
+          requestId: 'request-a',
+          first: shared,
+          second: shared,
+          groups: [shared, { nested: shared }],
+        };
+        const expected = structuredClone(metadata);
+        ctx.emit('langfuse/context', 's1', {
+          metadata,
+          userId: undefined,
+          tags: undefined,
+          traceparent: undefined,
+        });
+        shared.projectId = 'changed-after-binding';
+        shared.values.push('changed-after-binding');
+        ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+        await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
+        await dispatchTool(ctx, execOf(), async () => okResult());
+        ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+
+        const root = mocks.roots[0];
+        for (const observation of [root, root.generations[0], root.spans[0]]) {
+          expect(metadataOf(observation)).toMatchObject(expected);
+          expect(observation.ended).toBe(1);
+        }
+        expect(errors).not.toHaveBeenCalled();
+      } finally {
+        errors.mockRestore();
+      }
+    });
+
+    it('accepts undefined optional request context fields', async () => {
+      await setup({ ...enabledConfig, userId: 'default-owner', tags: ['default'] });
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        ctx.emit('langfuse/context', 's1', {
+          metadata: undefined,
+          userId: undefined,
+          tags: undefined,
+          traceparent: undefined,
+        });
+        ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+        await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
+        ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+
+        expect(mocks.roots[0].attributes['user.id']).toBe('default-owner');
+        expect(mocks.roots[0].attributes['langfuse.trace.tags']).toEqual(['default']);
+        expect(mocks.roots[0].generations[0].ended).toBe(1);
+        expect(errors).not.toHaveBeenCalled();
+      } finally {
+        errors.mockRestore();
+      }
+    });
+
+    it('ignores a context toJSON method that could replace validated metadata', async () => {
+      await setup();
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const toJSON = vi.fn(() => ({ metadata: { score: NaN } }));
+      const context = {
+        metadata: { requestId: 'request-a', score: 1 },
+        toJSON,
+      };
+      try {
+        expect(() => ctx.emit('langfuse/context', 's1', context)).not.toThrow();
+        ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+        await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
+        await dispatchTool(ctx, execOf(), async () => okResult());
+        ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+
+        const root = mocks.roots[0];
+        for (const observation of [root, root.generations[0], root.spans[0]]) {
+          expect(metadataOf(observation)).toMatchObject({ requestId: 'request-a', score: 1 });
+          expect(observation.ended).toBe(1);
+        }
+        expect(toJSON).not.toHaveBeenCalled();
+        expect(errors).not.toHaveBeenCalled();
+      } finally {
+        errors.mockRestore();
+      }
+    });
+
+    it('snapshots a JSON metadata getter once instead of validating and reading it twice', async () => {
+      await setup();
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+      let reads = 0;
+      const value = { projectId: 'before-binding' };
+      const metadata = Object.defineProperty({ requestId: 'request-a' }, 'resolved', {
+        enumerable: true,
+        get() {
+          reads++;
+          if (reads > 1) throw new Error('sk-lf-second-read-secret');
+          return value;
+        },
+      });
+      try {
+        expect(() => ctx.emit('langfuse/context', 's1', { metadata })).not.toThrow();
+        value.projectId = 'after-binding';
+        ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+        await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
+        ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+
+        expect(reads).toBe(1);
+        for (const observation of [mocks.roots[0], mocks.roots[0].generations[0]]) {
+          expect(metadataOf(observation)).toMatchObject({
+            requestId: 'request-a',
+            resolved: { projectId: 'before-binding' },
+          });
+        }
+        expect(errors).not.toHaveBeenCalled();
+      } finally {
+        errors.mockRestore();
+      }
+    });
+
+    it('discards pending request metadata when its session is disposed', async () => {
+      await setup();
+      const discarded = sessionOf('discarded');
+      const surviving = sessionOf('surviving');
+      ctx.emit('langfuse/context', discarded.id, { metadata: { requestId: 'discarded' } });
+      ctx.emit('langfuse/context', surviving.id, { metadata: { requestId: 'surviving' } });
+      ctx.emit('session/disposed', discarded);
+      ctx.emit('session/event', discarded, turnStart(0));
+      ctx.emit('session/event', surviving, turnStart(0));
+      ctx.emit('session/event', discarded, turnEnd(0));
+      ctx.emit('session/event', surviving, turnEnd(0));
+
+      expect(metadataOf(mocks.roots[0])).not.toHaveProperty('requestId');
+      expect(metadataOf(mocks.roots[1]).requestId).toBe('surviving');
+    });
+
+    it('keeps native runtime facts authoritative over conflicting request metadata', async () => {
+      await setup();
+      ctx.emit('langfuse/context', 's1', {
+        metadata: {
+          requestId: 'request-a',
+          turn: 999,
+          provider: 'custom-provider',
+          callId: 'custom-call',
+          toolName: 'custom-tool',
+          childSessionId: 'custom-child',
+          endReason: 'custom-end',
+        },
+      });
+      ctx.emit('session/event', sessionOf('s1'), turnStart(3));
+      await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
+      await dispatchTool(ctx, execOf(), async () => okResult());
+      ctx.emit('session/created', childSessionOf('child', 's1'));
+      ctx.emit('subagent/start', subagentStart('child'));
+      ctx.emit('subagent/end', subagentEnd('child', 'completed'));
+      ctx.emit('session/event', sessionOf('s1'), turnEnd(3));
+
+      const root = mocks.roots[0];
+      expect(metadataOf(root)).toMatchObject({
+        requestId: 'request-a',
+        turn: 3,
+        endReason: 'completed',
+      });
+      expect(metadataOf(root.generations[0].spans[0])).toMatchObject({
+        requestId: 'request-a',
+        provider: 'test',
+      });
+      expect(metadataOf(root.spans[0])).toMatchObject({
+        requestId: 'request-a',
+        callId: 'c1',
+        toolName: 'write_file',
+      });
+      expect(metadataOf(root.spans[1])).toMatchObject({
+        requestId: 'request-a',
+        childSessionId: 'child',
+        provider: 'spawn',
+      });
+    });
+
+    it('retains request metadata when message and tool content capture is disabled', async () => {
+      await setup({ ...enabledConfig, captureContent: false });
+      ctx.emit('langfuse/context', 's1', {
+        metadata: { requestId: 'request-a', routing: { projectId: 'project-a' } },
+      });
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/event', sessionOf('s1'), userMessage('private prompt'));
+      await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () =>
+          streamOf(textDelta('private output'), finishStop()),
+        ),
+      );
+      await dispatchTool(ctx, execOf(), async () => okResult());
+      ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+
+      const root = mocks.roots[0];
+      for (const observation of [root, root.generations[0], root.spans[0]]) {
+        expect(metadataOf(observation)).toMatchObject({
+          requestId: 'request-a',
+          routing: { projectId: 'project-a' },
+        });
+      }
+      expect(root.attributes).not.toHaveProperty('langfuse.trace.input');
+      expect(root.attributes).not.toHaveProperty('langfuse.trace.output');
+    });
+
+    it('binds request metadata to an existing native inbox task before execution', async () => {
+      await setup({
+        ...enabledConfig,
+        publicKey: 'public-inbox-test',
+        secretKey: 'secret-inbox-test',
+      });
+      const session = sessionOf('native');
+      const inbox = (phase: string, taskId = 'task-a') =>
+        ctx.emit('a2a/inbox', {
+          phase,
+          contextId: session.id,
+          taskId,
+          messageId: `input-${taskId}`,
+          nativeMessageId: `native-${taskId}`,
+          at: 3000,
+          queuedAt: 1000,
+          selectedAt: 2000,
+          pending: 0,
+          turn: 1,
+          step: 1,
+        });
+      inbox('resolved');
+      ctx.emit('session/event', session, turnStart(1));
+      inbox('selected');
+      const request = { metadata: { requestId: 'request-a', taskId: 'custom-task' } };
+      ctx.emit('langfuse/context', session.id, request);
+      request.metadata.requestId = 'mutated-after-binding';
+      inbox('prepared');
+      ctx.emit('session/event', session, userMessage('run the task'));
+      await drain(
+        ctx.waterfall(
+          'llm/stream',
+          optionsOf({ sessionId: session.id as GenerateOptions['sessionId'] }),
+          () => streamOf(finishStop()),
+        ),
+      );
+      await dispatchTool(ctx, execOf({ agent: agentOf(session.id) }), async () => okResult());
+      ctx.emit('session/event', session, turnEnd(1));
+      inbox('completed');
+      ctx.emit('session/event', session, turnStart(2));
+      inbox('selected', 'task-b');
+      inbox('prepared', 'task-b');
+      ctx.emit('session/event', session, turnEnd(2));
+      inbox('completed', 'task-b');
+
+      const task = mocks.roots[0];
+      const turn = task.spans.find((span) => span.name === 'agent:turn')!;
+      for (const observation of [task, turn, turn.generations[0], turn.spans.at(-1)!]) {
+        expect(metadataOf(observation)).toMatchObject({ requestId: 'request-a' });
+      }
+      expect(metadataOf(task)).toMatchObject({ taskId: 'task-a', taskState: 'completed' });
+      expect(metadataOf(turn)).toMatchObject({ taskId: 'task-a', turn: 1 });
+      expect(metadataOf(mocks.roots[1])).not.toHaveProperty('requestId');
     });
 
     it('rejects malformed and all-zero trace parents without breaking a turn', async () => {
