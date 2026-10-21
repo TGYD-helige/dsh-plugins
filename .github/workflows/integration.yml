@@ -8,9 +8,9 @@ name: Integration
 #
 # Two leg shapes, split by secrets exposure:
 # - scenario: the base LLM leg. It receives DSH_INTEGRATION_* secrets and
-#   executes PR-modifiable scenario scripts. No environment gate (so no
-#   deployment records): the secrets go only to same-repo runs — fork PRs get
-#   no secrets and Stage B self-skips.
+#   executes PR-modifiable scenario scripts after one shared environment gate.
+#   Fork PRs require approval on the protected `fork-integration` environment;
+#   same-repo PRs and push/manual runs use the unprotected `integration` one.
 # - scenario-backends: backend-only provider legs (db push + real backend
 #   writes/reads against a service database). No secrets anywhere — they run
 #   ungated, including on fork PRs.
@@ -18,12 +18,13 @@ name: Integration
 on:
   push:
     branches: [main]
-  pull_request:
+  pull_request_target:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -32,6 +33,8 @@ permissions:
 env:
   # dsh is developer preview — pin the CLI under test (AGENTS.md compat stance).
   DSH_CLI_VERSION: 0.2.1-rc.2
+  INTEGRATION_CHECKOUT_REPOSITORY: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name || github.repository }}
+  INTEGRATION_CHECKOUT_REF: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   detect:
@@ -44,13 +47,28 @@ jobs:
       has_backends: ${{ steps.select.outputs.has_backends }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.INTEGRATION_CHECKOUT_REPOSITORY }}
+          ref: ${{ env.INTEGRATION_CHECKOUT_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
       - name: Select packages with an integration scenario
         id: select
         run: node .github/scripts/integration-matrix.mjs
 
+  integration-approval:
+    name: Approve secret-backed Integration
+    needs: detect
+    environment:
+      name: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository && 'fork-integration' || 'integration' }}
+      deployment: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Secret-backed Integration approved"
+
   scenario:
     name: E2E (${{ matrix.name }})
-    needs: detect
+    needs: [detect, integration-approval]
     if: needs.detect.outputs.has_scenarios == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -59,13 +77,17 @@ jobs:
       matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
     env:
       DSH_TELEMETRY_DISABLED: '1'
-      # Only the availability flag at job level — the secrets themselves enter
-      # no step except Stage B, so PR-modified install/build scripts never see
-      # them. Fork PRs evaluate to 'false' (no secrets are exposed to forks).
+      # Secret values are step-scoped. The approval gate authorizes this exact
+      # PR revision, including its install/build scripts and scenario code.
       DSH_SECRETS_AVAILABLE: ${{ secrets.DSH_INTEGRATION_BASE_URL != '' && secrets.DSH_INTEGRATION_API_KEY != '' }}
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.INTEGRATION_CHECKOUT_REPOSITORY }}
+          ref: ${{ env.INTEGRATION_CHECKOUT_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
       # pnpm version comes from the packageManager field in package.json —
       # do not set it here too (pnpm/action-setup errors on duplicates).
@@ -130,9 +152,8 @@ jobs:
           # Optional model override for the scenarios; unset/empty falls back
           # to deepseek-v4-flash inside the scripts.
           DSH_INTEGRATION_MODEL: ${{ secrets.DSH_INTEGRATION_MODEL }}
-          # dsh-langfuse only: blanked on other packages' legs (fork PRs get
-          # no secrets at all and the scenario self-skips Stage B). Hook, tool-hooks,
-          # and cancel-hook legs require real Langfuse API read-back; base/subagent
+          # dsh-langfuse only: blanked on other packages' legs. Hook, tool-hooks,
+          # cancel-hook and metadata legs require real Langfuse API read-back; base/subagent
           # legs retain the fake-OTLP fallback when keys are absent.
           LANGFUSE_PUBLIC_KEY: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_PUBLIC_KEY || '' }}
           LANGFUSE_SECRET_KEY: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_SECRET_KEY || '' }}
@@ -166,17 +187,24 @@ jobs:
             ${{ runner.temp }}/dsh-storage-e2e/dsh.db
             ${{ runner.temp }}/dsh-home/sessions
 
-      - name: Skipped — Stage B (secrets unavailable)
+      - name: Fail — Stage B secrets unavailable
         if: env.DSH_SECRETS_AVAILABLE != 'true'
         run: |
-          echo "::warning::DSH_INTEGRATION_BASE_URL or DSH_INTEGRATION_API_KEY secret not set — skipping Stage B."
+          echo "::error::DSH_INTEGRATION_BASE_URL and DSH_INTEGRATION_API_KEY are required for Stage B."
+          exit 1
 
   native-inbox:
     name: E2E (dsh-a2a.inbox)
+    needs: integration-approval
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.INTEGRATION_CHECKOUT_REPOSITORY }}
+          ref: ${{ env.INTEGRATION_CHECKOUT_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
         with:
@@ -188,7 +216,6 @@ jobs:
         run: node .github/scripts/check-inbox.mjs -t '^(?!.*(native ownership|graceful retention))'
 
       - name: Verify real Langfuse inbox ingestion
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           DSH_INBOX_LANGFUSE_LIVE: 'true'
           LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
@@ -198,10 +225,16 @@ jobs:
 
   native-ownership:
     name: E2E (dsh-a2a native ownership)
+    needs: integration-approval
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.INTEGRATION_CHECKOUT_REPOSITORY }}
+          ref: ${{ env.INTEGRATION_CHECKOUT_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
         with:
@@ -213,7 +246,6 @@ jobs:
         run: node .github/scripts/check-inbox.mjs -t 'native ownership'
 
       - name: Report native ownership E2E to Langfuse and verify ingestion
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           DSH_NATIVE_OWNERSHIP_LANGFUSE_LIVE: 'true'
           LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
@@ -223,10 +255,16 @@ jobs:
 
   graceful-retention:
     name: E2E (dsh-a2a graceful retention)
+    needs: integration-approval
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.INTEGRATION_CHECKOUT_REPOSITORY }}
+          ref: ${{ env.INTEGRATION_CHECKOUT_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v7
         with:
@@ -238,7 +276,6 @@ jobs:
         run: node .github/scripts/check-inbox.mjs -t 'graceful retention'
 
       - name: Report graceful recovery E2E to Langfuse and verify ingestion
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           DSH_GRACEFUL_RETENTION_LANGFUSE_LIVE: 'true'
           LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
@@ -260,6 +297,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.INTEGRATION_CHECKOUT_REPOSITORY }}
+          ref: ${{ env.INTEGRATION_CHECKOUT_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
       - uses: pnpm/action-setup@v6
 
