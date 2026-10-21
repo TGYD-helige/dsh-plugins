@@ -2,8 +2,28 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import * as integration from './integration/lib/ci-shared.mjs';
 
 const workflow = readFileSync(new URL('../workflows/integration.yml', import.meta.url), 'utf8');
+
+test('Langfuse release identifies the tested PR head instead of the pull_request_target base', () => {
+  const keys = ['INTEGRATION_CHECKOUT_REF', 'GITHUB_SHA'];
+  const previous = keys.map((key) => process.env[key]);
+  try {
+    process.env.GITHUB_SHA = 'base-sha';
+    process.env.INTEGRATION_CHECKOUT_REF = 'head-sha';
+    assert.equal(integration.integrationRevision(), 'head-sha');
+    delete process.env.INTEGRATION_CHECKOUT_REF;
+    assert.equal(integration.integrationRevision(), 'base-sha');
+    delete process.env.GITHUB_SHA;
+    assert.equal(integration.integrationRevision(), 'local');
+  } finally {
+    keys.forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key];
+      else process.env[key] = previous[index];
+    });
+  }
+});
 
 test('fork E2E uses one approval gate before running the exact PR revision with secrets', () => {
   assert.match(workflow, /\n  pull_request_target:\n/);

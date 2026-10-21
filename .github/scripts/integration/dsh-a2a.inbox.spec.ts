@@ -20,6 +20,7 @@ import AgentLoop from '@deepseek-ai/dsh-agent-loop';
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl';
 import * as A2aPlugin from '../../../packages/dsh-a2a/src/index.js';
 import { freePort } from './lib/a2a-shared.mjs';
+import { integrationRevision } from './lib/ci-shared.mjs';
 import * as Langfuse from '../../../packages/dsh-langfuse/src/index.js';
 import { startFakeIngestion, capturedToObservations, runVerification } from './lib/langfuse-shared.mjs';
 import { A2aBridge } from '../../../packages/dsh-a2a/src/bridge.js';
@@ -643,7 +644,7 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable i
   const replies = ['发布前检查待办：\n1. 构建项目\n2. 运行测试\n3. 检查发布说明', '已遵循运行中的引导：只列构建和测试，不执行发布。\n1. 构建项目\n2. 运行测试', '按补充要求调整：\n1. 运行测试\n2. 构建项目'];
   const f = await boot({ contextId, script: replies.map(reply => textResponse(reply)), langfuse: { enabled: true, publicKey, secretKey, baseUrl,
     traceName: 'dsh-inbox', captureContent: true, environment: 'ci',
-    release: process.env.GITHUB_SHA ?? 'local',
+    release: integrationRevision(),
     tags: ['ci', 'scenario:inbox', `run:${runId}`, `attempt:${attempt}`],
   } });
   const inputs = [`${contextId}-first`, `${contextId}-second`];
@@ -675,7 +676,7 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')('persists searchable i
   const toStartTime = new Date(Date.now() + 60_000).toISOString();
   await Promise.all(inputs.map(async (codeword, index) => {
     const result = await runVerification({ baseUrl, publicKey, secretKey, fromStartTime, toStartTime,
-      codeword, model: 'mock',
+      codeword, observationName: 'inbox:admitted',
       evaluate(observations) {
         const root = observations.find(observation => observation.name === 'dsh-inbox');
         const problems = [];
@@ -1033,7 +1034,7 @@ it('reports Goal continuation, promotion and local recovery to Langfuse', async 
   const fromStartTime = new Date(Date.now() - 60_000).toISOString();
   const telemetry = { enabled: true, publicKey: live ? publicKey : 'test', secretKey: live ? secretKey : 'test',
     baseUrl: live ? baseUrl : `http://127.0.0.1:${collector!.address().port}`, captureContent: true,
-    traceName: 'dsh-inbox-native-ownership', environment: 'ci', release: process.env.GITHUB_SHA ?? 'local',
+    traceName: 'dsh-inbox-native-ownership', environment: 'ci', release: integrationRevision(),
     tags: ['ci', 'scenario:native-ownership', marker] };
   const f = await boot({ contextId: marker, langfuse: telemetry, script: [
     () => { f.ctx.goals.create(f.ctx.agents.get(marker)!, { objective: marker }); return textResponse('working'); },
@@ -1426,7 +1427,7 @@ describe('graceful retention', () => {
     const fromStartTime = new Date(Date.now() - 60_000).toISOString();
     const telemetry = { enabled: true, publicKey: live ? publicKey : 'test', secretKey: live ? secretKey : 'test',
       baseUrl: live ? baseUrl : `http://127.0.0.1:${collector!.address().port}`, captureContent: true,
-      traceName: 'dsh-inbox-graceful-retention', environment: 'ci', release: process.env.GITHUB_SHA ?? 'local', tags: ['ci', 'scenario:graceful-retention'] };
+      traceName: 'dsh-inbox-graceful-retention', environment: 'ci', release: integrationRevision(), tags: ['ci', 'scenario:graceful-retention'] };
     const root = await mkdtemp(join(tmpdir(), 'a2a-graceful-langfuse-'));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const first = await host(root);

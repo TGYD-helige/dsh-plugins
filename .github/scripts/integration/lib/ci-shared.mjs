@@ -20,6 +20,10 @@ export function integrationModel() {
   return process.env.DSH_INTEGRATION_MODEL?.trim() || 'deepseek-v4-flash';
 }
 
+export function integrationRevision() {
+  return process.env.INTEGRATION_CHECKOUT_REF?.trim() || process.env.GITHUB_SHA?.trim() || 'local';
+}
+
 // If the runner routes egress through a host-level proxy, fetch to the
 // gateway can break — drop proxy vars from the LLM-carrying process.
 export function netEnv() {
