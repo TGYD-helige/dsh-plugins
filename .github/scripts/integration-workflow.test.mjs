@@ -68,3 +68,17 @@ test('missing Stage B credentials fail the job instead of reporting a successful
   assert.equal(result.status, 1);
   assert.match(result.stdout, /::error::/);
 });
+
+test('integration scenarios use the dsh version pinned by the workspace', () => {
+  const manifest = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
+  const version = manifest.devDependencies['@deepseek-ai/dsh-agent'];
+  const langfuseShared = readFileSync(
+    new URL('./integration/lib/langfuse-shared.mjs', import.meta.url),
+    'utf8',
+  );
+  assert.ok(workflow.includes(`DSH_CLI_VERSION: ${version}`), 'CI must install the tested dsh CLI');
+  assert.ok(
+    langfuseShared.includes(`envOr(process.env.DSH_CLI_VERSION, '${version}')`),
+    'local hook scenarios must default to the tested dsh version',
+  );
+});
