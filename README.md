@@ -18,13 +18,15 @@ Composable, config-driven plugins for [DeepSeek Harness (dsh)](https://github.co
 
 <table>
   <tr>
-    <td><strong>dsh-a2a</strong><br><a href="packages/dsh-a2a"><img src="packages/dsh-a2a/preview.png" alt="dsh-a2a preview" width="260"></a></td>
-    <td><strong>dsh-storage</strong><br><a href="packages/dsh-storage"><img src="packages/dsh-storage/preview.png" alt="dsh-storage preview" width="260"></a></td>
-    <td><strong>dsh-langfuse</strong><br><a href="packages/dsh-langfuse"><img src="packages/dsh-langfuse/preview.png" alt="dsh-langfuse preview" width="260"></a></td>
-    <td><strong>dsh-policy</strong><br><a href="packages/dsh-policy"><img src="packages/dsh-policy/preview.png" alt="dsh-policy preview" width="260"></a></td>
+    <td width="50%" valign="top"><strong>dsh-a2a</strong><br><a href="packages/dsh-a2a"><img src="packages/dsh-a2a/preview.png" alt="dsh-a2a preview" width="360"></a></td>
+    <td width="50%" valign="top"><strong>dsh-storage</strong><br><a href="packages/dsh-storage"><img src="packages/dsh-storage/preview.png" alt="dsh-storage preview" width="360"></a></td>
   </tr>
   <tr>
-    <td><strong>dsh-subagent-filesystem</strong><br><a href="packages/dsh-subagent-filesystem"><img src="packages/dsh-subagent-filesystem/preview.png" alt="dsh-subagent-filesystem preview" width="260"></a></td>
+    <td width="50%" valign="top"><strong>dsh-langfuse</strong><br><a href="packages/dsh-langfuse"><img src="packages/dsh-langfuse/preview.png" alt="dsh-langfuse preview" width="360"></a></td>
+    <td width="50%" valign="top"><strong>dsh-policy</strong><br><a href="packages/dsh-policy"><img src="packages/dsh-policy/preview.png" alt="dsh-policy preview" width="360"></a></td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top"><strong>dsh-subagent-filesystem</strong><br><a href="packages/dsh-subagent-filesystem"><img src="packages/dsh-subagent-filesystem/preview.png" alt="dsh-subagent-filesystem preview" width="360"></a></td>
   </tr>
 </table>
 

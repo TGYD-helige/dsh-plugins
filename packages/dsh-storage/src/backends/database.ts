@@ -165,18 +165,91 @@ export class DatabaseBackend implements StorageBackend {
     });
   }
 
-  async readMessages(sessionId: string, messageId?: string): Promise<MessageRow[]> {
+  async readMessages(sessionId: string, messageId: string): Promise<MessageRow[]> {
+    return this.readRows({
+      sessionId,
+      deletedAt: null,
+      id: pk(`message ${sessionId}\0${messageId}`),
+    });
+  }
+
+  async readToolCallMessages(sessionId: string, callId: string): Promise<MessageRow[]> {
     if (!this.prisma) return [];
-    // ponytail: tool-call lookup scans one session; add an indexed call lookup if that becomes slow.
-    // Scan only the active segment for tool results; exact-ID reads still find
-    // archived rows so redelivery does not count the same message twice.
+    const provider = this.config.provider;
+    const sqlserver = provider === 'sqlserver';
+    const sortTime =
+      provider === 'mysql'
+        ? "DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s.%f')"
+        : provider === 'postgresql'
+          ? "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS.US')"
+          : sqlserver
+            ? 'CONVERT(varchar(33), created_at, 126)'
+            : 'CAST(created_at AS TEXT)';
+    let cursor: { id: string; time: string | null } | undefined;
+    for (;;) {
+      const params: Array<string | null> =
+        provider === 'mysql' || provider === 'sqlite' ? [sessionId, sessionId] : [sessionId];
+      let before = '';
+      if (cursor) {
+        if (cursor.time === null) {
+          before =
+            provider === 'postgresql'
+              ? 'AND (created_at IS NOT NULL OR (created_at IS NULL AND id < ?))'
+              : 'AND created_at IS NULL AND id < ?';
+          params.push(cursor.id);
+        } else {
+          before = `AND (created_at < ? OR (created_at = ? AND id < ?)${provider === 'postgresql' ? '' : ' OR created_at IS NULL'})`;
+          params.push(cursor.time, cursor.time, cursor.id);
+        }
+      }
+      let sql = `SELECT ${sqlserver ? 'TOP 100 ' : ''}id, tool_calls, ${sortTime} AS sort_time
+        FROM ai_messages WHERE session_id = ?
+        ${provider === 'sqlite' ? 'AND session_id COLLATE BINARY = ?' : ''}
+        ${provider === 'mysql' ? 'AND BINARY session_id = BINARY ?' : ''}
+        AND deleted_at IS NULL AND history_id IS NULL AND type = 'model' AND tool_calls IS NOT NULL
+        ${
+          sqlserver
+            ? `AND session_id COLLATE Latin1_General_100_BIN2 = @P1
+          AND DATALENGTH(CAST(session_id AS nvarchar(max))) = DATALENGTH(CAST(@P1 AS nvarchar(max)))`
+            : ''
+        }
+        ${before} ORDER BY created_at DESC, id DESC ${sqlserver ? '' : 'LIMIT 100'}`;
+      if (sqlserver || provider === 'postgresql') {
+        let index = 0;
+        sql = sql.replaceAll('?', () => `${sqlserver ? '@P' : '$'}${++index}`);
+      }
+      const page = await this.prisma.$queryRawUnsafe(sql, ...params);
+      for (const row of page) {
+        let calls = row.tool_calls;
+        if (typeof calls === 'string') {
+          try {
+            calls = JSON.parse(calls);
+          } catch {
+            continue;
+          }
+        }
+        if (Array.isArray(calls) && calls.some((call: any) => call?.id === callId)) {
+          return this.readRows({
+            sessionId,
+            deletedAt: null,
+            historyId: null,
+            type: 'model',
+            id: row.id,
+          });
+        }
+      }
+      if (page.length < 100) return [];
+      const last = page.at(-1);
+      cursor = { id: last.id, time: last.sort_time };
+    }
+  }
+
+  private async readRows(where: Record<string, unknown>): Promise<MessageRow[]> {
+    if (!this.prisma) return [];
     const rows = await this.prisma.aiMessage.findMany({
-      where: {
-        sessionId,
-        deletedAt: null,
-        ...(messageId ? { id: pk(`message ${sessionId}\0${messageId}`) } : { historyId: null }),
-      },
+      where,
       orderBy: { createdAt: 'asc' },
+      take: 1,
     });
     const json = (value: unknown) => (typeof value === 'string' ? JSON.parse(value) : value);
     return rows.map((row: any) => {

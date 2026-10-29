@@ -296,7 +296,7 @@ async function backendOnlyLeg(dbProvider) {
     type: 'tool/result', data: { message: { source: { callId: 'c1' }, content: [toolResult] } },
   };
   for (let delivery = 0; delivery < 2; delivery++) {
-    const row = mergeToolResult(resultEvent, await backend.readMessages('s1'));
+    const row = mergeToolResult(resultEvent, await backend.readToolCallMessages('s1', 'c1'));
     assert(row?.id === 'a1', 'tool result did not match the persisted model call');
     await backend.upsertMessage(row);
   }
@@ -353,7 +353,7 @@ async function backendOnlyLeg(dbProvider) {
   });
   await backend.upsertSession({ sessionId: 's1', messageCount: 1, totalTokens: 0 });
   const archivedRows = await prisma.aiMessage.findMany({ where: { historyId: archiveId } });
-  const activeRows = await backend.readMessages('s1');
+  const activeRows = await backend.readMessages('s1', 'm2');
   const activeRollup = await backend.readSession('s1');
   assert(archivedRows.length === 2, 'archived messages are not queryable by history ID');
   assert(activeRows.length === 1 && activeRows[0].id === 'm2', 'active message query includes history');

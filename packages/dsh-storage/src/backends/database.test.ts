@@ -8,6 +8,7 @@ const prismaMock = vi.hoisted(() => {
   class PrismaClient {
     aiMessage = { upsert: vi.fn(), findMany: vi.fn(), aggregate: vi.fn(), updateMany: vi.fn() };
     aiChatHistory = { findFirst: vi.fn(), create: vi.fn(), update: vi.fn() };
+    $queryRawUnsafe = vi.fn(async () => []);
     $transaction = vi.fn(async (run: (client: PrismaClient) => Promise<unknown>) => run(this));
     $connect = vi.fn(async () => {});
     $disconnect = vi.fn(async () => {});
@@ -104,10 +105,15 @@ describe('DatabaseBackend', () => {
         createdAt: new Date(1700000000000),
       },
     ]);
-    const rows = await backend.readMessages('s1');
+    const rows = await backend.readMessages('s1', 'a1');
     expect(prisma.aiMessage.findMany).toHaveBeenCalledWith({
-      where: { sessionId: 's1', deletedAt: null, historyId: null },
+      where: {
+        sessionId: 's1',
+        deletedAt: null,
+        id: createHash('sha256').update('message s1\0a1').digest('hex').slice(0, 36),
+      },
       orderBy: { createdAt: 'asc' },
+      take: 1,
     });
     expect(rows).toMatchObject([
       {
@@ -125,8 +131,158 @@ describe('DatabaseBackend', () => {
         id: createHash('sha256').update('message s1\0a1').digest('hex').slice(0, 36),
       },
       orderBy: { createdAt: 'asc' },
+      take: 1,
     });
   });
+
+  it.each(['mysql', 'postgresql', 'sqlite', 'sqlserver'] as const)(
+    'locates one tool-call row in %s without loading unrelated history',
+    async (provider) => {
+      backend = new DatabaseBackend({
+        provider,
+        url: provider === 'sqlserver' ? 'sqlserver://host;database=db;user=u;password=p' : url,
+      });
+      await backend.init();
+      const prisma = prismaMock.instances[0];
+      prisma.$queryRawUnsafe.mockResolvedValueOnce([
+        {
+          id: 'physical-id',
+          tool_calls: [{ id: "call-'quoted" }],
+          sort_time: '2026-10-29T10:00:00.1234567',
+        },
+      ]);
+      prisma.aiMessage.findMany.mockResolvedValueOnce([]);
+      await backend.readToolCallMessages('s1', "call-'quoted");
+      const [sql, ...params] = prisma.$queryRawUnsafe.mock.calls[0];
+      expect(sql).toContain('SELECT');
+      expect(sql).toContain('deleted_at IS NULL');
+      expect(sql).toContain('history_id IS NULL');
+      expect(sql).toMatch(/LIMIT 100|TOP 100/);
+      expect(sql).not.toContain("call-'quoted");
+      expect(params).toContain('s1');
+      if (provider === 'sqlserver') {
+        expect(sql).toContain('session_id COLLATE Latin1_General_100_BIN2 = @P1');
+        expect(sql).toContain(
+          'DATALENGTH(CAST(session_id AS nvarchar(max))) = DATALENGTH(CAST(@P1 AS nvarchar(max)))',
+        );
+        expect(sql).not.toContain('OPENJSON');
+      }
+      expect(prisma.aiMessage.findMany).toHaveBeenCalledWith({
+        where: {
+          sessionId: 's1',
+          deletedAt: null,
+          historyId: null,
+          type: 'model',
+          id: 'physical-id',
+        },
+        orderBy: { createdAt: 'asc' },
+        take: 1,
+      });
+      prisma.aiMessage.findMany.mockClear();
+      await expect(backend.readToolCallMessages('s1', 'missing')).resolves.toEqual([]);
+      expect(prisma.aiMessage.findMany).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['mysql', 'postgresql', 'sqlite', 'sqlserver'] as const)(
+    'pages %s tool-call candidates without nested SQL or losing timestamp precision',
+    async (provider) => {
+      backend = new DatabaseBackend({
+        provider,
+        url: provider === 'sqlserver' ? 'sqlserver://host;database=db;user=u;password=p' : url,
+      });
+      await backend.init();
+      const prisma = prismaMock.instances[0];
+      const time = '2026-10-29T10:00:00.1234567';
+      prisma.$queryRawUnsafe
+        .mockResolvedValueOnce(
+          Array.from({ length: 100 }, (_, i) => ({
+            id: `row-${100 - i}`,
+            sort_time: time,
+            tool_calls: JSON.stringify([{ id: i % 2 ? 'C1' : 'c1 ' }]),
+          })),
+        )
+        .mockResolvedValueOnce([{ id: 'target', sort_time: time, tool_calls: '[{"id":"c1"}]' }]);
+      prisma.aiMessage.findMany.mockResolvedValueOnce([]);
+      await backend.readToolCallMessages('S1', 'c1');
+      expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(2);
+      for (const [sql] of prisma.$queryRawUnsafe.mock.calls) {
+        expect(sql).not.toMatch(/JOIN|EXISTS|json_each|OPENJSON|\(SELECT/i);
+        expect(sql).toMatch(/LIMIT 100|TOP 100/);
+        expect(sql).toContain('tool_calls');
+      }
+      expect(prisma.$queryRawUnsafe.mock.calls[1].slice(1)).toContain(time);
+      expect(prisma.aiMessage.findMany).toHaveBeenCalledExactlyOnceWith({
+        where: { sessionId: 'S1', deletedAt: null, historyId: null, type: 'model', id: 'target' },
+        orderBy: { createdAt: 'asc' },
+        take: 1,
+      });
+    },
+  );
+
+  it.each(['mysql', 'postgresql', 'sqlite', 'sqlserver'] as const)(
+    'discards nonmatching %s pages without loading message bodies',
+    async (provider) => {
+      backend = new DatabaseBackend({
+        provider,
+        url: provider === 'sqlserver' ? 'sqlserver://host;database=db;user=u;password=p' : url,
+      });
+      await backend.init();
+      const prisma = prismaMock.instances[0];
+      prisma.$queryRawUnsafe
+        .mockResolvedValueOnce(
+          Array.from({ length: 100 }, (_, i) => ({
+            id: `row-${100 - i}`,
+            sort_time: '2026-10-29T10:00:00.1234567',
+            tool_calls: '[{"id":"c1 "}]',
+          })),
+        )
+        .mockResolvedValueOnce([]);
+      await expect(backend.readToolCallMessages('S1', 'c1')).resolves.toEqual([]);
+      expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(2);
+      expect(prisma.aiMessage.findMany).not.toHaveBeenCalled();
+      const sql = prisma.$queryRawUnsafe.mock.calls[0][0];
+      expect(sql).not.toContain('content');
+      const exactScope =
+        provider === 'sqlserver'
+          ? 'session_id COLLATE Latin1_General_100_BIN2 = @P1'
+          : provider === 'sqlite'
+            ? 'session_id COLLATE BINARY = ?'
+            : provider === 'mysql'
+              ? 'BINARY session_id = BINARY ?'
+              : 'session_id = $1';
+      expect(sql).toContain(exactScope);
+    },
+  );
+
+  it.each(['mysql', 'postgresql', 'sqlite', 'sqlserver'] as const)(
+    'continues through NULL timestamp %s candidates with a bounded cursor',
+    async (provider) => {
+      backend = new DatabaseBackend({
+        provider,
+        url: provider === 'sqlserver' ? 'sqlserver://host;database=db;user=u;password=p' : url,
+      });
+      await backend.init();
+      const prisma = prismaMock.instances[0];
+      prisma.$queryRawUnsafe
+        .mockResolvedValueOnce(
+          Array.from({ length: 100 }, (_, i) => ({
+            id: `row-${100 - i}`,
+            sort_time: null,
+            tool_calls: '[{"id":"other"}]',
+          })),
+        )
+        .mockResolvedValueOnce([{ id: 'target', sort_time: null, tool_calls: '[{"id":"c1"}]' }]);
+      prisma.aiMessage.findMany.mockResolvedValueOnce([]);
+      await backend.readToolCallMessages('s1', 'c1');
+      const [sql, ...params] = prisma.$queryRawUnsafe.mock.calls[1];
+      expect(sql).toContain('created_at IS NULL AND id <');
+      if (provider === 'postgresql') expect(sql).toContain('created_at IS NOT NULL OR');
+      expect(params.at(-1)).toBe('row-1');
+      expect(params).not.toContain(null);
+      expect(prisma.aiMessage.findMany.mock.calls[0][0].where.id).toBe('target');
+    },
+  );
 
   it('builds the mysql adapter from a mariadb:// url', async () => {
     backend = new DatabaseBackend({ provider: 'mysql', url: 'mysql://u:p@host:3306/db' });
