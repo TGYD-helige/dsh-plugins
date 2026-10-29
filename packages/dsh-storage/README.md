@@ -75,7 +75,13 @@ Consumers can resume from the latest active compression snapshot plus later mess
 Snapshots and newly mirrored rows include `metadata.sessionCreatedAt` and `metadata.seq`
 to distinguish resumed session generations and messages in the same database second.
 Older snapshots without this metadata retain their creation-time boundary. The mirror
-stores attachment references; attachment bytes still need their existing durable storage.
+does not fetch attachments or invent usable paths/URLs from opaque attachment IDs.
+Attachments, developer updates, extension blocks and non-object tool arguments are
+preserved as labelled JSON data in text parts when legacy `Content[]` cannot represent
+them natively. Such snapshots preserve reference information, not attachment bytes or a
+complete native session/tool registry. Attachment bytes still need their existing durable
+storage. An unchanged legacy reader remains timestamp-based; it must consume the sequence
+metadata to distinguish later messages in the same database second.
 
 ## Archive a session
 

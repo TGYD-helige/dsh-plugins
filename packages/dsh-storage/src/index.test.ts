@@ -153,6 +153,41 @@ describe('dsh-storage plugin', () => {
     expect(backend.upsertSession).not.toHaveBeenCalled();
   });
 
+  it('logs snapshot failures and still mirrors later conversation events', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const failure = new Error('missing message interpreter');
+    const session = {
+      id: 's1',
+      deriveMessages: () => {
+        throw failure;
+      },
+    };
+    try {
+      apply(ctx, enabledConfig);
+      expect(() =>
+        ctx.events.emit(
+          'session/event',
+          session,
+          ev('compaction/end', { compactionId: 'bad', turn: 1 }),
+        ),
+      ).not.toThrow();
+      ctx.events.emit('session/event', session, userEvent('Still available', 'next'));
+      await ctx.parallel('session/flush', session as any);
+      expect(log).toHaveBeenCalledWith('[dsh-storage] compaction snapshot error:', failure);
+      const backend = backends.instances[0];
+      expect(
+        backend.upsertMessage.mock.calls.map(([row]: any[]) => ({
+          id: row.id,
+          type: row.type,
+          content: row.content,
+        })),
+      ).toEqual([{ id: 'next', type: 'user', content: 'Still available' }]);
+    } finally {
+      await ctx.fiber.dispose();
+      log.mockRestore();
+    }
+  });
+
   it('mirrors user/assistant events into message and session rows', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];

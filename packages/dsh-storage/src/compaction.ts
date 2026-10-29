@@ -1,5 +1,9 @@
 import type { MessageRow } from './types.js';
 
+function recordedData(block: any): { text: string } {
+  return { text: `[Recorded DSH ${block.type} data]\n${JSON.stringify(block)}` };
+}
+
 /** Legacy Content[] checkpoints remain readable by databaseChatStorage. */
 export function compressionSnapshot(session: any, event: any): MessageRow | null {
   if (event?.type !== 'compaction/end' || event.data?.error !== undefined) return null;
@@ -9,7 +13,20 @@ export function compressionSnapshot(session: any, event: any): MessageRow | null
     if (message.role === 'tool') {
       const id = message.toolCallId ?? message.source?.callId;
       const name = calls.get(id);
-      if (!name) throw new Error('compaction snapshot has an unmatched tool result');
+      if (!name)
+        return [
+          {
+            role: 'user',
+            parts: [
+              recordedData({
+                type: 'tool-result',
+                toolCallId: id,
+                content: message.content,
+                isError: Boolean(message.isError),
+              }),
+            ],
+          },
+        ];
       return [
         {
           role: 'user',
@@ -26,6 +43,7 @@ export function compressionSnapshot(session: any, event: any): MessageRow | null
       ];
     }
     const parts = message.content.map((block: any, index: number) => {
+      if (message.role === 'developer') return recordedData(block);
       switch (block.type) {
         case 'text':
           return { text: block.text };
@@ -38,18 +56,22 @@ export function compressionSnapshot(session: any, event: any): MessageRow | null
             ...(signature ? { thoughtSignature: signature } : {}),
           };
         }
-        case 'tool-call':
+        case 'tool-call': {
+          calls.delete(block.id);
+          let args: unknown;
+          try {
+            args = block.arguments ? JSON.parse(block.arguments) : {};
+          } catch {
+            return recordedData(block);
+          }
+          if (!args || typeof args !== 'object' || Array.isArray(args)) return recordedData(block);
           calls.set(block.id, block.name);
           return {
-            functionCall: { id: block.id, name: block.name, args: JSON.parse(block.arguments) },
+            functionCall: { id: block.id, name: block.name, args },
           };
-        case 'image':
-        case 'file':
-          return {
-            fileData: { fileUri: block.attachment.id, mimeType: block.attachment.mediaType },
-          };
+        }
         default:
-          throw new Error(`unsupported compaction snapshot block: ${block.type}`);
+          return recordedData(block);
       }
     });
     return [{ role: message.role === 'assistant' ? 'model' : 'user', parts }];
