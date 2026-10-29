@@ -63,6 +63,26 @@ SQL Server note: Prisma's sqlserver connector has no `Json` type, so its variant
 
 Mirroring is a no-throw seam: backend errors are logged with a `[dsh-storage]` prefix and never escape into the agent loop.
 
+Successful native `compaction/end` events also write a `utility_compressor` message. Its
+`content` is the source-compatible `Content[]` JSON array of the complete surviving
+conversation: summary plus retained tail, with tool calls/results paired by ID. System
+prompts are excluded. The surface is captured at the event, before asynchronous database
+writes; failed/canceled compactions leave the previous snapshot intact. Snapshot rows do
+not increment the visible message count. Adjacent messages with the same role merge their
+ordered parts, since the legacy reader would otherwise skip the retained tail.
+
+Consumers can resume from the latest active compression snapshot plus later message rows.
+Snapshots and newly mirrored rows include `metadata.sessionCreatedAt` and `metadata.seq`
+to distinguish resumed session generations and messages in the same database second.
+Older snapshots without this metadata retain their creation-time boundary. The mirror
+does not fetch attachments or invent usable paths/URLs from opaque attachment IDs.
+Attachments, developer updates, extension blocks and non-object tool arguments are
+preserved as labelled JSON data in text parts when legacy `Content[]` cannot represent
+them natively. Such snapshots preserve reference information, not attachment bytes or a
+complete native session/tool registry. Attachment bytes still need their existing durable
+storage. An unchanged legacy reader remains timestamp-based; it must consume the sequence
+metadata to distinguish later messages in the same database second.
+
 ## Archive a session
 
 When handling a session-clear request, call `await ctx.get('dshStorage').archiveSession(sessionId)` after stopping the live turn. It waits for queued mirror writes, then transactionally assigns all current, non-deleted `ai_messages` rows (`history_id IS NULL`) to a non-deleted `ai_chat_histories` row. The returned history ID can be used to query those rows directly from the database; a second call with no active messages returns `null`. A database failure rejects this explicit operation instead of reporting a successful clear.

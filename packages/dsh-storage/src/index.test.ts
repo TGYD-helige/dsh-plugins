@@ -118,6 +118,76 @@ describe('dsh-storage plugin', () => {
     expect(backend.init).toHaveBeenCalledTimes(1);
   });
 
+  it('stores successful compaction as a source-compatible snapshot of the committed surface', async () => {
+    apply(ctx, enabledConfig);
+    const session = {
+      id: 's1',
+      header: { createdAt: 1000 },
+      deriveMessages: vi.fn(() => [
+        { role: 'system', content: [{ type: 'text', text: 'Private system prompt' }] },
+        { role: 'user', content: [{ type: 'text', text: 'Summary of earlier work' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'Retained tail' }] },
+      ]),
+    };
+    ctx.events.emit(
+      'session/event',
+      session,
+      ev('compaction/end', { compactionId: 'compact-1', turn: 1 }),
+    );
+    session.deriveMessages.mockReturnValue([]);
+    await ctx.parallel('session/flush', session as any);
+    const backend = backends.instances[0];
+    const row = backend.upsertMessage.mock.calls[0]?.[0];
+    expect(row).toMatchObject({
+      id: 'compact-1',
+      type: 'utility_compressor',
+      sessionId: 's1',
+      agentId: 'main',
+      historyId: null,
+    });
+    expect(JSON.parse(row.content)).toEqual([
+      { role: 'user', parts: [{ text: 'Summary of earlier work' }] },
+      { role: 'model', parts: [{ text: 'Retained tail' }] },
+    ]);
+    expect(row.metadata).toMatchObject({ seq: 1, sessionCreatedAt: 1000 });
+    expect(backend.upsertSession).not.toHaveBeenCalled();
+  });
+
+  it('logs snapshot failures and still mirrors later conversation events', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const failure = new Error('missing message interpreter');
+    const session = {
+      id: 's1',
+      deriveMessages: () => {
+        throw failure;
+      },
+    };
+    try {
+      apply(ctx, enabledConfig);
+      expect(() =>
+        ctx.events.emit(
+          'session/event',
+          session,
+          ev('compaction/end', { compactionId: 'bad', turn: 1 }),
+        ),
+      ).not.toThrow();
+      ctx.events.emit('session/event', session, userEvent('Still available', 'next'));
+      await ctx.parallel('session/flush', session as any);
+      expect(log).toHaveBeenCalledWith('[dsh-storage] compaction snapshot error:', failure);
+      const backend = backends.instances[0];
+      expect(
+        backend.upsertMessage.mock.calls.map(([row]: any[]) => ({
+          id: row.id,
+          type: row.type,
+          content: row.content,
+        })),
+      ).toEqual([{ id: 'next', type: 'user', content: 'Still available' }]);
+    } finally {
+      await ctx.fiber.dispose();
+      log.mockRestore();
+    }
+  });
+
   it('mirrors user/assistant events into message and session rows', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
