@@ -22,6 +22,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-session';
 import Schema from '@deepseek-ai/schemastery';
 import { DatabaseBackend, type DatabaseProvider } from './backends/database.js';
+import { compressionSnapshot } from './compaction.js';
 import { mergeToolResult, projectEvent, usageSampleOf } from './projector.js';
 import type { MessageRow, SessionRow, StorageBackend } from './types.js';
 
@@ -215,7 +216,19 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   /* eslint-disable @typescript-eslint/no-explicit-any */
   ctx.on('session/event', (session: any, event: any) => {
     const sessionId: string = session?.id ?? 'unknown';
+    let snapshot: MessageRow | null;
+    try {
+      // Capture the committed surface now; queued writes must not observe later steps.
+      snapshot = compressionSnapshot(session, event);
+    } catch (error) {
+      console.error('[dsh-storage] compaction snapshot error:', error);
+      return;
+    }
     enqueue(sessionId, async () => {
+      if (snapshot) {
+        await fanout((backend) => backend.upsertMessage(snapshot));
+        return;
+      }
       let accum = sessions.get(sessionId);
       if (!accum) {
         accum = await seedAccum(sessionId);
@@ -223,6 +236,9 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
       }
 
       let row: MessageRow | null = projectEvent(session, event, sessionId);
+      if (row && session.header?.createdAt !== undefined) {
+        row.metadata = { ...row.metadata, sessionCreatedAt: session.header.createdAt };
+      }
       const storedRows =
         row || event?.type === 'tool/result'
           ? await backends[0].readMessages(sessionId, row?.id)
