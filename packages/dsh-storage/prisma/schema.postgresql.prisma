@@ -41,6 +41,7 @@ model AiMessage {
   @@index([deletedAt], map: "idx_deleted")
   @@index([agentId], map: "idx_agent")
   @@index([sessionId, agentId, type, createdAt], map: "idx_session_agent_type_created")
+  @@index([sessionId, deletedAt, type, historyId, createdAt, id], map: "idx_message_tool_lookup")
   @@map("ai_messages")
 }
 
@@ -61,6 +62,7 @@ model AiChatHistory {
   messages       AiMessage[]
 
   @@index([sessionId], map: "idx_chat_history_session")
+  @@index([sessionId, deletedAt, id], map: "idx_session_rollup_lookup")
   @@index([deletedAt], map: "idx_chat_history_deleted")
   @@map("ai_chat_histories")
 }

@@ -329,6 +329,38 @@ describe('dsh-storage plugin', () => {
     ]);
   });
 
+  it('uses the restored model surface to avoid scanning on a cold cache', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    backend.readMessages.mockResolvedValue([
+      {
+        id: 'restored-message',
+        type: 'model',
+        toolCalls: [{ id: 'restored-call' }],
+      },
+    ]);
+    const session = {
+      id: 's1',
+      deriveMessages: () => [
+        {
+          role: 'assistant',
+          id: 'restored-message',
+          content: [{ type: 'tool-call', id: 'restored-call' }],
+        },
+      ],
+    };
+    ctx.events.emit(
+      'session/event',
+      session,
+      ev('tool/result', {
+        message: { source: { callId: 'restored-call' }, content: [] },
+      }),
+    );
+    await ctx.events.parallel('session/flush', session);
+    expect(backend.readMessages).toHaveBeenCalledExactlyOnceWith('s1', 'restored-message');
+    expect(backend.readToolCallMessages).not.toHaveBeenCalled();
+  });
+
   it('does not query message history when a tool result has no call id', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];

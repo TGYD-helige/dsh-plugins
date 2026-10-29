@@ -55,7 +55,19 @@ The logical message id rides in `metadata.id`; message rows use a deterministic 
 
 For `user/message` rows, `content` remains the text projection, while `metadata.message` retains the original user message as received, including `source` and ordered content blocks. Image/file blocks keep whatever attachment reference, path, URL, or inline data the incoming message actually contains; this mirror does not fetch or rewrite attachments. Re-projection writes the same raw message into the existing row.
 
-The `tool_calls` array retains dsh's tool-call blocks (`id`, `name`, `arguments`); the matching entry gains the structured `result` block and, on failure, an `error` identity. The plugin caches live call-to-message IDs. Cache misses query the exact call ID within the session and return at most one active model row; message-ID reads also return at most one row. It reads persisted model rows to match results across process restarts and upserts the same row ID, so duplicate results do not add rows or increment the session's message count. Existing historical `type=tool` rows are left intact.
+The `tool_calls` array retains dsh's tool-call blocks (`id`, `name`, `arguments`); the matching entry gains the structured `result` block and, on failure, an `error` identity. Live call IDs are cached, and restored calls can resolve their message ID from the model surface: both paths read one message primary key. Older calls are searched in keyset pages of at most 100 ID/tool-call candidates, matched in the plugin and discarded before fetching the next page. SQL never searches JSON, joins tables, or nests SELECT statements. Active rollup selection pages only IDs and checks attached-message IDs separately; a bounded active-ID cache avoids repeatedly paging old archives. Duplicate results update the same row and do not increment message counts. Existing historical `type=tool` rows are left intact.
+
+The Prisma schemas include `idx_message_tool_lookup` on `(session_id, deleted_at, type, history_id, created_at, id)` for the equality filters followed by the keyset order. Existing databases require a **manual** index upgrade; this plugin never runs schema migrations:
+
+```sql
+CREATE INDEX idx_message_tool_lookup
+ON ai_messages (session_id, deleted_at, type, history_id, created_at, id);
+
+CREATE INDEX idx_session_rollup_lookup
+ON ai_chat_histories (session_id, deleted_at, id);
+```
+
+Check existing indexes before executing this statement. Real query plans depend on the database and data distribution; the row cap bounds each response even before the index is installed.
 
 When an assistant message contains dsh `reasoning` blocks, `thoughts` is an array of `{ content }` entries in block order. If the adapter supplies a matching signature in the message's `source.replayState.blocks`, that entry also carries `thoughtSignature`. The full model `source`, including opaque `replayState`, is preserved in row metadata for lossless provider replay. The backend's `readMessages()` also accepts older `{ description }` entries and JSON string thoughts, returning them as `{ content }`. `subject` and a per-thought timestamp are not invented when the upstream message does not supply them.
 

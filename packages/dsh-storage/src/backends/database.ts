@@ -107,6 +107,7 @@ export async function createAdapter(config: DatabaseBackendConfig): Promise<unkn
 export class DatabaseBackend implements StorageBackend {
   readonly name = 'database';
   private prisma: any = null;
+  private activeHistoryIds = new Map<string, string>();
 
   constructor(private config: DatabaseBackendConfig) {}
 
@@ -175,47 +176,122 @@ export class DatabaseBackend implements StorageBackend {
 
   async readToolCallMessages(sessionId: string, callId: string): Promise<MessageRow[]> {
     if (!this.prisma) return [];
-    const where = "session_id = ? AND deleted_at IS NULL AND history_id IS NULL AND type = 'model'";
-    let sql: string;
-    let params: string[];
-    switch (this.config.provider) {
-      case 'mysql':
-        sql = `SELECT id FROM ai_messages WHERE ${where} AND BINARY session_id = BINARY ?
-          AND JSON_CONTAINS(tool_calls, ?) ORDER BY created_at DESC, id DESC LIMIT 1`;
-        params = [sessionId, sessionId, JSON.stringify([{ id: callId }])];
-        break;
-      case 'postgresql':
-        sql = `SELECT id FROM ai_messages WHERE ${where.replace('?', '$1')}
-          AND tool_calls @> $2::jsonb ORDER BY created_at DESC, id DESC LIMIT 1`;
-        params = [sessionId, JSON.stringify([{ id: callId }])];
-        break;
-      case 'sqlite':
-        sql = `SELECT id FROM ai_messages WHERE ${where}
-          AND EXISTS (SELECT 1 FROM json_each(tool_calls) WHERE CASE WHEN type = 'object' THEN json_extract(value, '$.id') END = ?)
-          ORDER BY created_at DESC, id DESC LIMIT 1`;
-        params = [sessionId, callId];
-        break;
-      case 'sqlserver':
-        // SQL Server equality ignores case in common collations and pads trailing spaces.
-        sql = `SELECT TOP 1 id FROM ai_messages WHERE ${where.replace('?', '@P1')}
-          AND session_id COLLATE Latin1_General_100_BIN2 = @P1
-          AND DATALENGTH(CAST(session_id AS nvarchar(max))) = DATALENGTH(CAST(@P1 AS nvarchar(max)))
-          AND EXISTS (SELECT 1 FROM OPENJSON(tool_calls) WITH (call_id nvarchar(max) '$.id')
-            WHERE call_id COLLATE Latin1_General_100_BIN2 = @P2
-            AND DATALENGTH(call_id) = DATALENGTH(CAST(@P2 AS nvarchar(max))))
-          ORDER BY created_at DESC, id DESC`;
-        params = [sessionId, callId];
-        break;
+    const provider = this.config.provider;
+    const sqlserver = provider === 'sqlserver';
+    const sortTime =
+      provider === 'mysql'
+        ? "DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s.%f')"
+        : provider === 'postgresql'
+          ? "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS.US')"
+          : sqlserver
+            ? 'CONVERT(varchar(33), created_at, 126)'
+            : 'CAST(created_at AS TEXT)';
+    let cursor: { id: string; time: string | null } | undefined;
+    for (;;) {
+      const params: Array<string | null> =
+        provider === 'mysql' || provider === 'sqlite' ? [sessionId, sessionId] : [sessionId];
+      let before = '';
+      if (cursor) {
+        if (cursor.time === null) {
+          before =
+            provider === 'postgresql'
+              ? 'AND (created_at IS NOT NULL OR (created_at IS NULL AND id < ?))'
+              : 'AND created_at IS NULL AND id < ?';
+          params.push(cursor.id);
+        } else {
+          before = `AND (created_at < ? OR (created_at = ? AND id < ?)${provider === 'postgresql' ? '' : ' OR created_at IS NULL'})`;
+          params.push(cursor.time, cursor.time, cursor.id);
+        }
+      }
+      let sql = `SELECT ${sqlserver ? 'TOP 100 ' : ''}id, tool_calls, ${sortTime} AS sort_time
+        FROM ai_messages WHERE session_id = ?
+        ${provider === 'sqlite' ? 'AND session_id COLLATE BINARY = ?' : ''}
+        ${provider === 'mysql' ? 'AND BINARY session_id = BINARY ?' : ''}
+        AND deleted_at IS NULL AND history_id IS NULL AND type = 'model' AND tool_calls IS NOT NULL
+        ${
+          sqlserver
+            ? `AND session_id COLLATE Latin1_General_100_BIN2 = @P1
+          AND DATALENGTH(CAST(session_id AS nvarchar(max))) = DATALENGTH(CAST(@P1 AS nvarchar(max)))`
+            : ''
+        }
+        ${before} ORDER BY created_at DESC, id DESC ${sqlserver ? '' : 'LIMIT 100'}`;
+      if (sqlserver || provider === 'postgresql') {
+        let index = 0;
+        sql = sql.replaceAll('?', () => `${sqlserver ? '@P' : '$'}${++index}`);
+      }
+      const page = await this.prisma.$queryRawUnsafe(sql, ...params);
+      for (const row of page) {
+        let calls = row.tool_calls;
+        if (typeof calls === 'string') {
+          try {
+            calls = JSON.parse(calls);
+          } catch {
+            continue;
+          }
+        }
+        if (Array.isArray(calls) && calls.some((call: any) => call?.id === callId)) {
+          return this.readRows({
+            sessionId,
+            deletedAt: null,
+            historyId: null,
+            type: 'model',
+            id: row.id,
+          });
+        }
+      }
+      if (page.length < 100) return [];
+      const last = page.at(-1);
+      cursor = { id: last.id, time: last.sort_time };
     }
-    const rows = await this.prisma.$queryRawUnsafe(sql, ...params);
-    if (rows.length === 0) return [];
-    return this.readRows({
-      sessionId,
-      deletedAt: null,
-      historyId: null,
-      type: 'model',
-      id: rows[0].id,
-    });
+  }
+
+  private rememberHistory(sessionId: string, id: string): void {
+    if (!this.activeHistoryIds.has(sessionId) && this.activeHistoryIds.size >= 1000) {
+      const oldest = this.activeHistoryIds.keys().next().value;
+      if (oldest !== undefined) this.activeHistoryIds.delete(oldest);
+    }
+    this.activeHistoryIds.set(sessionId, id);
+  }
+
+  private async activeHistory(client: any, sessionId: string): Promise<{ id: string } | null> {
+    const cachedId = this.activeHistoryIds.get(sessionId);
+    if (cachedId) {
+      const cached = await client.aiChatHistory.findFirst({
+        where: { id: cachedId, sessionId, deletedAt: null },
+        select: { id: true, sessionId: true },
+      });
+      if (
+        cached?.sessionId === sessionId &&
+        !(await client.aiMessage.findFirst({
+          where: { historyId: cachedId },
+          select: { id: true },
+        }))
+      )
+        return { id: cachedId };
+      this.activeHistoryIds.delete(sessionId);
+    }
+    let lastId: string | undefined;
+    for (;;) {
+      const page = await client.aiChatHistory.findMany({
+        where: { sessionId, deletedAt: null, ...(lastId ? { id: { lt: lastId } } : {}) },
+        select: { id: true, sessionId: true },
+        orderBy: { id: 'desc' },
+        take: 100,
+      });
+      for (const row of page) {
+        if (row.sessionId !== sessionId) continue;
+        const attached = await client.aiMessage.findFirst({
+          where: { historyId: row.id },
+          select: { id: true },
+        });
+        if (!attached) {
+          this.rememberHistory(sessionId, row.id);
+          return { id: row.id };
+        }
+      }
+      if (page.length < 100) return null;
+      lastId = page.at(-1).id;
+    }
   }
 
   private async readRows(where: Record<string, unknown>): Promise<MessageRow[]> {
@@ -264,8 +340,10 @@ export class DatabaseBackend implements StorageBackend {
 
   async readSession(sessionId: string): Promise<SessionRow | null> {
     if (!this.prisma) return null;
+    const active = await this.activeHistory(this.prisma, sessionId);
+    if (!active) return null;
     const row = await this.prisma.aiChatHistory.findFirst({
-      where: { sessionId, deletedAt: null, messages: { none: {} } },
+      where: { id: active.id, sessionId, deletedAt: null },
     });
     if (!row) return null;
     return {
@@ -291,10 +369,7 @@ export class DatabaseBackend implements StorageBackend {
     // processing per session (see the per-session chain in index.ts). The
     // cuid primary key matches the source project and early-scaffold rows,
     // so existing data is continued, never duplicated.
-    const existing = await this.prisma.aiChatHistory.findFirst({
-      where: { sessionId: row.sessionId, deletedAt: null, messages: { none: {} } },
-      select: { id: true },
-    });
+    const existing = await this.activeHistory(this.prisma, row.sessionId);
     const data = {
       sessionId: row.sessionId,
       title: row.title ?? undefined,
@@ -307,31 +382,70 @@ export class DatabaseBackend implements StorageBackend {
     if (existing) {
       await this.prisma.aiChatHistory.update({ where: { id: existing.id }, data });
     } else {
-      await this.prisma.aiChatHistory.create({ data });
+      const created = await this.prisma.aiChatHistory.create({ data, select: { id: true } });
+      if (created) this.rememberHistory(row.sessionId, created.id);
     }
   }
 
   async archiveSession(sessionId: string): Promise<string | null> {
     if (!this.prisma) throw new Error('dsh-storage database is not initialized');
-    return this.prisma.$transaction(async (tx: any) => {
-      const where = { sessionId, historyId: null, deletedAt: null };
-      const stats = await tx.aiMessage.aggregate({
-        where,
-        _count: { _all: true },
-        _min: { createdAt: true },
-        _max: { createdAt: true },
-      });
-      if (stats._count._all === 0) return null;
+    const provider = this.config.provider;
+    const scope =
+      provider === 'mysql'
+        ? 'session_id = ? AND BINARY session_id = BINARY ?'
+        : provider === 'sqlite'
+          ? 'session_id = ? AND session_id COLLATE BINARY = ?'
+          : provider === 'sqlserver'
+            ? `session_id = ? AND session_id COLLATE Latin1_General_100_BIN2 = ?
+              AND DATALENGTH(CAST(session_id AS nvarchar(max))) = DATALENGTH(CAST(? AS nvarchar(max)))`
+            : 'session_id = ?';
+    const sessionParams =
+      provider === 'postgresql'
+        ? [sessionId]
+        : provider === 'sqlserver'
+          ? [sessionId, sessionId, sessionId]
+          : [sessionId, sessionId];
+    const bind = (sql: string) => {
+      let index = 0;
+      return provider === 'postgresql' || provider === 'sqlserver'
+        ? sql.replaceAll('?', () => `${provider === 'postgresql' ? '$' : '@P'}${++index}`)
+        : sql;
+    };
+    const date = (value: unknown): Date | null => {
+      if (value === null) return null;
+      if (value instanceof Date) return value;
+      if (typeof value !== 'number' && typeof value !== 'bigint' && typeof value !== 'string')
+        throw new Error('Invalid archive timestamp');
+      const parsed = new Date(
+        typeof value === 'bigint' || (typeof value === 'string' && /^-?\d+$/.test(value))
+          ? Number(value)
+          : value,
+      );
+      if (!Number.isFinite(parsed.getTime())) throw new Error('Invalid archive timestamp');
+      return parsed;
+    };
+    const archived = await this.prisma.$transaction(async (tx: any) => {
+      const [stats] = await tx.$queryRawUnsafe(
+        bind(
+          `SELECT ${provider === 'sqlserver' ? 'COUNT_BIG' : 'COUNT'}(*) AS message_count,
+         MIN(created_at) AS first_message_at, MAX(created_at) AS last_message_at
+         FROM ai_messages WHERE ${scope} AND history_id IS NULL AND deleted_at IS NULL`,
+        ),
+        ...sessionParams,
+      );
+      const messageCount = Number(stats?.message_count);
+      if (!Number.isSafeInteger(messageCount) || messageCount < 0)
+        throw new Error('Invalid archive message count');
+      if (messageCount === 0) return null;
+      const firstMessageAt = date(stats.first_message_at);
+      const lastMessageAt = date(stats.last_message_at);
 
       // Active rollups have no attached messages; an archive gains them below.
-      const active = await tx.aiChatHistory.findFirst({
-        where: { sessionId, deletedAt: null, messages: { none: {} } },
-        select: { id: true },
-      });
+      const active = await this.activeHistory(tx, sessionId);
       const rollup = {
-        messageCount: stats._count._all,
-        firstMessageAt: stats._min.createdAt,
-        lastMessageAt: stats._max.createdAt,
+        messageCount,
+        firstMessageAt,
+        lastMessageAt,
       };
       const history = active
         ? await tx.aiChatHistory.update({ where: { id: active.id }, data: rollup })
@@ -339,15 +453,37 @@ export class DatabaseBackend implements StorageBackend {
             data: { sessionId, ...rollup, totalTokens: 0n },
             select: { id: true },
           });
-      const updated = await tx.aiMessage.updateMany({ where, data: { historyId: history.id } });
-      if (updated.count !== stats._count._all) {
+      const timestamp =
+        provider === 'sqlite'
+          ? '?'
+          : provider === 'sqlserver'
+            ? 'SYSUTCDATETIME()'
+            : provider === 'mysql'
+              ? 'CURRENT_TIMESTAMP(3)'
+              : "CURRENT_TIMESTAMP(3) AT TIME ZONE 'UTC'";
+      const params = [
+        history.id,
+        ...(provider === 'sqlite' ? [new Date().toISOString()] : []),
+        ...sessionParams,
+      ];
+      const updated = await tx.$executeRawUnsafe(
+        bind(
+          `UPDATE ai_messages SET history_id = ?, updated_at = ${timestamp}
+         WHERE ${scope} AND history_id IS NULL AND deleted_at IS NULL`,
+        ),
+        ...params,
+      );
+      if (Number(updated) !== messageCount) {
         throw new Error('active messages changed during archive');
       }
       return history.id;
     });
+    this.activeHistoryIds.delete(sessionId);
+    return archived;
   }
 
   async close(): Promise<void> {
+    this.activeHistoryIds.clear();
     await this.prisma?.$disconnect?.();
   }
 }

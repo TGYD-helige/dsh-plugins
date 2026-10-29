@@ -124,15 +124,40 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     }
   }
 
-  async function readToolResultRows(sessionId: string, event: any): Promise<MessageRow[]> {
+  async function readToolResultRows(
+    session: any,
+    sessionId: string,
+    event: any,
+  ): Promise<MessageRow[]> {
     const callId = toolResultCallId(event);
     if (!callId) return [];
-    const messageId = toolCallMessages.get(sessionId)?.get(callId);
+    let messageId = toolCallMessages.get(sessionId)?.get(callId);
+    if (!messageId && typeof session?.deriveMessages === 'function') {
+      const messages = session.deriveMessages();
+      for (let index = messages.length - 1; index >= 0; index--) {
+        const message = messages[index];
+        if (
+          message.role === 'assistant' &&
+          typeof message.id === 'string' &&
+          Array.isArray(message.content) &&
+          message.content.some((block: any) => block?.type === 'tool-call' && block.id === callId)
+        ) {
+          messageId = message.id;
+          break;
+        }
+      }
+    }
     if (messageId) {
       const rows = await backends[0].readMessages(sessionId, messageId);
-      if (rows.length > 0) return rows;
+      if (
+        rows.some(
+          (row) =>
+            Array.isArray(row.toolCalls) && row.toolCalls.some((call) => call?.id === callId),
+        )
+      )
+        return rows;
     }
-    // Cold resume and eviction still locate one row without materializing the session.
+    // Older calls absent from the live surface are searched in bounded database pages.
     const rows = await backends[0].readToolCallMessages(sessionId, callId);
     for (const row of rows) rememberToolCalls(sessionId, row);
     return rows;
@@ -274,7 +299,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
       }
       const storedRows =
         event?.type === 'tool/result'
-          ? await readToolResultRows(sessionId, event)
+          ? await readToolResultRows(session, sessionId, event)
           : row
             ? await backends[0].readMessages(sessionId, row.id)
             : [];
