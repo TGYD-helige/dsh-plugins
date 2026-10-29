@@ -165,18 +165,65 @@ export class DatabaseBackend implements StorageBackend {
     });
   }
 
-  async readMessages(sessionId: string, messageId?: string): Promise<MessageRow[]> {
+  async readMessages(sessionId: string, messageId: string): Promise<MessageRow[]> {
+    return this.readRows({
+      sessionId,
+      deletedAt: null,
+      id: pk(`message ${sessionId}\0${messageId}`),
+    });
+  }
+
+  async readToolCallMessages(sessionId: string, callId: string): Promise<MessageRow[]> {
     if (!this.prisma) return [];
-    // ponytail: tool-call lookup scans one session; add an indexed call lookup if that becomes slow.
-    // Scan only the active segment for tool results; exact-ID reads still find
-    // archived rows so redelivery does not count the same message twice.
+    const where = "session_id = ? AND deleted_at IS NULL AND history_id IS NULL AND type = 'model'";
+    let sql: string;
+    let params: string[];
+    switch (this.config.provider) {
+      case 'mysql':
+        sql = `SELECT id FROM ai_messages WHERE ${where} AND BINARY session_id = BINARY ?
+          AND JSON_CONTAINS(tool_calls, ?) ORDER BY created_at DESC, id DESC LIMIT 1`;
+        params = [sessionId, sessionId, JSON.stringify([{ id: callId }])];
+        break;
+      case 'postgresql':
+        sql = `SELECT id FROM ai_messages WHERE ${where.replace('?', '$1')}
+          AND tool_calls @> $2::jsonb ORDER BY created_at DESC, id DESC LIMIT 1`;
+        params = [sessionId, JSON.stringify([{ id: callId }])];
+        break;
+      case 'sqlite':
+        sql = `SELECT id FROM ai_messages WHERE ${where}
+          AND EXISTS (SELECT 1 FROM json_each(tool_calls) WHERE CASE WHEN type = 'object' THEN json_extract(value, '$.id') END = ?)
+          ORDER BY created_at DESC, id DESC LIMIT 1`;
+        params = [sessionId, callId];
+        break;
+      case 'sqlserver':
+        // SQL Server equality ignores case in common collations and pads trailing spaces.
+        sql = `SELECT TOP 1 id FROM ai_messages WHERE ${where.replace('?', '@P1')}
+          AND session_id COLLATE Latin1_General_100_BIN2 = @P1
+          AND DATALENGTH(CAST(session_id AS nvarchar(max))) = DATALENGTH(CAST(@P1 AS nvarchar(max)))
+          AND EXISTS (SELECT 1 FROM OPENJSON(tool_calls) WITH (call_id nvarchar(max) '$.id')
+            WHERE call_id COLLATE Latin1_General_100_BIN2 = @P2
+            AND DATALENGTH(call_id) = DATALENGTH(CAST(@P2 AS nvarchar(max))))
+          ORDER BY created_at DESC, id DESC`;
+        params = [sessionId, callId];
+        break;
+    }
+    const rows = await this.prisma.$queryRawUnsafe(sql, ...params);
+    if (rows.length === 0) return [];
+    return this.readRows({
+      sessionId,
+      deletedAt: null,
+      historyId: null,
+      type: 'model',
+      id: rows[0].id,
+    });
+  }
+
+  private async readRows(where: Record<string, unknown>): Promise<MessageRow[]> {
+    if (!this.prisma) return [];
     const rows = await this.prisma.aiMessage.findMany({
-      where: {
-        sessionId,
-        deletedAt: null,
-        ...(messageId ? { id: pk(`message ${sessionId}\0${messageId}`) } : { historyId: null }),
-      },
+      where,
       orderBy: { createdAt: 'asc' },
+      take: 1,
     });
     const json = (value: unknown) => (typeof value === 'string' ? JSON.parse(value) : value);
     return rows.map((row: any) => {

@@ -13,6 +13,7 @@ vi.mock('./backends/database.js', () => ({
     init = vi.fn(() => backends.initImpl?.() ?? Promise.resolve());
     readSession = vi.fn(async () => null);
     readMessages = vi.fn(async () => [] as any[]);
+    readToolCallMessages = vi.fn(async () => [] as any[]);
     upsertMessage = vi.fn(async () => {});
     upsertSession = vi.fn(async () => {});
     archiveSession = vi.fn(async (): Promise<string | null> => 'history-1');
@@ -263,6 +264,7 @@ describe('dsh-storage plugin', () => {
       rows.set(row.id, row);
     });
     backend.readMessages.mockImplementation(async () => [...rows.values()]);
+    backend.readToolCallMessages.mockImplementation(async () => [...rows.values()]);
     const session = { id: 's1' };
     const call = assistantEvent('', undefined, 'a1') as any;
     call.data.message.content.push({
@@ -290,11 +292,147 @@ describe('dsh-storage plugin', () => {
     expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(1);
   });
 
+  it('uses a committed assistant tool call to read only its model row for a result', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const model = {
+      id: 'a1',
+      sessionId: 's1',
+      historyId: null,
+      type: 'model',
+      content: '',
+      toolCalls: [{ type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }],
+      createdAt: new Date(1700000000000),
+    };
+    backend.readMessages.mockResolvedValue([model]);
+    const call = assistantEvent('', undefined, 'a1') as any;
+    call.data.message.content.push({ type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' });
+
+    ctx.events.emit('session/event', { id: 's1' }, call);
+    ctx.events.emit(
+      'session/event',
+      { id: 's1' },
+      ev('tool/result', {
+        message: {
+          role: 'tool',
+          source: { kind: 'tool', callId: 'c1' },
+          toolCallId: 'c1',
+          content: [{ type: 'text', text: 'ok' }],
+        },
+      }),
+    );
+    await flush();
+
+    expect(backend.readMessages.mock.calls.map((args: any[]) => args)).toEqual([
+      ['s1', 'a1'],
+      ['s1', 'a1'],
+    ]);
+  });
+
+  it('does not query message history when a tool result has no call id', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    ctx.events.emit('session/event', { id: 's1' }, ev('tool/result', { message: { content: [] } }));
+    await ctx.events.parallel('session/flush', { id: 's1' });
+    expect(backend.readMessages).not.toHaveBeenCalled();
+    expect(backend.readToolCallMessages).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it('locates only the matching row on a cache miss and remembers its call ids', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const model = {
+      id: 'a1',
+      sessionId: 's1',
+      historyId: null,
+      type: 'model',
+      content: '',
+      toolCalls: [
+        { type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' },
+        { type: 'tool-call', id: 'c2', name: 'write', arguments: '{}' },
+      ],
+      createdAt: new Date(1700000000000),
+    };
+    backend.readToolCallMessages.mockResolvedValue([model]);
+    backend.readMessages.mockResolvedValue([model]);
+    const result = (callId: string) =>
+      ev('tool/result', {
+        message: { source: { kind: 'tool', callId }, toolCallId: callId, content: [] },
+      });
+
+    ctx.events.emit('session/event', { id: 's1' }, result('c1'));
+    ctx.events.emit('session/event', { id: 's1' }, result('c2'));
+    await flush();
+
+    expect(backend.readMessages.mock.calls.map((args: any[]) => args)).toEqual([['s1', 'a1']]);
+    expect(backend.readToolCallMessages).toHaveBeenCalledExactlyOnceWith('s1', 'c1');
+  });
+
+  it('locates only the matching row when an old call id is evicted from the bounded cache', async () => {
+    const rows = new Map<string, any>();
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    backend.upsertMessage.mockImplementation(async (row: any) => {
+      rows.set(row.id, row);
+    });
+    const readCalls: any[][] = [];
+    backend.readMessages.mockImplementation(async (_sessionId: string, messageId?: string) => {
+      readCalls.push(messageId === undefined ? [] : [messageId]);
+      return messageId === undefined
+        ? [...rows.values()]
+        : rows.get(messageId)
+          ? [rows.get(messageId)]
+          : [];
+    });
+    backend.readToolCallMessages.mockImplementation(async (_sessionId: string, callId: string) =>
+      [...rows.values()].filter((row) => row.toolCalls?.some((call: any) => call.id === callId)),
+    );
+    const session = { id: 's1' };
+    const first = assistantEvent('', undefined, 'a0') as any;
+    first.data.message.content.push({ type: 'tool-call', id: 'c0', name: 'read', arguments: '{}' });
+    ctx.events.emit('session/event', session, first);
+    const later = assistantEvent('', undefined, 'a1') as any;
+    for (let index = 1; index <= 1000; index++) {
+      later.data.message.content.push({
+        type: 'tool-call',
+        id: `c${index}`,
+        name: 'read',
+        arguments: '{}',
+      });
+    }
+    ctx.events.emit('session/event', session, later);
+
+    ctx.events.emit(
+      'session/event',
+      session,
+      ev('tool/result', {
+        message: {
+          role: 'tool',
+          source: { kind: 'tool', callId: 'c0' },
+          toolCallId: 'c0',
+          content: [{ type: 'text', text: 'old result' }],
+        },
+      }),
+    );
+    await ctx.events.parallel('session/flush', session);
+
+    expect(backend.readToolCallMessages).toHaveBeenCalledExactlyOnceWith('s1', 'c0');
+    expect(readCalls.every((args) => args.length === 1)).toBe(true);
+    expect(rows.get('a0').toolCalls).toEqual([
+      expect.objectContaining({
+        id: 'c0',
+        result: { type: 'text', text: 'old result' },
+      }),
+    ]);
+  });
+
   it('matches a tool result against a model row persisted before resume', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
     backend.readSession.mockResolvedValue({ sessionId: 's1', messageCount: 1, totalTokens: 0 });
-    backend.readMessages.mockResolvedValue([
+    backend.readToolCallMessages.mockResolvedValue([
       {
         id: 'a1',
         sessionId: 's1',
@@ -332,7 +470,7 @@ describe('dsh-storage plugin', () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
-    backend.readMessages.mockRejectedValueOnce(new Error('db down'));
+    backend.readToolCallMessages.mockRejectedValueOnce(new Error('db down'));
     ctx.events.emit(
       'session/event',
       { id: 's1' },

@@ -46,8 +46,10 @@ export interface StorageBackend {
   init?(): Promise<void>;
   /** Read the stored session row, for seeding the live rollup on resume. */
   readSession?(sessionId: string): Promise<SessionRow | null>;
-  /** Read persisted messages, optionally narrowing to one logical message ID. */
-  readMessages(sessionId: string, messageId?: string): Promise<MessageRow[]>;
+  /** Read one persisted logical message, including archived rows for redelivery. */
+  readMessages(sessionId: string, messageId: string): Promise<MessageRow[]>;
+  /** Find at most one active model message containing this exact tool call. */
+  readToolCallMessages(sessionId: string, callId: string): Promise<MessageRow[]>;
   upsertMessage(row: MessageRow): Promise<void>;
   upsertSession(row: SessionRow): Promise<void>;
   /** Move active messages into a queryable history row; null when already empty. */

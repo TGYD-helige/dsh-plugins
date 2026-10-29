@@ -23,7 +23,7 @@ import type {} from '@deepseek-ai/dsh-session';
 import Schema from '@deepseek-ai/schemastery';
 import { DatabaseBackend, type DatabaseProvider } from './backends/database.js';
 import { compressionSnapshot } from './compaction.js';
-import { mergeToolResult, projectEvent, usageSampleOf } from './projector.js';
+import { mergeToolResult, projectEvent, toolResultCallId, usageSampleOf } from './projector.js';
 import type { MessageRow, SessionRow, StorageBackend } from './types.js';
 
 export const name = 'dsh-storage';
@@ -106,6 +106,37 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   ];
 
   const sessions = new Map<string, SessionAccum>();
+  const toolCallMessages = new Map<string, Map<string, string>>();
+  const TOOL_CALL_CACHE_LIMIT = 1000;
+
+  function rememberToolCalls(sessionId: string, row: MessageRow | null): void {
+    if (row?.type !== 'model' || !Array.isArray(row.toolCalls)) return;
+    for (const call of row.toolCalls) {
+      if (typeof call?.id !== 'string') continue;
+      const calls = toolCallMessages.get(sessionId) ?? new Map<string, string>();
+      // Bound each session's cache; Map iteration evicts the oldest insertion first.
+      if (!calls.has(call.id) && calls.size >= TOOL_CALL_CACHE_LIMIT) {
+        const oldest = calls.keys().next().value;
+        if (oldest !== undefined) calls.delete(oldest);
+      }
+      calls.set(call.id, row.id);
+      toolCallMessages.set(sessionId, calls);
+    }
+  }
+
+  async function readToolResultRows(sessionId: string, event: any): Promise<MessageRow[]> {
+    const callId = toolResultCallId(event);
+    if (!callId) return [];
+    const messageId = toolCallMessages.get(sessionId)?.get(callId);
+    if (messageId) {
+      const rows = await backends[0].readMessages(sessionId, messageId);
+      if (rows.length > 0) return rows;
+    }
+    // Cold resume and eviction still locate one row without materializing the session.
+    const rows = await backends[0].readToolCallMessages(sessionId, callId);
+    for (const row of rows) rememberToolCalls(sessionId, row);
+    return rows;
+  }
 
   // Row writes are fire-and-forget during the run, but tracked so the
   // session/flush checkpoint and shutdown can drain them — a one-shot
@@ -189,6 +220,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     started = track(guard(async (backend) => backend.init?.()));
     return async () => {
       sessions.clear();
+      toolCallMessages.clear();
       await Promise.all([...pending]);
       await guard(async (backend) => backend.close?.());
     };
@@ -201,6 +233,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
       const archived = (chains.get(sessionId) ?? started).then(async () => {
         const id = await backends[0].archiveSession(sessionId);
         sessions.delete(sessionId);
+        toolCallMessages.delete(sessionId);
         return id;
       });
       const settled = archived.then(
@@ -240,9 +273,11 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
         row.metadata = { ...row.metadata, sessionCreatedAt: session.header.createdAt };
       }
       const storedRows =
-        row || event?.type === 'tool/result'
-          ? await backends[0].readMessages(sessionId, row?.id)
-          : [];
+        event?.type === 'tool/result'
+          ? await readToolResultRows(sessionId, event)
+          : row
+            ? await backends[0].readMessages(sessionId, row.id)
+            : [];
       if (event?.type === 'tool/result') row = mergeToolResult(event, storedRows);
       const existing = row && storedRows.find((stored) => stored.id === row?.id);
       if (event?.type === 'assistant/message' && row && existing && Array.isArray(row.toolCalls)) {
@@ -269,6 +304,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
           accum.lastMessageAt = row.createdAt;
         }
         await fanout((backend) => backend.upsertMessage(row));
+        rememberToolCalls(sessionId, row);
       }
 
       // Replacement usage accounting: the latest sample for a (turn, step)
@@ -330,6 +366,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     // the dispose was meant to drop).
     enqueue(sessionId, async () => {
       sessions.delete(sessionId);
+      toolCallMessages.delete(sessionId);
     });
     // Delete the chain entry only once it has settled AND is still the same
     // entry — deleting earlier would let a recreated session race the

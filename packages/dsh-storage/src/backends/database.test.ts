@@ -8,6 +8,7 @@ const prismaMock = vi.hoisted(() => {
   class PrismaClient {
     aiMessage = { upsert: vi.fn(), findMany: vi.fn(), aggregate: vi.fn(), updateMany: vi.fn() };
     aiChatHistory = { findFirst: vi.fn(), create: vi.fn(), update: vi.fn() };
+    $queryRawUnsafe = vi.fn(async () => []);
     $transaction = vi.fn(async (run: (client: PrismaClient) => Promise<unknown>) => run(this));
     $connect = vi.fn(async () => {});
     $disconnect = vi.fn(async () => {});
@@ -104,10 +105,15 @@ describe('DatabaseBackend', () => {
         createdAt: new Date(1700000000000),
       },
     ]);
-    const rows = await backend.readMessages('s1');
+    const rows = await backend.readMessages('s1', 'a1');
     expect(prisma.aiMessage.findMany).toHaveBeenCalledWith({
-      where: { sessionId: 's1', deletedAt: null, historyId: null },
+      where: {
+        sessionId: 's1',
+        deletedAt: null,
+        id: createHash('sha256').update('message s1\0a1').digest('hex').slice(0, 36),
+      },
       orderBy: { createdAt: 'asc' },
+      take: 1,
     });
     expect(rows).toMatchObject([
       {
@@ -125,8 +131,53 @@ describe('DatabaseBackend', () => {
         id: createHash('sha256').update('message s1\0a1').digest('hex').slice(0, 36),
       },
       orderBy: { createdAt: 'asc' },
+      take: 1,
     });
   });
+
+  it.each(['mysql', 'postgresql', 'sqlite', 'sqlserver'] as const)(
+    'locates one tool-call row in %s without loading unrelated history',
+    async (provider) => {
+      backend = new DatabaseBackend({
+        provider,
+        url: provider === 'sqlserver' ? 'sqlserver://host;database=db;user=u;password=p' : url,
+      });
+      await backend.init();
+      const prisma = prismaMock.instances[0];
+      prisma.$queryRawUnsafe.mockResolvedValueOnce([{ id: 'physical-id' }]);
+      prisma.aiMessage.findMany.mockResolvedValueOnce([]);
+      await backend.readToolCallMessages('s1', "call-'quoted");
+      const [sql, ...params] = prisma.$queryRawUnsafe.mock.calls[0];
+      expect(sql).toContain('SELECT');
+      expect(sql).toContain('deleted_at IS NULL');
+      expect(sql).toContain('history_id IS NULL');
+      expect(sql).toMatch(/LIMIT 1|TOP 1/);
+      expect(sql).not.toContain("call-'quoted");
+      expect(params).toContain('s1');
+      if (provider === 'sqlserver') {
+        expect(sql).toContain('session_id COLLATE Latin1_General_100_BIN2 = @P1');
+        expect(sql).toContain(
+          'DATALENGTH(CAST(session_id AS nvarchar(max))) = DATALENGTH(CAST(@P1 AS nvarchar(max)))',
+        );
+        expect(sql).toContain('call_id COLLATE Latin1_General_100_BIN2 = @P2');
+        expect(sql).toContain('DATALENGTH(call_id) = DATALENGTH(CAST(@P2 AS nvarchar(max)))');
+      }
+      expect(prisma.aiMessage.findMany).toHaveBeenCalledWith({
+        where: {
+          sessionId: 's1',
+          deletedAt: null,
+          historyId: null,
+          type: 'model',
+          id: 'physical-id',
+        },
+        orderBy: { createdAt: 'asc' },
+        take: 1,
+      });
+      prisma.aiMessage.findMany.mockClear();
+      await expect(backend.readToolCallMessages('s1', 'missing')).resolves.toEqual([]);
+      expect(prisma.aiMessage.findMany).not.toHaveBeenCalled();
+    },
+  );
 
   it('builds the mysql adapter from a mariadb:// url', async () => {
     backend = new DatabaseBackend({ provider: 'mysql', url: 'mysql://u:p@host:3306/db' });

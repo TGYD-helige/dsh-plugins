@@ -116,10 +116,16 @@ export function projectEvent(_session: any, event: any, sessionId: string): Mess
   }
 }
 
+export function toolResultCallId(event: any): string | undefined {
+  const callId =
+    event?.data?.message?.source?.callId ?? event?.data?.message?.content?.[0]?.toolCallId;
+  return typeof callId === 'string' ? callId : undefined;
+}
+
 /** Update the persisted assistant call identified by a tool result. */
 export function mergeToolResult(event: any, rows: MessageRow[]): MessageRow | null {
   const result = event?.data?.message?.content?.[0] ?? null;
-  const callId = event?.data?.message?.source?.callId ?? result?.toolCallId;
+  const callId = toolResultCallId(event);
   if (!callId) return null;
   const model = [...rows]
     .reverse()
