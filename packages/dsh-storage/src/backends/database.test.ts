@@ -6,19 +6,9 @@ import { DatabaseBackend } from './database.js';
 const prismaMock = vi.hoisted(() => {
   const instances: any[] = [];
   class PrismaClient {
-    aiMessage = {
-      upsert: vi.fn(),
-      findMany: vi.fn(),
-      findFirst: vi.fn(async () => null),
-    };
-    aiChatHistory = {
-      findFirst: vi.fn(),
-      findMany: vi.fn(async () => []),
-      create: vi.fn(),
-      update: vi.fn(),
-    };
+    aiMessage = { upsert: vi.fn(), findMany: vi.fn(), aggregate: vi.fn(), updateMany: vi.fn() };
+    aiChatHistory = { findFirst: vi.fn(), create: vi.fn(), update: vi.fn() };
     $queryRawUnsafe = vi.fn(async () => []);
-    $executeRawUnsafe = vi.fn(async () => 0);
     $transaction = vi.fn(async (run: (client: PrismaClient) => Promise<unknown>) => run(this));
     $connect = vi.fn(async () => {});
     $disconnect = vi.fn(async () => {});
@@ -230,36 +220,6 @@ describe('DatabaseBackend', () => {
     },
   );
 
-  it('pages rollup IDs and checks attached-message IDs without relation filters or bodies', async () => {
-    await backend.init();
-    const prisma = prismaMock.instances[0];
-    prisma.aiChatHistory.findMany
-      .mockResolvedValueOnce(
-        Array.from({ length: 100 }, (_, i) => ({
-          id: `history-${100 - i}`,
-          sessionId: 's1',
-        })),
-      )
-      .mockResolvedValueOnce([{ id: 'active', sessionId: 's1' }]);
-    prisma.aiMessage.findFirst.mockImplementation(async ({ where }: any) =>
-      where.historyId === 'active' ? null : { id: 'attached' },
-    );
-    prisma.aiChatHistory.findFirst.mockResolvedValueOnce({ id: 'active', ...sessionRow });
-    await expect(backend.readSession('s1')).resolves.toMatchObject({ sessionId: 's1' });
-    expect(prisma.aiChatHistory.findMany).toHaveBeenCalledTimes(2);
-    for (const [query] of prisma.aiChatHistory.findMany.mock.calls) {
-      expect(query.take).toBe(100);
-      expect(query.select).toEqual({ id: true, sessionId: true });
-      expect(query.where.messages).toBeUndefined();
-    }
-    expect(prisma.aiChatHistory.findMany.mock.calls[1][0].where.id).toEqual({ lt: 'history-1' });
-    for (const [query] of prisma.aiMessage.findFirst.mock.calls) {
-      expect(query.select).toEqual({ id: true });
-      expect(Object.keys(query.where)).toEqual(['historyId']);
-    }
-    expect(prisma.aiMessage.findMany).not.toHaveBeenCalled();
-  });
-
   it.each(['mysql', 'postgresql', 'sqlite', 'sqlserver'] as const)(
     'discards nonmatching %s pages without loading message bodies',
     async (provider) => {
@@ -295,28 +255,6 @@ describe('DatabaseBackend', () => {
     },
   );
 
-  it('does not select another case-sensitive session rollup or change attached-message semantics', async () => {
-    await backend.init();
-    const prisma = prismaMock.instances[0];
-    prisma.aiChatHistory.findMany.mockResolvedValueOnce([
-      { id: 'other-session', sessionId: 'S1' },
-      { id: 'archived', sessionId: 's1' },
-      { id: 'active', sessionId: 's1' },
-    ]);
-    prisma.aiMessage.findFirst.mockImplementation(async ({ where }: any) =>
-      where.historyId === 'archived' ? { id: 'soft-deleted-message' } : null,
-    );
-    await backend.upsertSession(sessionRow);
-    expect(prisma.aiMessage.findFirst.mock.calls).toEqual([
-      [{ where: { historyId: 'archived' }, select: { id: true } }],
-      [{ where: { historyId: 'active' }, select: { id: true } }],
-    ]);
-    expect(prisma.aiChatHistory.update).toHaveBeenCalledWith({
-      where: { id: 'active' },
-      data: expect.objectContaining({ sessionId: 's1' }),
-    });
-  });
-
   it.each(['mysql', 'postgresql', 'sqlite', 'sqlserver'] as const)(
     'continues through NULL timestamp %s candidates with a bounded cursor',
     async (provider) => {
@@ -345,28 +283,6 @@ describe('DatabaseBackend', () => {
       expect(prisma.aiMessage.findMany.mock.calls[0][0].where.id).toBe('target');
     },
   );
-
-  it('validates cached active rollup IDs without rescanning old archives, and refreshes stale IDs', async () => {
-    await backend.init();
-    const prisma = prismaMock.instances[0];
-    prisma.aiChatHistory.findMany.mockResolvedValueOnce([{ id: 'active', sessionId: 's1' }]);
-    await backend.upsertSession(sessionRow);
-    prisma.aiChatHistory.findFirst.mockResolvedValueOnce({ id: 'active', sessionId: 's1' });
-    await backend.upsertSession(sessionRow);
-    expect(prisma.aiChatHistory.findMany).toHaveBeenCalledTimes(1);
-    expect(prisma.aiChatHistory.findFirst).toHaveBeenCalledExactlyOnceWith({
-      where: { id: 'active', sessionId: 's1', deletedAt: null },
-      select: { id: true, sessionId: true },
-    });
-    prisma.aiChatHistory.findFirst.mockResolvedValueOnce({ id: 'active', sessionId: 's1' });
-    prisma.aiMessage.findFirst.mockImplementation(async ({ where }: any) =>
-      where.historyId === 'active' ? { id: 'attached' } : null,
-    );
-    prisma.aiChatHistory.findMany.mockResolvedValueOnce([{ id: 'new-active', sessionId: 's1' }]);
-    await backend.upsertSession(sessionRow);
-    expect(prisma.aiChatHistory.findMany).toHaveBeenCalledTimes(2);
-    expect(prisma.aiChatHistory.update.mock.calls.at(-1)[0].where).toEqual({ id: 'new-active' });
-  });
 
   it('builds the mysql adapter from a mariadb:// url', async () => {
     backend = new DatabaseBackend({ provider: 'mysql', url: 'mysql://u:p@host:3306/db' });
@@ -475,11 +391,9 @@ describe('DatabaseBackend', () => {
 
     await backend.upsertSession(sessionRow);
 
-    expect(prisma.aiChatHistory.findMany).toHaveBeenCalledWith({
-      where: { sessionId: 's1', deletedAt: null },
-      select: { id: true, sessionId: true },
-      orderBy: { id: 'desc' },
-      take: 100,
+    expect(prisma.aiChatHistory.findFirst).toHaveBeenCalledWith({
+      where: { sessionId: 's1', deletedAt: null, messages: { none: {} } },
+      select: { id: true },
     });
     expect(prisma.aiChatHistory.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -489,7 +403,6 @@ describe('DatabaseBackend', () => {
         firstMessageAt: new Date(1700000000000),
         lastMessageAt: new Date(1700000001000),
       }),
-      select: { id: true },
     });
     expect(prisma.aiChatHistory.update).not.toHaveBeenCalled();
   });
@@ -497,7 +410,7 @@ describe('DatabaseBackend', () => {
   it('updates the existing session row found by sessionId', async () => {
     await backend.init();
     const prisma = prismaMock.instances[0];
-    prisma.aiChatHistory.findMany.mockResolvedValue([{ id: 'legacy-cuid', sessionId: 's1' }]);
+    prisma.aiChatHistory.findFirst.mockResolvedValue({ id: 'legacy-cuid' });
 
     await backend.upsertSession(sessionRow);
 
@@ -508,89 +421,63 @@ describe('DatabaseBackend', () => {
     expect(prisma.aiChatHistory.create).not.toHaveBeenCalled();
   });
 
-  it.each(['sqlite', 'mysql', 'postgresql', 'sqlserver'] as const)(
-    'archives %s active messages with direct exact-session SQL in one transaction',
-    async (provider) => {
-      backend = new DatabaseBackend({
-        provider,
-        url: provider === 'sqlserver' ? 'sqlserver://host;database=db;user=u;password=p' : url,
-      });
-      await backend.init();
-      const prisma = prismaMock.instances[0];
-      const first = new Date(1700000000000);
-      const last = new Date(1700000001000);
-      prisma.$queryRawUnsafe.mockResolvedValue([
-        {
-          message_count: 2n,
-          first_message_at: provider === 'sqlite' ? BigInt(first.getTime()) : first,
-          last_message_at: provider === 'sqlite' ? BigInt(last.getTime()) : last,
-        },
-      ]);
-      prisma.aiChatHistory.findMany.mockResolvedValue([{ id: 'history-1', sessionId: 's1' }]);
-      prisma.aiChatHistory.update.mockResolvedValue({ id: 'history-1' });
-      prisma.$executeRawUnsafe.mockResolvedValue(2);
+  it('archives active messages with their rollup in one transaction', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const first = new Date(1700000000000);
+    const last = new Date(1700000001000);
+    prisma.aiMessage.aggregate.mockResolvedValue({
+      _count: { _all: 2 },
+      _min: { createdAt: first },
+      _max: { createdAt: last },
+    });
+    prisma.aiChatHistory.findFirst.mockResolvedValue({ id: 'history-1' });
+    prisma.aiChatHistory.update.mockResolvedValue({ id: 'history-1' });
+    prisma.aiMessage.updateMany.mockResolvedValue({ count: 2 });
 
-      await expect(backend.archiveSession('s1')).resolves.toBe('history-1');
-      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-      const [statsSql, ...statsParams] = prisma.$queryRawUnsafe.mock.calls[0];
-      expect(statsSql).toContain('MIN(created_at)');
-      expect(statsSql).toContain('MAX(created_at)');
-      expect(statsSql).not.toMatch(/\(\s*SELECT|JOIN/i);
-      expect(statsParams.every((value: unknown) => value === 's1')).toBe(true);
-      const [updateSql, ...updateParams] = prisma.$executeRawUnsafe.mock.calls[0];
-      expect(updateSql).toContain('UPDATE ai_messages SET history_id');
-      expect(updateSql).toContain('updated_at');
-      if (provider === 'mysql') expect(updateSql).toContain('CURRENT_TIMESTAMP(3)');
-      expect(updateSql).not.toMatch(/\(\s*SELECT|JOIN/i);
-      expect(updateParams[0]).toBe('history-1');
-      for (const sql of [statsSql, updateSql]) {
-        expect(sql).toContain('history_id IS NULL');
-        expect(sql).toContain('deleted_at IS NULL');
-        if (provider === 'mysql') expect(sql).toContain('BINARY session_id = BINARY ?');
-        if (provider === 'sqlite') expect(sql).toContain('session_id COLLATE BINARY = ?');
-        if (provider === 'sqlserver') {
-          expect(sql).toContain('Latin1_General_100_BIN2');
-          expect(sql).toContain('DATALENGTH');
-        }
-      }
-      expect(prisma.aiChatHistory.findMany).toHaveBeenCalledWith({
-        where: { sessionId: 's1', deletedAt: null },
-        select: { id: true, sessionId: true },
-        orderBy: { id: 'desc' },
-        take: 100,
-      });
-      expect(prisma.aiChatHistory.update).toHaveBeenCalledWith({
-        where: { id: 'history-1' },
-        data: { messageCount: 2, firstMessageAt: first, lastMessageAt: last },
-      });
-    },
-  );
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-1');
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.aiMessage.aggregate).toHaveBeenCalledWith({
+      where: { sessionId: 's1', historyId: null, deletedAt: null },
+      _count: { _all: true },
+      _min: { createdAt: true },
+      _max: { createdAt: true },
+    });
+    expect(prisma.aiChatHistory.findFirst).toHaveBeenCalledWith({
+      where: { sessionId: 's1', deletedAt: null, messages: { none: {} } },
+      select: { id: true },
+    });
+    expect(prisma.aiMessage.updateMany).toHaveBeenCalledWith({
+      where: { sessionId: 's1', historyId: null, deletedAt: null },
+      data: { historyId: 'history-1' },
+    });
+    expect(prisma.aiChatHistory.update).toHaveBeenCalledWith({
+      where: { id: 'history-1' },
+      data: { messageCount: 2, firstMessageAt: first, lastMessageAt: last },
+    });
+  });
 
   it('does not create an archive when there are no active messages', async () => {
     await backend.init();
     const prisma = prismaMock.instances[0];
-    prisma.$queryRawUnsafe.mockResolvedValue([
-      { message_count: 0, first_message_at: null, last_message_at: null },
-    ]);
+    prisma.aiMessage.aggregate.mockResolvedValue({ _count: { _all: 0 } });
 
     await expect(backend.archiveSession('s1')).resolves.toBeNull();
     expect(prisma.aiChatHistory.create).not.toHaveBeenCalled();
-    expect(prisma.$executeRawUnsafe).not.toHaveBeenCalled();
+    expect(prisma.aiMessage.updateMany).not.toHaveBeenCalled();
   });
 
   it('creates an archive rollup when active messages lack one', async () => {
     await backend.init();
     const prisma = prismaMock.instances[0];
-    prisma.$queryRawUnsafe.mockResolvedValue([
-      {
-        message_count: 1,
-        first_message_at: new Date(1700000000000),
-        last_message_at: new Date(1700000000000),
-      },
-    ]);
+    prisma.aiMessage.aggregate.mockResolvedValue({
+      _count: { _all: 1 },
+      _min: { createdAt: new Date(1700000000000) },
+      _max: { createdAt: new Date(1700000000000) },
+    });
     prisma.aiChatHistory.findFirst.mockResolvedValue(null);
     prisma.aiChatHistory.create.mockResolvedValue({ id: 'history-2' });
-    prisma.$executeRawUnsafe.mockResolvedValue(1);
+    prisma.aiMessage.updateMany.mockResolvedValue({ count: 1 });
 
     await expect(backend.archiveSession('s1')).resolves.toBe('history-2');
     expect(prisma.aiChatHistory.create).toHaveBeenCalledWith({
@@ -608,16 +495,14 @@ describe('DatabaseBackend', () => {
   it('rejects an archive if the active message set changes inside the transaction', async () => {
     await backend.init();
     const prisma = prismaMock.instances[0];
-    prisma.$queryRawUnsafe.mockResolvedValue([
-      {
-        message_count: 1,
-        first_message_at: new Date(1700000000000),
-        last_message_at: new Date(1700000000000),
-      },
-    ]);
-    prisma.aiChatHistory.findMany.mockResolvedValue([{ id: 'history-1', sessionId: 's1' }]);
+    prisma.aiMessage.aggregate.mockResolvedValue({
+      _count: { _all: 1 },
+      _min: { createdAt: new Date(1700000000000) },
+      _max: { createdAt: new Date(1700000000000) },
+    });
+    prisma.aiChatHistory.findFirst.mockResolvedValue({ id: 'history-1' });
     prisma.aiChatHistory.update.mockResolvedValue({ id: 'history-1' });
-    prisma.$executeRawUnsafe.mockResolvedValue(0);
+    prisma.aiMessage.updateMany.mockResolvedValue({ count: 0 });
 
     await expect(backend.archiveSession('s1')).rejects.toThrow('active messages changed');
   });
@@ -648,7 +533,6 @@ describe('DatabaseBackend', () => {
   it('reads a stored session row for resume seeding', async () => {
     await backend.init();
     const prisma = prismaMock.instances[0];
-    prisma.aiChatHistory.findMany.mockResolvedValue([{ id: 'active', sessionId: 's1' }]);
     prisma.aiChatHistory.findFirst.mockResolvedValue({
       sessionId: 's1',
       title: 'old',
@@ -661,7 +545,7 @@ describe('DatabaseBackend', () => {
     const row = await backend.readSession('s1');
 
     expect(prisma.aiChatHistory.findFirst).toHaveBeenCalledWith({
-      where: { id: 'active', sessionId: 's1', deletedAt: null },
+      where: { sessionId: 's1', deletedAt: null, messages: { none: {} } },
     });
     expect(row).toEqual({
       sessionId: 's1',
@@ -703,7 +587,6 @@ describe('DatabaseBackend', () => {
   it('parses string-stored metadata back on readSession (sqlserver)', async () => {
     await backend.init();
     const prisma = prismaMock.instances[0];
-    prisma.aiChatHistory.findMany.mockResolvedValue([{ id: 'active', sessionId: 's1' }]);
     prisma.aiChatHistory.findFirst.mockResolvedValue({
       sessionId: 's1',
       title: null,

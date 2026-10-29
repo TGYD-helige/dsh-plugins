@@ -107,7 +107,6 @@ export async function createAdapter(config: DatabaseBackendConfig): Promise<unkn
 export class DatabaseBackend implements StorageBackend {
   readonly name = 'database';
   private prisma: any = null;
-  private activeHistoryIds = new Map<string, string>();
 
   constructor(private config: DatabaseBackendConfig) {}
 
@@ -245,55 +244,6 @@ export class DatabaseBackend implements StorageBackend {
     }
   }
 
-  private rememberHistory(sessionId: string, id: string): void {
-    if (!this.activeHistoryIds.has(sessionId) && this.activeHistoryIds.size >= 1000) {
-      const oldest = this.activeHistoryIds.keys().next().value;
-      if (oldest !== undefined) this.activeHistoryIds.delete(oldest);
-    }
-    this.activeHistoryIds.set(sessionId, id);
-  }
-
-  private async activeHistory(client: any, sessionId: string): Promise<{ id: string } | null> {
-    const cachedId = this.activeHistoryIds.get(sessionId);
-    if (cachedId) {
-      const cached = await client.aiChatHistory.findFirst({
-        where: { id: cachedId, sessionId, deletedAt: null },
-        select: { id: true, sessionId: true },
-      });
-      if (
-        cached?.sessionId === sessionId &&
-        !(await client.aiMessage.findFirst({
-          where: { historyId: cachedId },
-          select: { id: true },
-        }))
-      )
-        return { id: cachedId };
-      this.activeHistoryIds.delete(sessionId);
-    }
-    let lastId: string | undefined;
-    for (;;) {
-      const page = await client.aiChatHistory.findMany({
-        where: { sessionId, deletedAt: null, ...(lastId ? { id: { lt: lastId } } : {}) },
-        select: { id: true, sessionId: true },
-        orderBy: { id: 'desc' },
-        take: 100,
-      });
-      for (const row of page) {
-        if (row.sessionId !== sessionId) continue;
-        const attached = await client.aiMessage.findFirst({
-          where: { historyId: row.id },
-          select: { id: true },
-        });
-        if (!attached) {
-          this.rememberHistory(sessionId, row.id);
-          return { id: row.id };
-        }
-      }
-      if (page.length < 100) return null;
-      lastId = page.at(-1).id;
-    }
-  }
-
   private async readRows(where: Record<string, unknown>): Promise<MessageRow[]> {
     if (!this.prisma) return [];
     const rows = await this.prisma.aiMessage.findMany({
@@ -340,10 +290,8 @@ export class DatabaseBackend implements StorageBackend {
 
   async readSession(sessionId: string): Promise<SessionRow | null> {
     if (!this.prisma) return null;
-    const active = await this.activeHistory(this.prisma, sessionId);
-    if (!active) return null;
     const row = await this.prisma.aiChatHistory.findFirst({
-      where: { id: active.id, sessionId, deletedAt: null },
+      where: { sessionId, deletedAt: null, messages: { none: {} } },
     });
     if (!row) return null;
     return {
@@ -369,7 +317,10 @@ export class DatabaseBackend implements StorageBackend {
     // processing per session (see the per-session chain in index.ts). The
     // cuid primary key matches the source project and early-scaffold rows,
     // so existing data is continued, never duplicated.
-    const existing = await this.activeHistory(this.prisma, row.sessionId);
+    const existing = await this.prisma.aiChatHistory.findFirst({
+      where: { sessionId: row.sessionId, deletedAt: null, messages: { none: {} } },
+      select: { id: true },
+    });
     const data = {
       sessionId: row.sessionId,
       title: row.title ?? undefined,
@@ -382,70 +333,31 @@ export class DatabaseBackend implements StorageBackend {
     if (existing) {
       await this.prisma.aiChatHistory.update({ where: { id: existing.id }, data });
     } else {
-      const created = await this.prisma.aiChatHistory.create({ data, select: { id: true } });
-      if (created) this.rememberHistory(row.sessionId, created.id);
+      await this.prisma.aiChatHistory.create({ data });
     }
   }
 
   async archiveSession(sessionId: string): Promise<string | null> {
     if (!this.prisma) throw new Error('dsh-storage database is not initialized');
-    const provider = this.config.provider;
-    const scope =
-      provider === 'mysql'
-        ? 'session_id = ? AND BINARY session_id = BINARY ?'
-        : provider === 'sqlite'
-          ? 'session_id = ? AND session_id COLLATE BINARY = ?'
-          : provider === 'sqlserver'
-            ? `session_id = ? AND session_id COLLATE Latin1_General_100_BIN2 = ?
-              AND DATALENGTH(CAST(session_id AS nvarchar(max))) = DATALENGTH(CAST(? AS nvarchar(max)))`
-            : 'session_id = ?';
-    const sessionParams =
-      provider === 'postgresql'
-        ? [sessionId]
-        : provider === 'sqlserver'
-          ? [sessionId, sessionId, sessionId]
-          : [sessionId, sessionId];
-    const bind = (sql: string) => {
-      let index = 0;
-      return provider === 'postgresql' || provider === 'sqlserver'
-        ? sql.replaceAll('?', () => `${provider === 'postgresql' ? '$' : '@P'}${++index}`)
-        : sql;
-    };
-    const date = (value: unknown): Date | null => {
-      if (value === null) return null;
-      if (value instanceof Date) return value;
-      if (typeof value !== 'number' && typeof value !== 'bigint' && typeof value !== 'string')
-        throw new Error('Invalid archive timestamp');
-      const parsed = new Date(
-        typeof value === 'bigint' || (typeof value === 'string' && /^-?\d+$/.test(value))
-          ? Number(value)
-          : value,
-      );
-      if (!Number.isFinite(parsed.getTime())) throw new Error('Invalid archive timestamp');
-      return parsed;
-    };
-    const archived = await this.prisma.$transaction(async (tx: any) => {
-      const [stats] = await tx.$queryRawUnsafe(
-        bind(
-          `SELECT ${provider === 'sqlserver' ? 'COUNT_BIG' : 'COUNT'}(*) AS message_count,
-         MIN(created_at) AS first_message_at, MAX(created_at) AS last_message_at
-         FROM ai_messages WHERE ${scope} AND history_id IS NULL AND deleted_at IS NULL`,
-        ),
-        ...sessionParams,
-      );
-      const messageCount = Number(stats?.message_count);
-      if (!Number.isSafeInteger(messageCount) || messageCount < 0)
-        throw new Error('Invalid archive message count');
-      if (messageCount === 0) return null;
-      const firstMessageAt = date(stats.first_message_at);
-      const lastMessageAt = date(stats.last_message_at);
+    return this.prisma.$transaction(async (tx: any) => {
+      const where = { sessionId, historyId: null, deletedAt: null };
+      const stats = await tx.aiMessage.aggregate({
+        where,
+        _count: { _all: true },
+        _min: { createdAt: true },
+        _max: { createdAt: true },
+      });
+      if (stats._count._all === 0) return null;
 
       // Active rollups have no attached messages; an archive gains them below.
-      const active = await this.activeHistory(tx, sessionId);
+      const active = await tx.aiChatHistory.findFirst({
+        where: { sessionId, deletedAt: null, messages: { none: {} } },
+        select: { id: true },
+      });
       const rollup = {
-        messageCount,
-        firstMessageAt,
-        lastMessageAt,
+        messageCount: stats._count._all,
+        firstMessageAt: stats._min.createdAt,
+        lastMessageAt: stats._max.createdAt,
       };
       const history = active
         ? await tx.aiChatHistory.update({ where: { id: active.id }, data: rollup })
@@ -453,37 +365,15 @@ export class DatabaseBackend implements StorageBackend {
             data: { sessionId, ...rollup, totalTokens: 0n },
             select: { id: true },
           });
-      const timestamp =
-        provider === 'sqlite'
-          ? '?'
-          : provider === 'sqlserver'
-            ? 'SYSUTCDATETIME()'
-            : provider === 'mysql'
-              ? 'CURRENT_TIMESTAMP(3)'
-              : "CURRENT_TIMESTAMP(3) AT TIME ZONE 'UTC'";
-      const params = [
-        history.id,
-        ...(provider === 'sqlite' ? [new Date().toISOString()] : []),
-        ...sessionParams,
-      ];
-      const updated = await tx.$executeRawUnsafe(
-        bind(
-          `UPDATE ai_messages SET history_id = ?, updated_at = ${timestamp}
-         WHERE ${scope} AND history_id IS NULL AND deleted_at IS NULL`,
-        ),
-        ...params,
-      );
-      if (Number(updated) !== messageCount) {
+      const updated = await tx.aiMessage.updateMany({ where, data: { historyId: history.id } });
+      if (updated.count !== stats._count._all) {
         throw new Error('active messages changed during archive');
       }
       return history.id;
     });
-    this.activeHistoryIds.delete(sessionId);
-    return archived;
   }
 
   async close(): Promise<void> {
-    this.activeHistoryIds.clear();
     await this.prisma?.$disconnect?.();
   }
 }
