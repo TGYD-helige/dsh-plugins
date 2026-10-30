@@ -255,7 +255,6 @@ describe('dsh-storage plugin', () => {
       session,
       assistantEvent('first', { inputTokens: 100, outputTokens: 0 }, 'a1'),
     );
-    await ctx.events.parallel('session/flush', session);
 
     const service = ctx.get('dshStorage') as { archiveSession(id: string): Promise<string | null> };
     backend.archiveSession.mockRejectedValueOnce(new Error('archive interrupted'));
@@ -269,6 +268,42 @@ describe('dsh-storage plugin', () => {
 
     expect(backend.upsertSession.mock.calls.at(-1)?.[0]).toMatchObject({
       totalTokens: 110,
+      metadata: { 'dsh-storage:token-baseline': 100 },
+    });
+  });
+
+  it('preserves the first baseline across consecutive archive failures', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const session = { id: 's1' };
+    ctx.events.emit(
+      'session/event',
+      session,
+      assistantEvent('first', { inputTokens: 100, outputTokens: 0 }, 'a1'),
+    );
+    await ctx.events.parallel('session/flush', session);
+
+    const service = ctx.get('dshStorage') as { archiveSession(id: string): Promise<string | null> };
+    backend.archiveSession
+      .mockRejectedValueOnce(new Error('first archive failure'))
+      .mockRejectedValueOnce(new Error('second archive failure'));
+    await expect(service.archiveSession('s1')).rejects.toThrow('first archive failure');
+    ctx.events.emit(
+      'session/event',
+      session,
+      assistantEvent('second', { inputTokens: 10, outputTokens: 0 }, 'a2'),
+    );
+    await ctx.events.parallel('session/flush', session);
+    await expect(service.archiveSession('s1')).rejects.toThrow('second archive failure');
+    ctx.events.emit(
+      'session/event',
+      session,
+      assistantEvent('third', { inputTokens: 5, outputTokens: 0 }, 'a3'),
+    );
+    await ctx.events.parallel('session/flush', session);
+
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0]).toMatchObject({
+      totalTokens: 115,
       metadata: { 'dsh-storage:token-baseline': 100 },
     });
   });

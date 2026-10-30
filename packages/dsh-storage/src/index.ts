@@ -276,16 +276,17 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     archiveSession(sessionId: string): Promise<string | null> {
       // Join the same per-session chain as event writes, then discard the old
       // in-memory rollup only after the database transaction commits.
-      const accum = sessions.get(sessionId);
-      if (accum && !accum.metadata[ARCHIVE_IN_PROGRESS]) {
-        // Freeze the live cumulative total at archive start. A later active
-        // rollup then represents only the delta after this point, not the
-        // entire pre-archive total again.
-        accum.metadata[TOKEN_BASELINE_KEY] = accum.totalTokens;
-      }
       const archived = (chains.get(sessionId) ?? Promise.resolve())
         .then(() => ensureStarted())
         .then(async () => {
+          const accum = sessions.get(sessionId);
+          if (accum && !accum.metadata[ARCHIVE_IN_PROGRESS]) {
+            // Freeze inside the session queue: all earlier events have now
+            // committed, and this first baseline survives every retry until
+            // the archive actually succeeds.
+            accum.metadata[TOKEN_BASELINE_KEY] = accum.totalTokens;
+            accum.metadata[ARCHIVE_IN_PROGRESS] = true;
+          }
           const id = await backends[0].archiveSession(sessionId);
           sessions.delete(sessionId);
           toolCallMessages.delete(sessionId);

@@ -519,7 +519,8 @@ async function backendOnlyLeg(dbProvider) {
     let archiveWrites = 0;
     client.aiMessage.updateMany = async (...args) => {
       archiveWrites += 1;
-      if (archiveWrites === 2) throw new Error('injected second archive batch failure');
+      if (archiveWrites === 2 || archiveWrites === 3)
+        throw new Error('injected consecutive archive batch failure');
       return originalUpdateMany(...args);
     };
     let failed = false;
@@ -527,8 +528,6 @@ async function backendOnlyLeg(dbProvider) {
       await backend.archiveSession('r1');
     } catch {
       failed = true;
-    } finally {
-      client.aiMessage.updateMany = originalUpdateMany;
     }
     assert(failed, 'archive failure injection did not run');
 
@@ -549,6 +548,32 @@ async function backendOnlyLeg(dbProvider) {
         metadata: { custom: 'keep-me', 'dsh-storage:token-baseline': 100 },
       },
     );
+    let failedAgain = false;
+    try {
+      await backend.archiveSession('r1');
+    } catch {
+      failedAgain = true;
+    } finally {
+      client.aiMessage.updateMany = originalUpdateMany;
+    }
+    assert(failedAgain, 'consecutive archive failure injection did not run');
+    await backend.upsertEvent(
+      {
+        id: 'retry-second-event',
+        sessionId: 'r1',
+        historyId: null,
+        type: 'user',
+        content: 'created after the second archive failure',
+        createdAt: new Date(1700000002500),
+      },
+      {
+        sessionId: 'r1',
+        title: 'Recovered title',
+        messageCount: 100,
+        totalTokens: 115,
+        metadata: { custom: 'keep-me', 'dsh-storage:token-baseline': 100 },
+      },
+    );
     const marked = (await prisma.aiChatHistory.findMany({ where: { sessionId: 'r1' } })).find(
       (row) => {
         const metadata = typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata;
@@ -561,13 +586,13 @@ async function backendOnlyLeg(dbProvider) {
     assert(recoveredId === marked.id, 'archive recovery switched to the newer active rollup');
     const recoveredHistory = await prisma.aiChatHistory.findFirst({ where: { id: recoveredId } });
     assert(
-      recoveredHistory.totalTokens === 110n,
+      recoveredHistory.totalTokens === 115n,
       `archive recovery lost the active token total: ${recoveredHistory.totalTokens}`,
     );
     const recoveredCount = await prisma.aiMessage.count({ where: { historyId: recoveredId } });
     assert(
-      recoveredCount === 106,
-      `recovered history has ${recoveredCount} messages instead of 106`,
+      recoveredCount === 107,
+      `recovered history has ${recoveredCount} messages instead of 107`,
     );
 
     await backend.upsertEvent(
