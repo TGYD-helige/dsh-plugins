@@ -502,6 +502,86 @@ async function backendOnlyLeg(dbProvider) {
     assert(!archiveMetadata?.['dsh-storage:archive-in-progress'], 'archive marker was not cleared');
   }
 
+  if (dbProvider === 'sqlite') {
+    // A successful first batch followed by a new event must resume the same history.
+    for (let index = 0; index < 105; index++) {
+      await backend.upsertMessage({
+        id: `retry-${index}`,
+        sessionId: 'r1',
+        historyId: null,
+        type: 'model',
+        content: '',
+        createdAt: new Date(1700000000000 + index),
+      });
+    }
+    const client = backend.prisma;
+    const originalUpdateMany = client.aiMessage.updateMany;
+    let archiveWrites = 0;
+    client.aiMessage.updateMany = async (...args) => {
+      archiveWrites += 1;
+      if (archiveWrites === 2) throw new Error('injected second archive batch failure');
+      return originalUpdateMany(...args);
+    };
+    let failed = false;
+    try {
+      await backend.archiveSession('r1');
+    } catch {
+      failed = true;
+    } finally {
+      client.aiMessage.updateMany = originalUpdateMany;
+    }
+    assert(failed, 'archive failure injection did not run');
+
+    await backend.upsertEvent(
+      {
+        id: 'retry-new-event',
+        sessionId: 'r1',
+        historyId: null,
+        type: 'user',
+        content: 'created during archive recovery',
+        createdAt: new Date(1700000002000),
+      },
+      {
+        sessionId: 'r1',
+        title: 'Recovered title',
+        messageCount: 99,
+        totalTokens: 999,
+        metadata: { custom: 'keep-me' },
+      },
+    );
+    const marked = (await prisma.aiChatHistory.findMany({ where: { sessionId: 'r1' } })).find(
+      (row) => {
+        const metadata = typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata;
+        return metadata?.['dsh-storage:archive-in-progress'];
+      },
+    );
+    assert(marked, 'interrupted history was not marked');
+    const recoveredId = await backend.archiveSession('r1');
+    assert(recoveredId === marked.id, 'archive recovery switched to the newer active rollup');
+    const recoveredCount = await prisma.aiMessage.count({ where: { historyId: recoveredId } });
+    assert(
+      recoveredCount === 106,
+      `recovered history has ${recoveredCount} messages instead of 106`,
+    );
+
+    await backend.upsertEvent(
+      {
+        id: 'retry-next-event',
+        sessionId: 'r1',
+        historyId: null,
+        type: 'user',
+        content: 'first event after recovery',
+        createdAt: new Date(1700000003000),
+      },
+      { sessionId: 'r1', messageCount: 1, totalTokens: 7 },
+    );
+    const nextActive = await backend.readSession('r1');
+    assert(nextActive?.messageCount === 1, 'next event inherited the old active message count');
+    assert(nextActive.totalTokens === 7, 'next event inherited the old active token count');
+    assert(nextActive.title === 'Recovered title', 'active title was not preserved');
+    assert(nextActive.metadata?.custom === 'keep-me', 'active metadata was not preserved');
+  }
+
   await prisma.$disconnect();
   await backend.close();
 

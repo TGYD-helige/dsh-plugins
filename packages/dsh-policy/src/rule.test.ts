@@ -162,6 +162,17 @@ describe('evaluate', () => {
     expect(run(rules, 'bash', bash('cat <<EOF >> `id`\nbody\nEOF'))?.decision).toBe('deny');
   });
 
+  it('honors shell quotes in redirection targets without changing here-doc body expansion', () => {
+    const rules: PolicyRuleConfig[] = [{ tool: 'bash', decision: 'deny', commandPrefix: 'id' }];
+    expect(run(rules, 'bash', bash("cat <<EOF > '$(id)'\nbody\nEOF"))).toBeUndefined();
+    expect(run(rules, 'bash', bash('cat <<EOF > $(id)\nbody\nEOF'))?.decision).toBe('deny');
+    expect(run(rules, 'bash', bash('cat <<EOF > "$(id)"\nbody\nEOF'))?.decision).toBe('deny');
+    // Quotes in an unquoted here-doc body are literal and do not suppress expansion.
+    expect(run(rules, 'bash', bash("cat <<EOF > /tmp/out\necho '$(id)'\nEOF"))?.decision).toBe(
+      'deny',
+    );
+  });
+
   it('does not swallow commands after a Bash here-string as here-doc data', () => {
     expect(
       run(

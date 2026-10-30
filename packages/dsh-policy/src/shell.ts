@@ -151,22 +151,41 @@ function readHereDoc(text: string, start: number) {
   }
 }
 
-/** Here-doc lines are data; only command substitutions in an unquoted body execute. */
-function hereDocCommands(body: string): string[] {
+/** Extract real substitutions; shell command-line tails optionally honor single/double quotes. */
+function hereDocCommands(body: string, respectQuotes = false): string[] {
   const commands: string[] = [];
+  let quote: string | undefined;
   let i = 0;
   while (i < body.length) {
-    if (body[i] === '\\' && i + 1 < body.length) {
+    const ch = body[i];
+    if (respectQuotes && quote === "'") {
+      if (ch === "'") quote = undefined;
+      i += 1;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < body.length) {
       i += 2;
       continue;
     }
-    if (body[i] === '$' && body[i + 1] === '(') {
+    if (respectQuotes) {
+      if (ch === quote) {
+        quote = undefined;
+        i += 1;
+        continue;
+      }
+      if (quote === undefined && (ch === "'" || ch === '"')) {
+        quote = ch;
+        i += 1;
+        continue;
+      }
+    }
+    if (ch === '$' && body[i + 1] === '(') {
       const { body: inner, end } = readParenSubshell(body, i + 2);
       commands.push(...splitSegments(inner));
       i = end;
       continue;
     }
-    if (body[i] === '`') {
+    if (ch === '`') {
       let close = i + 1;
       while (close < body.length && body[close] !== '`') {
         close += body[close] === '\\' ? 2 : 1;
@@ -210,7 +229,9 @@ export function splitSegments(command: string, dialect: ShellDialect = 'bash'): 
         push();
         if (!doc.quoted) segments.push(...hereDocCommands(doc.body));
         segments.push(
-          ...(doc.outputRedirect ? hereDocCommands(doc.tail) : splitSegments(doc.tail, dialect)),
+          ...(doc.outputRedirect
+            ? hereDocCommands(doc.tail, true)
+            : splitSegments(doc.tail, dialect)),
         );
         i = doc.end;
         continue;

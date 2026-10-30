@@ -475,6 +475,12 @@ export class DatabaseBackend implements StorageBackend {
           metadata: this.jsonField(metadata),
         },
       });
+      // A recovery may have created a second active rollup during the failed
+      // batches. Do not let its pre-archive counts seed the next live segment.
+      await tx.aiChatHistory.updateMany({
+        where: { sessionId, id: { not: historyId }, deletedAt: null, messages: { none: {} } },
+        data: { messageCount: 0, totalTokens: 0n, firstMessageAt: null, lastMessageAt: null },
+      });
     });
     return historyId;
   }
