@@ -38,6 +38,7 @@ function pk(value: string): string {
 }
 
 const ARCHIVE_IN_PROGRESS = 'dsh-storage:archive-in-progress';
+const TOKEN_BASELINE_KEY = 'dsh-storage:token-baseline';
 
 function metadataOf(value: unknown): Record<string, unknown> {
   const parsed = typeof value === 'string' ? JSON.parse(value) : value;
@@ -467,13 +468,21 @@ export class DatabaseBackend implements StorageBackend {
       const latestActive = await tx.aiChatHistory.findFirst({
         where: { sessionId, id: { not: historyId }, deletedAt: null, messages: { none: {} } },
         orderBy: { lastMessageAt: 'desc' },
-        select: { totalTokens: true },
+        select: { totalTokens: true, metadata: true },
       });
       const currentTokens = current?.totalTokens ?? 0n;
-      const totalTokens =
-        latestActive && latestActive.totalTokens > currentTokens
-          ? latestActive.totalTokens
-          : currentTokens;
+      const baselineValue = metadataOf(latestActive?.metadata)[TOKEN_BASELINE_KEY];
+      const baseline = Number(baselineValue);
+      let totalTokens = currentTokens;
+      if (latestActive && Number.isSafeInteger(baseline) && baseline >= 0) {
+        // The baseline records the active rollup's seed total. Everything
+        // after it belongs to this archive, including restart-only deltas.
+        const delta = latestActive.totalTokens - BigInt(baseline);
+        if (delta > 0n) totalTokens += delta;
+      } else if (latestActive && latestActive.totalTokens > currentTokens) {
+        // Legacy rows without a baseline keep the cumulative compatibility path.
+        totalTokens = latestActive.totalTokens;
+      }
       const metadata = { ...metadataOf(current?.metadata) };
       delete metadata[ARCHIVE_IN_PROGRESS];
       await tx.aiChatHistory.update({

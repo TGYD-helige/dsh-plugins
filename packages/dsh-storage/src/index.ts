@@ -74,6 +74,7 @@ interface SessionAccum {
 
 /** Metadata key for our usage bookkeeping — namespaced so other writers' fields never collide with it. */
 const LAST_USAGE_KEY = 'dsh-storage:lastUsage';
+const TOKEN_BASELINE_KEY = 'dsh-storage:token-baseline';
 
 /** Shape-guarded restore of our usage sample from arbitrary metadata. */
 function usageSampleOfMetadata(value: unknown): SessionAccum['usageSample'] {
@@ -245,7 +246,9 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
             firstMessageAt: row.firstMessageAt ?? undefined,
             lastMessageAt: row.lastMessageAt ?? undefined,
             // Preserve every existing metadata field; we only own our key.
-            metadata: { ...(row.metadata ?? {}) },
+            // The baseline distinguishes cumulative active totals from a
+            // restart's fresh-segment deltas during archive recovery.
+            metadata: { [TOKEN_BASELINE_KEY]: row.totalTokens, ...(row.metadata ?? {}) },
             usageSample: usageSampleOfMetadata(row.metadata?.[LAST_USAGE_KEY]),
           };
         }
@@ -255,7 +258,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
       }
     }
     if (readFailure) throw readFailure;
-    return { messageCount: 0, totalTokens: 0, metadata: {} };
+    return { messageCount: 0, totalTokens: 0, metadata: { [TOKEN_BASELINE_KEY]: 0 } };
   }
 
   ctx.effect(() => {

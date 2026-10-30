@@ -545,8 +545,8 @@ async function backendOnlyLeg(dbProvider) {
         sessionId: 'r1',
         title: 'Recovered title',
         messageCount: 99,
-        totalTokens: 110,
-        metadata: { custom: 'keep-me' },
+        totalTokens: 10,
+        metadata: { custom: 'keep-me', 'dsh-storage:token-baseline': 0 },
       },
     );
     const marked = (await prisma.aiChatHistory.findMany({ where: { sessionId: 'r1' } })).find(

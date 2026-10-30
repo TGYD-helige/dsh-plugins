@@ -701,7 +701,10 @@ describe('DatabaseBackend', () => {
         id: 'history-1',
         metadata: { 'dsh-storage:archive-in-progress': true },
       })
-      .mockResolvedValueOnce({ metadata: { 'dsh-storage:archive-in-progress': true } })
+      .mockResolvedValueOnce({
+        metadata: { 'dsh-storage:archive-in-progress': true },
+        totalTokens: 100n,
+      })
       .mockResolvedValueOnce(newerActive)
       .mockResolvedValueOnce(newerActive);
     const recovered = { id: 'history-1', totalTokens: 100n };
@@ -747,6 +750,73 @@ describe('DatabaseBackend', () => {
         messages: { none: {} },
       },
       data: { messageCount: 0, totalTokens: 0n, firstMessageAt: null, lastMessageAt: null },
+    });
+  });
+
+  it('adds restart-only token deltas to the interrupted history', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const first = new Date(1700000000000);
+    const last = new Date(1700000001000);
+    const newerActive = {
+      id: 'restart-active',
+      sessionId: 's1',
+      title: 'Restarted session',
+      messageCount: 1,
+      totalTokens: 10n,
+      firstMessageAt: first,
+      lastMessageAt: last,
+      metadata: { 'dsh-storage:token-baseline': 0 },
+    };
+    prisma.aiMessage.aggregate
+      .mockResolvedValueOnce({ _count: { _all: 150 }, _min: first, _max: last })
+      .mockResolvedValueOnce({ _count: { _all: 50 }, _min: first, _max: last })
+      .mockResolvedValueOnce({ _count: { _all: 150 }, _min: first, _max: last });
+    prisma.aiChatHistory.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'history-1',
+        metadata: { 'dsh-storage:archive-in-progress': true },
+      })
+      .mockResolvedValueOnce({
+        metadata: { 'dsh-storage:archive-in-progress': true },
+        totalTokens: 100n,
+      })
+      .mockResolvedValueOnce(newerActive)
+      .mockResolvedValueOnce(newerActive);
+    const recovered = { id: 'history-1', totalTokens: 100n };
+    prisma.aiChatHistory.create.mockResolvedValueOnce(recovered);
+    prisma.aiChatHistory.update.mockImplementation(async ({ data }: any) => {
+      if (data.totalTokens !== undefined) recovered.totalTokens = data.totalTokens;
+      return recovered;
+    });
+    prisma.aiChatHistory.updateMany.mockImplementation(async ({ data }: any) => {
+      Object.assign(newerActive, data);
+      return { count: 1 };
+    });
+    prisma.aiMessage.findFirst
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({ historyId: 'history-1' });
+    prisma.aiMessage.findMany
+      .mockResolvedValueOnce(Array.from({ length: 150 }, (_, i) => ({ id: `first-${i}` })))
+      .mockResolvedValueOnce(Array.from({ length: 50 }, (_, i) => ({ id: `second-${i}` })))
+      .mockResolvedValueOnce(Array.from({ length: 50 }, (_, i) => ({ id: `third-${i}` })));
+    prisma.aiMessage.updateMany
+      .mockResolvedValueOnce({ count: 100 })
+      .mockRejectedValueOnce(new Error('second batch failed'))
+      .mockResolvedValueOnce({ count: 50 });
+
+    await expect(backend.archiveSession('s1')).rejects.toThrow('second batch failed');
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-1');
+    expect(recovered.totalTokens).toBe(110n);
+    const resumed = await backend.readSession('s1');
+    expect(resumed).toMatchObject({
+      title: 'Restarted session',
+      messageCount: 0,
+      totalTokens: 0,
+      firstMessageAt: null,
+      lastMessageAt: null,
+      metadata: { 'dsh-storage:token-baseline': 0 },
     });
   });
 
