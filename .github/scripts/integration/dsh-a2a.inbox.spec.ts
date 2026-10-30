@@ -593,7 +593,7 @@ it('persists completion when a legacy streaming send disconnects', async () => {
 
 it('rediscovers late inbox traces and filters admissions through the Langfuse read-back API', async () => {
   const queries: URLSearchParams[] = [];
-  const maxRangeMs = 15 * 60 * 1000;
+  const maxRangeMs = 5 * 60 * 1000;
   let discovered = false;
   const server = createServer((request, response) => {
     const query = new URL(request.url!, 'http://localhost').searchParams;
