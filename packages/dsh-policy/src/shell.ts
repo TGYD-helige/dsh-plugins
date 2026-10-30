@@ -118,7 +118,7 @@ function readHereDoc(text: string, start: number) {
   const declaration = text
     .slice(start, outputRedirect ? declarationEnd : tailStart)
     .replace(/\r$/, '');
-  const tail = outputRedirect ? '' : rawTail;
+  const tail = rawTail;
   const bodyStart = declarationEnd + 1;
   let lineStart = bodyStart;
   for (;;) {
@@ -131,13 +131,21 @@ function readHereDoc(text: string, start: number) {
       return {
         declaration,
         tail,
+        outputRedirect,
         body: text.slice(bodyStart, lineStart),
         quoted,
         end: newline === -1 ? text.length : lineEnd + 1,
       };
     }
     if (newline === -1) {
-      return { declaration, tail, body: text.slice(bodyStart), quoted, end: text.length };
+      return {
+        declaration,
+        tail,
+        outputRedirect,
+        body: text.slice(bodyStart),
+        quoted,
+        end: text.length,
+      };
     }
     lineStart = lineEnd + 1;
   }
@@ -201,7 +209,9 @@ export function splitSegments(command: string, dialect: ShellDialect = 'bash'): 
         buf += doc.declaration;
         push();
         if (!doc.quoted) segments.push(...hereDocCommands(doc.body));
-        segments.push(...splitSegments(doc.tail, dialect));
+        segments.push(
+          ...(doc.outputRedirect ? hereDocCommands(doc.tail) : splitSegments(doc.tail, dialect)),
+        );
         i = doc.end;
         continue;
       }

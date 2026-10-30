@@ -100,3 +100,26 @@ test('integration scenarios use the dsh version pinned by the workspace', () => 
     'local hook scenarios must default to the tested dsh version',
   );
 });
+
+test('http provider skips service startup but still runs its HTTP integration', () => {
+  const backends = workflow.match(
+    /^ {2}scenario-backends:\n[\s\S]*?(?=^ {2}[\w-]+:|$(?![\s\S]))/m,
+  )?.[0];
+  assert.ok(backends, 'scenario-backends job must exist');
+  const startup = backends.match(
+    / {6}- name: Start service database \([\s\S]*?(?= {6}- name: Stage B)/,
+  )?.[0];
+  assert.ok(startup, 'service startup step must exist');
+  assert.match(startup, /if: matrix\.provider != 'http'/);
+  for (const provider of ['sqlite', 'mysql', 'postgresql', 'sqlserver', 'redis']) {
+    assert.match(startup, new RegExp(`^ {12}${provider}\\)`, 'm'));
+  }
+
+  const stage = backends.match(/ {6}- name: Stage B — run scenario\n(?: {8}.*\n)+/)?.[0];
+  assert.ok(stage, 'HTTP integration must retain its Stage B step');
+  assert.doesNotMatch(stage, /if:/);
+  assert.match(
+    stage,
+    /run: node "\.github\/scripts\/integration\/\$\{\{ matrix\.package \}\}\.mjs"/,
+  );
+});

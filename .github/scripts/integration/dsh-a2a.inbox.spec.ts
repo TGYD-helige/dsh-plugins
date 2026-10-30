@@ -593,16 +593,44 @@ it('persists completion when a legacy streaming send disconnects', async () => {
 
 it('rediscovers late inbox traces and filters admissions through the Langfuse read-back API', async () => {
   const queries: URLSearchParams[] = [];
+  const maxRangeMs = 15 * 60 * 1000;
   let discovered = false;
   const server = createServer((request, response) => {
     const query = new URL(request.url!, 'http://localhost').searchParams;
     queries.push(query);
-    const name = query.get('name') ?? 'llm-call';
+    const from = Date.parse(query.get('fromStartTime') ?? '');
+    const to = Date.parse(query.get('toStartTime') ?? '');
+    const name = query.get('name');
+    if (
+      !Number.isFinite(from) ||
+      !Number.isFinite(to) ||
+      to <= from ||
+      to - from > maxRangeMs ||
+      to > Date.now() ||
+      query.get('limit') !== '50' ||
+      (name?.startsWith('inbox:') && query.get('type') !== 'SPAN')
+    ) {
+      response.writeHead(422, { 'content-type': 'application/json' }).end(
+        JSON.stringify({
+          message:
+            'Your query could not be completed. Please narrow your request by adding more specific filters (e.g., a shorter date range).',
+        }),
+      );
+      return;
+    }
+    const observationName = name ?? 'llm-call';
     const traceId = query.get('traceId') ?? (discovered ? 'trace' : 'later-turn');
     if (!query.has('traceId')) discovered = true;
     response.writeHead(200, { 'content-type': 'application/json' }).end(
       JSON.stringify({
-        data: [{ id: 'observation', traceId, name, metadata: { messageId: 'inbox-api-marker' } }],
+        data: [
+          {
+            id: 'observation',
+            traceId,
+            name: observationName,
+            metadata: { messageId: 'inbox-api-marker' },
+          },
+        ],
         meta: { totalPages: 1 },
       }),
     );
@@ -635,7 +663,16 @@ it('rediscovers late inbox traces and filters admissions through the Langfuse re
   expect(queries[0].get('model')).toBe('mock');
   expect(queries[0].get('type')).toBe('GENERATION');
   expect(queries.filter((query) => query.get('model') === 'mock')).toHaveLength(2);
-  expect(queries.find((query) => query.get('name') === 'inbox:admitted')?.has('model')).toBe(false);
+  const admission = queries.find((query) => query.get('name') === 'inbox:admitted');
+  expect(admission?.has('model')).toBe(false);
+  expect(admission?.get('type')).toBe('SPAN');
+  for (const query of queries) {
+    const from = Date.parse(query.get('fromStartTime')!);
+    const to = Date.parse(query.get('toStartTime')!);
+    expect(to - from).toBeLessThanOrEqual(maxRangeMs);
+    expect(to).toBeLessThanOrEqual(Date.now());
+    expect(query.get('limit')).toBe('50');
+  }
 }, 25_000);
 
 it('drains parked official inbox input on a real waking send in FIFO order', async () => {

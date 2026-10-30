@@ -351,6 +351,7 @@ describe('native A2A inbox', () => {
 
     const restored = harness(structuredClone(f.log), f.store, true);
     await restored.start();
+    await restored.native.resolve('context');
     const taskId = await restored.native.resume('context', 'task-one');
     await restored.agent.whenIdle();
     expect(taskId).not.toBe('task-one');

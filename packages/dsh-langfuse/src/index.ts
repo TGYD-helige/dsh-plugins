@@ -382,6 +382,7 @@ function boundMaskedPayload<T>(
     if (Array.isArray(value)) {
       append('[');
       for (const [index, item] of value.entries()) {
+        if (overflow) break;
         if (index > 0) append(',');
         if (item === undefined) append('null');
         else write(item);
@@ -390,7 +391,10 @@ function boundMaskedPayload<T>(
     } else {
       append('{');
       let first = true;
-      for (const [key, child] of Object.entries(value)) {
+      for (const key in value) {
+        if (overflow) break;
+        if (!Object.hasOwn(value, key)) continue;
+        const child = (value as Record<string, unknown>)[key];
         if (child === undefined && !reporter.shouldRedactField(key)) continue;
         if (!first) append(',');
         first = false;

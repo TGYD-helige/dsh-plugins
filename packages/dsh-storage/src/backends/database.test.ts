@@ -598,7 +598,10 @@ describe('DatabaseBackend', () => {
       .mockResolvedValueOnce({ _count: { _all: 50 }, _min: first, _max: last });
     prisma.aiChatHistory.findFirst
       .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'history-2',
+        metadata: { 'dsh-storage:archive-in-progress': true },
+      })
       .mockResolvedValueOnce({ metadata: { 'dsh-storage:archive-in-progress': true } })
       .mockResolvedValueOnce({ metadata: { 'dsh-storage:archive-in-progress': true } });
     prisma.aiChatHistory.create
@@ -621,6 +624,46 @@ describe('DatabaseBackend', () => {
     expect(prisma.aiMessage.updateMany).toHaveBeenCalledTimes(2);
   });
 
+  it('resumes the interrupted history before a newer active rollup', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const first = new Date(1700000000000);
+    const last = new Date(1700000001000);
+    prisma.aiMessage.aggregate
+      .mockResolvedValueOnce({ _count: { _all: 150 }, _min: first, _max: last })
+      .mockResolvedValueOnce({ _count: { _all: 50 }, _min: first, _max: last })
+      .mockResolvedValueOnce({ _count: { _all: 150 }, _min: first, _max: last });
+    prisma.aiChatHistory.findFirst.mockImplementation(({ where }: any) =>
+      where.id === 'history-1'
+        ? { id: 'history-1', metadata: { 'dsh-storage:archive-in-progress': true } }
+        : null,
+    );
+    prisma.aiChatHistory.create
+      .mockResolvedValueOnce({ id: 'history-1' })
+      .mockResolvedValueOnce({ id: 'history-2' });
+    prisma.aiChatHistory.update.mockResolvedValue({ id: 'history-1' });
+    prisma.aiMessage.findFirst
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({ historyId: 'history-1' });
+    prisma.aiMessage.findMany
+      .mockResolvedValueOnce(Array.from({ length: 150 }, (_, i) => ({ id: `first-${i}` })))
+      .mockResolvedValueOnce(Array.from({ length: 50 }, (_, i) => ({ id: `second-${i}` })))
+      .mockResolvedValueOnce(Array.from({ length: 50 }, (_, i) => ({ id: `third-${i}` })));
+    prisma.aiMessage.updateMany
+      .mockResolvedValueOnce({ count: 100 })
+      .mockRejectedValueOnce(new Error('second batch failed'))
+      .mockResolvedValueOnce({ count: 50 });
+
+    await expect(backend.archiveSession('s1')).rejects.toThrow('second batch failed');
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-1');
+    expect(prisma.aiChatHistory.create).toHaveBeenCalledTimes(1);
+    expect(prisma.aiMessage.updateMany.mock.calls.map((call: any) => call[0].data)).toEqual([
+      { historyId: 'history-1' },
+      { historyId: 'history-1' },
+      { historyId: 'history-1' },
+    ]);
+  });
+
   it('creates a new history instead of merging into a completed archive', async () => {
     await backend.init();
     const prisma = prismaMock.instances[0];
@@ -632,8 +675,8 @@ describe('DatabaseBackend', () => {
       _max: { createdAt: last },
     });
     prisma.aiChatHistory.findFirst
-      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({ id: 'history-old', metadata: {} })
+      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({ metadata: { 'dsh-storage:archive-in-progress': true } });
     prisma.aiChatHistory.create.mockResolvedValue({ id: 'history-new' });
     prisma.aiMessage.findFirst.mockResolvedValue({ historyId: 'history-old' });
@@ -673,15 +716,14 @@ describe('DatabaseBackend', () => {
         _min: { createdAt: first },
         _max: { createdAt: last },
       });
-    prisma.aiChatHistory.findFirst
-      .mockResolvedValueOnce({ id: 'history-1', metadata: {} })
-      .mockResolvedValueOnce({ metadata: { 'dsh-storage:archive-in-progress': true } })
-      .mockResolvedValueOnce({ metadata: { 'dsh-storage:archive-in-progress': true } })
-      .mockResolvedValueOnce({ metadata: { 'dsh-storage:archive-in-progress': true } });
+    prisma.aiChatHistory.findFirst.mockImplementation(({ where }: any) =>
+      where.id === 'history-1'
+        ? { id: 'history-1', metadata: { 'dsh-storage:archive-in-progress': true } }
+        : { id: 'history-1', metadata: {} },
+    );
     prisma.aiChatHistory.update
-      .mockResolvedValueOnce({ id: 'history-1' })
       .mockRejectedValueOnce(new Error('final update failed'))
-      .mockResolvedValueOnce({ id: 'history-1' });
+      .mockResolvedValue({ id: 'history-1' });
     prisma.aiMessage.findFirst.mockResolvedValue({ historyId: 'history-1' });
     prisma.aiMessage.findMany.mockResolvedValue([{ id: 'a1' }, { id: 'a2' }]);
     prisma.aiMessage.updateMany.mockResolvedValue({ count: 2 });

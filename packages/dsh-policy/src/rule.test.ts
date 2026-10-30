@@ -156,6 +156,12 @@ describe('evaluate', () => {
     ).toBe('deny');
   });
 
+  it('checks command substitutions in here-doc output redirection targets', () => {
+    const rules: PolicyRuleConfig[] = [{ tool: 'bash', decision: 'deny', commandPrefix: 'id' }];
+    expect(run(rules, 'bash', bash('cat <<EOF > $(id)\nbody\nEOF'))?.decision).toBe('deny');
+    expect(run(rules, 'bash', bash('cat <<EOF >> `id`\nbody\nEOF'))?.decision).toBe('deny');
+  });
+
   it('does not swallow commands after a Bash here-string as here-doc data', () => {
     expect(
       run(

@@ -379,24 +379,23 @@ export class DatabaseBackend implements StorageBackend {
         _max: { createdAt: true },
       });
       const expected = stats._count._all as number;
-      if (expected === 0) {
-        // All batches may have succeeded before a finalization failure. Resume
-        // that marked history instead of skipping the final aggregate/cleanup.
-        const interrupted = await tx.aiMessage.findFirst({
-          where: { sessionId, historyId: { not: null }, deletedAt: null },
-          orderBy: { updatedAt: 'desc' },
-          select: { historyId: true },
+      // A previous batch may have attached messages already. Resume that marked
+      // history before considering a newer active rollup or an empty finalization.
+      const interrupted = await tx.aiMessage.findFirst({
+        where: { sessionId, historyId: { not: null }, deletedAt: null },
+        orderBy: { updatedAt: 'desc' },
+        select: { historyId: true },
+      });
+      if (interrupted?.historyId) {
+        const candidate = await tx.aiChatHistory.findFirst({
+          where: { id: interrupted.historyId },
+          select: { metadata: true },
         });
-        if (interrupted?.historyId) {
-          const candidate = await tx.aiChatHistory.findFirst({
-            where: { id: interrupted.historyId },
-            select: { metadata: true },
-          });
-          if (metadataOf(candidate?.metadata)[ARCHIVE_IN_PROGRESS] === true)
-            return { expected, historyId: interrupted.historyId };
-        }
-        return { expected, historyId: null };
+        if (metadataOf(candidate?.metadata)[ARCHIVE_IN_PROGRESS] === true)
+          return { expected, historyId: interrupted.historyId };
       }
+      if (expected === 0) return { expected, historyId: null };
+
       const rollup = {
         messageCount: expected,
         firstMessageAt: stats._min.createdAt,
@@ -422,21 +421,6 @@ export class DatabaseBackend implements StorageBackend {
         return { expected, historyId: active.id };
       }
 
-      // A previous batch may have attached messages already. Continue that
-      // history instead of creating a duplicate after a transient failure.
-      const interrupted = await tx.aiMessage.findFirst({
-        where: { sessionId, historyId: { not: null }, deletedAt: null },
-        orderBy: { updatedAt: 'desc' },
-        select: { historyId: true },
-      });
-      if (interrupted?.historyId) {
-        const candidate = await tx.aiChatHistory.findFirst({
-          where: { id: interrupted.historyId },
-          select: { metadata: true },
-        });
-        if (metadataOf(candidate?.metadata)[ARCHIVE_IN_PROGRESS] === true)
-          return { expected, historyId: interrupted.historyId };
-      }
       const history = await tx.aiChatHistory.create({
         data: {
           sessionId,

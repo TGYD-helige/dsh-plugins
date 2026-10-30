@@ -2961,6 +2961,38 @@ describe('dsh-langfuse plugin', () => {
       }
     });
 
+    it('stops object traversal and masking after the payload budget is exhausted', async () => {
+      const secret = 'stop-private-value';
+      const fields = Object.fromEntries([
+        ['password', `${secret}${'x'.repeat(1000)}`],
+        ...Array.from({ length: 5000 }, (_, index) => [`field${index}`, 'value']),
+      ]);
+      const options = optionsOf({ futurePayload: fields } as Partial<GenerateOptions>);
+      const chunks = [textDelta('visible'), finishStop()];
+      const entriesSpy = vi.spyOn(Object, 'entries');
+      const maskSpy = vi.spyOn(LangfuseReporter.prototype, 'mask');
+      const fieldSpy = vi.spyOn(LangfuseReporter.prototype, 'shouldRedactField');
+      try {
+        await setup({ ...enabledConfig, maxPayloadBytes: 128, redactFields: ['password'] });
+        const received = await drain(
+          ctx.waterfall('llm/stream', options, () => streamOf(...chunks)),
+        );
+
+        expect(received).toEqual(chunks);
+        expect(entriesSpy.mock.calls.filter(([value]) => value === fields)).toHaveLength(0);
+        expect(maskSpy.mock.calls.length).toBeLessThan(100);
+        expect(fieldSpy.mock.calls.length).toBeLessThan(100);
+        const generation = fakeObs(mocks.roots[0]).generations[0];
+        expect(JSON.stringify(generation.body.input)).not.toContain(secret);
+        expect(Buffer.byteLength(JSON.stringify(generation.body.input))).toBeLessThanOrEqual(128);
+        expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
+      } finally {
+        entriesSpy.mockRestore();
+        maskSpy.mockRestore();
+        fieldSpy.mockRestore();
+      }
+    });
+
     it('redacts structured request fields before truncating previews without changing the stream', async () => {
       const secret = 'request-private-value';
       const requestJson = JSON.stringify({ password: secret, padding: 'p'.repeat(400) });

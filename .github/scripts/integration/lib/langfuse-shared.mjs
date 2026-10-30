@@ -58,6 +58,8 @@ const VERIFY_DEADLINE_MS = 5 * 60 * 1000;
 const POLL_INTERVAL_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_PAGES = 20;
+const MAX_QUERY_RANGE_MS = 15 * 60 * 1000;
+const QUERY_PAGE_LIMIT = '50';
 const EXPECTED_MODEL = integrationModel();
 const HOOK_CONTEXT = 'ci-hook-context-verification';
 const HOOK_RESULT = 'hook-script-result: marker-verified';
@@ -461,6 +463,22 @@ export async function runVerification({
   const origin = baseUrl.replace(/\/+$/, '');
   const deadline = Date.now() + VERIFY_DEADLINE_MS;
   const auth = `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString('base64')}`;
+  // Full observation IO is expensive. Keep every discovery/read-back request
+  // inside one short, non-future window even if a caller supplied a wide range.
+  function timeRange() {
+    const now = Date.now();
+    const requestedTo = Date.parse(toStartTime);
+    const boundedTo = Number.isFinite(requestedTo) ? Math.min(requestedTo, now) : now;
+    const requestedFrom = Date.parse(fromStartTime);
+    const boundedFrom = Math.max(
+      Number.isFinite(requestedFrom) ? requestedFrom : boundedTo - MAX_QUERY_RANGE_MS,
+      boundedTo - MAX_QUERY_RANGE_MS,
+    );
+    return {
+      fromStartTime: new Date(boundedFrom).toISOString(),
+      toStartTime: new Date(boundedTo).toISOString(),
+    };
+  }
 
   async function fetchObservations(params) {
     const rows = [];
@@ -468,9 +486,8 @@ export async function runVerification({
       // Small pages on purpose: the API docs warn that large page sizes
       // trigger request errors on some deployments.
       const query = new URLSearchParams({
-        fromStartTime,
-        toStartTime,
-        limit: '100',
+        ...timeRange(),
+        limit: QUERY_PAGE_LIMIT,
         page: String(page),
         ...params,
       });
@@ -524,14 +541,13 @@ export async function runVerification({
   while (true) {
     let waitMs = POLL_INTERVAL_MS;
     try {
-      // Discovery: the turn's generation carries the codeword in its IO (the
-      // prompt mentions the marker file; tool-call arguments repeat it). No
-      // server-side name filter — generations are renamed `llm-call [<first
-      // line>]` at close, so exact-name queries would miss them; the prefix
-      // and the run-unique codeword do the filtering client-side. Purpose
+      // Named inbox discoveries are SPAN reads: narrow them on the server by
+      // both name and type. Generation discovery cannot use an exact name —
+      // generations are renamed `llm-call [<first line>]` at close — so it
+      // filters by type/model and then by prefix/codeword client-side. Purpose
       // calls or later turns may arrive first; rediscover candidates on every poll.
       const candidates = await fetchObservations(
-        observationName ? { name: observationName } : { type: 'GENERATION', model },
+        observationName ? { name: observationName, type: 'SPAN' } : { type: 'GENERATION', model },
       );
       const traceIds = [
         ...new Set(

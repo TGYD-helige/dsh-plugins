@@ -528,8 +528,10 @@ export class NativeInbox implements A2aInbox {
       for (const task of page.tasks) {
         const retained = task.metadata?.[RETAINED_INPUTS];
         if (typeof retained !== 'string') continue;
-        snapshots.push(task);
+        // Terminal snapshots belong to explicit resume(); do not consume their
+        // retained metadata during ordinary context recovery.
         if (this.terminal(task)) continue;
+        snapshots.push(task);
         for (const input of JSON.parse(retained) as typeof inputs) {
           const { message } = input;
           if (message.source.kind !== 'a2a' || message.source.taskId !== task.id)
