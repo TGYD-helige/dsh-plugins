@@ -462,14 +462,25 @@ export class DatabaseBackend implements StorageBackend {
       });
       const current = await tx.aiChatHistory.findFirst({
         where: { id: historyId },
-        select: { metadata: true },
+        select: { metadata: true, totalTokens: true },
       });
+      const latestActive = await tx.aiChatHistory.findFirst({
+        where: { sessionId, id: { not: historyId }, deletedAt: null, messages: { none: {} } },
+        orderBy: { lastMessageAt: 'desc' },
+        select: { totalTokens: true },
+      });
+      const currentTokens = current?.totalTokens ?? 0n;
+      const totalTokens =
+        latestActive && latestActive.totalTokens > currentTokens
+          ? latestActive.totalTokens
+          : currentTokens;
       const metadata = { ...metadataOf(current?.metadata) };
       delete metadata[ARCHIVE_IN_PROGRESS];
       await tx.aiChatHistory.update({
         where: { id: historyId },
         data: {
           messageCount: stats._count._all,
+          totalTokens,
           firstMessageAt: stats._min.createdAt,
           lastMessageAt: stats._max.createdAt,
           metadata: this.jsonField(metadata),

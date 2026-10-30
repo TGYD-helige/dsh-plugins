@@ -545,7 +545,7 @@ async function backendOnlyLeg(dbProvider) {
         sessionId: 'r1',
         title: 'Recovered title',
         messageCount: 99,
-        totalTokens: 999,
+        totalTokens: 110,
         metadata: { custom: 'keep-me' },
       },
     );
@@ -556,8 +556,14 @@ async function backendOnlyLeg(dbProvider) {
       },
     );
     assert(marked, 'interrupted history was not marked');
+    await prisma.aiChatHistory.update({ where: { id: marked.id }, data: { totalTokens: 100n } });
     const recoveredId = await backend.archiveSession('r1');
     assert(recoveredId === marked.id, 'archive recovery switched to the newer active rollup');
+    const recoveredHistory = await prisma.aiChatHistory.findFirst({ where: { id: recoveredId } });
+    assert(
+      recoveredHistory.totalTokens === 110n,
+      `archive recovery lost the active token total: ${recoveredHistory.totalTokens}`,
+    );
     const recoveredCount = await prisma.aiMessage.count({ where: { historyId: recoveredId } });
     assert(
       recoveredCount === 106,
