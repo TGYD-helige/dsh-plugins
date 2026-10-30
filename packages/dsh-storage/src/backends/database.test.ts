@@ -14,7 +14,13 @@ const prismaMock = vi.hoisted(() => {
       aggregate: vi.fn(),
       updateMany: vi.fn(),
     };
-    aiChatHistory = { findFirst: vi.fn(), create: vi.fn(), update: vi.fn(), updateMany: vi.fn() };
+    aiChatHistory = {
+      findFirst: vi.fn(),
+      findMany: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+      updateMany: vi.fn(),
+    };
     $queryRawUnsafe = vi.fn(async () => []);
     $transaction = vi.fn(async (run: (client: PrismaClient) => Promise<unknown>) => run(this));
     $connect = vi.fn(async () => {
@@ -689,7 +695,11 @@ describe('DatabaseBackend', () => {
       totalTokens: 110n,
       firstMessageAt: first,
       lastMessageAt: last,
-      metadata: { custom: 'keep-me', 'dsh-storage:token-baseline': 100 },
+      metadata: {
+        custom: 'keep-me',
+        'dsh-storage:archive-in-progress': true,
+        'dsh-storage:token-baseline': 100,
+      },
     };
     prisma.aiMessage.aggregate
       .mockResolvedValueOnce({ _count: { _all: 150 }, _min: first, _max: last })
@@ -709,9 +719,12 @@ describe('DatabaseBackend', () => {
       .mockResolvedValueOnce(newerActive);
     const recovered = { id: 'history-1', totalTokens: 100n };
     prisma.aiChatHistory.create.mockResolvedValueOnce(recovered);
+    prisma.aiChatHistory.findMany.mockResolvedValue([newerActive]);
     prisma.aiChatHistory.update.mockImplementation(async ({ data }: any) => {
       if (data.totalTokens?.increment) recovered.totalTokens += data.totalTokens.increment;
       else if (data.totalTokens !== undefined) recovered.totalTokens = data.totalTokens;
+      if (data.metadata !== undefined && data.messageCount === undefined)
+        newerActive.metadata = data.metadata;
       return recovered;
     });
     prisma.aiChatHistory.updateMany.mockImplementation(async ({ data }: any) => {
@@ -740,8 +753,8 @@ describe('DatabaseBackend', () => {
       totalTokens: 0,
       firstMessageAt: null,
       lastMessageAt: null,
-      metadata: { custom: 'keep-me' },
     });
+    expect(resumed?.metadata).toEqual({ custom: 'keep-me' });
     expect(prisma.aiChatHistory.updateMany).toHaveBeenCalledWith({
       where: {
         sessionId: 's1',

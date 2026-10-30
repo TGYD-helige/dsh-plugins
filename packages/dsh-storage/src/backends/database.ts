@@ -502,6 +502,21 @@ export class DatabaseBackend implements StorageBackend {
         where: { sessionId, id: { not: historyId }, deletedAt: null, messages: { none: {} } },
         data: { messageCount: 0, totalTokens: 0n, firstMessageAt: null, lastMessageAt: null },
       });
+      const activeRollups = await tx.aiChatHistory.findMany({
+        where: { sessionId, id: { not: historyId }, deletedAt: null, messages: { none: {} } },
+        select: { id: true, metadata: true },
+      });
+      for (const active of activeRollups ?? []) {
+        // A completed archive must not leak its retry marker or stale baseline
+        // into the next live segment, or the next archive will skip freezing.
+        const activeMetadata = { ...metadataOf(active.metadata) };
+        delete activeMetadata[ARCHIVE_IN_PROGRESS];
+        delete activeMetadata[TOKEN_BASELINE_KEY];
+        await tx.aiChatHistory.update({
+          where: { id: active.id },
+          data: { metadata: this.jsonField(activeMetadata) },
+        });
+      }
     });
     return historyId;
   }

@@ -604,13 +604,81 @@ async function backendOnlyLeg(dbProvider) {
         content: 'first event after recovery',
         createdAt: new Date(1700000003000),
       },
-      { sessionId: 'r1', messageCount: 1, totalTokens: 7 },
+      { sessionId: 'r1', messageCount: 1, totalTokens: 20 },
     );
     const nextActive = await backend.readSession('r1');
     assert(nextActive?.messageCount === 1, 'next event inherited the old active message count');
-    assert(nextActive.totalTokens === 7, 'next event inherited the old active token count');
+    assert(nextActive.totalTokens === 20, 'next event inherited the old active token count');
     assert(nextActive.title === 'Recovered title', 'active title was not preserved');
     assert(nextActive.metadata?.custom === 'keep-me', 'active metadata was not preserved');
+    assert(
+      !nextActive.metadata?.['dsh-storage:archive-in-progress'],
+      'archive marker survived recovery',
+    );
+    assert(
+      nextActive.metadata?.['dsh-storage:token-baseline'] === undefined,
+      'stale token baseline survived recovery',
+    );
+
+    // A later segment must freeze a new baseline instead of reusing the first
+    // archive's 100-token marker.
+    const nextActiveRow = await prisma.aiChatHistory.findFirst({
+      where: { sessionId: 'r1', deletedAt: null, messages: { none: {} } },
+      select: { id: true },
+    });
+    assert(nextActiveRow, 'next segment active history is missing');
+    client.aiMessage.updateMany = async () => {
+      throw new Error('next segment archive failure');
+    };
+    let nextFailed = false;
+    try {
+      await backend.archiveSession('r1');
+    } catch {
+      nextFailed = true;
+    } finally {
+      client.aiMessage.updateMany = originalUpdateMany;
+    }
+    assert(nextFailed, 'next segment archive failure did not run');
+    await backend.upsertEvent(
+      {
+        id: 'retry-next-segment-event',
+        sessionId: 'r1',
+        historyId: null,
+        type: 'user',
+        content: 'created after the next segment archive failure',
+        createdAt: new Date(1700000004000),
+      },
+      {
+        sessionId: 'r1',
+        messageCount: 2,
+        totalTokens: 25,
+        metadata: { custom: 'keep-me', 'dsh-storage:token-baseline': 20 },
+      },
+    );
+    const nextRecoveredId = await backend.archiveSession('r1');
+    assert(
+      nextRecoveredId === nextActiveRow.id,
+      `next segment recovery switched history: ${nextRecoveredId} !== ${nextActiveRow.id}`,
+    );
+    const nextRecovered = await prisma.aiChatHistory.findFirst({ where: { id: nextRecoveredId } });
+    assert(nextRecovered.totalTokens === 25n, 'next segment recovery lost token delta');
+    const remainingActive = await prisma.aiChatHistory.findMany({
+      where: { sessionId: 'r1', deletedAt: null, messages: { none: {} } },
+    });
+    for (const active of remainingActive) {
+      assert(active.messageCount === 0, 'next segment active count was not reset');
+      assert(active.totalTokens === 0n, 'next segment active tokens were not reset');
+      const metadata =
+        typeof active.metadata === 'string' ? JSON.parse(active.metadata) : active.metadata;
+      assert(
+        !metadata?.['dsh-storage:archive-in-progress'],
+        'next segment archive marker survived recovery',
+      );
+      assert(
+        metadata?.['dsh-storage:token-baseline'] === undefined,
+        'next segment baseline survived recovery',
+      );
+    }
   }
 
   await prisma.$disconnect();
