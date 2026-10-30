@@ -114,6 +114,12 @@ export const Config = Schema.object({
    * below it). Empty = <OS temp>/dsh-a2a-uploads.
    */
   uploadsDir: Schema.string().default(''),
+  urlDownloads: Schema.object({
+    allowPrivate: Schema.boolean()
+      .default(false)
+      .description('allow every private/loopback URL host in a trusted intranet'),
+    allowedHosts: Schema.array(Schema.string()).default([]),
+  }).description('URL downloads; private hosts require allowPrivate or an allowedHosts entry.'),
   subagentTools: Schema.object({
     enabled: Schema.boolean().default(false),
   }),
@@ -165,6 +171,7 @@ export interface A2aPluginConfig {
   heartbeat?: { enabled: boolean; intervalMs: number };
   cwd: string;
   uploadsDir: string;
+  urlDownloads?: { allowPrivate?: boolean; allowedHosts: string[] };
   subagentTools: { enabled: boolean };
   agent: { provider: string; model: string; preset: string };
   card: { name: string; description: string; version: string; publicUrl: string };
@@ -202,6 +209,8 @@ export function apply(
     const bridge = new A2aBridge(ctx, {
       cwd: config.cwd,
       uploadsDir: config.uploadsDir || undefined,
+      downloadAllowPrivate: config.urlDownloads?.allowPrivate,
+      downloadAllowedHosts: config.urlDownloads?.allowedHosts,
       agentOptions: {
         provider: config.agent.provider || undefined,
         model: config.agent.model || undefined,

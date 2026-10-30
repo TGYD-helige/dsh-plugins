@@ -98,10 +98,9 @@ export function apply(ctx: Context, config: PolicyPluginConfig): void {
           return { kind: 'ask', reason: hit.rule.message };
       }
     } catch (error) {
-      // A policy gate must never break the agent loop: a broken evaluation
-      // delegates to the rest of the chain (dsh's own gates keep their say).
+      // Keep the agent loop alive without turning a broken policy into an allow.
       console.error('[dsh-policy] evaluation failed:', error);
-      return next();
+      return { kind: 'deny', reason: 'policy evaluation failed' };
     }
   });
 }

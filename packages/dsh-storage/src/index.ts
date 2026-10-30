@@ -63,12 +63,11 @@ interface SessionAccum {
   /** Existing history-row metadata, preserved verbatim across our writes. */
   metadata: Record<string, unknown>;
   /**
-   * The latest usage sample with its step key — replacement accounting. dsh
-   * emits a step's usage samples adjacently (chunks, then the message), so
-   * only the most recent sample needs keeping to dedup the chunk↔message
-   * pair and progressive samples; it is also all a resume needs to avoid
-   * double-counting the in-flight step. Persisted in the row's metadata as
-   * `dsh-storage:lastUsage` (namespaced — other writers' fields survive).
+   * The highest committed usage event sequence and its sample. Session event
+   * sequences are ordered, so this bounded high-water mark rejects redelivery
+   * without retaining every seen ID; different attempts on one step still add.
+   * Persisted in the row's metadata as `dsh-storage:lastUsage` (namespaced —
+   * other writers' fields survive).
    */
   usageSample?: { key: string; input: number; output: number };
 }
@@ -157,7 +156,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
       )
         return rows;
     }
-    // Older calls absent from the live surface are searched in bounded database pages.
+    // Cold resume and eviction fall back to bounded database candidate pages.
     const rows = await backends[0].readToolCallMessages(sessionId, callId);
     for (const row of rows) rememberToolCalls(sessionId, row);
     return rows;
@@ -170,7 +169,10 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
 
   function track(task: Promise<void>): Promise<void> {
     pending.add(task);
-    void task.finally(() => pending.delete(task));
+    void task.then(
+      () => pending.delete(task),
+      () => pending.delete(task),
+    );
     return task;
   }
 
@@ -185,12 +187,27 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     ).then(() => {});
   }
 
-  // Backend init starts at plugin load; every write chains behind it so no
-  // row is lost to a still-connecting backend.
-  let started: Promise<void>;
+  // All sessions share one in-flight init. A failed attempt is cleared so the
+  // next event can retry once; no read or write passes a failed init barrier.
+  let started: Promise<void> | undefined;
+
+  function ensureStarted(): Promise<void> {
+    if (!started) {
+      const attempt = track(
+        Promise.all(backends.map((backend) => backend.init?.())).then(() => {}),
+      );
+      started = attempt;
+      void attempt.catch(() => {
+        if (started === attempt) started = undefined;
+      });
+    }
+    return started;
+  }
 
   function fanout(call: (backend: StorageBackend) => Promise<void>): Promise<void> {
-    return track(started.then(() => guard(call)));
+    // Event failures reject into the per-session queue, which is the no-throw
+    // boundary. Swallowing here would make a partial write look committed.
+    return track(ensureStarted().then(() => Promise.all(backends.map(call)).then(() => {})));
   }
 
   // Per-session serialization: all event processing for one session runs
@@ -202,10 +219,10 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   const chains = new Map<string, Promise<void>>();
 
   function enqueue(sessionId: string, task: () => Promise<void>): void {
-    // First task of a session also chains behind backend init, so seedAccum
-    // never reads from a still-connecting backend (prisma === null would
-    // masquerade as "row not found" and zero-seed over the stored rollup).
-    const next = (chains.get(sessionId) ?? started)
+    // Every task rechecks the init barrier: a failed earlier attempt must not
+    // become a resolved chain that lets later events zero-seed or no-op write.
+    const next = (chains.get(sessionId) ?? Promise.resolve())
+      .then(() => ensureStarted())
       .then(task)
       .catch((error) => console.error('[dsh-storage] mirror task error:', error));
     chains.set(sessionId, next);
@@ -242,11 +259,11 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   }
 
   ctx.effect(() => {
-    started = track(guard(async (backend) => backend.init?.()));
+    void ensureStarted().catch((error) => console.error('[dsh-storage] database error:', error));
     return async () => {
       sessions.clear();
       toolCallMessages.clear();
-      await Promise.all([...pending]);
+      await Promise.allSettled([...pending]);
       await guard(async (backend) => backend.close?.());
     };
   });
@@ -255,12 +272,14 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     archiveSession(sessionId: string): Promise<string | null> {
       // Join the same per-session chain as event writes, then discard the old
       // in-memory rollup only after the database transaction commits.
-      const archived = (chains.get(sessionId) ?? started).then(async () => {
-        const id = await backends[0].archiveSession(sessionId);
-        sessions.delete(sessionId);
-        toolCallMessages.delete(sessionId);
-        return id;
-      });
+      const archived = (chains.get(sessionId) ?? Promise.resolve())
+        .then(() => ensureStarted())
+        .then(async () => {
+          const id = await backends[0].archiveSession(sessionId);
+          sessions.delete(sessionId);
+          toolCallMessages.delete(sessionId);
+          return id;
+        });
       const settled = archived.then(
         () => {},
         () => {},
@@ -287,11 +306,11 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
         await fanout((backend) => backend.upsertMessage(snapshot));
         return;
       }
-      let accum = sessions.get(sessionId);
-      if (!accum) {
-        accum = await seedAccum(sessionId);
-        sessions.set(sessionId, accum);
-      }
+      const stored = sessions.get(sessionId) ?? (await seedAccum(sessionId));
+      sessions.set(sessionId, stored);
+      // Stage every change on a copy. The live accumulator advances only
+      // after the message + rollup transaction commits.
+      const accum: SessionAccum = { ...stored, metadata: { ...stored.metadata } };
 
       let row: MessageRow | null = projectEvent(session, event, sessionId);
       if (row && session.header?.createdAt !== undefined) {
@@ -322,30 +341,23 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
       if (!row && event?.type === 'tool/result') {
         console.error('[dsh-storage] no matching model tool call for result');
       }
-      if (row) {
-        if (!existing && event?.type !== 'tool/result') {
-          accum.messageCount += 1;
-          accum.firstMessageAt ??= row.createdAt;
-          accum.lastMessageAt = row.createdAt;
-        }
-        await fanout((backend) => backend.upsertMessage(row));
-        rememberToolCalls(sessionId, row);
+      if (row && !existing && event?.type !== 'tool/result') {
+        accum.messageCount += 1;
+        accum.firstMessageAt ??= row.createdAt;
+        accum.lastMessageAt = row.createdAt;
       }
 
-      // Replacement usage accounting: the latest sample for a (turn, step)
-      // supersedes the previous one — fold only the delta, so the
-      // chunk↔message pair and progressive samples never double-count, and a
-      // failed step (usage chunk, no message) still counts. Samples of one
-      // step arrive adjacently, so a single latest sample is all we track.
+      // Every settled attempt/message is one model call; retries on the same
+      // step are additive rather than replacement snapshots.
       const sampled = usageSampleOf(event);
       let usageDelta = 0;
       if (sampled) {
-        const prev = accum.usageSample;
-        usageDelta =
-          sampled.sample.input +
-          sampled.sample.output -
-          (prev && prev.key === sampled.key ? prev.input + prev.output : 0);
-        if (!prev || prev.key !== sampled.key || usageDelta !== 0) {
+        const sequence = Number(sampled.key);
+        const previous = Number(accum.usageSample?.key);
+        const duplicate =
+          Number.isSafeInteger(sequence) && Number.isSafeInteger(previous) && sequence <= previous;
+        if (!duplicate) {
+          usageDelta = sampled.sample.input + sampled.sample.output;
           accum.usageSample = { key: sampled.key, ...sampled.sample };
           accum.totalTokens += usageDelta;
         }
@@ -378,8 +390,10 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
           lastMessageAt: accum.lastMessageAt ?? null,
           ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
         };
-        await fanout((backend) => backend.upsertSession(sessionRow));
+        await fanout((backend) => backend.upsertEvent(row, sessionRow));
       }
+      sessions.set(sessionId, accum);
+      rememberToolCalls(sessionId, row);
     });
   });
 
@@ -403,8 +417,18 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     });
   });
 
-  // Durability checkpoint: the store awaits every session/flush listener.
-  ctx.on('session/flush', async () => {
-    await Promise.all([...pending]);
+  // Durability checkpoint: wait only for this session. Shutdown still drains
+  // the global pending set; an unrelated slow session must not block this one.
+  ctx.on('session/flush', async (session: any) => {
+    const chain = chains.get(session?.id ?? 'unknown');
+    if (chain) {
+      await chain;
+      return;
+    }
+    try {
+      await ensureStarted();
+    } catch (error) {
+      console.error('[dsh-storage] database error:', error);
+    }
   });
 }

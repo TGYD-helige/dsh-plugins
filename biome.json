@@ -36,10 +36,15 @@
   "files": {
     "includes": [
       "packages/**/*.ts",
+      "packages/**/*.json",
+      "packages/**/*.mjs",
       "!packages/dsh-storage/src/generated",
       "*.json",
       "*.yaml",
-      ".github/**/*.yml"
+      ".github/**/*.yml",
+      ".github/**/*.mjs",
+      ".github/**/*.ts",
+      "!.agents/worktrees"
     ]
   }
 }

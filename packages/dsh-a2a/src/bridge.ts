@@ -37,6 +37,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import type {} from '@deepseek-ai/dsh-tools';
 import type { ApprovalOutcome, ApprovalRequestEvent } from '@deepseek-ai/dsh-user-approval/types';
+import { AdmissionGate } from './admission.js';
 import {
   type A2aApproval,
   type A2aApprovalCodec,
@@ -53,6 +54,10 @@ export interface BridgeOptions {
   cwd: string;
   /** Upload root for persisted file parts; absent = the OS temp dir. */
   uploadsDir?: string;
+  /** Allow every private URL host in a trusted intranet. */
+  downloadAllowPrivate?: boolean;
+  /** Private URL file hosts explicitly allowed by the deployment. */
+  downloadAllowedHosts?: readonly string[];
   /** Optional provider/model overrides for created agents. */
   agentOptions?: { provider?: string; model?: string };
   /** Agent preset id; empty/absent = the deployment default (when a roster exists). */
@@ -118,6 +123,7 @@ export class A2aBridge {
   private readonly bySession = new Map<string, TaskEntry>(); // sessionId (== contextId) → entry
   private readonly clearing = new Set<string>();
   private readonly creating = new Map<string, Set<Promise<unknown>>>();
+  private readonly admissions = new AdmissionGate();
   private readonly executing = new Map<string, Set<Promise<void>>>();
   private readonly asked = new Map<
     string,
@@ -204,7 +210,8 @@ export class A2aBridge {
     taskId: string,
     contextId: string,
   ): Promise<{ entry: TaskEntry; freshTask: boolean }> {
-    const creation = this.ensureTaskInner(taskId, contextId);
+    const admission = this.admissions.acquire(contextId);
+    const creation = admission.ready.then(() => this.ensureTaskInner(taskId, contextId));
     let pending = this.creating.get(contextId);
     if (!pending) {
       pending = new Set();
@@ -216,6 +223,7 @@ export class A2aBridge {
     } finally {
       pending.delete(creation);
       if (pending.size === 0) this.creating.delete(contextId);
+      admission.release();
     }
   }
 
@@ -302,12 +310,14 @@ export class A2aBridge {
           resumeSessionId: sessionId,
           agentOptions,
           setup,
+          ...(this.inbox ? { keepInboxOnDispose: true } : {}),
         })
       : await this.ctx.agents.create({
           sessionId,
           meta: { cwd: this.options.cwd, ...(agentPreset ? { agentPreset } : {}) },
           agentOptions,
           setup,
+          ...(this.inbox ? { keepInboxOnDispose: true } : {}),
         });
     const entry: TaskEntry = {
       taskId,
@@ -338,6 +348,10 @@ export class A2aBridge {
       attachments,
       uploadsDir(this.options.uploadsDir),
       materializer ? { contextId, materializer } : undefined,
+      {
+        allowPrivate: this.options.downloadAllowPrivate,
+        allowedHosts: this.options.downloadAllowedHosts,
+      },
     );
   }
 
@@ -493,7 +507,11 @@ export class A2aBridge {
       await execution;
     } finally {
       pending.delete(execution);
-      if (pending.size === 0) this.executing.delete(contextId);
+      if (pending.size === 0) {
+        this.executing.delete(contextId);
+        const entry = this.bySession.get(contextId);
+        if (entry && entry.running.size === 0) entry.terminalState = undefined;
+      }
     }
   }
 
@@ -544,7 +562,10 @@ export class A2aBridge {
       throw error;
     } finally {
       entry.running.delete(running);
-      if (entry.running.size === 0) entry.terminalState = undefined;
+      // Keep a failure visible to messages already admitted into this execution
+      // batch; trackExecution clears it once a genuinely new batch can arrive.
+      if (entry.running.size === 0 && !this.executing.get(entry.sessionId as string)?.size)
+        entry.terminalState = undefined;
     }
   }
 

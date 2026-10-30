@@ -13,7 +13,15 @@
  *    and disconnects
  */
 
-import { a2aClient, assert, bootA2a, STATES, stopA2a, textOf, THINKING_OFF } from './lib/a2a-shared.mjs';
+import {
+  a2aClient,
+  assert,
+  bootA2a,
+  STATES,
+  stopA2a,
+  THINKING_OFF,
+  textOf,
+} from './lib/a2a-shared.mjs';
 
 const boot = await bootA2a({ tag: 'turns', extraPatch: THINKING_OFF });
 let proc = boot.proc;
@@ -94,8 +102,9 @@ try {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
-    let cut;
-    while ((cut = buffer.indexOf('\n\n')) >= 0 && !snapshot) {
+    while (!snapshot) {
+      const cut = buffer.indexOf('\n\n');
+      if (cut < 0) break;
       const raw = buffer.slice(0, cut);
       buffer = buffer.slice(cut + 2);
       if (!raw.startsWith('data: ')) continue;

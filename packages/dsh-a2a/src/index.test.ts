@@ -72,6 +72,16 @@ describe('dsh-a2a plugin', () => {
     expect(() => Config({ subagentTools: { enabled: 'yes' as never } })).toThrow();
   });
 
+  it('enables private downloads only through explicit opt-ins', () => {
+    expect(Config({}).urlDownloads).toEqual({ allowPrivate: false, allowedHosts: [] });
+    expect(Config({ urlDownloads: { allowPrivate: true } }).urlDownloads).toMatchObject({
+      allowPrivate: true,
+    });
+    expect(
+      Config({ urlDownloads: { allowedHosts: ['127.0.0.1', 'files.internal'] } }).urlDownloads,
+    ).toMatchObject({ allowedHosts: ['127.0.0.1', 'files.internal'] });
+  });
+
   it('serves the agent card while loaded and closes the server on fiber unload', async () => {
     const started = await apply(ctx, config());
     expect(console.log).toHaveBeenCalledWith(expect.stringContaining('[dsh-a2a] A2A endpoint:'));

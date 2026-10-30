@@ -51,7 +51,9 @@ base.sort((a, b) => a.name.localeCompare(b.name));
 backends.sort((a, b) => a.package.localeCompare(b.package) || a.provider.localeCompare(b.provider));
 
 console.log(`base legs: ${base.map((e) => e.name).join(', ') || '(none)'}`);
-console.log(`backend legs: ${backends.map((e) => `${e.package}/${e.provider}`).join(', ') || '(none)'}`);
+console.log(
+  `backend legs: ${backends.map((e) => `${e.package}/${e.provider}`).join(', ') || '(none)'}`,
+);
 appendFileSync(
   process.env.GITHUB_OUTPUT,
   `matrix=${JSON.stringify({ include: base })}\n` +

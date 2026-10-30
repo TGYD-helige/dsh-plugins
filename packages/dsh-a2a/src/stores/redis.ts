@@ -65,9 +65,9 @@ export class RedisTaskStore implements ManagedTaskStore {
         100,
       );
       cursor = next;
-      for (const key of keys) {
-        const raw: string | null = await this.redis.get(key);
-        if (raw) shells.push(JSON.parse(raw) as Task);
+      if (keys.length) {
+        const raws: Array<string | null> = await this.redis.mget(...keys);
+        for (const raw of raws) if (raw) shells.push(JSON.parse(raw) as Task);
       }
     } while (cursor !== '0');
     return listShells(shells, params);

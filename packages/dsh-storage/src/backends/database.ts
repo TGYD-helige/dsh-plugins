@@ -37,6 +37,15 @@ function pk(value: string): string {
   return createHash('sha256').update(value).digest('hex').slice(0, 36);
 }
 
+const ARCHIVE_IN_PROGRESS = 'dsh-storage:archive-in-progress';
+
+function metadataOf(value: unknown): Record<string, unknown> {
+  const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : {};
+}
+
 /**
  * Parse the prisma-style sqlserver URL
  * (sqlserver://host:1433;database=d;user=u;password=p;encrypt=true;trustServerCertificate=true)
@@ -110,6 +119,11 @@ export class DatabaseBackend implements StorageBackend {
 
   constructor(private config: DatabaseBackendConfig) {}
 
+  private client(): any {
+    if (!this.prisma) throw new Error('dsh-storage database is not initialized');
+    return this.prisma;
+  }
+
   /** Load the pre-generated client for the configured provider (seam for tests). */
   protected async loadClient(): Promise<any> {
     const mod = await import(
@@ -123,8 +137,14 @@ export class DatabaseBackend implements StorageBackend {
       this.loadClient(),
       createAdapter(this.config),
     ]);
-    this.prisma = new PrismaClient({ adapter });
-    await this.prisma.$connect();
+    const prisma = new PrismaClient({ adapter });
+    try {
+      await prisma.$connect();
+      this.prisma = prisma;
+    } catch (error) {
+      await prisma.$disconnect?.().catch(() => {});
+      throw error;
+    }
   }
 
   /** JSON column value, text-serialized on SQL Server (no Prisma Json type). */
@@ -153,16 +173,19 @@ export class DatabaseBackend implements StorageBackend {
     };
   }
 
-  async upsertMessage(row: MessageRow): Promise<void> {
-    if (!this.prisma) return;
+  private async writeMessage(client: any, row: MessageRow): Promise<void> {
     // NUL-separated: a space-joined pair would be ambiguous ('a b','c' ≡ 'a','b c').
     const id = pk(`message ${row.sessionId}\0${row.id}`);
     const data = this.toDbData(row);
-    await this.prisma.aiMessage.upsert({
+    await client.aiMessage.upsert({
       where: { id },
       create: { id, sessionId: row.sessionId, historyId: row.historyId, ...data },
       update: data,
     });
+  }
+
+  async upsertMessage(row: MessageRow): Promise<void> {
+    await this.writeMessage(this.client(), row);
   }
 
   async readMessages(sessionId: string, messageId: string): Promise<MessageRow[]> {
@@ -174,7 +197,7 @@ export class DatabaseBackend implements StorageBackend {
   }
 
   async readToolCallMessages(sessionId: string, callId: string): Promise<MessageRow[]> {
-    if (!this.prisma) return [];
+    const prisma = this.client();
     const provider = this.config.provider;
     const sqlserver = provider === 'sqlserver';
     const sortTime =
@@ -218,7 +241,7 @@ export class DatabaseBackend implements StorageBackend {
         let index = 0;
         sql = sql.replaceAll('?', () => `${sqlserver ? '@P' : '$'}${++index}`);
       }
-      const page = await this.prisma.$queryRawUnsafe(sql, ...params);
+      const page = await prisma.$queryRawUnsafe(sql, ...params);
       for (const row of page) {
         let calls = row.tool_calls;
         if (typeof calls === 'string') {
@@ -245,8 +268,7 @@ export class DatabaseBackend implements StorageBackend {
   }
 
   private async readRows(where: Record<string, unknown>): Promise<MessageRow[]> {
-    if (!this.prisma) return [];
-    const rows = await this.prisma.aiMessage.findMany({
+    const rows = await this.client().aiMessage.findMany({
       where,
       orderBy: { createdAt: 'asc' },
       take: 1,
@@ -289,8 +311,7 @@ export class DatabaseBackend implements StorageBackend {
   }
 
   async readSession(sessionId: string): Promise<SessionRow | null> {
-    if (!this.prisma) return null;
-    const row = await this.prisma.aiChatHistory.findFirst({
+    const row = await this.client().aiChatHistory.findFirst({
       where: { sessionId, deletedAt: null, messages: { none: {} } },
     });
     if (!row) return null;
@@ -311,13 +332,12 @@ export class DatabaseBackend implements StorageBackend {
     };
   }
 
-  async upsertSession(row: SessionRow): Promise<void> {
-    if (!this.prisma) return;
+  private async writeSession(client: any, row: SessionRow): Promise<void> {
     // Find-then-write is race-free because the plugin serializes event
     // processing per session (see the per-session chain in index.ts). The
     // cuid primary key matches the source project and early-scaffold rows,
     // so existing data is continued, never duplicated.
-    const existing = await this.prisma.aiChatHistory.findFirst({
+    const existing = await client.aiChatHistory.findFirst({
       where: { sessionId: row.sessionId, deletedAt: null, messages: { none: {} } },
       select: { id: true },
     });
@@ -331,15 +351,26 @@ export class DatabaseBackend implements StorageBackend {
       metadata: this.jsonField(row.metadata),
     };
     if (existing) {
-      await this.prisma.aiChatHistory.update({ where: { id: existing.id }, data });
+      await client.aiChatHistory.update({ where: { id: existing.id }, data });
     } else {
-      await this.prisma.aiChatHistory.create({ data });
+      await client.aiChatHistory.create({ data });
     }
   }
 
+  async upsertSession(row: SessionRow): Promise<void> {
+    await this.writeSession(this.client(), row);
+  }
+
+  async upsertEvent(message: MessageRow | null, session: SessionRow): Promise<void> {
+    await this.client().$transaction(async (tx: any) => {
+      if (message) await this.writeMessage(tx, message);
+      await this.writeSession(tx, session);
+    });
+  }
+
   async archiveSession(sessionId: string): Promise<string | null> {
-    if (!this.prisma) throw new Error('dsh-storage database is not initialized');
-    return this.prisma.$transaction(async (tx: any) => {
+    const client = this.client();
+    const { expected, historyId } = await client.$transaction(async (tx: any) => {
       const where = { sessionId, historyId: null, deletedAt: null };
       const stats = await tx.aiMessage.aggregate({
         where,
@@ -347,30 +378,121 @@ export class DatabaseBackend implements StorageBackend {
         _min: { createdAt: true },
         _max: { createdAt: true },
       });
-      if (stats._count._all === 0) return null;
+      const expected = stats._count._all as number;
+      if (expected === 0) {
+        // All batches may have succeeded before a finalization failure. Resume
+        // that marked history instead of skipping the final aggregate/cleanup.
+        const interrupted = await tx.aiMessage.findFirst({
+          where: { sessionId, historyId: { not: null }, deletedAt: null },
+          orderBy: { updatedAt: 'desc' },
+          select: { historyId: true },
+        });
+        if (interrupted?.historyId) {
+          const candidate = await tx.aiChatHistory.findFirst({
+            where: { id: interrupted.historyId },
+            select: { metadata: true },
+          });
+          if (metadataOf(candidate?.metadata)[ARCHIVE_IN_PROGRESS] === true)
+            return { expected, historyId: interrupted.historyId };
+        }
+        return { expected, historyId: null };
+      }
+      const rollup = {
+        messageCount: expected,
+        firstMessageAt: stats._min.createdAt,
+        lastMessageAt: stats._max.createdAt,
+      };
 
       // Active rollups have no attached messages; an archive gains them below.
       const active = await tx.aiChatHistory.findFirst({
         where: { sessionId, deletedAt: null, messages: { none: {} } },
+        select: { id: true, metadata: true },
+      });
+      if (active) {
+        await tx.aiChatHistory.update({
+          where: { id: active.id },
+          data: {
+            ...rollup,
+            metadata: this.jsonField({
+              ...metadataOf(active.metadata),
+              [ARCHIVE_IN_PROGRESS]: true,
+            }),
+          },
+        });
+        return { expected, historyId: active.id };
+      }
+
+      // A previous batch may have attached messages already. Continue that
+      // history instead of creating a duplicate after a transient failure.
+      const interrupted = await tx.aiMessage.findFirst({
+        where: { sessionId, historyId: { not: null }, deletedAt: null },
+        orderBy: { updatedAt: 'desc' },
+        select: { historyId: true },
+      });
+      if (interrupted?.historyId) {
+        const candidate = await tx.aiChatHistory.findFirst({
+          where: { id: interrupted.historyId },
+          select: { metadata: true },
+        });
+        if (metadataOf(candidate?.metadata)[ARCHIVE_IN_PROGRESS] === true)
+          return { expected, historyId: interrupted.historyId };
+      }
+      const history = await tx.aiChatHistory.create({
+        data: {
+          sessionId,
+          ...rollup,
+          totalTokens: 0n,
+          metadata: this.jsonField({ [ARCHIVE_IN_PROGRESS]: true }),
+        },
         select: { id: true },
       });
-      const rollup = {
-        messageCount: stats._count._all,
-        firstMessageAt: stats._min.createdAt,
-        lastMessageAt: stats._max.createdAt,
-      };
-      const history = active
-        ? await tx.aiChatHistory.update({ where: { id: active.id }, data: rollup })
-        : await tx.aiChatHistory.create({
-            data: { sessionId, ...rollup, totalTokens: 0n },
-            select: { id: true },
-          });
-      const updated = await tx.aiMessage.updateMany({ where, data: { historyId: history.id } });
-      if (updated.count !== stats._count._all) {
-        throw new Error('active messages changed during archive');
-      }
-      return history.id;
+      return { expected, historyId: history.id };
     });
+    if (!historyId) return null;
+
+    // Keep each write batch short instead of holding one transaction over the
+    // entire active segment. The final aggregate is the correctness barrier.
+    let updated = 0;
+    while (updated < expected) {
+      const candidates = await client.aiMessage.findMany({
+        where: { sessionId, historyId: null, deletedAt: null },
+        select: { id: true },
+        take: 100,
+      });
+      if (candidates.length === 0) break;
+      const batch = await client.aiMessage.updateMany({
+        where: { id: { in: candidates.map((row: any) => row.id) } },
+        data: { historyId },
+      });
+      if (batch.count === 0) break;
+      updated += batch.count;
+    }
+    if (updated !== expected) throw new Error('active messages changed during archive');
+
+    await client.$transaction(async (tx: any) => {
+      const stats = await tx.aiMessage.aggregate({
+        where: { historyId, deletedAt: null },
+        _count: { _all: true },
+        _min: { createdAt: true },
+        _max: { createdAt: true },
+      });
+      const current = await tx.aiChatHistory.findFirst({
+        where: { id: historyId },
+        select: { metadata: true },
+      });
+      const metadata = { ...metadataOf(current?.metadata) };
+      delete metadata[ARCHIVE_IN_PROGRESS];
+      await tx.aiChatHistory.update({
+        where: { id: historyId },
+        data: {
+          messageCount: stats._count._all,
+          firstMessageAt: stats._min.createdAt,
+          lastMessageAt: stats._max.createdAt,
+          metadata: this.jsonField(metadata),
+        },
+      });
+    });
+    return historyId;
   }
 
   async close(): Promise<void> {

@@ -116,17 +116,35 @@ export function projectEvent(_session: any, event: any, sessionId: string): Mess
   }
 }
 
+/** Identify the assistant tool call answered by either supported result shape. */
 export function toolResultCallId(event: any): string | undefined {
+  const message = event?.data?.message;
+  const first = message?.content?.[0];
   const callId =
-    event?.data?.message?.source?.callId ?? event?.data?.message?.content?.[0]?.toolCallId;
+    message?.toolCallId ??
+    message?.source?.callId ??
+    (first?.type === 'tool-result' ? first.toolCallId : undefined);
   return typeof callId === 'string' ? callId : undefined;
 }
 
 /** Update the persisted assistant call identified by a tool result. */
 export function mergeToolResult(event: any, rows: MessageRow[]): MessageRow | null {
-  const result = event?.data?.message?.content?.[0] ?? null;
+  const message = event?.data?.message;
+  const content = Array.isArray(message?.content) ? message.content : [];
+  const legacy =
+    content.length === 1 && content[0]?.type === 'tool-result' ? content[0] : undefined;
   const callId = toolResultCallId(event);
   if (!callId) return null;
+  const result =
+    legacy ??
+    (message
+      ? {
+          type: 'tool-result',
+          toolCallId: callId,
+          content,
+          ...(typeof message.isError === 'boolean' ? { isError: message.isError } : {}),
+        }
+      : null);
   const model = [...rows]
     .reverse()
     .find(
@@ -158,21 +176,19 @@ export interface UsageSample {
 }
 
 /**
- * Extract the usage sample carried by one event, keyed by its step, or null
- * when the event carries none.
+ * Extract one model call's usage, keyed by its durable event sequence.
  *
  * V3 session log (dsh-session@0.1.6-alpha.2):
- * - `assistant/message.data.usage` — the settled step's final accounting;
- * - `assistant/attempt` — a failed/retried/cancelled step commits no surface
+ * - `assistant/message.data.usage` — the settled call's accounting;
+ * - `assistant/attempt` — a failed/retried/cancelled call commits no surface
  *   message; the adapter's usage chunk survives as a raw `chunk` record in the
  *   embedded compact `stream` (deltas are packed, but usage is a raw type).
  *
- * Samples for one `(turn, step)` are REPLACEMENTS, not additive: later
- * samples supersede earlier ones (a failed attempt's usage, then the settled
- * message's). The caller keeps the latest sample per step and folds only the
- * delta into its rollup. Totals include the cache buckets: cacheRead/cacheWrite
- * are billed in their own buckets (observed cacheReadTokens ≫ inputTokens in
- * dsh session logs — they are not subsets of inputTokens).
+ * Calls on one `(turn, step)` are additive: a retry is another billed model
+ * call, not a progressive snapshot. Only redelivery of the same event sequence
+ * is a duplicate. Totals include the cache buckets: cacheRead/cacheWrite are
+ * billed in their own buckets (observed cacheReadTokens ≫ inputTokens in dsh
+ * session logs — they are not subsets of inputTokens).
  */
 export function usageSampleOf(event: any): { key: string; sample: UsageSample } | null {
   const total = (u: any): UsageSample => ({
@@ -193,6 +209,6 @@ export function usageSampleOf(event: any): { key: string; sample: UsageSample } 
   } else {
     return null;
   }
-  if (!usage || data?.turn == null || data?.step == null) return null;
-  return { key: `${data.turn}:${data.step}`, sample: total(usage) };
+  if (!usage || !Number.isSafeInteger(event?.seq)) return null;
+  return { key: String(event.seq), sample: total(usage) };
 }

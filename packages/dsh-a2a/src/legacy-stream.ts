@@ -42,6 +42,10 @@ export function legacyStreamHandler(requestHandler: A2ARequestHandler): RequestH
         return;
       }
       const stream = response;
+      const resubscribing = req.body.method === 'tasks/resubscribe';
+      let closed!: () => void;
+      const close = new Promise<void>((resolve) => (closed = resolve));
+      if (resubscribing) res.once('close', closed);
       try {
         const startStream = () => {
           if (context.activatedExtensions)
@@ -52,11 +56,13 @@ export function legacyStreamHandler(requestHandler: A2ARequestHandler): RequestH
           res.flushHeaders();
         };
         // The SDK always streams resubscribe errors; sends validate before SSE headers.
-        if (req.body.method === 'tasks/resubscribe') startStream();
-        const first = await stream.next();
+        if (resubscribing) startStream();
+        const next = () => (resubscribing ? Promise.race([stream.next(), close]) : stream.next());
+        const first = await next();
+        if (!first) return;
         if (!res.headersSent) startStream();
         let last: Exclude<typeof first.value, void> | undefined;
-        const write = (event: Exclude<typeof first.value, void>) => {
+        const write = async (event: Exclude<typeof first.value, void>) => {
           last = event;
           const result = event.result as
             | { kind?: string; status?: { state?: string }; final?: boolean }
@@ -65,20 +71,33 @@ export function legacyStreamHandler(requestHandler: A2ARequestHandler): RequestH
           // A task snapshot on resubscribe does not close it and is left intact.
           if (result?.kind === 'status-update' && result.status?.state === 'input-required')
             result.final = true;
-          res.write(`data: ${JSON.stringify(event)}\n\n`);
+          if (!res.write(`data: ${JSON.stringify(event)}\n\n`)) {
+            await new Promise<void>((resolve) => {
+              const ready = () => {
+                res.off('drain', ready);
+                res.off('close', ready);
+                resolve();
+              };
+              res.once('drain', ready);
+              res.once('close', ready);
+            });
+          }
           return result?.kind === 'status-update' && result.final;
         };
-        if (!first.done && write(first.value)) return;
-        for await (const event of stream) {
-          if (res.destroyed) continue; // Keep the SDK consuming results after its client leaves.
-          if (write(event)) return;
+        if (!first.done && (await write(first.value))) return;
+        while (true) {
+          const nextEvent = await next();
+          if (!nextEvent || nextEvent.done) break;
+          if (res.destroyed && !resubscribing) continue; // Sends still drain for persistence.
+          if (res.destroyed) break;
+          if (await write(nextEvent.value)) return;
         }
         // A cold subscription has no live bus: the SDK ends after the snapshot.
         const snapshot = last?.result as
           | { kind?: string; id?: string; contextId?: string; status?: unknown; metadata?: unknown }
           | undefined;
         if (!res.destroyed && snapshot?.kind === 'task')
-          write({
+          await write({
             ...last!,
             result: {
               kind: 'status-update',
@@ -90,6 +109,7 @@ export function legacyStreamHandler(requestHandler: A2ARequestHandler): RequestH
             },
           });
       } finally {
+        if (resubscribing) res.off('close', closed);
         await stream.return(undefined);
       }
     } catch (error) {

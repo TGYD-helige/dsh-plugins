@@ -801,6 +801,83 @@ describe('dsh-langfuse plugin', () => {
       expect(raw.map((chunk) => chunk.type)).toEqual(chunks.map((chunk) => chunk.type));
     });
 
+    it('redacts a fragmented secret before dropping oversized raw chunks', async () => {
+      await setup({ ...enabledConfig, maxPayloadBytes: 128, redactFields: ['password'] });
+      const chunks: StreamChunk[] = [
+        {
+          type: 'tool-call-delta',
+          index: 1,
+          id: 'c1' as ToolCallId,
+          argumentsDelta: '{"password":"fragmented-',
+        },
+        {
+          type: 'tool-call-delta',
+          index: 1,
+          id: 'c1' as ToolCallId,
+          argumentsDelta: `secret-value","padding":"${'x'.repeat(200)}"}`,
+        },
+        finishStop(),
+      ];
+
+      expect(
+        await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks))),
+      ).toEqual(chunks);
+      const request = mocks.roots[0].generations[0].spans[0];
+      expect(JSON.stringify(lastUpdate(request).output)).not.toContain('fragmented-');
+      expect(JSON.stringify(lastUpdate(request).output)).not.toContain('secret-value');
+      expect(lastUpdate(request).metadata).toMatchObject({ truncated: true });
+    });
+
+    it('redacts assembled text before applying the final output bound', async () => {
+      await setup({ ...enabledConfig, maxPayloadBytes: 96, redactFields: ['password'] });
+      const chunks = [
+        textDelta('{"password":"assembled-'),
+        textDelta(`secret-value","padding":"${'x'.repeat(200)}"}`),
+        finishStop(),
+      ];
+
+      expect(
+        await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks))),
+      ).toEqual(chunks);
+      const generation = fakeObs(mocks.roots[0]).generations[0];
+      const output = JSON.stringify(lastUpdate(generation).output) ?? '';
+      expect(output).not.toContain('assembled-');
+      expect(output).not.toContain('secret-value');
+      expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
+    });
+
+    it('bounds streaming buffers while dropping fragmented secrets as a whole', async () => {
+      const maskSpy = vi.spyOn(LangfuseReporter.prototype, 'mask');
+      try {
+        await setup({ ...enabledConfig, maxPayloadBytes: 128, redactFields: ['password'] });
+        const chunks = [
+          textDelta('{"password":"stream-'),
+          textDelta(`secret-value","padding":"${'x'.repeat(1000)}"}`),
+          ...Array.from({ length: 40 }, () => textDelta('y')),
+          finishStop(),
+        ];
+
+        const received = await drain(
+          ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks)),
+        );
+
+        expect(received).toEqual(chunks);
+        const generation = fakeObs(mocks.roots[0]).generations[0];
+        const request = generation.spans[0];
+        expect(lastUpdate(request).output).toEqual([]);
+        expect(lastUpdate(generation).output).toBeUndefined();
+        expect(lastUpdate(request).metadata).toMatchObject({ truncated: true });
+        expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
+        for (const [payload] of maskSpy.mock.calls) {
+          const serialized =
+            typeof payload === 'string' ? payload : (JSON.stringify(payload) ?? '');
+          expect(Buffer.byteLength(serialized)).toBeLessThan(512);
+        }
+      } finally {
+        maskSpy.mockRestore();
+      }
+    });
+
     it('redacts excerpt sources before extracting and truncating observation names', async () => {
       const secretKey = 'LONG-CREDENTIAL-'.repeat(12);
       await setup({ ...enabledConfig, secretKey, redactFields: ['path', 'password'] });
@@ -981,6 +1058,38 @@ describe('dsh-langfuse plugin', () => {
       expect(result.content).toEqual([image]);
       expect(root.ended).toBe(1);
       expect(generation.ended).toBe(1);
+    });
+
+    it('uses a fresh request budget for image enrichment after initial truncation', async () => {
+      const readImage = vi.fn(async () => ({
+        ref: image.attachment,
+        data: Uint8Array.of(1, 2, 3),
+      }));
+      ctx.provide('attachments', { readImage } as unknown as AttachmentStore);
+      await setup({ ...enabledConfig, captureMedia: true, maxPayloadBytes: 512 });
+      const options = optionsOf({
+        messages: [
+          {
+            role: 'user',
+            content: [image, { type: 'text', text: 'p'.repeat(500) }],
+          },
+        ],
+      });
+      const before = JSON.stringify(options);
+      const chunks = [textDelta('answer'), finishStop()];
+
+      const received = await drain(ctx.waterfall('llm/stream', options, () => streamOf(...chunks)));
+      await ctx.parallel('session/flush', sessionOf('s1'));
+
+      expect(received).toEqual(chunks);
+      const generation = fakeObs(mocks.roots[0]).generations[0];
+      expect(
+        generation.updates.some((update) =>
+          (JSON.stringify(update.input) ?? '').includes('data:image/png;base64,AQID'),
+        ),
+      ).toBe(true);
+      expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
+      expect(JSON.stringify(options)).toBe(before);
     });
 
     it('joins explicit per-session parents once, isolates concurrent sessions and inherits child context', async () => {
@@ -2567,6 +2676,44 @@ describe('dsh-langfuse plugin', () => {
       expect(mocks.roots).toHaveLength(2);
     });
 
+    it('ends an active model operation on session/disposed without duplicate ends', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      const stream = ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop()));
+      const root = fakeObs(mocks.roots[0]);
+      const generation = root.generations[0];
+      const request = generation.spans[0];
+
+      ctx.emit('session/disposed', sessionOf('s1'));
+      expect(root.ended).toBe(1);
+      expect(generation.ended).toBe(1);
+      expect(request.ended).toBe(1);
+
+      await drain(stream);
+      expect(generation.ended).toBe(1);
+      expect(request.ended).toBe(1);
+    });
+
+    it('ends an active tool operation on session/disposed without duplicate ends', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      let release!: (result: ToolExecutionResult) => void;
+      const resultPromise = new Promise<ToolExecutionResult>((resolve) => {
+        release = resolve;
+      });
+      const operation = dispatchTool(ctx, execOf(), () => resultPromise);
+      const root = fakeObs(mocks.roots[0]);
+      const tool = root.spans[0];
+
+      ctx.emit('session/disposed', sessionOf('s1'));
+      expect(root.ended).toBe(1);
+      expect(tool.ended).toBe(1);
+
+      release(okResult());
+      expect(await operation).toEqual(okResult());
+      expect(tool.ended).toBe(1);
+    });
+
     it('ends a stale root when the next turn replaces it', async () => {
       await setup();
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
@@ -2740,6 +2887,226 @@ describe('dsh-langfuse plugin', () => {
       const { signal: _, ...expectedInput } = options;
       expect(generation.body.input).toEqual(expectedInput);
       expect(request.body.input).toEqual(expectedInput);
+    });
+
+    it('bounds captured payloads and preserves the original stream', async () => {
+      await setup({ ...enabledConfig, maxPayloadBytes: 48 });
+      const chunks = [textDelta('x'.repeat(200)), finishStop()];
+      const received = await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks)),
+      );
+      expect(received).toEqual(chunks);
+
+      const generation = fakeObs(mocks.roots[0]).generations[0];
+      const request = generation.spans[0];
+      expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
+      expect(lastUpdate(request).metadata).toMatchObject({ truncated: true });
+      expect((JSON.stringify(lastUpdate(generation).output) ?? '').length).toBeLessThan(200);
+      expect((JSON.stringify(lastUpdate(request).output) ?? '').length).toBeLessThan(200);
+    });
+
+    it('bounds oversized request inputs and marks both observations', async () => {
+      await setup({ ...enabledConfig, maxPayloadBytes: 64 });
+      await drain(
+        ctx.waterfall(
+          'llm/stream',
+          optionsOf({
+            messages: [{ role: 'user', content: [{ type: 'text', text: 'p'.repeat(500) }] }],
+          }),
+          () => streamOf(finishStop()),
+        ),
+      );
+
+      const generation = fakeObs(mocks.roots[0]).generations[0];
+      expect(generation.body.input).toMatchObject({ truncated: true });
+      expect(generation.spans[0].body.input).toMatchObject({ truncated: true });
+      expect(JSON.stringify(generation.body.input).length).toBeLessThan(500);
+      expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
+    });
+
+    it('bounds oversized request structure before full masking or serialization', async () => {
+      const secret = 'peak-private-value';
+      const requestText = JSON.stringify({ password: secret, padding: 'p'.repeat(200_000) });
+      const options = optionsOf({
+        messages: [{ role: 'user', content: [{ type: 'text', text: requestText }] }],
+      });
+      const chunks = [textDelta('visible'), finishStop()];
+      const maskSpy = vi.spyOn(LangfuseReporter.prototype, 'mask');
+      const stringifySpy = vi.spyOn(JSON, 'stringify');
+      try {
+        await setup({ ...enabledConfig, maxPayloadBytes: 128, redactFields: ['password'] });
+        const received = await drain(
+          ctx.waterfall('llm/stream', options, () => streamOf(...chunks)),
+        );
+
+        expect(received).toEqual(chunks);
+        expect(
+          maskSpy.mock.calls.filter(
+            ([payload]) => payload && typeof payload === 'object' && 'messages' in payload,
+          ),
+        ).toHaveLength(0);
+        const serializedLengths = stringifySpy.mock.results.map((result) =>
+          typeof result.value === 'string' ? result.value.length : 0,
+        );
+        expect(Math.max(...serializedLengths, 0)).toBeLessThan(4096);
+        const generation = fakeObs(mocks.roots[0]).generations[0];
+        expect(JSON.stringify(generation.body.input)).not.toContain(secret);
+        expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
+        const originalBlock = options.messages[0].content[0];
+        expect(originalBlock.type).toBe('text');
+        if (originalBlock.type === 'text') expect(originalBlock.text).toBe(requestText);
+      } finally {
+        maskSpy.mockRestore();
+        stringifySpy.mockRestore();
+      }
+    });
+
+    it('redacts structured request fields before truncating previews without changing the stream', async () => {
+      const secret = 'request-private-value';
+      const requestJson = JSON.stringify({ password: secret, padding: 'p'.repeat(400) });
+      const chunks = [textDelta('visible'), finishStop()];
+      await setup({ ...enabledConfig, maxPayloadBytes: 224, redactFields: ['password'] });
+
+      const received = await drain(
+        ctx.waterfall(
+          'llm/stream',
+          optionsOf({
+            messages: [{ role: 'user', content: [{ type: 'text', text: requestJson }] }],
+          }),
+          () => streamOf(...chunks),
+        ),
+      );
+
+      expect(received).toEqual(chunks);
+      const generation = fakeObs(mocks.roots[0]).generations[0];
+      const request = generation.spans[0];
+      const exported = JSON.stringify({
+        generationInput: generation.body.input,
+        requestInput: request.body.input,
+        rawOutput: lastUpdate(request).output,
+      });
+      expect(exported).not.toContain(secret);
+      expect(exported).toContain('[REDACTED]');
+      expect(generation.body.input).toMatchObject({ truncated: true });
+      expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
+    });
+
+    it('redacts structured tool arguments before truncating assembled output', async () => {
+      const secret = 'tool-private-value';
+      const args = JSON.stringify({ password: secret, padding: 'x'.repeat(400) });
+      const chunks = [toolCallEnd('write_file', args), finishStop()];
+      await setup({ ...enabledConfig, maxPayloadBytes: 224, redactFields: ['password'] });
+
+      const received = await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks)),
+      );
+
+      expect(received).toEqual(chunks);
+      expect(chunks[0]).toEqual(toolCallEnd('write_file', args));
+      const generation = fakeObs(mocks.roots[0]).generations[0];
+      expect(JSON.stringify(lastUpdate(generation).output)).not.toContain(secret);
+      expect(JSON.stringify(lastUpdate(generation).output)).toContain('[REDACTED]');
+      expect(JSON.stringify(lastUpdate(generation.spans[0]).output)).not.toContain(secret);
+      expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
+    });
+
+    it('bounds tool-call overhead and final serialized output for empty arguments', async () => {
+      await setup({ ...enabledConfig, maxPayloadBytes: 96 });
+      const chunks = [
+        ...Array.from({ length: 20 }, () => toolCallEnd('write_file', '')),
+        finishStop(),
+      ];
+
+      const received = await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks)),
+      );
+
+      expect(received).toEqual(chunks);
+      const generation = fakeObs(mocks.roots[0]).generations[0];
+      const output = lastUpdate(generation);
+      expect(JSON.stringify(output.output).length).toBeLessThan(500);
+      expect(output.metadata).toMatchObject({ truncated: true, toolCallCount: 20 });
+    });
+
+    it.each([1, 2, 17, 31, 64])(
+      'keeps truncated JSON exports within the %i-byte serialized cap',
+      async (maxPayloadBytes) => {
+        await setup({ ...enabledConfig, maxPayloadBytes });
+        const chunks = [textDelta('x'.repeat(200)), finishStop()];
+        await drain(
+          ctx.waterfall(
+            'llm/stream',
+            optionsOf({
+              messages: [{ role: 'user', content: [{ type: 'text', text: 'p'.repeat(500) }] }],
+            }),
+            () => streamOf(...chunks),
+          ),
+        );
+
+        const generation = fakeObs(mocks.roots[0]).generations[0];
+        const values = [
+          generation.body.input,
+          generation.spans[0].body.input,
+          lastUpdate(generation.spans[0]).output,
+          lastUpdate(generation).output,
+        ];
+        for (const value of values) {
+          if (value === undefined) continue;
+          const serialized = JSON.stringify(value);
+          expect(serialized).toBeDefined();
+          expect(Buffer.byteLength(serialized!)).toBeLessThanOrEqual(maxPayloadBytes);
+        }
+      },
+    );
+
+    it('counts raw array brackets and commas after redaction in the serialized cap', async () => {
+      const chunks = [textDelta('a'), finishStop()];
+      const maxPayloadBytes = chunks.reduce(
+        (total, chunk) => total + Buffer.byteLength(JSON.stringify(chunk)),
+        0,
+      );
+      await setup({ ...enabledConfig, maxPayloadBytes });
+
+      expect(
+        await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks))),
+      ).toEqual(chunks);
+      const request = mocks.roots[0].generations[0].spans[0];
+      expect(Buffer.byteLength(JSON.stringify(lastUpdate(request).output))).toBeLessThanOrEqual(
+        maxPayloadBytes,
+      );
+      expect(lastUpdate(request).metadata).toMatchObject({ truncated: true });
+    });
+
+    it('keeps an exact-length raw array unchanged through final reporter masking', async () => {
+      const chunks = [finishStop()];
+      const maxPayloadBytes = Buffer.byteLength(JSON.stringify(chunks));
+      await setup({ ...enabledConfig, maxPayloadBytes });
+
+      const received = await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks)),
+      );
+
+      expect(received).toEqual(chunks);
+      const request = mocks.roots[0].generations[0].spans[0];
+      expect(lastUpdate(request).output).toEqual(chunks);
+      expect(Buffer.byteLength(JSON.stringify(lastUpdate(request).output))).toBe(maxPayloadBytes);
+    });
+
+    it('bounds non-delta secrets after final reporter masking at the exact cap', async () => {
+      const chunks = [toolCallEnd('sk', 'sk'), finishStop()];
+      const maxPayloadBytes = Buffer.byteLength(JSON.stringify(chunks));
+      await setup({ ...enabledConfig, maxPayloadBytes });
+
+      const received = await drain(
+        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks)),
+      );
+
+      expect(received).toEqual(chunks);
+      const request = mocks.roots[0].generations[0].spans[0];
+      const output = lastUpdate(request).output;
+      expect(Buffer.byteLength(JSON.stringify(output))).toBeLessThanOrEqual(maxPayloadBytes);
+      expect(JSON.stringify(output)).not.toContain('sk');
+      expect(lastUpdate(request).metadata).toMatchObject({ truncated: true });
     });
 
     it('sets completionStartTime at the first token delta, not at block boundaries', async () => {
@@ -3118,6 +3485,24 @@ describe('dsh-langfuse plugin', () => {
       expect(delegationSpan.ended).toBe(1);
     });
 
+    it('falls back to the root when concurrent tools make the parent ambiguous', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      const first = execOf({ callId: 'a' as ToolCallId, name: 'subagent' });
+      const second = execOf({ callId: 'b' as ToolCallId, name: 'other' });
+      await ctx.waterfall('tools/pre-execute', first, async () => ({ kind: 'allow' }));
+      await ctx.waterfall('tools/pre-execute', second, async () => ({ kind: 'allow' }));
+
+      ctx.emit('session/created', childSessionOf('c1', 's1'));
+      const root = fakeObs(mocks.roots[0]);
+      const child = root.spans.find((span) => span.name === 'subagent');
+      expect(child).toBeDefined();
+      expect(root.spans[1].spans).toHaveLength(0);
+
+      ctx.emit('tools/result', first, okResult());
+      ctx.emit('tools/result', second, okResult());
+    });
+
     it('gives child sessions no turn trace and feeds the prompt to the span', async () => {
       await setup();
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
@@ -3176,6 +3561,19 @@ describe('dsh-langfuse plugin', () => {
       expect(subSpan.ended).toBe(1);
     });
 
+    it('does not mark a new parent turn when an old subagent fails', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/created', childSessionOf('c1', 's1'));
+      ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
+      ctx.emit('session/event', sessionOf('s1'), turnStart(1));
+      const nextRoot = fakeObs(mocks.roots[1]);
+
+      ctx.emit('subagent/end', subagentEnd('c1', 'error'));
+      ctx.emit('session/event', sessionOf('s1'), turnEnd(1));
+      expect(lastUpdate(nextRoot).metadata).not.toHaveProperty('hadErrors');
+    });
+
     it('withholds the final assistant message when captureContent is off', async () => {
       await setup({ ...enabledConfig, captureContent: false });
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
@@ -3209,7 +3607,8 @@ describe('dsh-langfuse plugin', () => {
       const subSpan = fakeObs(mocks.roots[0]).spans[0];
 
       // Background/continuable children dispose their session before
-      // subagent/end fires — the dispose must NOT close the span.
+      // subagent/end fires — once started, the dispose must NOT close the span.
+      ctx.emit('subagent/start', subagentStart('c1'));
       ctx.emit('session/disposed', sessionOf('c1'));
       expect(subSpan.ended).toBe(0);
 
@@ -3218,6 +3617,21 @@ describe('dsh-langfuse plugin', () => {
         output: { stopReason: 'completed' },
         level: 'DEFAULT',
       });
+      expect(subSpan.ended).toBe(1);
+    });
+
+    it('closes an unstarted child when activation rolls back', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/created', childSessionOf('c1', 's1'));
+      const subSpan = fakeObs(mocks.roots[0]).spans[0];
+
+      ctx.emit('session/disposed', sessionOf('c1'));
+      expect(subSpan.ended).toBe(1);
+      expect(subSpan.updates.at(-1)).toMatchObject({ level: 'WARNING' });
+
+      // A late end from an already rolled-back activation must not close it twice.
+      ctx.emit('subagent/end', subagentEnd('c1', 'completed'));
       expect(subSpan.ended).toBe(1);
     });
 
@@ -3349,6 +3763,16 @@ describe('LangfuseReporter', () => {
     },
   );
 
+  it('keeps redaction idempotent for short credentials and existing markers', async () => {
+    const reporter = new LangfuseReporter(config);
+    await reporter.ready;
+    const masked = reporter.mask('sk');
+    expect(masked).toBe('[REDACTED]');
+    expect(reporter.mask(masked)).toBe(masked);
+    expect(reporter.mask('prefix sk [REDACTED]')).toBe('prefix [REDACTED] [REDACTED]');
+    await reporter.shutdown();
+  });
+
   it('redacts processor environment/release labels, including SDK env fallbacks', async () => {
     vi.stubEnv('LANGFUSE_TRACING_ENVIRONMENT', 'sk-lf-environment');
     vi.stubEnv('LANGFUSE_RELEASE', 'sk-lf-release');
@@ -3464,6 +3888,41 @@ describe('LangfuseReporter', () => {
     expect(reporter.startSpan(trace, { name: 's' })).toBeNull();
     await expect(reporter.flush()).resolves.toBeUndefined();
     await expect(reporter.shutdown()).resolves.toBeUndefined();
+    errorSpy.mockRestore();
+  });
+
+  it('ends observations when final updates fail', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const reporter = new LangfuseReporter(config);
+    await reporter.ready;
+    const root = fakeSpan(reporter.openTrace({ name: 't' }));
+    const generation = fakeGen(reporter.startGeneration(root, { name: 'g' }));
+    const renamed = fakeGen(reporter.startGeneration(root, { name: 'renamed' }));
+    const span = fakeSpan(reporter.startSpan(root, { name: 's' }));
+
+    vi.spyOn(generation, 'update').mockImplementation(() => {
+      throw new Error('update failed');
+    });
+    reporter.endGeneration(generation, {});
+    expect(generation.ended).toBe(1);
+
+    vi.spyOn(renamed.otelSpan, 'updateName').mockImplementation(() => {
+      throw new Error('rename failed');
+    });
+    reporter.endGeneration(renamed, { name: 'new-name' });
+    expect(renamed.ended).toBe(1);
+
+    vi.spyOn(span, 'update').mockImplementation(() => {
+      throw new Error('update failed');
+    });
+    reporter.endSpan(span);
+    expect(span.ended).toBe(1);
+
+    vi.spyOn(root, 'setTraceIO').mockImplementation(() => {
+      throw new Error('trace IO failed');
+    });
+    reporter.endSpan(root, { output: 'done' });
+    expect(root.ended).toBe(1);
     errorSpy.mockRestore();
   });
 

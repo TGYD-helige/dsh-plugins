@@ -87,6 +87,99 @@ describe('evaluate', () => {
     expect(run(rules, 'bash', bash('git grep npm'))).toBeUndefined();
   });
 
+  it('matches the executable command word through quotes, escapes and line continuations', () => {
+    for (const command of ['"npm" install', 'n\\pm install', 'np\\\nm install']) {
+      expect(
+        run([{ tool: 'bash', decision: 'deny', commandPrefix: 'npm' }], 'bash', bash(command))
+          ?.decision,
+      ).toBe('deny');
+      expect(
+        run([{ tool: 'bash', decision: 'deny', commandRegex: 'npm\\b' }], 'bash', bash(command))
+          ?.decision,
+      ).toBe('deny');
+    }
+  });
+
+  it('checks commands inside Bash process substitutions', () => {
+    for (const command of ['cat <(npm install)', 'cat >(npm install)']) {
+      expect(
+        run([{ tool: 'bash', decision: 'deny', commandPrefix: 'npm' }], 'bash', bash(command))
+          ?.decision,
+      ).toBe('deny');
+    }
+  });
+
+  it('treats here-doc bodies as data except for real command substitutions', () => {
+    const rules: PolicyRuleConfig[] = [{ tool: 'bash', decision: 'deny', commandPrefix: 'npm' }];
+    expect(run(rules, 'bash', bash("cat <<'EOF'\nnpm install\nEOF"))).toBeUndefined();
+    expect(run(rules, 'bash', bash('cat <<EOF\nnpm install\nEOF'))).toBeUndefined();
+    expect(run(rules, 'bash', bash("cat <<'EOF'\necho $(npm install)\nEOF"))).toBeUndefined();
+    expect(run(rules, 'bash', bash('cat <<EOF\necho $(npm install)\nEOF'))?.decision).toBe('deny');
+    expect(run(rules, 'bash', bash('cat <<EOF\nnpm install\nEOF\nnpm install'))?.decision).toBe(
+      'deny',
+    );
+  });
+
+  it('normalizes mixed quotes in here-doc delimiters without swallowing later commands', () => {
+    const rules: PolicyRuleConfig[] = [{ tool: 'bash', decision: 'deny', commandPrefix: 'npm' }];
+    expect(run(rules, 'bash', bash('cat <<E"OF"\nbody\nEOF\nnpm install'))?.decision).toBe('deny');
+    // Quoting any part of the delimiter suppresses substitutions in its body.
+    expect(run(rules, 'bash', bash('cat <<E"OF"\necho $(npm install)\nEOF'))).toBeUndefined();
+  });
+
+  it('supports commands after a here-doc declaration without executing body lines as commands', () => {
+    const command = 'cat <<EOF && echo ok\nnpm install\nEOF';
+    expect(
+      run([{ tool: 'bash', decision: 'deny', commandPrefix: 'npm' }], 'bash', bash(command)),
+    ).toBeUndefined();
+    expect(
+      run([{ tool: 'bash', decision: 'deny', commandPrefix: 'echo ok' }], 'bash', bash(command))
+        ?.decision,
+    ).toBe('deny');
+    expect(
+      run(
+        [{ tool: 'bash', decision: 'deny', commandPrefix: 'npm' }],
+        'bash',
+        bash('cat <<EOF && echo ok\necho $(npm install)\nEOF'),
+      )?.decision,
+    ).toBe('deny');
+  });
+
+  it('keeps output redirection on a here-doc declaration while treating its body as data', () => {
+    const rules: PolicyRuleConfig[] = [{ tool: 'bash', decision: 'deny', commandPrefix: 'npm' }];
+    expect(run(rules, 'bash', bash("cat <<'EOF' > /tmp/out\nnpm install\nEOF"))).toBeUndefined();
+    expect(
+      run(rules, 'bash', bash('cat <<EOF >> /tmp/out\necho $(npm install)\nEOF'))?.decision,
+    ).toBe('deny');
+    expect(
+      run(rules, 'bash', bash("cat <<'EOF' > /tmp/out\nbody\nEOF\nnpm install"))?.decision,
+    ).toBe('deny');
+  });
+
+  it('does not swallow commands after a Bash here-string as here-doc data', () => {
+    expect(
+      run(
+        [{ tool: 'bash', decision: 'deny', commandPrefix: 'npm' }],
+        'bash',
+        bash('cat <<<EOF\nnpm install\n'),
+      )?.decision,
+    ).toBe('deny');
+    expect(
+      run([{ tool: 'bash', decision: 'deny', commandPrefix: 'npm' }], 'bash', bash('cat <<<EOF')),
+    ).toBeUndefined();
+  });
+
+  it('treats PowerShell backticks as escapes rather than Bash substitutions', () => {
+    const rules: PolicyRuleConfig[] = [{ tool: 'pwsh', decision: 'deny', commandPrefix: 'npm' }];
+    expect(run(rules, 'pwsh', bash('Write-Output "`$(npm)"'))).toBeUndefined();
+    expect(run(rules, 'pwsh', bash('Write-Output $(npm)'))?.decision).toBe('deny');
+  });
+
+  it('does not treat PowerShell backslashes as Bash escapes', () => {
+    const rules: PolicyRuleConfig[] = [{ tool: 'pwsh', decision: 'deny', commandPrefix: 'npm' }];
+    expect(run(rules, 'pwsh', bash('n\\pm install'))).toBeUndefined();
+  });
+
   it('accepts an array of command prefixes (any-of)', () => {
     const rules: PolicyRuleConfig[] = [
       { tool: 'bash', decision: 'deny', commandPrefix: ['rm -rf', 'rm -fr', 'shred'] },

@@ -228,13 +228,15 @@ describe('dsh-policy plugin', () => {
     expect(next).toHaveBeenCalledTimes(1);
   });
 
-  it('swallows evaluation errors with the [dsh-policy] prefix and delegates', async () => {
+  it('logs evaluation errors with the [dsh-policy] prefix and fails closed', async () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     apply(ctx, geminiLike);
     const circular: Record<string, unknown> = {};
     circular.self = circular;
-    const result = await ctx.waterfall('tools/pre-execute', execOf('bash', circular), downstream);
-    expect(result).toEqual({ kind: 'allow' }); // downstream's answer
+    const next = vi.fn(downstream);
+    const result = await ctx.waterfall('tools/pre-execute', execOf('bash', circular), next);
+    expect(result).toEqual({ kind: 'deny', reason: 'policy evaluation failed' });
+    expect(next).not.toHaveBeenCalled();
     expect(errorSpy).toHaveBeenCalledWith('[dsh-policy] evaluation failed:', expect.any(Error));
     errorSpy.mockRestore();
   });

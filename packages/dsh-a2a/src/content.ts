@@ -17,7 +17,11 @@
  * raw bytes and must degrade, never fail.
  */
 
+import { lookup as dnsLookup } from 'node:dns/promises';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
+import { BlockList, isIP } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import type { Part } from '@a2a-js/sdk';
@@ -43,11 +47,19 @@ interface Materialization {
   materializer: A2aFileMaterializer;
 }
 
+export interface UrlDownloadOptions {
+  /** Allow every private/loopback host in a trusted intranet; HTTP(S), size and time limits still apply. */
+  allowPrivate?: boolean;
+  /** Private/loopback hosts are refused unless explicitly named here. */
+  allowedHosts?: readonly string[];
+}
+
 export async function buildMessageContent(
   parts: readonly Part[],
   attachments: AttachmentStore | undefined,
   dir: string,
   materialization?: Materialization,
+  downloads: UrlDownloadOptions = {},
 ): Promise<ContentBlock[]> {
   const content: ContentBlock[] = [];
   for (const part of parts) {
@@ -62,7 +74,7 @@ export async function buildMessageContent(
         break;
       case 'raw':
       case 'url':
-        content.push(await fileContent(c, part, attachments, dir, materialization));
+        content.push(await fileContent(c, part, attachments, dir, materialization, downloads));
         break;
       default:
         // A part kind this SDK version predates: keep it visible, never drop.
@@ -100,7 +112,13 @@ function failNote(
   error: unknown,
 ): ContentBlock {
   console.error(`[dsh-a2a] ${label}:`, error);
-  return note(part, mediaType, uri, error instanceof Error ? error.message : String(error));
+  const text = error instanceof Error ? error.message : String(error);
+  return note(
+    part,
+    mediaType,
+    uri,
+    uri ? text.replaceAll(uri, redactedUri(uri) ?? '[redacted URL]') : text,
+  );
 }
 
 /** Resolve one file part to an attachment block or a workspace file. */
@@ -109,7 +127,8 @@ async function fileContent(
   part: Part,
   attachments: AttachmentStore | undefined,
   dir: string,
-  materialization?: Materialization,
+  materialization: Materialization | undefined,
+  downloads: UrlDownloadOptions,
 ): Promise<ContentBlock> {
   let bytes: Uint8Array;
   let mediaType = part.mediaType;
@@ -117,7 +136,7 @@ async function fileContent(
   try {
     if (c.$case === 'url') {
       uri = c.value;
-      const got = await download(uri);
+      const got = await download(uri, downloads);
       bytes = got.bytes;
       mediaType ||= got.mediaType ?? '';
     } else {
@@ -231,6 +250,7 @@ function documentBlock(
   filePath: string,
   originalName: string,
 ): ContentBlock {
+  const displayUri = uri ? redactedUri(uri) : undefined;
   const attrs = [
     // The basename of the final path, so name= always matches the file on
     // disk — including collision suffixes.
@@ -238,7 +258,7 @@ function documentBlock(
     originalName &&
       originalName !== path.win32.basename(filePath) &&
       `originalName="${attr(originalName)}"`,
-    uri && `uri="${attr(uri)}"`,
+    displayUri && `uri="${attr(displayUri)}"`,
     mediaType && `type="${attr(mediaType)}"`,
     `size="${bytes}"`,
     `path="${attr(filePath)}"`,
@@ -257,10 +277,11 @@ function note(
   uri: string | undefined,
   reason: string,
 ): ContentBlock {
+  const displayUri = uri ? redactedUri(uri) : undefined;
   const desc = [
     part.filename && `"${part.filename}"`,
     mediaType && `(${mediaType})`,
-    uri && `at ${uri}`,
+    displayUri && `at ${displayUri}`,
   ]
     .filter(Boolean)
     .join(' ');
@@ -281,30 +302,172 @@ function attr(value: string): string {
   return value.replace(/["\r\n<>]/g, ' ');
 }
 
-/** Fetch one url part's bytes over http(s), bounded in size and time. */
-async function download(uri: string): Promise<{ bytes: Uint8Array; mediaType?: string }> {
-  const scheme = new URL(uri).protocol;
-  if (scheme !== 'http:' && scheme !== 'https:') {
-    throw new Error(`unsupported scheme "${scheme}"`);
+/** Display-only URL: credentials, query and fragment never enter prompts or notes. */
+function redactedUri(uri: string): string | undefined {
+  try {
+    const parsed = new URL(uri);
+    parsed.username = '';
+    parsed.password = '';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return undefined;
   }
-  const response = await fetch(uri, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const declared = Number(response.headers.get('content-length'));
-  if (declared > MAX_DOWNLOAD_BYTES) {
-    throw new Error(`exceeds the ${MAX_DOWNLOAD_BYTES}-byte download limit`);
+}
+
+const nonPublic = new BlockList();
+for (const [subnet, prefix] of [
+  ['0.0.0.0', 8],
+  ['10.0.0.0', 8],
+  ['100.64.0.0', 10],
+  ['127.0.0.0', 8],
+  ['169.254.0.0', 16],
+  ['172.16.0.0', 12],
+  ['192.0.0.0', 24],
+  ['192.0.2.0', 24],
+  ['192.168.0.0', 16],
+  ['198.18.0.0', 15],
+  ['198.51.100.0', 24],
+  ['203.0.113.0', 24],
+  ['224.0.0.0', 4],
+  ['240.0.0.0', 4],
+] as const)
+  nonPublic.addSubnet(subnet, prefix, 'ipv4');
+for (const [subnet, prefix] of [
+  ['::', 128],
+  ['::1', 128],
+  ['fc00::', 7],
+  ['fe80::', 10],
+  ['ff00::', 8],
+  ['2001:db8::', 32],
+] as const)
+  nonPublic.addSubnet(subnet, prefix, 'ipv6');
+
+function assertPublicAddress(address: string): void {
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address)?.[1];
+  const value = mapped ?? address;
+  const family = isIP(value);
+  if (!family || nonPublic.check(value, family === 6 ? 'ipv6' : 'ipv4')) {
+    throw new Error(`download targets a private or non-public address: ${address}`);
   }
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  if (response.body) {
-    // Throwing out of the loop cancels the stream via the iterator's return.
-    for await (const chunk of response.body) {
-      total += chunk.byteLength;
-      if (total > MAX_DOWNLOAD_BYTES) {
+}
+
+async function safeAddresses(
+  hostname: string,
+  allowedHosts: ReadonlySet<string>,
+  allowPrivate: boolean,
+) {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (allowPrivate || allowedHosts.has(host)) return [];
+  const addresses = isIP(host)
+    ? [{ address: host, family: isIP(host) }]
+    : await dnsLookup(host, { all: true, verbatim: true });
+  if (!addresses.length) throw new Error(`download host has no address: ${host}`);
+  for (const { address } of addresses) assertPublicAddress(address);
+  return addresses;
+}
+
+/** Fetch one url part's bytes over http(s), bounded in size, redirects, address and time. */
+async function download(
+  uri: string,
+  options: UrlDownloadOptions,
+): Promise<{ bytes: Uint8Array; mediaType?: string }> {
+  const allowedHosts = new Set(
+    (options.allowedHosts ?? []).map((host) => host.replace(/^\[|\]$/g, '').toLowerCase()),
+  );
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(new Error('download timed out')),
+    DOWNLOAD_TIMEOUT_MS,
+  );
+  timeout.unref();
+  try {
+    let current = new URL(uri);
+    for (let redirect = 0; ; redirect++) {
+      if (current.protocol !== 'http:' && current.protocol !== 'https:') {
+        throw new Error(`unsupported scheme "${current.protocol}"`);
+      }
+      await safeAddresses(current.hostname, allowedHosts, options.allowPrivate === true);
+      const response = await new Promise<import('node:http').IncomingMessage>((resolve, reject) => {
+        const request = (current.protocol === 'http:' ? httpRequest : httpsRequest)(
+          current,
+          {
+            signal: controller.signal,
+            lookup: (hostname, lookupOptions, callback) => {
+              const allowed =
+                options.allowPrivate === true ||
+                allowedHosts.has(hostname.replace(/^\[|\]$/g, '').toLowerCase());
+              const resolving = allowed
+                ? dnsLookup(hostname, { all: lookupOptions.all ?? false }).then((entry) =>
+                    Array.isArray(entry) ? entry : [entry],
+                  )
+                : safeAddresses(hostname, allowedHosts, false);
+              void resolving.then(
+                (addresses) => {
+                  if (lookupOptions.all) return callback(null, addresses);
+                  const { address, family } = addresses[0];
+                  callback(null, address, family);
+                  return addresses;
+                },
+                (error) => callback(error, '', 0),
+              );
+            },
+          },
+          resolve,
+        );
+        request.on('socket', (socket) => {
+          socket.once('connect', () => {
+            if (options.allowPrivate === true) return;
+            if (allowedHosts.has(current.hostname.replace(/^\[|\]$/g, '').toLowerCase())) return;
+            try {
+              assertPublicAddress(socket.remoteAddress ?? '');
+            } catch (error) {
+              request.destroy(error as Error);
+            }
+          });
+        });
+        request.on('error', reject);
+        request.end();
+      });
+      const status = response.statusCode ?? 0;
+      const location = response.headers.location;
+      if ([301, 302, 303, 307, 308].includes(status) && location) {
+        response.resume();
+        if (redirect >= 5) throw new Error('too many download redirects');
+        current = new URL(location, current);
+        continue;
+      }
+      if (status < 200 || status >= 300) {
+        response.resume();
+        throw new Error(`HTTP ${status}`);
+      }
+      const declared = Number(response.headers['content-length']);
+      if (declared > MAX_DOWNLOAD_BYTES) {
+        response.destroy();
         throw new Error(`exceeds the ${MAX_DOWNLOAD_BYTES}-byte download limit`);
       }
-      chunks.push(chunk);
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      try {
+        for await (const chunk of response) {
+          total += chunk.byteLength;
+          if (total > MAX_DOWNLOAD_BYTES) {
+            throw new Error(`exceeds the ${MAX_DOWNLOAD_BYTES}-byte download limit`);
+          }
+          chunks.push(chunk);
+        }
+      } catch (error) {
+        response.destroy();
+        throw error;
+      }
+      const contentType = response.headers['content-type'];
+      const mediaType = (Array.isArray(contentType) ? contentType[0] : contentType)
+        ?.split(';')[0]
+        .trim();
+      return { bytes: Buffer.concat(chunks, total), mediaType: mediaType || undefined };
     }
+  } finally {
+    clearTimeout(timeout);
   }
-  const mediaType = response.headers.get('content-type')?.split(';')[0].trim() || undefined;
-  return { bytes: Buffer.concat(chunks, total), mediaType };
 }

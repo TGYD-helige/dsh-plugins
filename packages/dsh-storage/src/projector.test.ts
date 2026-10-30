@@ -227,6 +227,39 @@ describe('projectEvent', () => {
     expect(mergeToolResult(event, [merged!])).toEqual(merged);
   });
 
+  it('preserves every block and the top-level error flag from a current ToolResultMessage', () => {
+    const call = { type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' };
+    const model = { id: 'a1', type: 'model', toolCalls: [call] } as any;
+    const content = [
+      { type: 'text', text: 'first' },
+      { type: 'image', attachment: { attachmentId: 'image-1', mediaType: 'image/png' } },
+      { type: 'text', text: 'last' },
+    ];
+    const merged = mergeToolResult(
+      {
+        type: 'tool/result',
+        data: {
+          message: {
+            role: 'tool',
+            source: { kind: 'tool', callId: 'c1' },
+            toolCallId: 'c1',
+            isError: true,
+            content,
+          },
+        },
+      },
+      [model],
+    );
+
+    expect(merged?.toolCalls).toEqual([
+      {
+        ...call,
+        result: { type: 'tool-result', toolCallId: 'c1', content, isError: true },
+        error: undefined,
+      },
+    ]);
+  });
+
   it.each([
     ['assistant/attempt', { type: 'assistant/attempt', seq: 1, time: 1, data: { stream: [] } }],
     ['turn/end', { type: 'turn/end', seq: 9, time: 1, data: { turn: 0, reason: 'done' } }],
@@ -239,10 +272,11 @@ describe('projectEvent', () => {
 });
 
 describe('usageSampleOf', () => {
-  it("samples an assistant/attempt's embedded usage record with its step key", () => {
+  it("samples an assistant/attempt's embedded usage record with its event identity", () => {
     expect(
       usageSampleOf({
         type: 'assistant/attempt',
+        seq: 7,
         data: {
           turn: 1,
           step: 2,
@@ -255,29 +289,31 @@ describe('usageSampleOf', () => {
           ],
         },
       }),
-    ).toEqual({ key: '1:2', sample: { input: 10, output: 5 } });
+    ).toEqual({ key: '7', sample: { input: 10, output: 5 } });
   });
 
-  it('samples an assistant/message usage with its step key', () => {
+  it('samples an assistant/message usage with its event identity', () => {
     expect(
       usageSampleOf({
         type: 'assistant/message',
+        seq: 8,
         data: { turn: 0, step: 1, usage: { inputTokens: 8, outputTokens: 2 } },
       }),
-    ).toEqual({ key: '0:1', sample: { input: 8, output: 2 } });
+    ).toEqual({ key: '8', sample: { input: 8, output: 2 } });
   });
 
   it('folds cache buckets into input (they are billed separately, not subsets)', () => {
     expect(
       usageSampleOf({
         type: 'assistant/message',
+        seq: 9,
         data: {
           turn: 0,
           step: 0,
           usage: { inputTokens: 100, outputTokens: 7, cacheReadTokens: 900, cacheWriteTokens: 30 },
         },
       }),
-    ).toEqual({ key: '0:0', sample: { input: 1030, output: 7 } });
+    ).toEqual({ key: '9', sample: { input: 1030, output: 7 } });
   });
 
   it('returns null for streams without usage and other events', () => {
@@ -295,12 +331,12 @@ describe('usageSampleOf', () => {
     expect(usageSampleOf({ type: 'user/message', data: {} })).toBeNull();
   });
 
-  it('returns null when usage or the step identity is missing', () => {
+  it('returns null when usage or the event identity is missing', () => {
     expect(usageSampleOf({ type: 'assistant/message', data: { turn: 0, step: 1 } })).toBeNull();
     expect(
       usageSampleOf({
         type: 'assistant/message',
-        data: { usage: { inputTokens: 1 } },
+        data: { turn: 0, step: 1, usage: { inputTokens: 1 } },
       }),
     ).toBeNull();
     expect(usageSampleOf({})).toBeNull();

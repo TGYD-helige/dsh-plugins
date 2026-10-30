@@ -18,7 +18,7 @@
  *   of the `tools/pre-execute` chain (dsh's own gates keep their say).
  */
 
-import { matchesPrefix, splitSegments } from './shell.js';
+import { matchesPrefix, normalizeCommandWord, type ShellDialect, splitSegments } from './shell.js';
 
 export type PolicyDecisionKind = 'allow' | 'deny' | 'ask';
 
@@ -154,13 +154,17 @@ function argsMatch(rule: CompiledRule, args: unknown, argsJson: string): boolean
   });
 }
 
-function matchesSegment(rule: CompiledRule, segment: string | undefined): boolean {
+function matchesSegment(
+  rule: CompiledRule,
+  segment: string | undefined,
+  dialect: ShellDialect,
+): boolean {
   const hasCommandCondition = rule.commandPrefixes !== undefined || rule.commandRes !== undefined;
   // No command string on this call: command conditions cannot be satisfied.
   if (segment === undefined) return !hasCommandCondition;
   return (
-    anyMatch(rule.commandPrefixes, (prefix) => matchesPrefix(segment, prefix)) &&
-    anyMatch(rule.commandRes, (re) => re.test(segment))
+    anyMatch(rule.commandPrefixes, (prefix) => matchesPrefix(segment, prefix, dialect)) &&
+    anyMatch(rule.commandRes, (re) => re.test(normalizeCommandWord(segment, dialect)))
   );
 }
 
@@ -178,8 +182,9 @@ export function evaluate(
   const command = extractCommand(args, commandKeys);
   // A call without a shell command is one virtual whole-call segment — only
   // rules without command conditions can match it.
+  const dialect = toolName === 'pwsh' ? 'pwsh' : 'bash';
   const segments: Array<string | undefined> =
-    command === undefined ? [undefined] : splitSegments(command);
+    command === undefined ? [undefined] : splitSegments(command, dialect);
 
   let undecided = false;
   const best: Partial<Record<PolicyDecisionKind, CompiledRule>> = {};
@@ -187,7 +192,7 @@ export function evaluate(
     let winner: CompiledRule | undefined;
     for (const rule of candidates) {
       if (!argsMatch(rule, args, argsJson)) continue;
-      if (!matchesSegment(rule, segment)) continue;
+      if (!matchesSegment(rule, segment, dialect)) continue;
       winner = winner === undefined ? rule : prefer(winner, rule);
     }
     if (winner === undefined) undecided = true;

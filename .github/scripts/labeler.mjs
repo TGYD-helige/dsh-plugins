@@ -14,30 +14,55 @@ for (const [name, description] of Object.entries({
   ci: 'CI / GitHub Actions changes',
   docs: 'Documentation changes',
   package: 'Package, build, or workspace configuration changes',
-})) defs.set(`area/${name}`, ['F59E0B', description]);
+}))
+  defs.set(`area/${name}`, ['F59E0B', description]);
 for (const [kind, color] of Object.entries({
-  feature: '14B8A6', bug: 'D73A4A', refactor: 'C026D3', docs: '1D4ED8',
-  test: '65A30D', ci: 'EA580C', chore: 'A16207',
-})) defs.set(`type/${kind}`, [color, `PR type: ${kind}`]);
+  feature: '14B8A6',
+  bug: 'D73A4A',
+  refactor: 'C026D3',
+  docs: '1D4ED8',
+  test: '65A30D',
+  ci: 'EA580C',
+  chore: 'A16207',
+}))
+  defs.set(`type/${kind}`, [color, `PR type: ${kind}`]);
 for (const [size, color] of Object.entries({
-  XS: '3FB950', S: '56D364', M: 'D29922', L: 'DB6D28', XL: 'F85149',
-})) defs.set(`size:${size}`, [color, `Changed lines: ${size}`]);
+  XS: '3FB950',
+  S: '56D364',
+  M: 'D29922',
+  L: 'DB6D28',
+  XL: 'F85149',
+}))
+  defs.set(`size:${size}`, [color, `Changed lines: ${size}`]);
 for (const [priority, color] of Object.entries({
-  P0: 'B91C1C', P1: 'F97316', P2: 'EAB308', P3: '22C55E',
-})) defs.set(priority, [color, 'Priority (triage)']);
+  P0: 'B91C1C',
+  P1: 'F97316',
+  P2: 'EAB308',
+  P3: '22C55E',
+}))
+  defs.set(priority, [color, 'Priority (triage)']);
 for (const platform of ['macos', 'linux', 'windows'])
   defs.set(`platform/${platform}`, ['2563EB', `Platform: ${platform}`]);
 
 const PRIORITY_RE = /^P[0-3]$/;
 const RULES_MANAGED_RE = /^(area\/|type\/|size:|platform\/)/;
 const TYPE_MAP = {
-  feat: 'feature', fix: 'bug', refactor: 'refactor', docs: 'docs',
-  test: 'test', ci: 'ci', chore: 'chore', build: 'chore',
-  perf: 'chore', style: 'chore',
+  feat: 'feature',
+  fix: 'bug',
+  refactor: 'refactor',
+  docs: 'docs',
+  test: 'test',
+  ci: 'ci',
+  chore: 'chore',
+  build: 'chore',
+  perf: 'chore',
+  style: 'chore',
 };
 
 function typeFromTitle(title) {
-  const match = title.match(/^(feat|fix|refactor|docs|test|ci|chore|build|perf|style)(\([^)]*\))?!?:/i);
+  const match = title.match(
+    /^(feat|fix|refactor|docs|test|ci|chore|build|perf|style)(\([^)]*\))?!?:/i,
+  );
   return match ? `type/${TYPE_MAP[match[1].toLowerCase()]}` : null;
 }
 
@@ -46,7 +71,11 @@ function areasFromFile(filename) {
   if (filename.startsWith('packages/dsh-storage/')) return ['area/storage'];
   if (filename.startsWith('packages/dsh-a2a/')) return ['area/a2a'];
   if (filename.startsWith('packages/dsh-langfuse/')) return ['area/langfuse'];
-  if (/^(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|biome\.json|tsconfig\.base\.json)$/.test(filename))
+  if (
+    /^(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|biome\.json|tsconfig\.base\.json)$/.test(
+      filename,
+    )
+  )
     return ['area/package'];
   if (/^[^/]+\.md$/i.test(filename)) return ['area/docs'];
   return [];
@@ -58,7 +87,8 @@ function sizeFromFiles(files) {
     (sum, file) => (SIZE_EXCLUDE.test(file.filename) ? sum : sum + file.additions + file.deletions),
     0,
   );
-  const size = total < 20 ? 'XS' : total < 100 ? 'S' : total < 300 ? 'M' : total < 1000 ? 'L' : 'XL';
+  const size =
+    total < 20 ? 'XS' : total < 100 ? 'S' : total < 300 ? 'M' : total < 1000 ? 'L' : 'XL';
   return { total, label: `size:${size}` };
 }
 
@@ -113,7 +143,9 @@ async function proposePriority(github, { owner, repo }, core, pr, files, size) {
   const apiKey = process.env.DSH_INTEGRATION_API_KEY || '';
   const isFork = pr.head.repo && pr.head.repo.full_name !== `${owner}/${repo}`;
   if (!baseUrl || !apiKey || isFork) {
-    core.info(`PR #${pr.number}: priority proposal skipped (fork=${isFork}, secrets=${!!baseUrl && !!apiKey})`);
+    core.info(
+      `PR #${pr.number}: priority proposal skipped (fork=${isFork}, secrets=${!!baseUrl && !!apiKey})`,
+    );
     return;
   }
   const currentPriority = pr.labels.map(labelName).find((label) => PRIORITY_RE.test(label));
@@ -176,7 +208,12 @@ async function proposePriority(github, { owner, repo }, core, pr, files, size) {
     return;
   }
 
-  await github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: [proposal.priority] });
+  await github.rest.issues.addLabels({
+    owner,
+    repo,
+    issue_number: pr.number,
+    labels: [proposal.priority],
+  });
   core.info(`PR #${pr.number}: priority ${proposal.priority} — ${proposal.reason}`);
 }
 
@@ -188,7 +225,12 @@ export async function syncPrLabels({ github, context, core }) {
   if (context.eventName === 'workflow_dispatch') {
     const input = String(context.payload.inputs.pr || 'all').trim();
     if (input === 'all') {
-      const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
+      const open = await github.paginate(github.rest.pulls.list, {
+        owner,
+        repo,
+        state: 'open',
+        per_page: 100,
+      });
       prNumbers = open.map((pull) => pull.number);
     } else {
       const number = Number(input);

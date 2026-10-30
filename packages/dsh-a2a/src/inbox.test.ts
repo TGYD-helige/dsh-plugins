@@ -22,7 +22,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore()) {
+function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retainPending = false) {
   const ctx = new Context();
   contexts.push(ctx);
   const log = structuredClone(seed);
@@ -82,6 +82,11 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore()) {
         const items = target === 'next-turn' ? nextTurn : nextStep;
         session.append('agent/inbox/spliced', { target, start: 0, inserted: [message] } as never);
         items.unshift(message);
+      },
+      splice(target: string, start: number, removedCount: number, inserted: UserMessage[]) {
+        const items = target === 'next-turn' ? nextTurn : nextStep;
+        session.append('agent/inbox/spliced', { target, start, removedCount, inserted } as never);
+        items.splice(start, removedCount, ...inserted);
       },
       replace(id: string, message: UserMessage) {
         const items = nextTurn.some((m) => m.id === id) ? nextTurn : nextStep;
@@ -197,7 +202,7 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore()) {
     resume: async () => handle,
   } as never);
   const bridge = new A2aBridge(ctx, { cwd: '/tmp' });
-  const native = new NativeInbox(ctx, bridge, store);
+  const native = new NativeInbox(ctx, bridge, store, retainPending);
   const executor = new DshAgentExecutor(bridge);
   const send = (
     id: string,
@@ -249,6 +254,158 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore()) {
 }
 
 describe('native A2A inbox', () => {
+  async function abortAtCheckpoint(
+    action: 'cancel' | 'clear' | 'dispose' | 'shutdown',
+    settleOperationFirst = false,
+  ) {
+    const store = new MemoryTaskStore();
+    let checkpointed!: () => void;
+    let releaseCheckpoint!: () => void;
+    const checkpointStarted = new Promise<void>((resolve) => (checkpointed = resolve));
+    const checkpointGate = new Promise<void>((resolve) => (releaseCheckpoint = resolve));
+    const save = store.save.bind(store);
+    Object.assign(store, {
+      checkpoint: async (
+        task: Parameters<MemoryTaskStore['save']>[0],
+        context: ServerCallContext,
+      ) => {
+        await save(task, context);
+        checkpointed();
+        await checkpointGate;
+      },
+    });
+    const f = harness([], store, action === 'shutdown');
+    const pending = f.send('one', { parked: true });
+    await checkpointStarted;
+    let operation: Promise<unknown>;
+    if (action === 'cancel') operation = f.native.cancel('task-one');
+    else if (action === 'clear') operation = f.native.clear('context');
+    else if (action === 'shutdown') operation = f.native.shutdown();
+    else {
+      f.ctx.emit('session/disposed', f.agent.session);
+      operation = Promise.resolve();
+    }
+    if (settleOperationFirst) {
+      await operation;
+      releaseCheckpoint();
+      await pending.execution;
+    } else {
+      releaseCheckpoint();
+      await Promise.all([pending.execution, operation]);
+    }
+    return { f, store };
+  }
+
+  it('discards a checkpoint commit when ordinary cancel wins the admission race', async () => {
+    const { f, store } = await abortAtCheckpoint('cancel');
+    const snapshot = await store.load('task-one', new ServerCallContext());
+    expect(snapshot?.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
+    expect(f.agent.send).toHaveBeenCalledOnce();
+    expect(f.agent.inbox.nextTurn).toHaveLength(0);
+  });
+
+  it('discards a late checkpoint commit after clear has completed', async () => {
+    const { f } = await abortAtCheckpoint('clear', true);
+    expect(f.agent.send).toHaveBeenCalledOnce();
+    expect(f.agent.inbox.nextTurn).toHaveLength(0);
+  });
+
+  it('retains a checkpoint commit through disposal', async () => {
+    const { f } = await abortAtCheckpoint('dispose');
+    expect(f.agent.send).toHaveBeenCalledOnce();
+    expect(f.agent.inbox.nextTurn.map((message) => message.id)).toHaveLength(1);
+  });
+
+  it('recovers checkpoint-committed input after retain-pending shutdown', async () => {
+    const { f, store } = await abortAtCheckpoint('shutdown');
+    expect(f.agent.inbox.nextTurn.map((message) => message.id)).toHaveLength(1);
+    const snapshot = await store.load('task-one', new ServerCallContext());
+    expect(snapshot?.status?.state).toBe(TaskState.TASK_STATE_SUBMITTED);
+    expect(snapshot?.metadata).toHaveProperty(
+      'https://github.com/TGYD-helige/dsh-plugins/blob/main/docs/protocol/inbox-v1.md#retained-inputs',
+    );
+
+    const restored = harness(structuredClone(f.log), store, true);
+    await restored.start();
+    await restored.native.resolve('context');
+    expect(restored.agent.inbox.nextTurn.map((message) => message.id)).toHaveLength(1);
+    restored.agent.drive();
+    await restored.agent.whenIdle();
+    expect(restored.consumed).toHaveLength(1);
+  });
+
+  it('resumes terminal retained input under a fresh task', async () => {
+    const f = harness([], new MemoryTaskStore(), true);
+    f.send('one', { parked: true });
+    await vi.waitFor(() => expect(f.agent.inbox.nextTurn).toHaveLength(1));
+    await f.native.shutdown();
+    const context = new ServerCallContext();
+    const previous = await f.store.load('task-one', context);
+    await f.store.save(
+      {
+        ...previous!,
+        status: { ...previous!.status!, state: TaskState.TASK_STATE_CANCELED },
+      },
+      context,
+    );
+
+    const restored = harness(structuredClone(f.log), f.store, true);
+    await restored.start();
+    const taskId = await restored.native.resume('context', 'task-one');
+    await restored.agent.whenIdle();
+    expect(taskId).not.toBe('task-one');
+    expect(restored.consumed).toHaveLength(1);
+    await vi.waitFor(async () => {
+      expect((await restored.store.load(taskId, context))?.status?.state).toBe(
+        TaskState.TASK_STATE_COMPLETED,
+      );
+    });
+    const replacement = await restored.store.load(taskId, context);
+    expect(replacement?.history[0].referenceTaskIds).toContain('task-one');
+  });
+
+  it('keeps moved existing inputs in retained insertion indexes', async () => {
+    const store = new MemoryTaskStore();
+    const first = harness([], store, true);
+    first.send('one', { parked: true });
+    await vi.waitFor(() => expect(first.agent.inbox.nextTurn).toHaveLength(1));
+    const existing = first.agent.inbox.nextTurn[0];
+    const moved = { ...existing, source: { ...existing.source, queuedAt: 2 } };
+    first.agent.inbox.append('next-step', moved);
+    first.agent.inbox.splice('next-turn', 0, 1, []);
+    const original = Message.fromJSON(JSON.parse((moved.source as any).message));
+    original.messageId = 'missing';
+    const missing = {
+      ...existing,
+      id: 'missing',
+      content: [{ type: 'text' as const, text: 'missing' }],
+      source: {
+        ...moved.source,
+        queuedAt: 1,
+        message: JSON.stringify(Message.toJSON(original)),
+      },
+    };
+    const context = new ServerCallContext();
+    const snapshot = await store.load('task-one', context);
+    snapshot!.metadata = {
+      ...snapshot!.metadata,
+      'https://github.com/TGYD-helige/dsh-plugins/blob/main/docs/protocol/inbox-v1.md#retained-inputs':
+        JSON.stringify([
+          { position: 0, target: 'next-turn', message: missing },
+          { position: 1, target: 'next-turn', message: moved },
+        ]),
+    };
+    await store.save(snapshot!, context);
+
+    const restored = harness(structuredClone(first.log), store, true);
+    await restored.start();
+    await restored.native.resolve('context');
+    expect(restored.agent.inbox.nextTurn.map((message) => message.id)).toEqual([
+      'missing',
+      existing.id,
+    ]);
+  });
+
   it('publishes only committed protocol inputs and keeps internal user messages private', async () => {
     const f = harness();
     const original = f.send('one', { parked: true });
@@ -404,6 +561,22 @@ describe('native A2A inbox', () => {
     expect(f.handle.dispose).toHaveBeenCalled();
   });
 
+  it('reports admission commit failures during shutdown', async () => {
+    const store = new MemoryTaskStore();
+    Object.assign(store, {
+      checkpoint: async () => {
+        throw new Error('commit failed');
+      },
+    });
+    const f = harness([], store, true);
+    const pending = f.send('one', { parked: true });
+    const shutdown = f.native.shutdown();
+    await expect(shutdown).rejects.toMatchObject({
+      errors: expect.arrayContaining([expect.objectContaining({ message: 'commit failed' })]),
+    });
+    await pending.execution;
+  });
+
   it('parks standard messages until a real waking send drains the official queue', async () => {
     const f = harness();
     const first = f.send('one', { parked: true });
@@ -449,6 +622,69 @@ describe('native A2A inbox', () => {
     await Promise.all([first.execution, second.execution]);
     expect(prepared).toEqual(['one', 'two', 'trigger']);
     expect(error).toHaveBeenCalledWith(expect.stringContaining('[dsh-a2a]'), expect.any(Error));
+  });
+
+  it('pauses without consuming and wakes pending work in order', async () => {
+    const f = harness();
+    const first = f.send('one', { parked: true });
+    const second = f.send('two', { parked: true });
+    await vi.waitFor(() => expect(f.agent.inbox.nextTurn).toHaveLength(2));
+    await f.native.pause('context');
+    expect(f.consumed).toEqual([]);
+    expect(f.agent.inbox.nextTurn).toHaveLength(2);
+    expect(f.agent.inbox.nextStep).toHaveLength(0);
+    await f.native.wake('context');
+    await Promise.all([first.execution, second.execution]);
+    const consumed = f.log
+      .filter((event) => event.type === 'user/message')
+      .map((event) => JSON.parse((event.data.source as any).message).messageId);
+    expect(consumed).toEqual(['one', 'two']);
+  });
+
+  it('requeues an uncommitted claimed batch when pausing the active driver', async () => {
+    const f = harness();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const hook = vi.fn(() => gate);
+    f.ctx.on('a2a/before-step', hook);
+    const pending = f.send('one');
+    await vi.waitFor(() => expect(hook).toHaveBeenCalledOnce());
+    const idle = f.agent.whenIdle;
+    f.agent.whenIdle = async () => {
+      f.agent.session.append('turn/end', {
+        turn: 1,
+        reason: { kind: 'aborted', reason: { kind: 'user' } },
+      });
+      await idle();
+    };
+    const pausing = f.native.pause('context');
+    release();
+    await pausing;
+    expect(f.agent.inbox.nextTurn).toHaveLength(1);
+    await f.native.wake('context');
+    await pending.execution;
+    const consumed = f.log
+      .filter((event) => event.type === 'user/message')
+      .map((event) => JSON.parse((event.data.source as any).message).messageId);
+    expect(consumed).toEqual(['one']);
+  });
+
+  it('restores pause intent and consumes only after an explicit wake', async () => {
+    const store = new MemoryTaskStore();
+    const first = harness([], store, true);
+    first.send('one', { parked: true });
+    await vi.waitFor(() => expect(first.agent.inbox.nextTurn).toHaveLength(1));
+    await first.native.pause('context');
+    await first.native.shutdown();
+
+    const restored = harness(structuredClone(first.log), store, true);
+    await restored.start();
+    await restored.native.resolve('context');
+    expect(restored.consumed).toEqual([]);
+    expect(restored.agent.inbox.nextTurn).toHaveLength(1);
+    await restored.native.wake('context');
+    await restored.agent.whenIdle();
+    expect(restored.consumed).toHaveLength(1);
   });
 
   it('clears pending input even when the agent is idle', async () => {

@@ -117,12 +117,13 @@ export class MemoryTaskStore implements ManagedTaskStore {
   }
 }
 
+const TERMINAL_REOPEN_GUARD_MS = 24 * 60 * 60 * 1000;
+
 /** Saves task snapshots on state transitions while keeping active deltas in process. */
 export class SanitizedTaskStore implements ManagedTaskStore {
   private readonly lastState = new Map<string, TaskState>();
   private readonly writes = new Map<string, Promise<void>>();
-  // Terminal task ids stay guarded until unload, like deleted-id tombstones.
-  private readonly terminalStates = new Map<string, TaskState>();
+  private readonly terminalStates = new Map<string, { state: TaskState; expiresAt: number }>();
   private readonly liveHistory = new Map<string, { scope: string; history: Task['history'] }>();
   // ponytail: deleted ids stay tombstoned until plugin unload; use expiring ids if clear volume grows.
   private readonly deleted = new Set<string>();
@@ -140,6 +141,7 @@ export class SanitizedTaskStore implements ManagedTaskStore {
       await Promise.all(pending);
     } while ([...this.writes.values()].some((write) => !pending.includes(write)));
     this.liveHistory.clear();
+    this.terminalStates.clear();
     await this.inner.close?.();
   }
 
@@ -155,6 +157,7 @@ export class SanitizedTaskStore implements ManagedTaskStore {
     await this.inner.delete(taskId, context);
     this.lastState.delete(taskId);
     this.writes.delete(taskId);
+    this.terminalStates.delete(taskId);
   }
 
   checkpoint(task: Task, context: ServerCallContext): Promise<void> {
@@ -164,8 +167,10 @@ export class SanitizedTaskStore implements ManagedTaskStore {
   async save(task: Task, context: ServerCallContext, checkpoint = false): Promise<void> {
     if (this.deleted.has(task.id)) return;
     const state = task.status?.state;
+    const now = Date.now();
     const terminal = this.terminalStates.get(task.id);
-    if (terminal !== undefined && state !== terminal) return;
+    if (terminal && terminal.expiresAt <= now) this.terminalStates.delete(task.id);
+    else if (terminal && state !== terminal.state) return;
     if (
       state !== undefined &&
       [
@@ -174,8 +179,20 @@ export class SanitizedTaskStore implements ManagedTaskStore {
         TaskState.TASK_STATE_FAILED,
         TaskState.TASK_STATE_REJECTED,
       ].includes(state)
-    )
-      this.terminalStates.set(task.id, state);
+    ) {
+      // Map order matches expiry order: only the expired prefix needs scanning.
+      for (const [id, guard] of this.terminalStates) {
+        if (guard.expiresAt > now) break;
+        this.terminalStates.delete(id);
+      }
+      // Re-registering an id refreshes both its deadline and insertion order.
+      this.terminalStates.delete(task.id);
+      this.terminalStates.set(task.id, {
+        state,
+        expiresAt: now + TERMINAL_REOPEN_GUARD_MS,
+      });
+    }
+    // shortcut: WORKING deltas clone and concatenate per event; use chunk accumulators if long streams make this hot path measurable.
     const history = structuredClone(task.history ?? []);
     const current = task.status?.message;
     if (current?.role === Role.ROLE_USER) commitInboxInput(history, current);
