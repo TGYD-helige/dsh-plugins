@@ -360,8 +360,8 @@ function boundMaskedPayload<T>(
     parts.push(text);
     remaining -= bytes;
   };
-  const write = (value: unknown): void => {
-    if (overflow || value === undefined) return;
+  const write = (value: unknown): unknown => {
+    if (overflow || value === undefined) return undefined;
     if (value === null || typeof value !== 'object' || value instanceof Date) {
       if (
         typeof value === 'string' &&
@@ -369,53 +369,68 @@ function boundMaskedPayload<T>(
         Buffer.byteLength(value) > remaining
       ) {
         overflow = true;
-        return;
+        return undefined;
       }
-      append(JSON.stringify(reporter.mask(value)));
-      return;
+      const masked = reporter.mask(value);
+      append(JSON.stringify(masked));
+      return masked;
     }
     if (seen.has(value)) {
       append(JSON.stringify('[Circular]'));
-      return;
+      return '[Circular]';
     }
     seen.add(value);
     if (Array.isArray(value)) {
       append('[');
+      const result: unknown[] = [];
       for (const [index, item] of value.entries()) {
         if (overflow) break;
         if (index > 0) append(',');
-        if (item === undefined) append('null');
-        else write(item);
+        if (item === undefined) {
+          append('null');
+          result.push(null);
+        } else {
+          const masked = write(item);
+          if (!overflow) result.push(masked);
+        }
       }
       append(']');
-    } else {
-      append('{');
-      let first = true;
-      for (const key in value) {
-        if (overflow) break;
-        if (!Object.hasOwn(value, key)) continue;
-        const child = (value as Record<string, unknown>)[key];
-        if (child === undefined && !reporter.shouldRedactField(key)) continue;
-        if (!first) append(',');
-        first = false;
-        append(JSON.stringify(reporter.mask(key)));
-        append(':');
-        if (reporter.shouldRedactField(key)) append(JSON.stringify('[REDACTED]'));
-        else write(child);
-      }
-      append('}');
+      seen.delete(value);
+      return result;
     }
+    append('{');
+    const result = Object.create(null) as Record<string, unknown>;
+    let first = true;
+    for (const key in value) {
+      if (overflow) break;
+      if (!Object.hasOwn(value, key)) continue;
+      const child = (value as Record<string, unknown>)[key];
+      if (child === undefined && !reporter.shouldRedactField(key)) continue;
+      if (!first) append(',');
+      first = false;
+      append(JSON.stringify(reporter.mask(key)));
+      append(':');
+      if (reporter.shouldRedactField(key)) {
+        append(JSON.stringify('[REDACTED]'));
+        result[key] = '[REDACTED]';
+      } else {
+        const masked = write(child);
+        if (!overflow) result[key] = masked;
+      }
+    }
+    append('}');
     seen.delete(value);
+    return result;
   };
   try {
-    write(input);
+    const masked = write(input);
+    if (!overflow) {
+      budget.remaining = remaining;
+      return masked as T;
+    }
   } catch {
     budget.truncated = true;
     return previewPayload('', budget);
-  }
-  if (!overflow) {
-    budget.remaining = remaining;
-    return reporter.mask(input);
   }
   budget.truncated = true;
   return previewPayload(parts.join(''), budget);
@@ -450,6 +465,10 @@ function capturePayloadChunk(
   chunks: StreamChunk[],
   budget: PayloadBudget,
 ): void {
+  if (budget.remaining <= 0) {
+    budget.truncated = true;
+    return;
+  }
   let serialized: string;
   try {
     serialized = JSON.stringify(chunk) ?? '';
@@ -1629,7 +1648,23 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
             case 'block-end':
               if (chunk.block.type === 'tool-call') {
                 toolCallCount += 1;
-                if (config.captureContent)
+                if (config.captureContent) {
+                  if (outputBudget.remaining <= 0) {
+                    outputBudget.truncated = true;
+                    break;
+                  }
+                  const envelopeBytes = Buffer.byteLength(
+                    JSON.stringify({
+                      id: chunk.block.id,
+                      type: 'function',
+                      function: { name: chunk.block.name, arguments: '' },
+                    }),
+                  );
+                  if (envelopeBytes > outputBudget.remaining) {
+                    outputBudget.truncated = true;
+                    outputBudget.remaining = 0;
+                    break;
+                  }
                   captureToolCall(
                     {
                       id: chunk.block.id,
@@ -1642,6 +1677,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
                     toolCalls,
                     outputBudget,
                   );
+                }
               }
               break;
             case 'usage':

@@ -359,7 +359,10 @@ async function backendOnlyLeg(dbProvider) {
   };
   for (let delivery = 0; delivery < 2; delivery++) {
     const row = mergeToolResult(resultEvent, await backend.readToolCallMessages('s1', 'c1'));
-    assert(row?.id === 'a1', 'tool result did not match the persisted model call');
+    assert(
+      row?.id === 'a1',
+      `tool result did not match the persisted model call: ${JSON.stringify(row)}`,
+    );
     await backend.upsertMessage(row);
   }
   // Redelivery must update in place, not duplicate (deterministic PK).
@@ -446,8 +449,12 @@ async function backendOnlyLeg(dbProvider) {
     if (dbProvider === 'sqlite') {
       await prisma.$executeRawUnsafe('DROP INDEX IF EXISTS idx_created');
       await prisma.$executeRawUnsafe('DROP INDEX IF EXISTS idx_session_agent_type_created');
+      await prisma.$executeRawUnsafe('DROP INDEX IF EXISTS idx_tool_call_lookup');
       await prisma.$executeRawUnsafe('ALTER TABLE ai_messages DROP COLUMN created_at');
       await prisma.$executeRawUnsafe('ALTER TABLE ai_messages ADD COLUMN created_at DATETIME');
+      await prisma.$executeRawUnsafe(
+        'CREATE INDEX idx_tool_call_lookup ON ai_messages (session_id, history_id, deleted_at, type, created_at, id)',
+      );
     } else if (dbProvider === 'mysql') {
       await prisma.$executeRawUnsafe('ALTER TABLE ai_messages MODIFY created_at TIMESTAMP NULL');
     } else if (dbProvider === 'postgresql') {
@@ -478,15 +485,53 @@ async function backendOnlyLeg(dbProvider) {
         createdAt: new Date(1700000000000 + index),
       });
     }
-    const nullMarker =
-      dbProvider === 'postgresql' ? '$1' : dbProvider === 'sqlserver' ? '@P1' : '?';
+    const nullMarkers =
+      dbProvider === 'postgresql' ? '$1, $2' : dbProvider === 'sqlserver' ? '@P1, @P2' : '?, ?';
+    // Mix NULL and non-NULL timestamps so keyset pagination must transition
+    // between both groups without returning the same row twice.
     await prisma.$executeRawUnsafe(
-      `UPDATE ai_messages SET created_at = NULL WHERE session_id = ${nullMarker}`,
+      `UPDATE ai_messages SET created_at = NULL WHERE session_id = ${nullMarkers.split(', ')[0]} AND created_at < ${nullMarkers.split(', ')[1]}`,
       'p1',
+      new Date(1700000000050),
     );
 
     const old = await backend.readToolCallMessages('p1', 'old-call');
     assert(old.length === 1 && old[0].id === 'page-0', 'NULL timestamp paging lost the old call');
+
+    // Verify the query planner can use the new composite index instead of
+    // repeatedly scanning archived rows. Other providers log their real plans
+    // for CI review; SQLite additionally asserts the index is selected.
+    const sessionMarker =
+      dbProvider === 'postgresql' ? '$1' : dbProvider === 'sqlserver' ? '@P1' : '?';
+    const nonNullTime = dbProvider === 'postgresql' ? 'AND created_at IS NOT NULL' : '';
+    const planQuery = `SELECT ${dbProvider === 'sqlserver' ? 'TOP 100 ' : ''}id FROM ai_messages WHERE session_id = ${sessionMarker} AND deleted_at IS NULL AND history_id IS NULL AND type = 'model' AND tool_calls IS NOT NULL ${nonNullTime} ORDER BY created_at DESC, id DESC ${dbProvider === 'sqlserver' ? '' : 'LIMIT 100'}`;
+    if (dbProvider === 'sqlserver') {
+      const plan = await prisma.$transaction(async (tx) => {
+        await tx.$executeRawUnsafe('SET SHOWPLAN_ALL ON');
+        try {
+          return await tx.$queryRawUnsafe(planQuery, 'p1');
+        } finally {
+          await tx.$executeRawUnsafe('SET SHOWPLAN_ALL OFF');
+        }
+      });
+      console.log('query plan (sqlserver):', JSON.stringify(plan).slice(0, 1200));
+    } else if (dbProvider === 'sqlite') {
+      const planDb = new DatabaseSync(url.replace(/^file:/, ''));
+      try {
+        const plan = planDb.prepare(`EXPLAIN QUERY PLAN ${planQuery}`).all('p1');
+        assert(
+          JSON.stringify(plan).includes('idx_tool_call_lookup'),
+          'SQLite did not use the tool-call composite index',
+        );
+        console.log('query plan (sqlite):', JSON.stringify(plan).slice(0, 1200));
+      } finally {
+        planDb.close();
+      }
+    } else {
+      const explain = dbProvider === 'postgresql' ? 'EXPLAIN (FORMAT JSON) ' : 'EXPLAIN ';
+      const plan = await prisma.$queryRawUnsafe(explain + planQuery, 'p1');
+      console.log(`query plan (${dbProvider}):`, JSON.stringify(plan).slice(0, 1200));
+    }
 
     const pagedArchiveId = await backend.archiveSession('p1');
     assert(pagedArchiveId, 'paged archive did not create a history');
@@ -530,7 +575,6 @@ async function backendOnlyLeg(dbProvider) {
       failed = true;
     }
     assert(failed, 'archive failure injection did not run');
-
     await backend.upsertEvent(
       {
         id: 'retry-new-event',
@@ -678,6 +722,24 @@ async function backendOnlyLeg(dbProvider) {
         metadata?.['dsh-storage:token-baseline'] === undefined,
         'next segment baseline survived recovery',
       );
+    }
+  }
+
+  if (dbProvider === 'sqlite') {
+    const planDb = new DatabaseSync(url.replace(/^file:/, ''));
+    try {
+      const plan = planDb
+        .prepare(
+          'EXPLAIN QUERY PLAN SELECT history_id FROM ai_messages WHERE session_id = ? AND history_id IS NOT NULL AND deleted_at IS NULL ORDER BY updated_at DESC, id DESC LIMIT 1',
+        )
+        .all('r1');
+      assert(
+        JSON.stringify(plan).includes('idx_archive_recovery'),
+        'SQLite did not use the archive recovery index',
+      );
+      console.log('archive recovery plan (sqlite):', JSON.stringify(plan).slice(0, 1200));
+    } finally {
+      planDb.close();
     }
   }
 

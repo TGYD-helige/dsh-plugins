@@ -201,49 +201,63 @@ export class DatabaseBackend implements StorageBackend {
     const prisma = this.client();
     const provider = this.config.provider;
     const sqlserver = provider === 'sqlserver';
+    // SQL Server formats datetime2 with all seven fractional digits: a raw JS
+    // Date would lose the 100ns precision needed by keyset pagination.
     const sortTime =
       provider === 'mysql'
         ? "DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s.%f')"
         : provider === 'postgresql'
           ? "to_char(created_at, 'YYYY-MM-DD HH24:MI:SS.US')"
           : sqlserver
-            ? 'CONVERT(varchar(33), created_at, 126)'
+            ? "FORMAT(created_at, 'yyyy-MM-ddTHH:mm:ss.fffffff')"
             : 'CAST(created_at AS TEXT)';
-    let cursor: { id: string; time: string | null } | undefined;
+    let cursor: { id: string; time: string | Date | null } | undefined;
+    let nullPhase = false;
     for (;;) {
-      const params: Array<string | null> =
+      const params: Array<string | Date | null> =
         provider === 'mysql' || provider === 'sqlite' ? [sessionId, sessionId] : [sessionId];
       let before = '';
-      if (cursor) {
-        if (cursor.time === null) {
+      if (provider === 'postgresql') {
+        // PostgreSQL defaults to NULLS FIRST, which cannot be paginated with a
+        // single mixed-time cursor. Walk non-NULL timestamps first, then IDs
+        // of NULL rows, instead of relying on a NULLS LAST index definition.
+        if (nullPhase) {
           before =
-            provider === 'postgresql'
-              ? 'AND (created_at IS NOT NULL OR (created_at IS NULL AND id < ?))'
-              : 'AND created_at IS NULL AND id < ?';
+            cursor?.time === null ? 'AND created_at IS NULL AND id < ?' : 'AND created_at IS NULL';
+          if (cursor) params.push(cursor.id);
+        } else {
+          before = 'AND created_at IS NOT NULL';
+          if (cursor?.time) {
+            before += ' AND (created_at < ? OR (created_at = ? AND id < ?))';
+            params.push(cursor.time, cursor.time, cursor.id);
+          }
+        }
+      } else if (cursor) {
+        if (cursor.time === null) {
+          before = 'AND created_at IS NULL AND id < ?';
           params.push(cursor.id);
         } else {
-          before = `AND (created_at < ? OR (created_at = ? AND id < ?)${provider === 'postgresql' ? '' : ' OR created_at IS NULL'})`;
+          before = 'AND (created_at < ? OR (created_at = ? AND id < ?) OR created_at IS NULL)';
           params.push(cursor.time, cursor.time, cursor.id);
         }
       }
-      let sql = `SELECT ${sqlserver ? 'TOP 100 ' : ''}id, tool_calls, ${sortTime} AS sort_time
+      const orderBy =
+        provider === 'postgresql' && nullPhase ? 'id DESC' : 'created_at DESC, id DESC';
+      let sql = `SELECT ${sqlserver ? 'TOP 100 ' : ''}id, ${sqlserver ? 'session_id, ' : ''}tool_calls, ${sortTime} AS sort_time
         FROM ai_messages WHERE session_id = ?
         ${provider === 'sqlite' ? 'AND session_id COLLATE BINARY = ?' : ''}
         ${provider === 'mysql' ? 'AND BINARY session_id = BINARY ?' : ''}
         AND deleted_at IS NULL AND history_id IS NULL AND type = 'model' AND tool_calls IS NOT NULL
-        ${
-          sqlserver
-            ? `AND session_id COLLATE Latin1_General_100_BIN2 = @P1
-          AND DATALENGTH(CAST(session_id AS nvarchar(max))) = DATALENGTH(CAST(@P1 AS nvarchar(max)))`
-            : ''
-        }
-        ${before} ORDER BY created_at DESC, id DESC ${sqlserver ? '' : 'LIMIT 100'}`;
+        ${before} ORDER BY ${orderBy} ${sqlserver ? '' : 'LIMIT 100'}`;
       if (sqlserver || provider === 'postgresql') {
         let index = 0;
         sql = sql.replaceAll('?', () => `${sqlserver ? '@P' : '$'}${++index}`);
       }
       const page = await prisma.$queryRawUnsafe(sql, ...params);
       for (const row of page) {
+        // The SQL Server index can seek on session_id without a collation
+        // expression; verify exact identity here instead of losing index use.
+        if (sqlserver && row.session_id !== undefined && row.session_id !== sessionId) continue;
         let calls = row.tool_calls;
         if (typeof calls === 'string') {
           try {
@@ -262,7 +276,14 @@ export class DatabaseBackend implements StorageBackend {
           });
         }
       }
-      if (page.length < 100) return [];
+      if (page.length < 100) {
+        if (provider === 'postgresql' && !nullPhase) {
+          nullPhase = true;
+          cursor = undefined;
+          continue;
+        }
+        return [];
+      }
       const last = page.at(-1);
       cursor = { id: last.id, time: last.sort_time };
     }
@@ -384,7 +405,7 @@ export class DatabaseBackend implements StorageBackend {
       // history before considering a newer active rollup or an empty finalization.
       const interrupted = await tx.aiMessage.findFirst({
         where: { sessionId, historyId: { not: null }, deletedAt: null },
-        orderBy: { updatedAt: 'desc' },
+        orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
         select: { historyId: true },
       });
       if (interrupted?.historyId) {

@@ -193,10 +193,9 @@ describe('DatabaseBackend', () => {
       expect(sql).not.toContain("call-'quoted");
       expect(params).toContain('s1');
       if (provider === 'sqlserver') {
-        expect(sql).toContain('session_id COLLATE Latin1_General_100_BIN2 = @P1');
-        expect(sql).toContain(
-          'DATALENGTH(CAST(session_id AS nvarchar(max))) = DATALENGTH(CAST(@P1 AS nvarchar(max)))',
-        );
+        expect(sql).toContain('session_id = @P1');
+        expect(sql).not.toContain('COLLATE');
+        expect(sql).not.toContain('DATALENGTH');
         expect(sql).not.toContain('OPENJSON');
       }
       expect(prisma.aiMessage.findMany).toHaveBeenCalledWith({
@@ -226,18 +225,18 @@ describe('DatabaseBackend', () => {
       await backend.init();
       const prisma = prismaMock.instances[0];
       const time = '2026-10-29T10:00:00.1234567';
-      prisma.$queryRawUnsafe
-        .mockResolvedValueOnce(
-          Array.from({ length: 100 }, (_, i) => ({
-            id: `row-${100 - i}`,
-            sort_time: time,
-            tool_calls: JSON.stringify([{ id: i % 2 ? 'C1' : 'c1 ' }]),
-          })),
-        )
-        .mockResolvedValueOnce([{ id: 'target', sort_time: time, tool_calls: '[{"id":"c1"}]' }]);
+      const pages = prisma.$queryRawUnsafe.mockResolvedValueOnce(
+        Array.from({ length: 100 }, (_, i) => ({
+          id: `row-${100 - i}`,
+          sort_time: time,
+          tool_calls: JSON.stringify([{ id: i % 2 ? 'C1' : 'c1 ' }]),
+        })),
+      );
+      if (provider === 'postgresql') pages.mockResolvedValueOnce([]);
+      pages.mockResolvedValueOnce([{ id: 'target', sort_time: time, tool_calls: '[{"id":"c1"}]' }]);
       prisma.aiMessage.findMany.mockResolvedValueOnce([]);
       await backend.readToolCallMessages('S1', 'c1');
-      expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(2);
+      expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(provider === 'postgresql' ? 3 : 2);
       for (const [sql] of prisma.$queryRawUnsafe.mock.calls) {
         expect(sql).not.toMatch(/JOIN|EXISTS|json_each|OPENJSON|\(SELECT/i);
         expect(sql).toMatch(/LIMIT 100|TOP 100/);
@@ -271,13 +270,13 @@ describe('DatabaseBackend', () => {
         )
         .mockResolvedValueOnce([]);
       await expect(backend.readToolCallMessages('S1', 'c1')).resolves.toEqual([]);
-      expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(2);
+      expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(provider === 'postgresql' ? 3 : 2);
       expect(prisma.aiMessage.findMany).not.toHaveBeenCalled();
       const sql = prisma.$queryRawUnsafe.mock.calls[0][0];
       expect(sql).not.toContain('content');
       const exactScope =
         provider === 'sqlserver'
-          ? 'session_id COLLATE Latin1_General_100_BIN2 = @P1'
+          ? 'session_id = @P1'
           : provider === 'sqlite'
             ? 'session_id COLLATE BINARY = ?'
             : provider === 'mysql'
@@ -296,25 +295,104 @@ describe('DatabaseBackend', () => {
       });
       await backend.init();
       const prisma = prismaMock.instances[0];
-      prisma.$queryRawUnsafe
-        .mockResolvedValueOnce(
-          Array.from({ length: 100 }, (_, i) => ({
-            id: `row-${100 - i}`,
-            sort_time: null,
-            tool_calls: '[{"id":"other"}]',
-          })),
-        )
-        .mockResolvedValueOnce([{ id: 'target', sort_time: null, tool_calls: '[{"id":"c1"}]' }]);
+      const pages = prisma.$queryRawUnsafe.mockResolvedValueOnce(
+        Array.from({ length: 100 }, (_, i) => ({
+          id: `row-${100 - i}`,
+          sort_time: null,
+          tool_calls: '[{"id":"other"}]',
+        })),
+      );
+      if (provider === 'postgresql') pages.mockResolvedValueOnce([]);
+      pages.mockResolvedValueOnce([{ id: 'target', sort_time: null, tool_calls: '[{"id":"c1"}]' }]);
       prisma.aiMessage.findMany.mockResolvedValueOnce([]);
       await backend.readToolCallMessages('s1', 'c1');
-      const [sql, ...params] = prisma.$queryRawUnsafe.mock.calls[1];
-      expect(sql).toContain('created_at IS NULL AND id <');
-      if (provider === 'postgresql') expect(sql).toContain('created_at IS NOT NULL OR');
-      expect(params.at(-1)).toBe('row-1');
+      const [sql, ...params] = prisma.$queryRawUnsafe.mock.calls[provider === 'postgresql' ? 2 : 1];
+      expect(sql).toContain('created_at IS NULL');
+      if (provider === 'postgresql') {
+        expect(sql).toContain('ORDER BY id DESC');
+        expect(params.at(-1)).toBe('s1');
+      } else {
+        expect(params.at(-1)).toBe('row-1');
+      }
       expect(params).not.toContain(null);
       expect(prisma.aiMessage.findMany.mock.calls[0][0].where.id).toBe('target');
     },
   );
+
+  it('keeps SQL Server datetime2 precision across a same-millisecond page boundary', async () => {
+    backend = new DatabaseBackend({
+      provider: 'sqlserver',
+      url: 'sqlserver://host;database=db;user=u;password=p',
+    });
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const boundary = '2026-10-29T10:00:00.1234567';
+    prisma.$queryRawUnsafe
+      .mockResolvedValueOnce(
+        Array.from({ length: 100 }, (_, i) => ({
+          id: `row-${i}`,
+          sort_time: boundary,
+          tool_calls: '[{"id":"other"}]',
+        })),
+      )
+      .mockResolvedValueOnce([
+        {
+          id: 'target',
+          sort_time: '2026-10-29T10:00:00.1234000',
+          tool_calls: '[{"id":"c1"}]',
+        },
+      ]);
+    prisma.aiMessage.findMany.mockResolvedValueOnce([]);
+
+    await backend.readToolCallMessages('s1', 'c1');
+
+    expect(prisma.$queryRawUnsafe.mock.calls[0][0]).toContain(
+      "FORMAT(created_at, 'yyyy-MM-ddTHH:mm:ss.fffffff') AS sort_time",
+    );
+    const [nextSql, ...params] = prisma.$queryRawUnsafe.mock.calls[1];
+    expect(nextSql).toContain('created_at < @P');
+    expect(params).toContainEqual(boundary);
+    expect(prisma.aiMessage.findMany.mock.calls[0][0].where.id).toBe('target');
+  });
+
+  it('rejects SQL Server collation near-matches before reading full rows', async () => {
+    backend = new DatabaseBackend({
+      provider: 'sqlserver',
+      url: 'sqlserver://host;database=db;user=u;password=p',
+    });
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    prisma.$queryRawUnsafe.mockResolvedValueOnce([
+      { id: 'near-match', session_id: 'S1', tool_calls: [{ id: 'c1' }] },
+    ]);
+
+    await expect(backend.readToolCallMessages('s1', 'c1')).resolves.toEqual([]);
+    expect(prisma.aiMessage.findMany).not.toHaveBeenCalled();
+  });
+
+  it('switches postgresql from non-null timestamps to the null-id page without duplicates', async () => {
+    backend = new DatabaseBackend({ provider: 'postgresql', url });
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    prisma.$queryRawUnsafe
+      .mockResolvedValueOnce(
+        Array.from({ length: 100 }, (_, i) => ({
+          id: `non-null-${i}`,
+          sort_time: new Date(1700000000000 + i),
+          tool_calls: '[{"id":"other"}]',
+        })),
+      )
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'target', sort_time: null, tool_calls: '[{"id":"c1"}]' }]);
+    prisma.aiMessage.findMany.mockResolvedValueOnce([]);
+
+    await backend.readToolCallMessages('s1', 'c1');
+
+    expect(prisma.$queryRawUnsafe.mock.calls[0][0]).toContain('created_at IS NOT NULL');
+    expect(prisma.$queryRawUnsafe.mock.calls[2][0]).toContain('created_at IS NULL');
+    expect(prisma.$queryRawUnsafe.mock.calls[2][0]).toContain('ORDER BY id DESC');
+    expect(prisma.aiMessage.findMany.mock.calls[0][0].where.id).toBe('target');
+  });
 
   it('builds the mysql adapter from a mariadb:// url', async () => {
     backend = new DatabaseBackend({ provider: 'mysql', url: 'mysql://u:p@host:3306/db' });
@@ -638,6 +716,10 @@ describe('DatabaseBackend', () => {
 
     await expect(backend.archiveSession('s1')).rejects.toThrow('batch failed');
     await expect(backend.archiveSession('s1')).resolves.toBe('history-2');
+    expect(prisma.aiMessage.findFirst.mock.calls[1][0].orderBy).toEqual([
+      { updatedAt: 'desc' },
+      { id: 'desc' },
+    ]);
     expect(prisma.aiChatHistory.create).toHaveBeenCalledTimes(1);
     expect(prisma.aiMessage.updateMany).toHaveBeenCalledTimes(2);
   });

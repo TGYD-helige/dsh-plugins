@@ -1605,32 +1605,32 @@ export class NativeInbox implements A2aInbox {
           failures.push(error);
         } finally {
           const targets: InboxTarget[] = ['next-step', 'next-turn'];
-          const retainedOrder = targets.flatMap((target) =>
-            run.retained[target].map((message) => message.id),
-          );
+          const committed = this.retainPending
+            ? new Set(
+                run.entry.handle.agent.session
+                  .snapshotEvents()
+                  .flatMap((event) => (event.type === 'user/message' ? [event.data.id] : [])),
+              )
+            : new Set<string>();
+          const retainedByTask = new Map<
+            string,
+            Array<{ message: UserMessage; target: InboxTarget; position: number }>
+          >();
+          let position = 0;
+          for (const target of targets) {
+            for (const message of run.retained[target]) {
+              const input = { message, target, position: position++ };
+              if (message.source.kind !== 'a2a' || committed.has(message.id)) continue;
+              const group = retainedByTask.get(message.source.taskId) ?? [];
+              group.push(input);
+              retainedByTask.set(message.source.taskId, group);
+            }
+          }
           for (const task of run.tasks.values()) {
             try {
               if (!task.settled) {
                 if (this.retainPending) {
-                  const committed = new Set(
-                    run.entry.handle.agent.session
-                      .snapshotEvents()
-                      .flatMap((event) => (event.type === 'user/message' ? [event.data.id] : [])),
-                  );
-                  const positionOf = (id: UserMessage['id']) => {
-                    const index = retainedOrder.indexOf(id);
-                    return index < 0 ? Number.MAX_SAFE_INTEGER : index;
-                  };
-                  const pending = (['next-step', 'next-turn'] as const).flatMap((target) =>
-                    run.retained[target].flatMap((message) => {
-                      const input = { message, target, position: positionOf(message.id) };
-                      return message.source.kind === 'a2a' &&
-                        message.source.taskId === task.task.id &&
-                        !committed.has(message.id)
-                        ? [input]
-                        : [];
-                    }),
-                  );
+                  const pending = retainedByTask.get(task.task.id) ?? [];
                   if (pending.length) {
                     task.task.metadata = {
                       ...task.task.metadata,
