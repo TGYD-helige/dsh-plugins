@@ -973,6 +973,37 @@ describe('DatabaseBackend', () => {
     await expect(backend.readSession('s1')).resolves.toBeNull();
   });
 
+  it('stores the archive token baseline as a JSON-safe number on sqlserver', async () => {
+    backend = new DatabaseBackend({
+      provider: 'sqlserver',
+      url: 'sqlserver://host:1433;database=dsh;user=sa;password=p',
+    });
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const first = new Date(1700000000000);
+    const last = new Date(1700000001000);
+    prisma.aiMessage.aggregate.mockResolvedValue({
+      _count: { _all: 1 },
+      _min: { createdAt: first },
+      _max: { createdAt: last },
+    });
+    prisma.aiChatHistory.findFirst
+      .mockResolvedValueOnce({ id: 'history-1', metadata: {}, totalTokens: 100n })
+      .mockResolvedValueOnce({ metadata: {} })
+      .mockResolvedValueOnce(null);
+    prisma.aiMessage.findMany.mockResolvedValue([{ id: 'm1' }]);
+    prisma.aiMessage.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-1');
+    const startUpdate = prisma.aiChatHistory.update.mock.calls[0][0];
+    const metadata =
+      typeof startUpdate.data.metadata === 'string'
+        ? JSON.parse(startUpdate.data.metadata)
+        : startUpdate.data.metadata;
+    expect(metadata['dsh-storage:token-baseline']).toBe(100);
+    expect(() => JSON.stringify(metadata)).not.toThrow();
+  });
+
   it('serializes session metadata as text on sqlserver', async () => {
     backend = new DatabaseBackend({
       provider: 'sqlserver',

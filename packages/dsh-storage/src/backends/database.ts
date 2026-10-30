@@ -415,7 +415,7 @@ export class DatabaseBackend implements StorageBackend {
             ...rollup,
             metadata: this.jsonField({
               ...metadataOf(active.metadata),
-              [TOKEN_BASELINE_KEY]: active.totalTokens,
+              [TOKEN_BASELINE_KEY]: Number(active.totalTokens ?? 0n),
               [ARCHIVE_IN_PROGRESS]: true,
             }),
           },
