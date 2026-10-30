@@ -11,9 +11,9 @@
  * compat layer.
  *
  * Leg shapes driven by DSH_PROVIDER:
- * - base leg (unset): the full dsh + LLM flow above.
- * - http leg (DSH_PROVIDER = http): real HTTP/SSE integration without dsh boot,
- *   LLM, or secrets, using the Vitest suites in dsh-a2a.*-http.spec.ts.
+ * - base leg (unset): the HTTP Vitest suites, then the full dsh + LLM flow above.
+ * - http leg (DSH_PROVIDER = http): only the real HTTP/SSE Vitest suites, without
+ *   dsh boot, LLM, or secrets.
  * - backend-only leg (DSH_PROVIDER = redis): no dsh boot, no LLM, no
  *   secrets — drive RedisTaskStore (+ the SanitizedTaskStore wrapper) against
  *   the service Redis in DSH_DB_URL.
@@ -42,21 +42,7 @@ import {
 
 const provider = process.env.DSH_PROVIDER || '';
 if (provider === 'http') {
-  const result = spawnSync(
-    'pnpm',
-    [
-      '--filter',
-      '@amaster.ai/dsh-a2a',
-      'exec',
-      'vitest',
-      'run',
-      '--config',
-      resolve('.github/scripts/integration/vitest.a2a-http.config.mts'),
-    ],
-    { stdio: 'inherit' },
-  );
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`A2A HTTP integration failed (${result.status})`);
+  runHttpSuite();
   process.exit(0);
 }
 if (provider === 'redis') {
@@ -65,6 +51,7 @@ if (provider === 'redis') {
 }
 if (provider) throw new Error(`unknown DSH_PROVIDER ${provider}`);
 
+runHttpSuite();
 const { a2a, proc, workDir } = await bootA2a({ tag: 'base', extraPatch: THINKING_OFF });
 const client = a2aClient(a2a);
 
@@ -256,6 +243,24 @@ try {
   console.log(`\nSCENARIO_OK base (task=${task.id})`);
 } finally {
   await stopA2a(proc);
+}
+
+function runHttpSuite() {
+  const result = spawnSync(
+    'pnpm',
+    [
+      '--filter',
+      '@amaster.ai/dsh-a2a',
+      'exec',
+      'vitest',
+      'run',
+      '--config',
+      resolve('.github/scripts/integration/vitest.a2a-http.config.mts'),
+    ],
+    { stdio: 'inherit' },
+  );
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`A2A HTTP integration failed (${result.status})`);
 }
 
 /**
