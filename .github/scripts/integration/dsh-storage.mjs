@@ -530,7 +530,8 @@ async function backendOnlyLeg(dbProvider) {
     } else {
       const explain = dbProvider === 'postgresql' ? 'EXPLAIN (FORMAT JSON) ' : 'EXPLAIN ';
       const plan = await prisma.$queryRawUnsafe(explain + planQuery, 'p1');
-      console.log(`query plan (${dbProvider}):`, JSON.stringify(plan).slice(0, 1200));
+      console.log(`query plan (${dbProvider}):`);
+      console.dir(plan, { depth: null });
     }
 
     const pagedArchiveId = await backend.archiveSession('p1');
