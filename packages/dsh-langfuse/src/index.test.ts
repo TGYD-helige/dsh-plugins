@@ -3814,6 +3814,14 @@ describe('LangfuseReporter', () => {
     await reporter.shutdown();
   });
 
+  it('does not expand markers when a configured secret contains marker text', async () => {
+    const reporter = new LangfuseReporter({ ...config, secretKey: 'x[REDACTED]y' });
+    await reporter.ready;
+    expect(reporter.mask('x[REDACTED]y')).toBe('x[REDACTED]y');
+    expect(reporter.mask('[REDACTED]')).toBe('[REDACTED]');
+    await reporter.shutdown();
+  });
+
   it('redacts processor environment/release labels, including SDK env fallbacks', async () => {
     vi.stubEnv('LANGFUSE_TRACING_ENVIRONMENT', 'sk-lf-environment');
     vi.stubEnv('LANGFUSE_RELEASE', 'sk-lf-release');

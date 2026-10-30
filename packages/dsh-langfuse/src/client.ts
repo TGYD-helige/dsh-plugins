@@ -186,14 +186,17 @@ export class LangfuseReporter {
           return;
         ranges.push([start, stop]);
       };
-      for (const match of text.matchAll(/(?:pk|sk)-lf-[\w-]+/g))
+      for (const match of text.matchAll(/(?:pk|sk)-lf-[\w-]+/g)) {
+        markerIndex = 0;
         addRange(match.index, match.index + match[0].length);
+      }
       for (const secret of secrets) {
         for (
           let index = text.indexOf(secret);
           index !== -1;
           index = text.indexOf(secret, index + 1)
         ) {
+          markerIndex = 0;
           addRange(index, index + secret.length);
         }
       }
