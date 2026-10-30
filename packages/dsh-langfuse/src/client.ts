@@ -186,17 +186,17 @@ export class LangfuseReporter {
           return;
         ranges.push([start, stop]);
       };
-      for (const match of text.matchAll(/(?:pk|sk)-lf-[\w-]+/g)) {
-        markerIndex = 0;
+      for (const match of text.matchAll(/(?:pk|sk)-lf-[\w-]+/g))
         addRange(match.index, match.index + match[0].length);
-      }
       for (const secret of secrets) {
+        // Each independent scan starts at the first marker. Do not reset for
+        // every match, or a large marker list becomes quadratic again.
+        markerIndex = 0;
         for (
           let index = text.indexOf(secret);
           index !== -1;
           index = text.indexOf(secret, index + 1)
         ) {
-          markerIndex = 0;
           addRange(index, index + secret.length);
         }
       }
