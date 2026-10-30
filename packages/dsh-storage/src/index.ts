@@ -75,6 +75,7 @@ interface SessionAccum {
 /** Metadata key for our usage bookkeeping — namespaced so other writers' fields never collide with it. */
 const LAST_USAGE_KEY = 'dsh-storage:lastUsage';
 const TOKEN_BASELINE_KEY = 'dsh-storage:token-baseline';
+const ARCHIVE_IN_PROGRESS = 'dsh-storage:archive-in-progress';
 
 /** Shape-guarded restore of our usage sample from arbitrary metadata. */
 function usageSampleOfMetadata(value: unknown): SessionAccum['usageSample'] {
@@ -275,6 +276,13 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     archiveSession(sessionId: string): Promise<string | null> {
       // Join the same per-session chain as event writes, then discard the old
       // in-memory rollup only after the database transaction commits.
+      const accum = sessions.get(sessionId);
+      if (accum && !accum.metadata[ARCHIVE_IN_PROGRESS]) {
+        // Freeze the live cumulative total at archive start. A later active
+        // rollup then represents only the delta after this point, not the
+        // entire pre-archive total again.
+        accum.metadata[TOKEN_BASELINE_KEY] = accum.totalTokens;
+      }
       const archived = (chains.get(sessionId) ?? Promise.resolve())
         .then(() => ensureStarted())
         .then(async () => {

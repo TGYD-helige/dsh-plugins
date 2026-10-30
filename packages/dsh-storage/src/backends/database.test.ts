@@ -499,7 +499,7 @@ describe('DatabaseBackend', () => {
     });
     expect(prisma.aiChatHistory.findFirst).toHaveBeenCalledWith({
       where: { sessionId: 's1', deletedAt: null, messages: { none: {} } },
-      select: { id: true, metadata: true },
+      select: { id: true, metadata: true, totalTokens: true },
     });
     expect(prisma.aiMessage.updateMany).toHaveBeenCalledWith({
       where: { id: { in: ['m1', 'm2'] } },
@@ -689,7 +689,7 @@ describe('DatabaseBackend', () => {
       totalTokens: 110n,
       firstMessageAt: first,
       lastMessageAt: last,
-      metadata: { custom: 'keep-me' },
+      metadata: { custom: 'keep-me', 'dsh-storage:token-baseline': 100 },
     };
     prisma.aiMessage.aggregate
       .mockResolvedValueOnce({ _count: { _all: 150 }, _min: first, _max: last })

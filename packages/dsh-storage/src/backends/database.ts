@@ -406,7 +406,7 @@ export class DatabaseBackend implements StorageBackend {
       // Active rollups have no attached messages; an archive gains them below.
       const active = await tx.aiChatHistory.findFirst({
         where: { sessionId, deletedAt: null, messages: { none: {} } },
-        select: { id: true, metadata: true },
+        select: { id: true, metadata: true, totalTokens: true },
       });
       if (active) {
         await tx.aiChatHistory.update({
@@ -415,6 +415,7 @@ export class DatabaseBackend implements StorageBackend {
             ...rollup,
             metadata: this.jsonField({
               ...metadataOf(active.metadata),
+              [TOKEN_BASELINE_KEY]: active.totalTokens,
               [ARCHIVE_IN_PROGRESS]: true,
             }),
           },

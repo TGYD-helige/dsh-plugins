@@ -246,6 +246,33 @@ describe('dsh-storage plugin', () => {
     expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(1);
   });
 
+  it('freezes the cumulative token baseline at archive start', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const session = { id: 's1' };
+    ctx.events.emit(
+      'session/event',
+      session,
+      assistantEvent('first', { inputTokens: 100, outputTokens: 0 }, 'a1'),
+    );
+    await ctx.events.parallel('session/flush', session);
+
+    const service = ctx.get('dshStorage') as { archiveSession(id: string): Promise<string | null> };
+    backend.archiveSession.mockRejectedValueOnce(new Error('archive interrupted'));
+    await expect(service.archiveSession('s1')).rejects.toThrow('archive interrupted');
+    ctx.events.emit(
+      'session/event',
+      session,
+      assistantEvent('second', { inputTokens: 10, outputTokens: 0 }, 'a2'),
+    );
+    await ctx.events.parallel('session/flush', session);
+
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0]).toMatchObject({
+      totalTokens: 110,
+      metadata: { 'dsh-storage:token-baseline': 100 },
+    });
+  });
+
   it('keeps the current rollup when archive fails', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
