@@ -58,6 +58,8 @@ const VERIFY_DEADLINE_MS = 5 * 60 * 1000;
 const POLL_INTERVAL_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_PAGES = 20;
+const MAX_QUERY_RANGE_MS = 5 * 60 * 1000;
+const QUERY_PAGE_LIMIT = '50';
 const EXPECTED_MODEL = integrationModel();
 const HOOK_CONTEXT = 'ci-hook-context-verification';
 const HOOK_RESULT = 'hook-script-result: marker-verified';
@@ -150,11 +152,17 @@ export function evaluateReasoning(observations) {
       o.output.some((c) => c?.type === 'reasoning-delta'),
   );
   const displayed = observations.some(
-    (o) => o.type === 'GENERATION' && Array.isArray(o.output?.thinking) &&
+    (o) =>
+      o.type === 'GENERATION' &&
+      Array.isArray(o.output?.thinking) &&
       o.output.thinking.some((part) => part?.type === 'thinking' && part.content?.length > 0),
   );
   return [
-    ...(!has ? ['no llm-request span output has a reasoning-delta chunk (thinking should be enabled at max)'] : []),
+    ...(!has
+      ? [
+          'no llm-request span output has a reasoning-delta chunk (thinking should be enabled at max)',
+        ]
+      : []),
     ...(!displayed ? ['no generation output displays reasoning'] : []),
   ];
 }
@@ -178,9 +186,7 @@ export function evaluateHookTrace(observations, codeword) {
   );
   const hook = observations.find(
     (o) =>
-      o.type === 'SPAN' &&
-      o.name === 'hook:UserPromptSubmit' &&
-      o.parentObservationId === root?.id,
+      o.type === 'SPAN' && o.name === 'hook:UserPromptSubmit' && o.parentObservationId === root?.id,
   );
   if (!root?.endTime) problems.push('missing completed turn trace');
   if (!generation?.endTime) problems.push('missing completed codeworded LLM generation');
@@ -214,35 +220,65 @@ export function evaluateHookTrace(observations, codeword) {
 // The separate tool-hooks leg runs a real process in each tool phase.
 export function evaluateToolHookTrace(observations, codeword) {
   const problems = evaluateTrace(observations, codeword);
-  const tools = observations.filter((o) => o.type === 'TOOL' && JSON.stringify(o.input ?? '').includes(codeword));
+  const tools = observations.filter(
+    (o) => o.type === 'TOOL' && JSON.stringify(o.input ?? '').includes(codeword),
+  );
   for (const tool of tools) {
     for (const point of ['BeforeTool', 'AfterTool']) {
-      const hook = observations.find((o) => o.name === `hook:${point}:verify-marker` &&
-        o.parentObservationId === tool.id && o.metadata?.callId === tool.metadata?.callId);
+      const hook = observations.find(
+        (o) =>
+          o.name === `hook:${point}:verify-marker` &&
+          o.parentObservationId === tool.id &&
+          o.metadata?.callId === tool.metadata?.callId,
+      );
       if (!hook) {
         problems.push(`missing ${point} under tool call ${tool.metadata?.callId}`);
         continue;
       }
       const times = [tool.startTime, tool.endTime, hook.startTime, hook.endTime].map(Date.parse);
-      if (times.some((time) => !Number.isFinite(time)) || times[2] < times[0] || times[3] > times[1]) {
+      if (
+        times.some((time) => !Number.isFinite(time)) ||
+        times[2] < times[0] ||
+        times[3] > times[1]
+      ) {
         problems.push(`${point} is unfinished or outside the tool lifetime`);
       }
-      if (hook.input?.callId !== tool.metadata?.callId || hook.input?.toolName !== tool.metadata?.toolName ||
-        !JSON.stringify(hook.input?.arguments ?? '').includes(codeword) || hook.input?.token !== '[REDACTED]') {
+      if (
+        hook.input?.callId !== tool.metadata?.callId ||
+        hook.input?.toolName !== tool.metadata?.toolName ||
+        !JSON.stringify(hook.input?.arguments ?? '').includes(codeword) ||
+        hook.input?.token !== '[REDACTED]'
+      ) {
         problems.push(`${point} input is missing, mismatched, or unmasked`);
       }
-      if (point === 'AfterTool' && !JSON.stringify(hook.input?.toolResult?.content ?? '').includes(`${codeword}-content`)) {
+      if (
+        point === 'AfterTool' &&
+        !JSON.stringify(hook.input?.toolResult?.content ?? '').includes(`${codeword}-content`)
+      ) {
         problems.push('AfterTool input does not contain the real tool result');
       }
       const output = hook.output;
-      if (output?.decision !== 'pass' || output?.outcome !== 'success' || output?.exitCode !== 0 ||
-        output?.result?.reason !== 'marker-verified' || output?.result?.additionalContext !== codeword ||
-        output?.result?.continue !== true || output?.result?.token !== '[REDACTED]' ||
-        output?.stdout?.length !== 4096 || String(hook.metadata?.stdoutTruncated) !== 'true' ||
-        output?.stderr !== `marker-verified:${point}`) {
-        problems.push(`${point} output is missing status, structured result, masking, or truncation`);
+      if (
+        output?.decision !== 'pass' ||
+        output?.outcome !== 'success' ||
+        output?.exitCode !== 0 ||
+        output?.result?.reason !== 'marker-verified' ||
+        output?.result?.additionalContext !== codeword ||
+        output?.result?.continue !== true ||
+        output?.result?.token !== '[REDACTED]' ||
+        output?.stdout?.length !== 4096 ||
+        String(hook.metadata?.stdoutTruncated) !== 'true' ||
+        output?.stderr !== `marker-verified:${point}`
+      ) {
+        problems.push(
+          `${point} output is missing status, structured result, masking, or truncation`,
+        );
       }
-      if (hook.metadata?.durationMs == null || !Number.isFinite(Number(hook.metadata?.durationMs)) || Number(hook.metadata?.durationMs) < 0) {
+      if (
+        hook.metadata?.durationMs == null ||
+        !Number.isFinite(Number(hook.metadata?.durationMs)) ||
+        Number(hook.metadata?.durationMs) < 0
+      ) {
         problems.push(`${point} has no valid duration`);
       }
       if (JSON.stringify(hook).includes('sk-lf-hook-fixture-private')) {
@@ -256,10 +292,16 @@ export function evaluateToolHookTrace(observations, codeword) {
 // Cancelled turns have no final answer; verify their own root and the delayed hook.
 export function evaluateCancelHookTrace(observations, codeword) {
   const problems = [];
-  const generation = observations.find((o) => o.type === 'GENERATION' &&
-    o.name?.startsWith('llm-call') && o.metadata?.purpose == null &&
-    JSON.stringify(o.input ?? '').includes(codeword));
-  const root = observations.find((o) => o.name === 'dsh-turn' && o.id === generation?.parentObservationId);
+  const generation = observations.find(
+    (o) =>
+      o.type === 'GENERATION' &&
+      o.name?.startsWith('llm-call') &&
+      o.metadata?.purpose == null &&
+      JSON.stringify(o.input ?? '').includes(codeword),
+  );
+  const root = observations.find(
+    (o) => o.name === 'dsh-turn' && o.id === generation?.parentObservationId,
+  );
   const hook = observations.find((o) => o.name === 'hook:UserCancel:cancel-observer');
   if (!generation?.endTime) problems.push('missing completed codeworded generation');
   if (!root?.endTime || root.metadata?.endReason !== 'aborted' || root.level !== 'WARNING') {
@@ -272,10 +314,14 @@ export function evaluateCancelHookTrace(observations, codeword) {
   if (times.some((time) => !Number.isFinite(time)) || times[0] > times[1] || times[1] >= times[2]) {
     problems.push('UserCancel must run after the original root ended with its own duration');
   }
-  if (!hook?.input?.marker?.includes(codeword) ||
+  if (
+    !hook?.input?.marker?.includes(codeword) ||
     !(Number(hook.input.nextTurn) > Number(root?.metadata?.turn)) ||
-    hook.output?.outcome !== 'success' || hook.output?.exitCode !== 0 ||
-    hook.output?.result?.reason !== 'cancel-observed' || !(Number(hook.metadata?.durationMs) >= 50)) {
+    hook.output?.outcome !== 'success' ||
+    hook.output?.exitCode !== 0 ||
+    hook.output?.result?.reason !== 'cancel-observed' ||
+    !(Number(hook.metadata?.durationMs) >= 50)
+  ) {
     problems.push('missing successful detached process output after the next turn started');
   }
   if (observations.some((o) => o.metadata?.detachedHook)) problems.push('unexpected detached root');
@@ -310,9 +356,10 @@ export function evaluateSubagentTrace(observations, codeword) {
     );
   }
 
-  const subSpan = spans.find((o) =>
-    (o.name === 'subagent' || o.name?.startsWith('subagent:')) &&
-    o.parentObservationId === delegation?.id,
+  const subSpan = spans.find(
+    (o) =>
+      (o.name === 'subagent' || o.name?.startsWith('subagent:')) &&
+      o.parentObservationId === delegation?.id,
   );
   need(subSpan, 'missing "subagent" span');
   if (subSpan && delegation) {
@@ -402,10 +449,36 @@ export function capturedToObservations(captured) {
 
 // Polls the v1 Observations API until a codeworded observation's trace matches
 // the expected shape or the deadline passes. Returns { ok, state }.
-export async function runVerification({ baseUrl, publicKey, secretKey, fromStartTime, toStartTime, codeword, evaluate, model = EXPECTED_MODEL, observationName }) {
+export async function runVerification({
+  baseUrl,
+  publicKey,
+  secretKey,
+  fromStartTime,
+  toStartTime,
+  codeword,
+  evaluate,
+  model = EXPECTED_MODEL,
+  observationName,
+}) {
   const origin = baseUrl.replace(/\/+$/, '');
   const deadline = Date.now() + VERIFY_DEADLINE_MS;
   const auth = `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString('base64')}`;
+  // Full observation IO is expensive. Keep every discovery/read-back request
+  // inside one short, non-future window even if a caller supplied a wide range.
+  function timeRange() {
+    const now = Date.now();
+    const requestedTo = Date.parse(toStartTime);
+    const boundedTo = Number.isFinite(requestedTo) ? Math.min(requestedTo, now) : now;
+    const requestedFrom = Date.parse(fromStartTime);
+    const boundedFrom = Math.max(
+      Number.isFinite(requestedFrom) ? requestedFrom : boundedTo - MAX_QUERY_RANGE_MS,
+      boundedTo - MAX_QUERY_RANGE_MS,
+    );
+    return {
+      fromStartTime: new Date(boundedFrom).toISOString(),
+      toStartTime: new Date(boundedTo).toISOString(),
+    };
+  }
 
   async function fetchObservations(params) {
     const rows = [];
@@ -413,9 +486,8 @@ export async function runVerification({ baseUrl, publicKey, secretKey, fromStart
       // Small pages on purpose: the API docs warn that large page sizes
       // trigger request errors on some deployments.
       const query = new URLSearchParams({
-        fromStartTime,
-        toStartTime,
-        limit: '100',
+        ...timeRange(),
+        limit: QUERY_PAGE_LIMIT,
         page: String(page),
         ...params,
       });
@@ -469,21 +541,22 @@ export async function runVerification({ baseUrl, publicKey, secretKey, fromStart
   while (true) {
     let waitMs = POLL_INTERVAL_MS;
     try {
-      // Discovery: the turn's generation carries the codeword in its IO (the
-      // prompt mentions the marker file; tool-call arguments repeat it). No
-      // server-side name filter — generations are renamed `llm-call [<first
-      // line>]` at close, so exact-name queries would miss them; the prefix
-      // and the run-unique codeword do the filtering client-side. Purpose
+      // Named inbox discoveries are SPAN reads: narrow them on the server by
+      // both name and type. Generation discovery cannot use an exact name —
+      // generations are renamed `llm-call [<first line>]` at close — so it
+      // filters by type/model and then by prefix/codeword client-side. Purpose
       // calls or later turns may arrive first; rediscover candidates on every poll.
-      const candidates = await fetchObservations(observationName
-        ? { name: observationName }
-        : { type: 'GENERATION', model });
+      const candidates = await fetchObservations(
+        observationName ? { name: observationName, type: 'SPAN' } : { type: 'GENERATION', model },
+      );
       const traceIds = [
         ...new Set(
           candidates
             .filter(
-              (o) => (observationName ? o.name === observationName : o.name?.startsWith('llm-call')) && o.metadata?.purpose == null &&
-              JSON.stringify(o).includes(codeword),
+              (o) =>
+                (observationName ? o.name === observationName : o.name?.startsWith('llm-call')) &&
+                o.metadata?.purpose == null &&
+                JSON.stringify(o).includes(codeword),
             )
             .map((o) => o.traceId),
         ),
@@ -493,7 +566,9 @@ export async function runVerification({ baseUrl, publicKey, secretKey, fromStart
         const observations = await fetchObservations({ traceId });
         console.log(`--- candidate trace ${traceId}: ${observations.length} observation(s) ---`);
         for (const o of observations) {
-          console.log(`  ${o.type}:${o.name} parent=${o.parentObservationId ?? 'null'} end=${o.endTime ?? 'null'}`);
+          console.log(
+            `  ${o.type}:${o.name} parent=${o.parentObservationId ?? 'null'} end=${o.endTime ?? 'null'}`,
+          );
         }
         const problems = evaluate(observations, codeword);
         if (problems.length === 0) {
@@ -565,7 +640,16 @@ export async function runScenario(opts) {
   }
 }
 
-async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHooks = false, cancelHook = false, metadata = false }) {
+async function scenarioMain({
+  tag,
+  name,
+  prompt,
+  evaluate,
+  hook = false,
+  toolHooks = false,
+  cancelHook = false,
+  metadata = false,
+}) {
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-langfuse-${tag}-e2e`);
   mkdirSync(workDir, { recursive: true });
   const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
@@ -616,30 +700,52 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHoo
   // sets autoInstallPeers: false, so runtime peers are added explicitly —
   // including the OTEL api/exporter packages @langfuse/otel itself peers on.
   // The dsh-* peers ship with the profile itself.
-  run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], { cwd: workDir, env: dshHomeEnv });
-  run(dsh, [
-    'plugin', '--profile', 'headless', 'add',
-    '@langfuse/tracing@5.10.1',
-    '@langfuse/otel@5.10.1',
-    '@opentelemetry/sdk-trace-node@2.10.0',
-    '@opentelemetry/api@1.9.1',
-    '@opentelemetry/exporter-trace-otlp-http@0.221.0',
-  ], { cwd: workDir, env: dshHomeEnv });
+  run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], {
+    cwd: workDir,
+    env: dshHomeEnv,
+  });
+  run(
+    dsh,
+    [
+      'plugin',
+      '--profile',
+      'headless',
+      'add',
+      '@langfuse/tracing@5.10.1',
+      '@langfuse/otel@5.10.1',
+      '@opentelemetry/sdk-trace-node@2.10.0',
+      '@opentelemetry/api@1.9.1',
+      '@opentelemetry/exporter-trace-otlp-http@0.221.0',
+    ],
+    { cwd: workDir, env: dshHomeEnv },
+  );
 
   let hookPatch = '';
   if (hook) {
     const version = envOr(process.env.DSH_CLI_VERSION, '0.2.1-rc.4');
-    run(dsh, [
-      'plugin', '--profile', 'headless', 'add',
-      `@deepseek-ai/dsh-hooks-codex@${version}`,
-      `@deepseek-ai/dsh-hook-protocol@${version}`,
-      `@deepseek-ai/dsh-shell@${version}`,
-    ], { cwd: workDir, env: dshHomeEnv });
+    run(
+      dsh,
+      [
+        'plugin',
+        '--profile',
+        'headless',
+        'add',
+        `@deepseek-ai/dsh-hooks-codex@${version}`,
+        `@deepseek-ai/dsh-hook-protocol@${version}`,
+        `@deepseek-ai/dsh-shell@${version}`,
+      ],
+      { cwd: workDir, env: dshHomeEnv },
+    );
     copyFileSync(new URL('./hook-script.mjs', import.meta.url), join(workDir, 'hook-script.mjs'));
     const hookConfigPath = join(workDir, 'hooks.json');
-    writeFileSync(hookConfigPath, JSON.stringify({
-      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'node hook-script.mjs' }] }] },
-    }));
+    writeFileSync(
+      hookConfigPath,
+      JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'node hook-script.mjs' }] }],
+        },
+      }),
+    );
     hookPatch = `
 - insert:
     - id: langfuse-hook-e2e
@@ -651,8 +757,11 @@ async function scenarioMain({ tag, name, prompt, evaluate, hook = false, toolHoo
   }
 
   if (toolHooks || cancelHook || metadata) {
-    const bridge = metadata ? 'metadata-context-bridge.mjs'
-      : cancelHook ? 'cancel-hook-bridge.mjs' : 'tool-hook-bridge.mjs';
+    const bridge = metadata
+      ? 'metadata-context-bridge.mjs'
+      : cancelHook
+        ? 'cancel-hook-bridge.mjs'
+        : 'tool-hook-bridge.mjs';
     const fixtureDir = join(dshHome, 'profiles', 'headless', `${tag}-fixture`);
     mkdirSync(fixtureDir, { recursive: true });
     // An anonymous manifest excludes the loose fixture from DeepSeek's package inventory.
@@ -775,10 +884,12 @@ ${hookPatch}
         break;
       }
       console.log(`::warning::${name} attempt ${attempt} did not verify: ${result.state}`);
-    } else if ((problems = evaluate(capturedToObservations(captured), codeword)).length === 0) {
-      state = 'captured shape matches';
-      break;
     } else {
+      problems = evaluate(capturedToObservations(captured), codeword);
+      if (problems.length === 0) {
+        state = 'captured shape matches';
+        break;
+      }
       console.log(`::warning::${name} attempt ${attempt} did not verify: ${problems.join('; ')}`);
     }
   }
@@ -792,7 +903,9 @@ ${hookPatch}
     const observations = capturedToObservations(captured);
     console.log(`\n--- captured ${observations.length} spans ---`);
     for (const o of observations) {
-      console.log(` ${o.type}:${o.name} parent=${o.parentObservationId ?? 'null'} end=${o.endTime ?? 'null'}`);
+      console.log(
+        ` ${o.type}:${o.name} parent=${o.parentObservationId ?? 'null'} end=${o.endTime ?? 'null'}`,
+      );
     }
     const trace = observations.find(
       (o) => o.name === 'dsh-turn' && o.parentObservationId == null && o.sessionId,

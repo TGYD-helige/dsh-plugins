@@ -1,12 +1,59 @@
 import { randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { TaskState } from '@a2a-js/sdk';
-import { AgentEvent, type AgentExecutor, ServerCallContext } from '@a2a-js/sdk/server';
+import { LegacyJsonRpcTransportHandler } from '@a2a-js/sdk/compat/v0_3/server';
+import {
+  type A2ARequestHandler,
+  AgentEvent,
+  type AgentExecutor,
+  ServerCallContext,
+} from '@a2a-js/sdk/server';
 import { JsonRpcTransport } from '@a2a-js/sdk-v03/client';
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
-import { expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
+import { legacyStreamHandler } from './legacy-stream.js';
 import { startA2aServer } from './server.js';
 import { MemoryTaskStore } from './task-store.js';
 import { SessionTranslator } from './translator.js';
+
+afterEach(() => vi.restoreAllMocks());
+
+function directLegacy(stream: AsyncGenerator<any, void, undefined>, write = vi.fn(() => true)) {
+  const requestHandler = {
+    getAgentCard: async () => ({
+      supportedInterfaces: [
+        { url: 'http://test', protocolBinding: 'JSONRPC', tenant: '', protocolVersion: '0.3' },
+      ],
+    }),
+  } as unknown as A2ARequestHandler;
+  vi.spyOn(LegacyJsonRpcTransportHandler.prototype, 'handle').mockResolvedValue(stream);
+  const res = Object.assign(new EventEmitter(), {
+    headersSent: false,
+    destroyed: false,
+    writableEnded: false,
+    setHeader: vi.fn(),
+    flushHeaders: vi.fn(function (this: { headersSent: boolean }) {
+      this.headersSent = true;
+    }),
+    write,
+    end: vi.fn(function (this: { writableEnded: boolean }) {
+      this.writableEnded = true;
+    }),
+    json: vi.fn(),
+  });
+  const req = {
+    method: 'POST',
+    path: '/',
+    body: { jsonrpc: '2.0', id: 1, method: 'tasks/resubscribe', params: { id: 'task' } },
+    is: vi.fn(() => true),
+    header: vi.fn(() => undefined),
+  };
+  return {
+    res,
+    req,
+    run: () => legacyStreamHandler(requestHandler)(req as never, res as never, vi.fn()),
+  };
+}
 
 it.each([
   ['completed', 'input-required'],
@@ -180,5 +227,66 @@ it('ends a cold resubscription with a final status after its task snapshot', asy
     });
   } finally {
     await server.close();
+  }
+});
+
+it('waits for drain before pulling another legacy stream event', async () => {
+  let pulls = 0;
+  const event = {
+    jsonrpc: '2.0',
+    id: 1,
+    result: { kind: 'task', id: 'task', contextId: 'ctx', status: { state: 'working' } },
+  };
+  const stream = (async function* () {
+    pulls++;
+    yield event;
+    pulls++;
+  })();
+  const write = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+  const { res, run } = directLegacy(stream, write);
+  const running = run();
+  await vi.waitFor(() => expect(write).toHaveBeenCalled());
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(pulls).toBe(1);
+  res.emit('drain');
+  await running;
+});
+
+it('stops a disconnected resubscription instead of draining it forever', async () => {
+  let finishNext!: (result: IteratorResult<unknown>) => void;
+  const event = {
+    jsonrpc: '2.0',
+    id: 1,
+    result: { kind: 'task', id: 'task', contextId: 'ctx', status: { state: 'input-required' } },
+  };
+  const stream = {
+    next: vi
+      .fn()
+      .mockResolvedValueOnce({ value: event, done: false })
+      .mockImplementation(
+        () =>
+          new Promise<IteratorResult<unknown>>((resolve) => {
+            finishNext = resolve;
+          }),
+      ),
+    return: vi.fn(async () => {
+      finishNext?.({ value: undefined, done: true });
+      return { value: undefined, done: true };
+    }),
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  } as unknown as AsyncGenerator<any, void, undefined>;
+  const { res, run } = directLegacy(stream);
+  const running = run();
+  await vi.waitFor(() => expect(stream.next).toHaveBeenCalledTimes(2));
+  res.destroyed = true;
+  res.emit('close');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  try {
+    expect(stream.return).toHaveBeenCalled();
+  } finally {
+    await stream.return();
+    await running;
   }
 });

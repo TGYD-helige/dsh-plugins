@@ -36,10 +36,9 @@ export interface SessionRow {
 }
 
 /**
- * A storage backend receives already-projected rows. Backends must be
- * no-throw from the plugin's perspective: implementations report errors to
- * the plugin logger and swallow them, mirroring must never break the agent
- * loop.
+ * A storage backend receives already-projected rows. Backend errors reject
+ * into the plugin's per-session queue, whose catch/log boundary keeps
+ * mirroring failures out of the agent loop.
  */
 export interface StorageBackend {
   readonly name: string;
@@ -48,10 +47,12 @@ export interface StorageBackend {
   readSession?(sessionId: string): Promise<SessionRow | null>;
   /** Read one persisted logical message, including archived rows for redelivery. */
   readMessages(sessionId: string, messageId: string): Promise<MessageRow[]>;
-  /** Find at most one active model message containing this exact tool call. */
+  /** Find the newest active model message containing this exact tool call. */
   readToolCallMessages(sessionId: string, callId: string): Promise<MessageRow[]>;
   upsertMessage(row: MessageRow): Promise<void>;
   upsertSession(row: SessionRow): Promise<void>;
+  /** Atomically persist one event's optional message and its session rollup. */
+  upsertEvent(message: MessageRow | null, session: SessionRow): Promise<void>;
   /** Move active messages into a queryable history row; null when already empty. */
   archiveSession(sessionId: string): Promise<string | null>;
   close?(): Promise<void>;

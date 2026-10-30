@@ -102,6 +102,11 @@ export const Config = Schema.object({
   traceName: Schema.string().default('dsh-turn'),
   /** Include full message/tool payloads in Langfuse IO. Disable to log metadata only. */
   captureContent: Schema.boolean().default(true),
+  maxPayloadBytes: Schema.number()
+    .min(1)
+    .step(1)
+    .default(256 * 1024)
+    .description('maximum captured request, raw-stream, and assembled-output bytes per LLM call'),
   redactFields: Schema.array(Schema.string())
     .default([])
     .description('case-insensitive payload fields to redact'),
@@ -127,6 +132,7 @@ export interface LangfusePluginConfig {
   baseUrl: string;
   traceName: string;
   captureContent: boolean;
+  maxPayloadBytes?: number;
   redactFields?: string[];
   userId?: string;
   tags?: string[];
@@ -189,6 +195,8 @@ interface ChildSession {
   turn?: number;
   /** The open `subagent` span for this child (null when creation failed). */
   span: ObservationHandle;
+  /** Whether the activation published subagent/start (rollback has no end event). */
+  started: boolean;
   /** Whether the span input was set — the child's first `user/message` wins. */
   hasInput: boolean;
 }
@@ -259,6 +267,277 @@ function requestBodyOf(options: GenerateOptions, captureContent: boolean): Recor
   }
   const { signal: _, ...body } = options;
   return body;
+}
+
+interface PayloadBudget {
+  remaining: number;
+  truncated: boolean;
+}
+
+const newPayloadBudget = (maxBytes: number): PayloadBudget => ({
+  remaining: maxBytes,
+  truncated: false,
+});
+
+/** Take a UTF-8 prefix without ever exceeding the remaining content-byte budget. */
+function takePayloadText(value: string, budget: PayloadBudget): string {
+  const bytes = Buffer.byteLength(value);
+  if (bytes <= budget.remaining) {
+    budget.remaining -= bytes;
+    return value;
+  }
+  budget.truncated = true;
+  if (budget.remaining <= 0) return '';
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(value.slice(0, middle)) <= budget.remaining) low = middle;
+    else high = middle - 1;
+  }
+  budget.remaining = 0;
+  return value.slice(0, low);
+}
+
+type BoundedPayload<T> = T | { truncated: true; preview?: string } | string | number;
+
+/** Build a preview whose complete JSON value, including its wrapper, fits the remaining cap. */
+function previewPayload<T>(serialized: string, budget: PayloadBudget): BoundedPayload<T> {
+  const remaining = budget.remaining;
+  const marker = { truncated: true as const };
+  const withPreview = { ...marker, preview: '' };
+  if (Buffer.byteLength(JSON.stringify(withPreview)) <= remaining) {
+    let low = 0;
+    let high = serialized.length;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      const candidate = { ...marker, preview: serialized.slice(0, middle) };
+      if (Buffer.byteLength(JSON.stringify(candidate)) <= remaining) low = middle;
+      else high = middle - 1;
+    }
+    budget.remaining = 0;
+    return { ...marker, preview: serialized.slice(0, low) };
+  }
+  if (Buffer.byteLength(JSON.stringify(marker)) <= remaining) {
+    budget.remaining = 0;
+    return marker;
+  }
+  // Even the marker is too large: retain a plain string prefix, still capped
+  // after JSON quoting/escaping rather than by source-string bytes.
+  let low = 0;
+  let high = serialized.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(JSON.stringify(serialized.slice(0, middle))) <= remaining) low = middle;
+    else high = middle - 1;
+  }
+  budget.remaining = 0;
+  return low > 0 ? serialized.slice(0, low) : remaining >= 2 ? '' : 0;
+}
+
+const MAX_ATOMIC_MASK_BYTES = 64 * 1024;
+
+/** Redact leaves while serializing, so an oversized payload never needs a full mask or stringify. */
+function boundMaskedPayload<T>(
+  input: T,
+  budget: PayloadBudget,
+  reporter: LangfuseReporter,
+): BoundedPayload<T> {
+  const seen = new WeakSet<object>();
+  const parts: string[] = [];
+  let remaining = budget.remaining;
+  let overflow = false;
+  const append = (text: string | undefined) => {
+    if (overflow || text === undefined) return;
+    const bytes = Buffer.byteLength(text);
+    if (bytes > remaining) {
+      // The node was already masked atomically; a serialized prefix is safe.
+      parts.push(takePayloadText(text, { remaining, truncated: true }));
+      remaining = 0;
+      overflow = true;
+      return;
+    }
+    parts.push(text);
+    remaining -= bytes;
+  };
+  const write = (value: unknown): unknown => {
+    if (overflow || value === undefined) return undefined;
+    if (value === null || typeof value !== 'object' || value instanceof Date) {
+      if (
+        typeof value === 'string' &&
+        Buffer.byteLength(value) > MAX_ATOMIC_MASK_BYTES &&
+        Buffer.byteLength(value) > remaining
+      ) {
+        overflow = true;
+        return undefined;
+      }
+      const masked = reporter.mask(value);
+      append(JSON.stringify(masked));
+      return masked;
+    }
+    if (seen.has(value)) {
+      append(JSON.stringify('[Circular]'));
+      return '[Circular]';
+    }
+    seen.add(value);
+    if (Array.isArray(value)) {
+      append('[');
+      const result: unknown[] = [];
+      for (const [index, item] of value.entries()) {
+        if (overflow) break;
+        if (index > 0) append(',');
+        if (item === undefined) {
+          append('null');
+          result.push(null);
+        } else {
+          const masked = write(item);
+          if (!overflow) result.push(masked);
+        }
+      }
+      append(']');
+      seen.delete(value);
+      return result;
+    }
+    append('{');
+    const result = Object.create(null) as Record<string, unknown>;
+    let first = true;
+    for (const key in value) {
+      if (overflow) break;
+      if (!Object.hasOwn(value, key)) continue;
+      const child = (value as Record<string, unknown>)[key];
+      if (child === undefined && !reporter.shouldRedactField(key)) continue;
+      if (!first) append(',');
+      first = false;
+      append(JSON.stringify(reporter.mask(key)));
+      append(':');
+      if (reporter.shouldRedactField(key)) {
+        append(JSON.stringify('[REDACTED]'));
+        result[key] = '[REDACTED]';
+      } else {
+        const masked = write(child);
+        if (!overflow) result[key] = masked;
+      }
+    }
+    append('}');
+    seen.delete(value);
+    return result;
+  };
+  try {
+    const masked = write(input);
+    if (!overflow) {
+      budget.remaining = remaining;
+      return masked as T;
+    }
+  } catch {
+    budget.truncated = true;
+    return previewPayload('', budget);
+  }
+  budget.truncated = true;
+  return previewPayload(parts.join(''), budget);
+}
+
+/** Bound a structured payload without changing its shape when it fits. */
+function boundPayload<T>(
+  input: T,
+  budget: PayloadBudget,
+  reporter?: LangfuseReporter,
+): BoundedPayload<T> {
+  if (reporter) return boundMaskedPayload(input, budget, reporter);
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(input) ?? '';
+  } catch {
+    budget.truncated = true;
+    return previewPayload('', budget);
+  }
+  const bytes = Buffer.byteLength(serialized);
+  if (bytes <= budget.remaining) {
+    budget.remaining -= bytes;
+    return input;
+  }
+  budget.truncated = true;
+  return previewPayload(serialized, budget);
+}
+
+/** Keep only whole chunks that fit; stream accounting still processes every original chunk. */
+function capturePayloadChunk(
+  chunk: StreamChunk,
+  chunks: StreamChunk[],
+  budget: PayloadBudget,
+): void {
+  if (budget.remaining <= 0) {
+    budget.truncated = true;
+    return;
+  }
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(chunk) ?? '';
+  } catch {
+    chunks.length = 0;
+    budget.truncated = true;
+    budget.remaining = 0;
+    return;
+  }
+  // Account for the final raw array too: [] around the first chunk and one
+  // comma per additional retained chunk, after redaction has changed lengths.
+  const bytes = Buffer.byteLength(serialized) + (chunks.length === 0 ? 2 : 1);
+  if (bytes > budget.remaining) {
+    // Partial groups are unsafe: a retained prefix may be a secret fragment.
+    chunks.length = 0;
+    budget.truncated = true;
+    budget.remaining = 0;
+    return;
+  }
+  chunks.push(chunk);
+  budget.remaining -= bytes;
+}
+
+/** Append only while the full assembled text fits; otherwise drop the whole channel. */
+function appendAssembledText(current: string, delta: string, budget: PayloadBudget): string {
+  const bytes = Buffer.byteLength(delta);
+  if (bytes > budget.remaining) {
+    budget.truncated = true;
+    budget.remaining = 0;
+    return '';
+  }
+  budget.remaining -= bytes;
+  return current + delta;
+}
+
+interface CapturedToolCall {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
+}
+
+/** Charge the whole tool-call envelope, not only its argument text. */
+function captureToolCall(
+  call: CapturedToolCall,
+  calls: CapturedToolCall[],
+  budget: PayloadBudget,
+): void {
+  if (budget.remaining <= 0) {
+    budget.truncated = true;
+    return;
+  }
+  const envelope = {
+    ...call,
+    function: { ...call.function, arguments: '' },
+  };
+  const bytes = Buffer.byteLength(JSON.stringify(envelope));
+  if (bytes > budget.remaining) {
+    budget.truncated = true;
+    budget.remaining = 0;
+    return;
+  }
+  budget.remaining -= bytes;
+  calls.push({
+    ...call,
+    function: {
+      ...call.function,
+      arguments: takePayloadText(call.function.arguments, budget),
+    },
+  });
 }
 
 /** Generation names carry the reply's first non-empty line (capped) for list readability. */
@@ -417,6 +696,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   >();
   const openHooks = new Map<string, Map<string, HookObservation>>();
   const openOperations = new Set<() => void>();
+  const operationSessions = new Map<() => void, string | undefined>();
   const traceContexts = new Map<string, LangfuseTraceContext>();
   type Handle =
     | NonNullable<ObservationHandle>
@@ -818,11 +1098,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     const parentSessionId: string | undefined = session.header.parentSession;
     if (!parentSessionId) return;
     const childId: string = session.id;
-    // Parent under the enclosing delegation tool span when one is open
-    // (foreground runs execute inside the parent's tools/execute), else the
-    // parent's own subagent span (nested delegation), else the root trace.
+    // Parent under the enclosing delegation tool span only when it is unique;
+    // concurrent tools have no reliable stack-top ordering, so use the known
+    // parent subagent/root instead of attributing the child to an arbitrary tool.
+    const openTools = openToolSpans.get(parentSessionId) ?? [];
     const parentObservation =
-      openToolSpans.get(parentSessionId)?.at(-1) ??
+      (openTools.length === 1 ? openTools[0] : undefined) ??
       children.get(parentSessionId)?.span ??
       traceFor(parentSessionId);
     const span = reporter.startSpan(parentObservation, {
@@ -835,6 +1116,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     children.set(childId, {
       parentSessionId,
       span,
+      started: false,
       hasInput: false,
       turnTrace:
         children.get(parentSessionId)?.turnTrace ??
@@ -845,13 +1127,20 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   ctx.on('subagent/start', (info) => {
     const child = children.get(info.id);
     if (!child) return; // remote (ACP) runs have no local session — nothing to nest
+    child.started = true;
     reporter.updateSpan(child.span, { metadata: { provider: info.provider, local: info.local } });
   });
 
   ctx.on('subagent/end', (info) => {
     const child = children.get(info.id);
     if (!child) return;
-    if (info.stopReason === 'error') noteError(info.id);
+    // A background child can finish after the parent moved to another turn.
+    // Only mark the root that was active when this child was created.
+    if (
+      info.stopReason === 'error' &&
+      sessions.get(rootSessionId(info.id) ?? '')?.trace === child.turnTrace
+    )
+      noteError(info.id);
     children.delete(info.id);
     afterMedia(child.span, (endedAt) =>
       reporter.endSpan(
@@ -1106,6 +1395,21 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
 
   ctx.on('session/disposed', (session) => {
     const sessionId: string = session.id;
+    for (const close of [...openOperations]) {
+      if (operationSessions.get(close) === sessionId) close();
+    }
+    const child = children.get(sessionId);
+    if (child && !child.started) {
+      // Activation rollback disposes the session without subagent/start/end.
+      children.delete(sessionId);
+      afterMedia(child.span, (endedAt) =>
+        reporter.endSpan(
+          child.span,
+          { level: 'WARNING', statusMessage: 'subagent activation rolled back' },
+          endedAt,
+        ),
+      );
+    }
     closeHooks(sessionId);
     const state = sessions.get(sessionId);
     sessions.delete(sessionId);
@@ -1143,7 +1447,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     const oneOffRoot = options.sessionId ? null : parent;
     const generationName = options.purpose ? `llm-call [${options.purpose}]` : 'llm-call';
     const modelParameters = modelParametersOf(options, config.captureContent);
-    const input = requestBodyOf(options, config.captureContent);
+    const maxPayloadBytes = config.maxPayloadBytes ?? 256 * 1024;
+    const requestBudget = newPayloadBudget(maxPayloadBytes);
+    const rawBudget = newPayloadBudget(maxPayloadBytes);
+    const outputBudget = newPayloadBudget(maxPayloadBytes);
+    const requestBody = requestBodyOf(options, config.captureContent);
+    const input = boundPayload(requestBody, requestBudget, reporter);
     const generation = reporter.startGeneration(parent, {
       name: generationName,
       model: options.model,
@@ -1170,7 +1479,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
               budget,
             ),
           })),
-        ).then((messages) => ({ ...input, messages })),
+        ).then((messages) => {
+          const enrichmentBudget = newPayloadBudget(maxPayloadBytes);
+          const enriched = boundPayload({ ...requestBody, messages }, enrichmentBudget, reporter);
+          requestBudget.truncated ||= enrichmentBudget.truncated;
+          return enriched;
+        }),
       );
     }
 
@@ -1216,6 +1530,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       closed = true;
       const endedAt = new Date();
       openOperations.delete(closeCall);
+      operationSessions.delete(closeCall);
       const failure =
         finish && (finish.kind === 'error' || finish.kind === 'aborted') ? finish : undefined;
       // No terminal finish chunk (the consumer abandoned the stream or
@@ -1236,17 +1551,33 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         level = 'WARNING';
         statusMessage = 'stream closed before the terminal finish chunk';
       }
+      // Redact complete grouped deltas before the final serialized bound;
+      // streaming capture has already bounded memory and dropped overflow whole.
+      const finalRawBudget = newPayloadBudget(maxPayloadBytes);
+      const rawOutput = boundPayload(
+        reporter.mask(redactChunks(rawChunks, reporter)),
+        finalRawBudget,
+      );
+      rawBudget.truncated ||= finalRawBudget.truncated;
       reporter.endSpan(
         requestSpan,
         {
-          output: config.captureContent ? redactChunks(rawChunks, reporter) : undefined,
+          output: config.captureContent ? rawOutput : undefined,
           level,
           statusMessage,
-          metadata: { chunkCount },
+          metadata: {
+            chunkCount,
+            truncated: requestBudget.truncated || rawBudget.truncated || undefined,
+          },
         },
         endedAt,
       );
       if (level === 'ERROR') noteError(options.sessionId);
+      // A final independent safety bound covers the complete output envelope;
+      // an exhausted streaming budget must not erase an otherwise valid prefix.
+      const finalOutputBudget = newPayloadBudget(maxPayloadBytes);
+      const output = boundPayload(outputBody(), finalOutputBudget, reporter);
+      outputBudget.truncated ||= finalOutputBudget.truncated;
       // Partial progress counts on every path: whatever streamed is kept.
       afterMedia(
         generation,
@@ -1257,7 +1588,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
               name: config.captureContent
                 ? enhanceWithFirstLine(generationName, reporter.mask(text))
                 : undefined,
-              output: outputBody(),
+              output,
               usage,
               completionStartTime,
               level,
@@ -1267,6 +1598,11 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
                 errorCode: failure?.failure?.code,
                 incomplete: finish ? undefined : true,
                 toolCallCount: toolCallCount > 0 ? toolCallCount : undefined,
+                truncated:
+                  requestBudget.truncated ||
+                  rawBudget.truncated ||
+                  outputBudget.truncated ||
+                  undefined,
               },
             },
             endedAt,
@@ -1276,6 +1612,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       reporter.endSpan(oneOffRoot, {}, endedAt);
     };
     openOperations.add(closeCall);
+    operationSessions.set(closeCall, options.sessionId);
     let stream: AsyncIterable<StreamChunk>;
     try {
       stream = next();
@@ -1294,7 +1631,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
             continue;
           }
           chunkCount += 1;
-          if (config.captureContent) rawChunks.push(chunk);
+          if (config.captureContent) capturePayloadChunk(chunk, rawChunks, rawBudget);
           // TTFT is the first real token — block boundaries, usage frames and
           // empty heartbeat deltas are not completions (the predicate above).
           if (completionStartTime === undefined && isTokenDelta(chunk)) {
@@ -1302,20 +1639,45 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
           }
           switch (chunk.type) {
             case 'text-delta':
-              if (config.captureContent) text += chunk.text;
+              if (config.captureContent) text = appendAssembledText(text, chunk.text, outputBudget);
               break;
             case 'reasoning-delta':
-              if (config.captureContent) reasoning += chunk.text;
+              if (config.captureContent)
+                reasoning = appendAssembledText(reasoning, chunk.text, outputBudget);
               break;
             case 'block-end':
               if (chunk.block.type === 'tool-call') {
                 toolCallCount += 1;
-                if (config.captureContent)
-                  toolCalls.push({
-                    id: chunk.block.id,
-                    type: 'function',
-                    function: { name: chunk.block.name, arguments: chunk.block.arguments },
-                  });
+                if (config.captureContent) {
+                  if (outputBudget.remaining <= 0) {
+                    outputBudget.truncated = true;
+                    break;
+                  }
+                  const envelopeBytes = Buffer.byteLength(
+                    JSON.stringify({
+                      id: chunk.block.id,
+                      type: 'function',
+                      function: { name: chunk.block.name, arguments: '' },
+                    }),
+                  );
+                  if (envelopeBytes > outputBudget.remaining) {
+                    outputBudget.truncated = true;
+                    outputBudget.remaining = 0;
+                    break;
+                  }
+                  captureToolCall(
+                    {
+                      id: chunk.block.id,
+                      type: 'function',
+                      function: {
+                        name: chunk.block.name,
+                        arguments: reporter.mask(chunk.block.arguments),
+                      },
+                    },
+                    toolCalls,
+                    outputBudget,
+                  );
+                }
               }
               break;
             case 'usage':
@@ -1382,6 +1744,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         closed = true;
         const endedAt = new Date();
         openOperations.delete(closeTool);
+        operationSessions.delete(closeTool);
         toolResults.delete(exec);
         if (sessionId && toolCalls.get(sessionId)?.get(exec.callId)?.span === span) {
           const calls = toolCalls.get(sessionId)!;
@@ -1407,6 +1770,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         else end();
       }
       openOperations.add(closeTool);
+      operationSessions.set(closeTool, sessionId);
       toolResults.set(exec, (result) => {
         if (closed) return;
         if (result.isError) noteError(sessionId);

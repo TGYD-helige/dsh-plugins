@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { runScenario } from './lib/langfuse-shared.mjs';
 import { evaluateMetadataTrace } from './lib/langfuse-metadata-check.mjs';
+import { runScenario } from './lib/langfuse-shared.mjs';
 
 await runScenario({
   tag: 'metadata',

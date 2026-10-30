@@ -47,13 +47,27 @@ const dshHomeEnv = { DSH_HOME: dshHome };
 
 // 1. Install the packed bundle — `dsh plugin` forwards to pnpm in the profile
 //    directory and auto-registers any dependency with a dsh.bundle patch.
-run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], { cwd: workDir, env: dshHomeEnv });
+run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], {
+  cwd: workDir,
+  env: dshHomeEnv,
+});
 
 // 2. The profile template sets autoInstallPeers: false, so the plugin's
 //    runtime peers (Prisma 7 client + the sqlite driver adapter) must be
 //    added explicitly. The PrismaClient itself ships pre-generated in the
 //    bundle — no generate step here.
-run(dsh, ['plugin', '--profile', 'headless', 'add', '@prisma/client@7.9.1', '@prisma/adapter-libsql@7.9.1'], { cwd: workDir, env: dshHomeEnv });
+run(
+  dsh,
+  [
+    'plugin',
+    '--profile',
+    'headless',
+    'add',
+    '@prisma/client@7.9.1',
+    '@prisma/adapter-libsql@7.9.1',
+  ],
+  { cwd: workDir, env: dshHomeEnv },
+);
 
 // 3. Enable the sqlite mirror through the profile's user patch layer (an
 //    id-targeted row replaces the bundle row's whole config). The template
@@ -103,7 +117,11 @@ const schemaPath = join(
   'prisma',
   'schema.sqlite.prisma',
 );
-run('pnpm', ['dlx', 'prisma@7.9.1', 'db', 'push', '--schema', schemaPath, '--url', `file:${dbPath}`], { cwd: workDir });
+run(
+  'pnpm',
+  ['dlx', 'prisma@7.9.1', 'db', 'push', '--schema', schemaPath, '--url', `file:${dbPath}`],
+  { cwd: workDir },
+);
 
 // 5. One real query, seeded to force a tool round-trip: the marker file's
 //    unique content can only reach the transcript through a tool result, so
@@ -123,7 +141,9 @@ function dbHasMarkerResult() {
   try {
     return (
       db
-        .prepare("SELECT COUNT(*) c FROM ai_messages WHERE type = 'model' AND tool_calls LIKE '%' || ? || '%'")
+        .prepare(
+          "SELECT COUNT(*) c FROM ai_messages WHERE type = 'model' AND tool_calls LIKE '%' || ? || '%'",
+        )
         .get(markerContent).c > 0
     );
   } finally {
@@ -140,7 +160,11 @@ for (let attempt = 1; attempt <= 3; attempt++) {
   if (attempt > 1) {
     // A retried run is a new session in the same file — start clean.
     rmSync(dbPath, { force: true });
-    run('pnpm', ['dlx', 'prisma@7.9.1', 'db', 'push', '--schema', schemaPath, '--url', `file:${dbPath}`], { cwd: workDir });
+    run(
+      'pnpm',
+      ['dlx', 'prisma@7.9.1', 'db', 'push', '--schema', schemaPath, '--url', `file:${dbPath}`],
+      { cwd: workDir },
+    );
   }
   console.log(`\n$ dsh --profile headless "${prompt}" (attempt ${attempt})`);
   const query = spawnSync(dsh, ['--profile', 'headless', prompt], {
@@ -166,12 +190,13 @@ for (let attempt = 1; attempt <= 3; attempt++) {
   console.log('::warning::attempt produced no marker-bearing tool result');
 }
 
-
 // 6. Assert the mirror in SQLite.
 console.log('\n--- ai_messages ---');
 const db = new DatabaseSync(dbPath, { readOnly: true });
 const messages = db
-  .prepare('SELECT session_id, type, content, model, metadata, tool_calls FROM ai_messages ORDER BY rowid')
+  .prepare(
+    'SELECT session_id, type, content, model, metadata, tool_calls FROM ai_messages ORDER BY rowid',
+  )
   .all();
 for (const m of messages) {
   console.log(
@@ -196,7 +221,10 @@ assert(model, 'assistant message row missing');
 assert(model.model === expectedModel, `expected model=${expectedModel}, got ${model.model}`);
 for (const m of messages) {
   const meta = JSON.parse(m.metadata);
-  assert(typeof meta.id === 'string' && meta.id.length > 0, `row missing metadata.id: ${m.metadata}`);
+  assert(
+    typeof meta.id === 'string' && meta.id.length > 0,
+    `row missing metadata.id: ${m.metadata}`,
+  );
 }
 
 // The tool round-trip, proven from the database: the marker content only
@@ -221,11 +249,19 @@ if (!messages.some((m) => m.type === 'model' && String(m.content).includes(marke
 assert(histories.length === 1, `expected 1 session row, got ${histories.length}`);
 const history = histories[0];
 assert(history.session_id === user.session_id, 'session row id mismatch');
-assert(Number(history.message_count) >= 3, `message_count=${history.message_count} < 3 (user + assistant/tool-call + assistant)`);
+assert(
+  Number(history.message_count) >= 3,
+  `message_count=${history.message_count} < 3 (user + assistant/tool-call + assistant)`,
+);
 assert(Number(history.total_tokens) > 0, `total_tokens=${history.total_tokens} == 0`);
-assert(history.first_message_at != null && history.last_message_at != null, 'message timestamps missing');
+assert(
+  history.first_message_at != null && history.last_message_at != null,
+  'message timestamps missing',
+);
 
-console.log(`\nSCENARIO_OK (messages=${messages.length}, toolCalls=${toolCallIds.size}, title=${JSON.stringify(history.title)})`);
+console.log(
+  `\nSCENARIO_OK (messages=${messages.length}, toolCalls=${toolCallIds.size}, title=${JSON.stringify(history.title)})`,
+);
 
 /**
  * Backend-only provider leg: db push the variant schema, drive
@@ -256,17 +292,31 @@ async function backendOnlyLeg(dbProvider) {
   const { mergeToolResult } = await import(pkgUrl('lib/projector.js').href);
   const backend = new DatabaseBackend({ provider: dbProvider, url });
   await backend.init();
-  await backend.upsertMessage({
-    id: 'm1',
-    sessionId: 's1',
-    historyId: null,
-    type: 'user',
-    content: `hello from ${dbProvider}`,
-    metadata: { event: 'user/message', seq: 1 },
-    createdAt: new Date(1700000000000),
-  });
+  await backend.upsertEvent(
+    {
+      id: 'm1',
+      sessionId: 's1',
+      historyId: null,
+      type: 'user',
+      content: `hello from ${dbProvider}`,
+      metadata: { event: 'user/message', seq: 1 },
+      createdAt: new Date(1700000000000),
+    },
+    {
+      sessionId: 's1',
+      messageCount: 1,
+      totalTokens: 0,
+      firstMessageAt: new Date(1700000000000),
+      lastMessageAt: new Date(1700000000000),
+    },
+  );
   const replayState = {
-    response: { kind: 'deepseek-messages', version: 1, model: 'deepseek-v4-flash', requestId: 'r1' },
+    response: {
+      kind: 'deepseek-messages',
+      version: 1,
+      model: 'deepseek-v4-flash',
+      requestId: 'r1',
+    },
     blocks: [
       { type: 'reasoning', signature: 'opaque-signature' },
       { type: 'text' },
@@ -284,20 +334,35 @@ async function backendOnlyLeg(dbProvider) {
     tokens: { inputTokens: 10, outputTokens: 5 },
     toolCalls: [{ type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }],
     metadata: {
-      event: 'assistant/message', seq: 2,
+      event: 'assistant/message',
+      seq: 2,
       source: { kind: 'model', provider: 'deepseek', model: 'deepseek-v4-flash', replayState },
     },
     createdAt: new Date(1700000001000),
   });
-  const toolResult = {
-    type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'file contents' }],
-  };
+  const toolResultContent = [
+    { type: 'text', text: 'file contents' },
+    { type: 'image', attachment: { attachmentId: 'image-1', mediaType: 'image/png', bytes: 4 } },
+    { type: 'text', text: 'end of result' },
+  ];
   const resultEvent = {
-    type: 'tool/result', data: { message: { source: { callId: 'c1' }, content: [toolResult] } },
+    type: 'tool/result',
+    data: {
+      message: {
+        role: 'tool',
+        source: { kind: 'tool', callId: 'c1' },
+        toolCallId: 'c1',
+        isError: true,
+        content: toolResultContent,
+      },
+    },
   };
   for (let delivery = 0; delivery < 2; delivery++) {
     const row = mergeToolResult(resultEvent, await backend.readToolCallMessages('s1', 'c1'));
-    assert(row?.id === 'a1', 'tool result did not match the persisted model call');
+    assert(
+      row?.id === 'a1',
+      `tool result did not match the persisted model call: ${JSON.stringify(row)}`,
+    );
     await backend.upsertMessage(row);
   }
   // Redelivery must update in place, not duplicate (deterministic PK).
@@ -324,12 +389,19 @@ async function backendOnlyLeg(dbProvider) {
   const prisma = new PrismaClient({ adapter: await createAdapter({ provider: dbProvider, url }) });
   const messages = await prisma.aiMessage.findMany({ orderBy: { createdAt: 'asc' } });
   const sessions = await prisma.aiChatHistory.findMany();
-  for (const m of messages) console.log(` [${m.type}] ${JSON.stringify(m.content)} tokens=${JSON.stringify(m.tokens)}`);
-  for (const h of sessions) console.log(` history title=${JSON.stringify(h.title)} count=${h.messageCount} tokens=${h.totalTokens}`);
+  for (const m of messages)
+    console.log(` [${m.type}] ${JSON.stringify(m.content)} tokens=${JSON.stringify(m.tokens)}`);
+  for (const h of sessions)
+    console.log(
+      ` history title=${JSON.stringify(h.title)} count=${h.messageCount} tokens=${h.totalTokens}`,
+    );
 
   const parseJsonColumn = (value) => (typeof value === 'string' ? JSON.parse(value) : value);
   assert(messages.length === 2, `expected 2 messages, got ${messages.length}`);
-  assert(messages[0].content === `hello from ${dbProvider} (edited)`, 'redelivery did not update in place');
+  assert(
+    messages[0].content === `hello from ${dbProvider} (edited)`,
+    'redelivery did not update in place',
+  );
   assert(parseJsonColumn(messages[1].metadata).id === 'a1', 'metadata did not round-trip');
   assert(parseJsonColumn(messages[1].tokens).inputTokens === 10, 'tokens did not round-trip');
   deepStrictEqual(parseJsonColumn(messages[1].metadata).source.replayState, replayState);
@@ -337,27 +409,344 @@ async function backendOnlyLeg(dbProvider) {
     parseJsonColumn(messages[1].thoughts)[0].thoughtSignature === 'opaque-signature',
     'thought signature did not round-trip',
   );
-  assert(
-    parseJsonColumn(messages[1].toolCalls)[0].result.content[0].text === 'file contents',
-    'tool result did not round-trip inside the model row',
+  deepStrictEqual(
+    parseJsonColumn(messages[1].toolCalls)[0].result,
+    { type: 'tool-result', toolCallId: 'c1', content: toolResultContent, isError: true },
+    'multi-block tool result did not round-trip inside the model row',
   );
   assert(sessions.length === 1 && Number(sessions[0].totalTokens) === 15, 'session rollup wrong');
 
   const archiveId = await backend.archiveSession('s1');
   assert(archiveId === sessions[0].id, 'archive did not retain the active rollup');
-  assert(await backend.archiveSession('s1') === null, 'empty archive was not idempotent');
-  assert(await backend.readSession('s1') === null, 'archived rollup was selected as active');
+  assert((await backend.archiveSession('s1')) === null, 'empty archive was not idempotent');
+  assert((await backend.readSession('s1')) === null, 'archived rollup was selected as active');
   await backend.upsertMessage({
-    id: 'm2', sessionId: 's1', historyId: null, type: 'user', content: 'after clear',
+    id: 'm2',
+    sessionId: 's1',
+    historyId: null,
+    type: 'user',
+    content: 'after clear',
     createdAt: new Date(1700000002000),
   });
   await backend.upsertSession({ sessionId: 's1', messageCount: 1, totalTokens: 0 });
   const archivedRows = await prisma.aiMessage.findMany({ where: { historyId: archiveId } });
   const activeRows = await backend.readMessages('s1', 'm2');
+  assert(
+    (await backend.readToolCallMessages('s1', 'c1')).length === 0,
+    'tool-call lookup includes archived history',
+  );
   const activeRollup = await backend.readSession('s1');
   assert(archivedRows.length === 2, 'archived messages are not queryable by history ID');
-  assert(activeRows.length === 1 && activeRows[0].id === 'm2', 'active message query includes history');
+  assert(
+    activeRows.length === 1 && activeRows[0].id === 'm2' && activeRows[0].historyId === null,
+    'active message query includes history',
+  );
   assert(activeRollup?.messageCount === 1, 'new active rollup reused archived counts');
+
+  {
+    // Real provider paging: the only matching old call sits beyond 100 candidates.
+    // Make just this test database's timestamp nullable to model legacy rows.
+    if (dbProvider === 'sqlite') {
+      await prisma.$executeRawUnsafe('DROP INDEX IF EXISTS idx_created');
+      await prisma.$executeRawUnsafe('DROP INDEX IF EXISTS idx_session_agent_type_created');
+      await prisma.$executeRawUnsafe('DROP INDEX IF EXISTS idx_tool_call_lookup');
+      await prisma.$executeRawUnsafe('ALTER TABLE ai_messages DROP COLUMN created_at');
+      await prisma.$executeRawUnsafe('ALTER TABLE ai_messages ADD COLUMN created_at DATETIME');
+      await prisma.$executeRawUnsafe(
+        'CREATE INDEX idx_tool_call_lookup ON ai_messages (session_id, history_id, deleted_at, type, created_at, id)',
+      );
+    } else if (dbProvider === 'mysql') {
+      await prisma.$executeRawUnsafe('ALTER TABLE ai_messages MODIFY created_at TIMESTAMP NULL');
+    } else if (dbProvider === 'postgresql') {
+      await prisma.$executeRawUnsafe(
+        'ALTER TABLE ai_messages ALTER COLUMN created_at DROP NOT NULL',
+      );
+    } else if (dbProvider === 'sqlserver') {
+      await prisma.$executeRawUnsafe(
+        'ALTER TABLE ai_messages ALTER COLUMN created_at datetime2 NULL',
+      );
+    }
+    for (let index = 0; index < 105; index++) {
+      const id = `page-${index}`;
+      await backend.upsertMessage({
+        id,
+        sessionId: 'p1',
+        historyId: null,
+        type: 'model',
+        content: '',
+        toolCalls: [
+          {
+            type: 'tool-call',
+            id: index === 0 ? 'old-call' : `other-${index}`,
+            name: 'read',
+            arguments: '{}',
+          },
+        ],
+        createdAt: new Date(1700000000000 + index),
+      });
+    }
+    const nullMarkers =
+      dbProvider === 'postgresql' ? '$1, $2' : dbProvider === 'sqlserver' ? '@P1, @P2' : '?, ?';
+    // Mix NULL and non-NULL timestamps so keyset pagination must transition
+    // between both groups without returning the same row twice.
+    await prisma.$executeRawUnsafe(
+      `UPDATE ai_messages SET created_at = NULL WHERE session_id = ${nullMarkers.split(', ')[0]} AND created_at < ${nullMarkers.split(', ')[1]}`,
+      'p1',
+      new Date(1700000000050),
+    );
+
+    const old = await backend.readToolCallMessages('p1', 'old-call');
+    assert(old.length === 1 && old[0].id === 'page-0', 'NULL timestamp paging lost the old call');
+
+    // Verify the query planner can use the new composite index instead of
+    // repeatedly scanning archived rows. Other providers log their real plans
+    // for CI review; SQLite additionally asserts the index is selected.
+    const sessionMarker =
+      dbProvider === 'postgresql' ? '$1' : dbProvider === 'sqlserver' ? '@P1' : '?';
+    const nonNullTime = dbProvider === 'postgresql' ? 'AND created_at IS NOT NULL' : '';
+    const planQuery = `SELECT ${dbProvider === 'sqlserver' ? 'TOP 100 ' : ''}id FROM ai_messages WHERE session_id = ${sessionMarker} AND deleted_at IS NULL AND history_id IS NULL AND type = 'model' AND tool_calls IS NOT NULL ${nonNullTime} ORDER BY created_at DESC, id DESC ${dbProvider === 'sqlserver' ? '' : 'LIMIT 100'}`;
+    if (dbProvider === 'sqlserver') {
+      const plan = await prisma.$transaction(async (tx) => {
+        await tx.$executeRawUnsafe('SET SHOWPLAN_ALL ON');
+        try {
+          return await tx.$queryRawUnsafe(planQuery, 'p1');
+        } finally {
+          await tx.$executeRawUnsafe('SET SHOWPLAN_ALL OFF');
+        }
+      });
+      console.log('query plan (sqlserver):', JSON.stringify(plan).slice(0, 1200));
+    } else if (dbProvider === 'sqlite') {
+      const planDb = new DatabaseSync(url.replace(/^file:/, ''));
+      try {
+        const plan = planDb.prepare(`EXPLAIN QUERY PLAN ${planQuery}`).all('p1');
+        assert(
+          JSON.stringify(plan).includes('idx_tool_call_lookup'),
+          'SQLite did not use the tool-call composite index',
+        );
+        console.log('query plan (sqlite):', JSON.stringify(plan).slice(0, 1200));
+      } finally {
+        planDb.close();
+      }
+    } else {
+      const explain = dbProvider === 'postgresql' ? 'EXPLAIN (FORMAT JSON) ' : 'EXPLAIN ';
+      const plan = await prisma.$queryRawUnsafe(explain + planQuery, 'p1');
+      console.log(`query plan (${dbProvider}):`);
+      console.dir(plan, { depth: null });
+    }
+
+    const pagedArchiveId = await backend.archiveSession('p1');
+    assert(pagedArchiveId, 'paged archive did not create a history');
+    assert((await backend.archiveSession('p1')) === null, 'paged archive was not idempotent');
+    const archivedCount = await prisma.aiMessage.count({ where: { historyId: pagedArchiveId } });
+    assert(archivedCount === 105, `archive linked ${archivedCount} messages instead of 105`);
+    const archivedRollup = await prisma.aiChatHistory.findFirst({ where: { id: pagedArchiveId } });
+    assert(archivedRollup?.messageCount === 105, 'archive rollup count is not 105');
+    const archiveMetadata =
+      typeof archivedRollup.metadata === 'string'
+        ? JSON.parse(archivedRollup.metadata)
+        : archivedRollup.metadata;
+    assert(!archiveMetadata?.['dsh-storage:archive-in-progress'], 'archive marker was not cleared');
+  }
+
+  if (dbProvider === 'sqlite') {
+    // A successful first batch followed by a new event must resume the same history.
+    for (let index = 0; index < 105; index++) {
+      await backend.upsertMessage({
+        id: `retry-${index}`,
+        sessionId: 'r1',
+        historyId: null,
+        type: 'model',
+        content: '',
+        createdAt: new Date(1700000000000 + index),
+      });
+    }
+    const client = backend.prisma;
+    const originalUpdateMany = client.aiMessage.updateMany;
+    let archiveWrites = 0;
+    client.aiMessage.updateMany = async (...args) => {
+      archiveWrites += 1;
+      if (archiveWrites === 2 || archiveWrites === 3)
+        throw new Error('injected consecutive archive batch failure');
+      return originalUpdateMany(...args);
+    };
+    let failed = false;
+    try {
+      await backend.archiveSession('r1');
+    } catch {
+      failed = true;
+    }
+    assert(failed, 'archive failure injection did not run');
+    await backend.upsertEvent(
+      {
+        id: 'retry-new-event',
+        sessionId: 'r1',
+        historyId: null,
+        type: 'user',
+        content: 'created during archive recovery',
+        createdAt: new Date(1700000002000),
+      },
+      {
+        sessionId: 'r1',
+        title: 'Recovered title',
+        messageCount: 99,
+        totalTokens: 110,
+        metadata: { custom: 'keep-me', 'dsh-storage:token-baseline': 100 },
+      },
+    );
+    let failedAgain = false;
+    try {
+      await backend.archiveSession('r1');
+    } catch {
+      failedAgain = true;
+    } finally {
+      client.aiMessage.updateMany = originalUpdateMany;
+    }
+    assert(failedAgain, 'consecutive archive failure injection did not run');
+    await backend.upsertEvent(
+      {
+        id: 'retry-second-event',
+        sessionId: 'r1',
+        historyId: null,
+        type: 'user',
+        content: 'created after the second archive failure',
+        createdAt: new Date(1700000002500),
+      },
+      {
+        sessionId: 'r1',
+        title: 'Recovered title',
+        messageCount: 100,
+        totalTokens: 115,
+        metadata: { custom: 'keep-me', 'dsh-storage:token-baseline': 100 },
+      },
+    );
+    const marked = (await prisma.aiChatHistory.findMany({ where: { sessionId: 'r1' } })).find(
+      (row) => {
+        const metadata = typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata;
+        return metadata?.['dsh-storage:archive-in-progress'];
+      },
+    );
+    assert(marked, 'interrupted history was not marked');
+    await prisma.aiChatHistory.update({ where: { id: marked.id }, data: { totalTokens: 100n } });
+    const recoveredId = await backend.archiveSession('r1');
+    assert(recoveredId === marked.id, 'archive recovery switched to the newer active rollup');
+    const recoveredHistory = await prisma.aiChatHistory.findFirst({ where: { id: recoveredId } });
+    assert(
+      recoveredHistory.totalTokens === 115n,
+      `archive recovery lost the active token total: ${recoveredHistory.totalTokens}`,
+    );
+    const recoveredCount = await prisma.aiMessage.count({ where: { historyId: recoveredId } });
+    assert(
+      recoveredCount === 107,
+      `recovered history has ${recoveredCount} messages instead of 107`,
+    );
+
+    await backend.upsertEvent(
+      {
+        id: 'retry-next-event',
+        sessionId: 'r1',
+        historyId: null,
+        type: 'user',
+        content: 'first event after recovery',
+        createdAt: new Date(1700000003000),
+      },
+      { sessionId: 'r1', messageCount: 1, totalTokens: 20 },
+    );
+    const nextActive = await backend.readSession('r1');
+    assert(nextActive?.messageCount === 1, 'next event inherited the old active message count');
+    assert(nextActive.totalTokens === 20, 'next event inherited the old active token count');
+    assert(nextActive.title === 'Recovered title', 'active title was not preserved');
+    assert(nextActive.metadata?.custom === 'keep-me', 'active metadata was not preserved');
+    assert(
+      !nextActive.metadata?.['dsh-storage:archive-in-progress'],
+      'archive marker survived recovery',
+    );
+    assert(
+      nextActive.metadata?.['dsh-storage:token-baseline'] === undefined,
+      'stale token baseline survived recovery',
+    );
+
+    // A later segment must freeze a new baseline instead of reusing the first
+    // archive's 100-token marker.
+    const nextActiveRow = await prisma.aiChatHistory.findFirst({
+      where: { sessionId: 'r1', deletedAt: null, messages: { none: {} } },
+      select: { id: true },
+    });
+    assert(nextActiveRow, 'next segment active history is missing');
+    client.aiMessage.updateMany = async () => {
+      throw new Error('next segment archive failure');
+    };
+    let nextFailed = false;
+    try {
+      await backend.archiveSession('r1');
+    } catch {
+      nextFailed = true;
+    } finally {
+      client.aiMessage.updateMany = originalUpdateMany;
+    }
+    assert(nextFailed, 'next segment archive failure did not run');
+    await backend.upsertEvent(
+      {
+        id: 'retry-next-segment-event',
+        sessionId: 'r1',
+        historyId: null,
+        type: 'user',
+        content: 'created after the next segment archive failure',
+        createdAt: new Date(1700000004000),
+      },
+      {
+        sessionId: 'r1',
+        messageCount: 2,
+        totalTokens: 25,
+        metadata: { custom: 'keep-me', 'dsh-storage:token-baseline': 20 },
+      },
+    );
+    const nextRecoveredId = await backend.archiveSession('r1');
+    assert(
+      nextRecoveredId === nextActiveRow.id,
+      `next segment recovery switched history: ${nextRecoveredId} !== ${nextActiveRow.id}`,
+    );
+    const nextRecovered = await prisma.aiChatHistory.findFirst({ where: { id: nextRecoveredId } });
+    assert(nextRecovered.totalTokens === 25n, 'next segment recovery lost token delta');
+    const remainingActive = await prisma.aiChatHistory.findMany({
+      where: { sessionId: 'r1', deletedAt: null, messages: { none: {} } },
+    });
+    for (const active of remainingActive) {
+      assert(active.messageCount === 0, 'next segment active count was not reset');
+      assert(active.totalTokens === 0n, 'next segment active tokens were not reset');
+      const metadata =
+        typeof active.metadata === 'string' ? JSON.parse(active.metadata) : active.metadata;
+      assert(
+        !metadata?.['dsh-storage:archive-in-progress'],
+        'next segment archive marker survived recovery',
+      );
+      assert(
+        metadata?.['dsh-storage:token-baseline'] === undefined,
+        'next segment baseline survived recovery',
+      );
+    }
+  }
+
+  if (dbProvider === 'sqlite') {
+    const planDb = new DatabaseSync(url.replace(/^file:/, ''));
+    try {
+      const plan = planDb
+        .prepare(
+          'EXPLAIN QUERY PLAN SELECT history_id FROM ai_messages WHERE session_id = ? AND history_id IS NOT NULL AND deleted_at IS NULL ORDER BY updated_at DESC, id DESC LIMIT 1',
+        )
+        .all('r1');
+      assert(
+        JSON.stringify(plan).includes('idx_archive_recovery'),
+        'SQLite did not use the archive recovery index',
+      );
+      assert(
+        !JSON.stringify(plan).includes('USE TEMP B-TREE'),
+        'archive recovery still sorts the history rows',
+      );
+      console.log('archive recovery plan (sqlite):', JSON.stringify(plan).slice(0, 1200));
+    } finally {
+      planDb.close();
+    }
+  }
 
   await prisma.$disconnect();
   await backend.close();

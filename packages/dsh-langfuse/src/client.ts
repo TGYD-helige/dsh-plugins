@@ -156,23 +156,48 @@ export class LangfuseReporter {
     this.ready = this.init();
   }
 
+  /** Whether a payload property should be replaced without inspecting its value. */
+  shouldRedactField(key: string): boolean {
+    return !!this.config.redactFields?.some((field) => field.toLowerCase() === key.toLowerCase());
+  }
+
   /** Clone telemetry only; never mutate harness-owned messages or tool results. */
   mask<T>(data: T): T {
     const secrets = [this.config.publicKey, this.config.secretKey].filter(Boolean);
     const fields = new Set(this.config.redactFields?.map((key) => key.toLowerCase()));
     const seen = new WeakSet<object>();
     const redactText = (text: string): string => {
-      const ranges: Array<[number, number]> = Array.from(
-        text.matchAll(/(?:pk|sk)-lf-[\w-]+/g),
+      const markedRanges: Array<[number, number]> = Array.from(
+        text.matchAll(/\[REDACTED\]/g),
         (match) => [match.index, match.index + match[0].length],
       );
+      const ranges: Array<[number, number]> = [];
+      let markerIndex = 0;
+      const addRange = (start: number, stop: number) => {
+        // Existing markers are atomic: a second mask must never expand them.
+        // Walk the sorted marker list once instead of rescanning it per match.
+        while (markerIndex < markedRanges.length && markedRanges[markerIndex][1] <= start)
+          markerIndex += 1;
+        if (
+          markerIndex < markedRanges.length &&
+          start < markedRanges[markerIndex][1] &&
+          stop > markedRanges[markerIndex][0]
+        )
+          return;
+        ranges.push([start, stop]);
+      };
+      for (const match of text.matchAll(/(?:pk|sk)-lf-[\w-]+/g))
+        addRange(match.index, match.index + match[0].length);
       for (const secret of secrets) {
+        // Each independent scan starts at the first marker. Do not reset for
+        // every match, or a large marker list becomes quadratic again.
+        markerIndex = 0;
         for (
           let index = text.indexOf(secret);
           index !== -1;
           index = text.indexOf(secret, index + 1)
         ) {
-          ranges.push([index, index + secret.length]);
+          addRange(index, index + secret.length);
         }
       }
       let output = '';
@@ -423,6 +448,11 @@ export class LangfuseReporter {
       });
       // v5 observation attributes have no `name` — renames ride the OTEL span.
       if (update.name) generation.otelSpan.updateName(update.name);
+    } catch (error) {
+      console.error('[dsh-langfuse] generation end failed:', error);
+    }
+    // An update failure must not strand the observation: v5 exports only ended spans.
+    try {
       generation.end(endedAt);
     } catch (error) {
       console.error('[dsh-langfuse] generation end failed:', error);
@@ -514,6 +544,11 @@ export class LangfuseReporter {
       if (update.output !== undefined && this.roots.has(span)) {
         span.setTraceIO({ output: update.output });
       }
+    } catch (error) {
+      console.error('[dsh-langfuse] span end failed:', error);
+    }
+    // Always close the span, even when its final attributes could not be written.
+    try {
       span.end(endedAt);
     } catch (error) {
       console.error('[dsh-langfuse] span end failed:', error);

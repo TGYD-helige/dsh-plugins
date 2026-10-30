@@ -11,7 +11,15 @@
  * `result.statusUpdate`).
  */
 
-import { a2aClient, assert, bootA2a, frameOf, STATES, stopA2a, THINKING_OFF } from './lib/a2a-shared.mjs';
+import {
+  a2aClient,
+  assert,
+  bootA2a,
+  frameOf,
+  STATES,
+  stopA2a,
+  THINKING_OFF,
+} from './lib/a2a-shared.mjs';
 
 const { a2a, proc } = await bootA2a({ tag: 'cancel', extraPatch: THINKING_OFF });
 const client = a2aClient(a2a);
@@ -34,8 +42,9 @@ try {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
-    let cut;
-    while ((cut = buffer.indexOf('\n\n')) >= 0) {
+    while (true) {
+      const cut = buffer.indexOf('\n\n');
+      if (cut < 0) break;
       const raw = buffer.slice(0, cut);
       buffer = buffer.slice(cut + 2);
       if (!raw.startsWith('data: ')) continue;

@@ -27,7 +27,7 @@ import {
   TaskState,
 } from '@a2a-js/sdk';
 import { duplicateInterfacesForLegacy } from '@a2a-js/sdk/compat/v0_3';
-import { RequestMalformedError } from '@a2a-js/sdk/errors';
+import { RequestMalformedError, UnsupportedOperationError } from '@a2a-js/sdk/errors';
 import {
   type AgentExecutionEvent,
   type AgentExecutor,
@@ -41,6 +41,7 @@ import {
 } from '@a2a-js/sdk/server';
 import { agentCardHandler, jsonRpcHandler, UserBuilder } from '@a2a-js/sdk/server/express';
 import express, { type RequestHandler } from 'express';
+import { AdmissionGate } from './admission.js';
 import { legacyStreamHandler } from './legacy-stream.js';
 
 export interface A2aServerOptions {
@@ -140,6 +141,22 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
   // SDK's default manager gives concurrent sends one bus. Give each send its
   // own bus while forwarding events to a stable task bus for resubscribe/cancel.
   const approvalReply = new AsyncLocalStorage<boolean>();
+  const admissionReply = new AsyncLocalStorage<{
+    release: () => void;
+    expectedSaves: number;
+    saves: number;
+  }>();
+  const admissions = new AdmissionGate();
+  async function acquireAdmission(message: Message | undefined) {
+    const key = message?.taskId || message?.contextId || message?.messageId || '';
+    const admission = admissions.acquire(key);
+    await admission.ready;
+    const state = { release: admission.release, expectedSaves: message?.taskId ? 2 : 1, saves: 0 };
+    return {
+      release: admission.release,
+      run: <T>(work: () => T): T => admissionReply.run(state, work),
+    };
+  }
   const taskBuses = new Map<
     string,
     {
@@ -148,8 +165,11 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       replay: AgentExecutionEvent[];
     }
   >();
+  const ownedTasks = new Set<string>();
   const busManager = {
     createOrGetByTaskId(taskId: string) {
+      // restoreTask also creates buses, but only message admission proves ownership.
+      if (admissionReply.getStore()) ownedTasks.add(taskId);
       let task = taskBuses.get(taskId);
       if (!task) {
         const broadcast = new DefaultExecutionEventBus();
@@ -179,6 +199,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
               before?.$case === 'text' &&
               delta?.$case === 'text'
             ) {
+              // shortcut: replay compaction joins text per delta; use chunks if long streams make this measurable.
               created.replay[created.replay.length - 1] = {
                 ...event,
                 data: {
@@ -235,6 +256,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       task?.broadcast.finished();
       task?.broadcast.removeAllListeners();
       taskBuses.delete(taskId);
+      ownedTasks.delete(taskId);
     },
   };
   const beforeWorkingTaskMessage = async (
@@ -256,6 +278,15 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       throw new RequestMalformedError(error instanceof Error ? error.message : String(error));
     }
   };
+  const admissionStore: TaskStore = {
+    save: async (task, context) => {
+      await options.taskStore.save(task, context);
+      const admission = admissionReply.getStore();
+      if (admission && ++admission.saves >= admission.expectedSaves) admission.release();
+    },
+    load: (taskId, context) => options.taskStore.load(taskId, context),
+    list: (params, context) => options.taskStore.list(params, context),
+  };
   const requestHandler = new (class extends DefaultRequestHandler {
     private async beforeMessage(message: Message | undefined, context: ServerCallContext) {
       if (!message) return;
@@ -267,12 +298,16 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     }
     override async sendMessage(...args: Parameters<DefaultRequestHandler['sendMessage']>) {
       const release = guardApproval(args[0].message);
+      const admission = await acquireAdmission(args[0].message);
       let releaseAdmission: undefined | (() => void);
       try {
         if (!release) await beforeWorkingTaskMessage(args[0].message, args[1]);
         if (!release) releaseAdmission = await this.beforeMessage(args[0].message, args[1]);
-        return await approvalReply.run(Boolean(release), () => super.sendMessage(...args));
+        return await approvalReply.run(Boolean(release), () =>
+          admission.run(() => super.sendMessage(...args)),
+        );
       } finally {
+        admission.release();
         releaseAdmission?.();
         release?.();
       }
@@ -282,28 +317,42 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       ...args: Parameters<DefaultRequestHandler['sendMessageStream']>
     ) {
       const release = guardApproval(args[0].message);
+      const admission = await acquireAdmission(args[0].message);
       let releaseAdmission: undefined | (() => void);
       try {
         if (!release) await beforeWorkingTaskMessage(args[0].message, args[1]);
         if (!release) releaseAdmission = await this.beforeMessage(args[0].message, args[1]);
-        const stream = observeTask(super.sendMessageStream(...args));
+        const stream = admission.run(() => observeTask(super.sendMessageStream(...args)));
         try {
-          if (release) {
-            const first = await approvalReply.run(true, () => stream.next());
-            if (!first.done) yield first.value;
-          }
+          const first = await admission.run(() =>
+            approvalReply.run(Boolean(release), () => stream.next()),
+          );
+          if (!first.done) yield first.value;
           yield* stream;
         } finally {
           if (release) await stream.return(undefined);
         }
       } finally {
+        admission.release();
         releaseAdmission?.();
         release?.();
       }
     }
 
     override async cancelTask(...args: Parameters<DefaultRequestHandler['cancelTask']>) {
+      // A cold native task must reattach before ownership is decided: its restored
+      // bus proves this worker can cancel it, while an unattached remote task still fails closed.
       await options.beforeTask?.(args[0].id, args[1]);
+      const task = await options.taskStore.load(args[0].id, args[1]);
+      if (
+        task?.status?.state === TaskState.TASK_STATE_WORKING &&
+        !ownedTasks.has(task.id) &&
+        !taskBuses.has(task.id)
+      ) {
+        throw new UnsupportedOperationError(
+          'Working task is owned by another worker; route cancellation to its owner.',
+        );
+      }
       return super.cancelTask(...args);
     }
 
@@ -407,7 +456,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
         await stream.return(undefined);
       }
     }
-  })(card, options.taskStore, options.executor, busManager);
+  })(card, admissionStore, options.executor, busManager);
 
   const app = express();
   // The SDK's jsonRpcHandler parses bodies with express.json()'s 100kb default;
@@ -547,6 +596,11 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     server.once('error', reject);
     server.listen(options.port, options.host, () => resolve());
   });
+  const actualPort = (server.address() as AddressInfo).port;
+  if (options.port === 0 && options.card.publicUrl === undefined) {
+    const actualBase = `http://${options.host}:${actualPort}`;
+    for (const endpoint of card.supportedInterfaces) endpoint.url = `${actualBase}${base}/`;
+  }
 
   return {
     restoreTask(task: Task, context: ServerCallContext) {
@@ -564,7 +618,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       })();
       return bus;
     },
-    port: (server.address() as AddressInfo).port,
+    port: actualPort,
     close: () =>
       new Promise<void>((resolve) => {
         for (const stop of stopHeartbeats) stop();

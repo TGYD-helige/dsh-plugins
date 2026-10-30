@@ -24,7 +24,15 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { integrationModel, netEnv, requireEnv, run } from './ci-shared.mjs';
 
-export async function runPolicyScenario({ tag, name, rulesYaml, prompt, expectPresent, prepare, verify }) {
+export async function runPolicyScenario({
+  tag,
+  name,
+  rulesYaml,
+  prompt,
+  expectPresent,
+  prepare,
+  verify,
+}) {
   try {
     await scenarioMain({ tag, name, rulesYaml, prompt, expectPresent, prepare, verify });
   } catch (error) {
@@ -47,7 +55,10 @@ async function scenarioMain({ tag, name, rulesYaml, prompt, expectPresent, prepa
 
   // 1. Install the packed bundle (idempotent — the workflow's Stage A already
   //    did it once). The dsh-* peers ship with the profile itself.
-  run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], { cwd: workDir, env: dshHomeEnv });
+  run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], {
+    cwd: workDir,
+    env: dshHomeEnv,
+  });
 
   // 2. Enable the plugin through the profile's user patch layer (an
   //    id-targeted row replaces the bundle row's whole config). The

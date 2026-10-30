@@ -100,7 +100,7 @@ jobs:
           node-version: 24
           cache: pnpm
 
-      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm install --frozen-lockfile
       - run: pnpm build
 
       # Pin DSH_HOME inside the workspace temp so the profile, sessions, and
@@ -210,7 +210,7 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm install --frozen-lockfile
 
       - name: Verify queue insertion over A2A HTTP and JSONL
         run: node .github/scripts/check-inbox.mjs -t '^(?!.*(native ownership|graceful retention))'
@@ -240,7 +240,7 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm install --frozen-lockfile
 
       - name: Verify Goal ownership, local crash recovery and queued-task promotion
         run: node .github/scripts/check-inbox.mjs -t 'native ownership'
@@ -270,7 +270,7 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm install --frozen-lockfile
 
       - name: Verify graceful restart, SIGTERM, cancellation and promotion races
         run: node .github/scripts/check-inbox.mjs -t 'graceful retention'
@@ -310,13 +310,13 @@ jobs:
           node-version: 24
           cache: pnpm
 
-      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm install --frozen-lockfile
       - run: pnpm build
 
-      # Backend-only provider legs: no dsh boot, no LLM, no secrets — just a
-      # real database, db push, and backend writes/reads. They also
-      # run on fork PRs (forks receive no secrets and nothing is needed).
+      # Database provider legs start a service and exercise backend writes/reads.
+      # HTTP has no service or db push; its integration still runs in Stage B below.
       - name: Start service database (${{ matrix.provider }})
+        if: matrix.provider != 'http'
         run: |
           set -euo pipefail
           case "${{ matrix.provider }}" in

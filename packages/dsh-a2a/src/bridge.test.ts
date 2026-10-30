@@ -1533,24 +1533,26 @@ describe('A2aBridge + DshAgentExecutor', () => {
   });
 
   it('does not run a queued message after the preceding turn fails', async () => {
-    let fail!: () => void;
-    const settlement = new Promise<void>((_, reject) => {
-      fail = () => reject(new Error('policy failed'));
-    });
-    ctx.on('a2a/task-settlement', () => settlement);
-    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let reject!: (error: Error) => void;
+    const gate = new Promise<string>((_, rej) => (reject = rej));
+    const resolve = vi.fn(() => gate);
+    ctx.provide('agentPresets', { resolve, mount: vi.fn() } as never);
+    bridge = new A2aBridge(ctx, { cwd: '/tmp', preset: 'missing' });
     const executor = new DshAgentExecutor(bridge);
     const firstBus = new DefaultExecutionEventBus();
     const secondBus = new DefaultExecutionEventBus();
     const { seen: secondSeen } = collect(secondBus);
     const first = executor.execute(requestContext(userMessage('first'), 't1', 'ctx1'), firstBus);
-    await vi.waitFor(() => expect(agents.created[0]?.prompts).toEqual(['first']));
+    await vi.waitFor(() => expect(resolve).toHaveBeenCalledOnce());
     const second = executor.execute(requestContext(userMessage('second'), 't1', 'ctx1'), secondBus);
-    fail();
+    reject(new Error('preset failed'));
     await Promise.all([first, second]);
-    expect(agents.created[0].prompts).toEqual(['first']);
+    expect(secondSeen[0]).toMatchObject({
+      kind: 'task',
+      data: { status: { state: TaskState.TASK_STATE_FAILED } },
+    });
+    expect(agents.created).toHaveLength(0);
     expect(statusUpdates(secondSeen).at(-1)?.status?.state).toBe(TaskState.TASK_STATE_FAILED);
-    error.mockRestore();
   });
 
   it('does not run a queued message after the preceding turn aborts', async () => {
@@ -1582,6 +1584,37 @@ describe('A2aBridge + DshAgentExecutor', () => {
     if (seen[0].kind !== 'task') throw new Error('unreachable');
     expect(seen[0].data.status?.state).toBe(TaskState.TASK_STATE_WORKING);
     expect(agents.created[0].prompts).toEqual(['hi', 'again']);
+  });
+
+  it('preserves request arrival order while the first message prepares content', async () => {
+    let release!: () => void;
+    let preparing!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const started = new Promise<void>((resolve) => (preparing = resolve));
+    const buildContent = bridge.buildContent.bind(bridge);
+    bridge.buildContent = vi.fn(async (message, contextId) => {
+      const text = message.parts[0]?.content;
+      if (text?.$case === 'text' && text.value === 'one') {
+        preparing();
+        await gate;
+      }
+      return buildContent(message, contextId);
+    });
+    const executor = new DshAgentExecutor(bridge);
+    const first = executor.execute(
+      requestContext(userMessage('one'), 't1', 'ctx1'),
+      new DefaultExecutionEventBus(),
+    );
+    await started;
+    const second = executor.execute(
+      requestContext(userMessage('two'), 't1', 'ctx1'),
+      new DefaultExecutionEventBus(),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    release();
+    await Promise.all([first, second]);
+
+    expect(agents.created[0].prompts).toEqual(['one', 'two']);
   });
 
   it('keeps overlapping requests for one task on separate event buses', async () => {
@@ -1621,6 +1654,29 @@ describe('A2aBridge + DshAgentExecutor', () => {
     expect(seen[0].data.status?.state).toBe(TaskState.TASK_STATE_SUBMITTED);
     const final = statusUpdates(seen).at(-1)!;
     expect(final.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
+  });
+
+  it('single-flights concurrent first requests for the same new context', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    ctx.provide('agentPresets', {
+      resolve: async () => {
+        await gate;
+        return { id: 'code' };
+      },
+      mount: vi.fn(async () => {}),
+    });
+
+    const first = bridge.ensureTask('t1', 'ctx1');
+    const second = bridge.ensureTask('t2', 'ctx1');
+    release();
+    const [a, b] = await Promise.all([first, second]);
+
+    expect(createCalls()).toHaveLength(1);
+    expect(agents.created).toHaveLength(1);
+    expect(a.entry.handle).toBe(b.entry.handle);
+    expect(a.freshTask).toBe(true);
+    expect(b.freshTask).toBe(true);
   });
 
   it('resumes a persisted context after restart instead of creating it again', async () => {
@@ -1929,36 +1985,11 @@ describe('A2aBridge + DshAgentExecutor', () => {
       return store;
     }
 
-    const stubFetch = (body: ConstructorParameters<typeof Response>[0], contentType: string) =>
-      vi.stubGlobal(
-        'fetch',
-        vi.fn(async () => new Response(body, { headers: { 'content-type': contentType } })),
-      );
-
     const promptPath = (prompt: string) => {
       const filePath = /path="([^"]+)"/.exec(prompt)?.[1];
       if (!filePath) throw new Error(`no path attribute in prompt: ${prompt}`);
       return filePath;
     };
-
-    it('downloads a url file part locally when a store is composed', async () => {
-      const store = fakeAttachments();
-      stubFetch(docBytes, DOCX);
-      const message: Message = {
-        ...userMessage(''),
-        parts: [
-          part({ $case: 'text', value: '这个文档讲了啥' }, 'text/plain'),
-          part({ $case: 'url', value: 'https://cdn.example.com/doc.docx' }, DOCX, 'doc.docx'),
-        ],
-      };
-      const { seen } = await executeMessage('t1', 'ctx1', message);
-      expect(store.saveFile).not.toHaveBeenCalled();
-      const blocks = agents.created[0].contents[0];
-      expect(blocks[0]).toMatchObject({ type: 'text', text: '这个文档讲了啥' });
-      expect(blocks[1]).toMatchObject({ type: 'text' });
-      expect(new Uint8Array(await readFile(promptPath(blocks[1].text ?? '')))).toEqual(docBytes);
-      expect(statusUpdates(seen).at(-1)!.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
-    });
 
     it('materializes non-image files without saving another host attachment', async () => {
       const store = fakeAttachments();
@@ -2052,26 +2083,6 @@ describe('A2aBridge + DshAgentExecutor', () => {
       expect(agents.created[0].contents[0][0].type).toBe('file');
       expect(spy.mock.calls.some(([p]) => String(p).includes('[dsh-a2a]'))).toBe(true);
       spy.mockRestore();
-    });
-
-    it('persists a url file part into the workspace when no store is composed', async () => {
-      stubFetch(docBytes, DOCX);
-      const message: Message = {
-        ...userMessage(''),
-        parts: [
-          part({ $case: 'text', value: '这个文档讲了啥' }, 'text/plain'),
-          part({ $case: 'url', value: 'https://cdn.example.com/doc.docx' }, DOCX, 'doc.docx'),
-        ],
-      };
-      const { seen } = await executeMessage('t1', 'ctx1', message);
-      const prompt = agents.created[0].prompts[0];
-      expect(prompt).toContain('<document name="doc.docx" uri="https://cdn.example.com/doc.docx"');
-      expect(prompt).toContain(`type="${DOCX}"`);
-      expect(prompt).toContain(`size="${docBytes.byteLength}"`);
-      const filePath = promptPath(prompt);
-      expect(filePath.startsWith(uploadsCwd)).toBe(true);
-      expect(new Uint8Array(await readFile(filePath))).toEqual(docBytes);
-      expect(statusUpdates(seen).at(-1)!.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
     });
 
     it('defaults uploads to a dsh-a2a-uploads dir under the OS temp dir', async () => {

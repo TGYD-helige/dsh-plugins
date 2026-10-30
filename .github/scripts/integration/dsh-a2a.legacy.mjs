@@ -15,20 +15,32 @@ try {
     const events = [];
     for await (const event of client.sendMessageStream({
       message: {
-        kind: 'message', messageId: randomUUID(), role: 'user', taskId, contextId,
+        kind: 'message',
+        messageId: randomUUID(),
+        role: 'user',
+        taskId,
+        contextId,
         parts: [{ kind: 'text', text }],
       },
-    })) events.push(event);
+    }))
+      events.push(event);
     const last = events.at(-1);
-    assert(last?.kind === 'status-update' && last.final === true,
-      `missing explicit final: ${JSON.stringify(last)}`);
+    assert(
+      last?.kind === 'status-update' && last.final === true,
+      `missing explicit final: ${JSON.stringify(last)}`,
+    );
     assert(last.status.state === 'input-required', `unexpected state: ${last.status.state}`);
     assert(last.metadata?.dshAgent?.reason === 'completed', 'missing completed reason');
-    assert(events.filter(event => event.kind === 'status-update' && event.final).length === 1,
-      'expected exactly one final status');
-    assert(last.status.message?.parts.some(part => part.kind === 'text' && part.text.trim()),
-      'missing final answer');
-    if (taskId) assert(last.taskId === taskId && last.contextId === contextId, 'continuation changed task');
+    assert(
+      events.filter((event) => event.kind === 'status-update' && event.final).length === 1,
+      'expected exactly one final status',
+    );
+    assert(
+      last.status.message?.parts.some((part) => part.kind === 'text' && part.text.trim()),
+      'missing final answer',
+    );
+    if (taskId)
+      assert(last.taskId === taskId && last.contextId === contextId, 'continuation changed task');
     taskId = last.taskId;
     contextId = last.contextId;
   }

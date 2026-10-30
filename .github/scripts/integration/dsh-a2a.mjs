@@ -10,8 +10,10 @@
  * SDK's terminal-state guard, and one legacy 0.3 `message/send` through the
  * compat layer.
  *
- * Two leg shapes driven by DSH_PROVIDER:
- * - base leg (unset): the full dsh + LLM flow above.
+ * Leg shapes driven by DSH_PROVIDER:
+ * - base leg (unset): the HTTP Vitest suites, then the full dsh + LLM flow above.
+ * - http leg (DSH_PROVIDER = http): only the real HTTP/SSE Vitest suites, without
+ *   dsh boot, LLM, or secrets.
  * - backend-only leg (DSH_PROVIDER = redis): no dsh boot, no LLM, no
  *   secrets — drive RedisTaskStore (+ the SanitizedTaskStore wrapper) against
  *   the service Redis in DSH_DB_URL.
@@ -23,9 +25,10 @@
  *   exit   : non-zero on any failure
  */
 
+import { spawnSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { createRequire } from 'node:module';
+import { join, resolve } from 'node:path';
 import {
   a2aClient,
   assert,
@@ -33,17 +36,22 @@ import {
   readEvents,
   STATES,
   stopA2a,
-  textOf,
   THINKING_OFF,
+  textOf,
 } from './lib/a2a-shared.mjs';
 
 const provider = process.env.DSH_PROVIDER || '';
+if (provider === 'http') {
+  runHttpSuite();
+  process.exit(0);
+}
 if (provider === 'redis') {
   await redisLeg();
   process.exit(0);
 }
 if (provider) throw new Error(`unknown DSH_PROVIDER ${provider}`);
 
+runHttpSuite();
 const { a2a, proc, workDir } = await bootA2a({ tag: 'base', extraPatch: THINKING_OFF });
 const client = a2aClient(a2a);
 
@@ -78,7 +86,9 @@ try {
   let task;
   for (let attempt = 1; attempt <= 3 && !task; attempt++) {
     console.log(`\n$ POST SendStreamingMessage (attempt ${attempt})`);
-    const res = await client.stream('SendStreamingMessage', { message: client.userMessage(prompt) });
+    const res = await client.stream('SendStreamingMessage', {
+      message: client.userMessage(prompt),
+    });
     assert(res.ok, `SendStreamingMessage http ${res.status}`);
     assert(
       res.headers.get('content-type')?.includes('text/event-stream'),
@@ -96,13 +106,19 @@ try {
     // Stream shape: task anchor first (1.0 ordering), working statuses, one
     // aggregating messageId for text deltas, tool-call + tool-result data
     // parts, usage on the final event.
-    assert(events[0]?.kind === 'task', `first event must be the task anchor, got ${events[0]?.kind}`);
+    assert(
+      events[0]?.kind === 'task',
+      `first event must be the task anchor, got ${events[0]?.kind}`,
+    );
     assert(
       events[0].value.status?.state === STATES.submitted,
       `anchor state ${events[0].value.status?.state}`,
     );
     const updates = events.filter((e) => e.kind === 'statusUpdate').map((e) => e.value);
-    assert(updates.some((e) => e.status?.state === STATES.working), 'no working statusUpdate');
+    assert(
+      updates.some((e) => e.status?.state === STATES.working),
+      'no working statusUpdate',
+    );
     assert(
       final?.kind === 'statusUpdate' && final.value.status?.state === STATES.inputRequired,
       `stream must end on input-required, got ${JSON.stringify(final)}`,
@@ -229,6 +245,24 @@ try {
   await stopA2a(proc);
 }
 
+function runHttpSuite() {
+  const result = spawnSync(
+    'pnpm',
+    [
+      '--filter',
+      '@amaster.ai/dsh-a2a',
+      'exec',
+      'vitest',
+      'run',
+      '--config',
+      resolve('.github/scripts/integration/vitest.a2a-http.config.mts'),
+    ],
+    { stdio: 'inherit' },
+  );
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`A2A HTTP integration failed (${result.status})`);
+}
+
 /**
  * Backend-only Redis leg: drive the production store path
  * (SanitizedTaskStore → RedisTaskStore) against the service Redis and check
@@ -245,7 +279,9 @@ async function redisLeg() {
   const { Redis } = require('ioredis');
 
   const raw = new Redis(url);
-  const store = new SanitizedTaskStore(new RedisTaskStore({ url, keyPrefix: 'ci', ttlSeconds: 60 }));
+  const store = new SanitizedTaskStore(
+    new RedisTaskStore({ url, keyPrefix: 'ci', ttlSeconds: 60 }),
+  );
   await store.init();
 
   const base = {
@@ -295,13 +331,13 @@ async function redisLeg() {
   await store.close();
   await raw.quit();
 
-  assert(keys.length === 1 && /^ci:tasks:[a-f0-9]{64}:ci-task-1$/.test(keys[0]), `unexpected keys ${keys}`);
+  assert(
+    keys.length === 1 && /^ci:tasks:[a-f0-9]{64}:ci-task-1$/.test(keys[0]),
+    `unexpected keys ${keys}`,
+  );
   assert(ttl > 0 && ttl <= 60, `ttl ${ttl} outside (0, 60]`);
   assert(loaded?.status?.state === 6, `loaded state ${loaded?.status?.state}`);
-  assert(
-    loaded.history?.[0]?.messageId === 'm1',
-    'persisted task must retain A2A history',
-  );
+  assert(loaded.history?.[0]?.messageId === 'm1', 'persisted task must retain A2A history');
   assert(listed.totalSize === 1 && listed.tasks[0]?.id === 'ci-task-1', 'list must find the task');
   console.log('SCENARIO_OK redis (backend-only leg)');
 }

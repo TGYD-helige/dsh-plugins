@@ -83,10 +83,14 @@ export class GcsTaskStore implements ManagedTaskStore {
       prefix: `${this.prefix}/${taskScopeKey(context)}/`,
     });
     const shells: Task[] = [];
-    for (const file of files) {
-      if (!file.name.endsWith('/metadata.json.gz')) continue;
-      const [buf] = await file.download();
-      shells.push(JSON.parse(gunzipSync(buf).toString('utf8')) as Task);
+    const metadata = files.filter((file: any) => file.name.endsWith('/metadata.json.gz'));
+    // Bound in-flight downloads while avoiding one network round-trip per task.
+    for (let start = 0; start < metadata.length; start += 16) {
+      const buffers = await Promise.all(
+        metadata.slice(start, start + 16).map((file: any) => file.download()),
+      );
+      for (const [buf] of buffers)
+        shells.push(JSON.parse(gunzipSync(buf).toString('utf8')) as Task);
     }
     return listShells(shells, params);
   }

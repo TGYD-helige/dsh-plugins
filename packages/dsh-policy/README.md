@@ -73,9 +73,9 @@ Plugin-level fields: `enabled` (master switch) and `commandKeys` (argument keys 
 ### Matching semantics
 
 - **Every condition on a rule must hold** for the rule to match (AND). A rule with no conditions beyond `tool` matches every call of that tool.
-- **Shell commands are checked segment by segment.** Compound commands (`a && b | c`, newlines, background `&`) are split, quote-aware, and `$( )` / backtick substitutions are extracted as their own segments — `cd /tmp && npm install` and `echo "$(npm install)"` both hit the `npm` rule.
+- **Shell commands are checked segment by segment.** Compound commands (`a && b | c`, newlines, background `&`) are split, quote-aware, and the executable command word is normalized through quotes, escapes and line continuations. Bash `$( )`, backtick and `<()` / `>()` substitutions are extracted as their own segments; here-doc bodies are data, except for real substitutions in unquoted bodies. PowerShell backticks are escapes, not Bash-style substitutions.
 - **Priority resolves competition within one segment**; across segments the aggregation is conservative: any segment's `deny` denies the whole call, then any `ask` escalates, and `allow` requires every segment decided allow. A broad deny is still overridable by a specific allow because both compete on the same segment (`bun run lint` at 300 vs `bun run` at 200).
-- **No rule matches → the call passes through** to the rest of the `tools/pre-execute` chain (`next()`), so dsh's own gates and other plugins keep their say. Invalid regexes are config errors and fail the plugin load; a runtime evaluation failure is logged with the `[dsh-policy]` prefix and delegates onward — the gate never breaks the agent loop.
+- **No rule matches → the call passes through** to the rest of the `tools/pre-execute` chain (`next()`), so dsh's own gates and other plugins keep their say. Invalid regexes are config errors and fail the plugin load; a runtime evaluation failure is logged with the `[dsh-policy]` prefix and denied (fail-closed) without breaking the agent loop.
 
 ### What the gate covers
 

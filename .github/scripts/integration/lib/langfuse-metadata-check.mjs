@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { format } from 'node:util';
-import { apply as applyMetadataBridge } from './metadata-context-bridge.mjs';
-import { capturedToObservations, evaluateSubagentTrace } from './langfuse-shared.mjs';
 import { integrationModel } from './ci-shared.mjs';
+import { capturedToObservations, evaluateSubagentTrace } from './langfuse-shared.mjs';
+import { apply as applyMetadataBridge } from './metadata-context-bridge.mjs';
 
 function objectValue(value) {
   if (typeof value !== 'string') return value;
@@ -33,8 +33,10 @@ export function evaluateMetadataTrace(observations, codeword) {
     const routing = objectValue(metadata.routing);
     need(routing?.region === 'original-region', 'nested metadata was not snapshotted');
     need(routing?.credential === '[REDACTED]', 'nested credential was not redacted');
-    need(JSON.stringify(objectValue(metadata.labels)) === '["original-label"]',
-      'nested array was not snapshotted');
+    need(
+      JSON.stringify(objectValue(metadata.labels)) === '["original-label"]',
+      'nested array was not snapshotted',
+    );
     need(metadata.optional === null, 'null metadata was lost');
     need(metadata.empty === '', 'empty metadata was lost');
     // Langfuse v3's read API JSON-parses top-level metadata strings. Exact
@@ -44,10 +46,16 @@ export function evaluateMetadataTrace(observations, codeword) {
     need(metadata.interactive === true, 'boolean metadata changed type');
     if (observation.type === 'TOOL') {
       need(metadata.callId && metadata.callId !== 'caller-shadow', 'native callId was overwritten');
-      need(metadata.toolName && metadata.toolName !== 'caller-shadow', 'native toolName was overwritten');
+      need(
+        metadata.toolName && metadata.toolName !== 'caller-shadow',
+        'native toolName was overwritten',
+      );
     }
     if (observation.name === 'llm-request') {
-      need(metadata.provider && metadata.provider !== 'caller-shadow', 'native provider was overwritten');
+      need(
+        metadata.provider && metadata.provider !== 'caller-shadow',
+        'native provider was overwritten',
+      );
     }
   }
   if (Number(root.metadata?.turn) < 0) problems.push('native turn was overwritten');
@@ -64,8 +72,12 @@ export async function checkMetadataWire({ require, connection, captured }) {
   const { SessionStore } = await import(require.resolve('@deepseek-ai/dsh-session'));
   const { createRequire } = await import('node:module');
   const toolRequire = createRequire(require.resolve('@deepseek-ai/dsh-tools'));
-  const { default: SystemPrompt } = await import(toolRequire.resolve('@deepseek-ai/dsh-system-prompt'));
-  const { default: ToolRuntime, defineTool } = await import(require.resolve('@deepseek-ai/dsh-tools'));
+  const { default: SystemPrompt } = await import(
+    toolRequire.resolve('@deepseek-ai/dsh-system-prompt')
+  );
+  const { default: ToolRuntime, defineTool } = await import(
+    require.resolve('@deepseek-ai/dsh-tools')
+  );
   const ctx = new Context();
   const offset = captured.length;
   const marker = 'ci-marker-metadata-sdk';
@@ -78,52 +90,67 @@ export async function checkMetadataWire({ require, connection, captured }) {
     const first = ctx.sessions.create();
     const second = ctx.sessions.create();
     const streamFor = async (session) => {
-      const stream = ctx.waterfall('llm/stream', {
-        provider: 'metadata-provider',
-        model: integrationModel(),
-        sessionId: session.id,
-        messages: [{ role: 'user', content: [{ type: 'text', text: marker }] }],
-        signal: new AbortController().signal,
-      }, async function* () {
-        yield { type: 'text-delta', index: 0, text: 'metadata answer' };
-        yield { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } };
-        yield { type: 'finish', reason: { kind: 'stop' } };
-      });
+      const stream = ctx.waterfall(
+        'llm/stream',
+        {
+          provider: 'metadata-provider',
+          model: integrationModel(),
+          sessionId: session.id,
+          messages: [{ role: 'user', content: [{ type: 'text', text: marker }] }],
+          signal: new AbortController().signal,
+        },
+        async function* () {
+          yield { type: 'text-delta', index: 0, text: 'metadata answer' };
+          yield { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } };
+          yield { type: 'finish', reason: { kind: 'stop' } };
+        },
+      );
       const chunks = [];
       for await (const chunk of stream) chunks.push(chunk);
       return chunks;
     };
-    const execute = (session, name, callId) => ctx.tools.execute({
-      name, arguments: { path: marker }, callId, agent: { id: session.id },
-      signal: new AbortController().signal,
-    });
+    const execute = (session, name, callId) =>
+      ctx.tools.execute({
+        name,
+        arguments: { path: marker },
+        callId,
+        agent: { id: session.id },
+        signal: new AbortController().signal,
+      });
     const output = {
       schema: { type: 'string' },
       render: (_args, value) => [{ type: 'text', text: value }],
     };
-    ctx.tools.register(defineTool({
-      name: 'read', description: 'read the fixture marker',
-      parameters: { path: { type: 'string', required: true } },
-      output, execute: () => marker,
-    }));
-    ctx.tools.register(defineTool({
-      name: 'subagent', description: 'delegate a scripted child session',
-      parameters: { path: { type: 'string', required: true } },
-      output,
-      execute: async () => {
-        const child = ctx.sessions.create(undefined, {
-          meta: { parentSession: first.id, origin: 'subagent', delegationDepth: 1 },
-        });
-        const info = { id: child.id, runId: `run-${child.id}`, provider: 'spawn', local: true };
-        ctx.emit('subagent/start', info);
-        child.append('turn/start', { turn: 0 });
-        await streamFor(child);
-        assert.equal((await execute(child, 'read', 'child-call')).isError, false);
-        child.append('turn/end', { turn: 0, reason: { kind: 'completed' } });
-        ctx.emit('subagent/end', { ...info, stopReason: 'completed' });
-        return marker;
-      },
-    }));
+    ctx.tools.register(
+      defineTool({
+        name: 'read',
+        description: 'read the fixture marker',
+        parameters: { path: { type: 'string', required: true } },
+        output,
+        execute: () => marker,
+      }),
+    );
+    ctx.tools.register(
+      defineTool({
+        name: 'subagent',
+        description: 'delegate a scripted child session',
+        parameters: { path: { type: 'string', required: true } },
+        output,
+        execute: async () => {
+          const child = ctx.sessions.create(undefined, {
+            meta: { parentSession: first.id, origin: 'subagent', delegationDepth: 1 },
+          });
+          const info = { id: child.id, runId: `run-${child.id}`, provider: 'spawn', local: true };
+          ctx.emit('subagent/start', info);
+          child.append('turn/start', { turn: 0 });
+          await streamFor(child);
+          assert.equal((await execute(child, 'read', 'child-call')).isError, false);
+          child.append('turn/end', { turn: 0, reason: { kind: 'completed' } });
+          ctx.emit('subagent/end', { ...info, stopReason: 'completed' });
+          return marker;
+        },
+      }),
+    );
     first.append('turn/start', { turn: 0 });
     second.append('turn/start', { turn: 0 });
     await Promise.all([streamFor(first), streamFor(second)]);
@@ -148,9 +175,15 @@ export async function checkMetadataWire({ require, connection, captured }) {
       ...firstTree,
     ];
     assert.deepEqual(evaluateMetadataTrace(resumedTree, marker), []);
-    assert.ok(evaluateMetadataTrace(firstTree.map((o) =>
-      o.id === delegatedChild.id ? { ...o, parentObservationId: firstRoot.id } : o,
-    ), marker).length > 0, 'a child outside the delegation must still fail verification');
+    assert.ok(
+      evaluateMetadataTrace(
+        firstTree.map((o) =>
+          o.id === delegatedChild.id ? { ...o, parentObservationId: firstRoot.id } : o,
+        ),
+        marker,
+      ).length > 0,
+      'a child outside the delegation must still fail verification',
+    );
     const secondTree = observations.filter((o) => o.sessionId === second.id);
     assert.ok(secondTree.length >= 4, 'the overlapping session must export its own observations');
     for (const observation of secondTree) {
@@ -162,8 +195,10 @@ export async function checkMetadataWire({ require, connection, captured }) {
       assert.ok(metadata, 'custom metadata must cross the real OTLP boundary');
       assert.equal(JSON.parse(metadata.value.stringValue).numericString, '123');
     }
-    assert.doesNotMatch(JSON.stringify(captured.slice(offset)),
-      /sk-lf-metadata-private|mutated-after-emission/);
+    assert.doesNotMatch(
+      JSON.stringify(captured.slice(offset)),
+      /sk-lf-metadata-private|mutated-after-emission/,
+    );
 
     const nextOffset = captured.length;
     first.append('turn/start', { turn: 1 });
@@ -175,7 +210,11 @@ export async function checkMetadataWire({ require, connection, captured }) {
     assert.ok(next.length >= 4, 'the next turn must export model and tool observations');
     for (const observation of next) {
       assert.equal(observation.metadata?.requestId, undefined, 'request metadata is consumed once');
-      assert.equal(observation.metadata?.projectId, undefined, 'request metadata must not leak to the next turn');
+      assert.equal(
+        observation.metadata?.projectId,
+        undefined,
+        'request metadata must not leak to the next turn',
+      );
     }
 
     for (const [index, invalidValue] of [NaN, { nested: undefined }, [() => 'hidden']].entries()) {
@@ -184,19 +223,28 @@ export async function checkMetadataWire({ require, connection, captured }) {
       try {
         console.error = (...args) => diagnostics.push(format(...args));
         ctx.emit('langfuse/context', first.id, {
-          userId: 'stale-owner', tags: ['stale-tag'],
+          userId: 'stale-owner',
+          tags: ['stale-tag'],
           metadata: { requestId: 'stale-request' },
         });
-        assert.doesNotThrow(() => ctx.emit('langfuse/context', first.id, {
-          userId: 'invalid-owner', tags: ['invalid-tag'],
-          metadata: { invalidValue, privatePayload: 'invalid-metadata-private' },
-        }));
+        assert.doesNotThrow(() =>
+          ctx.emit('langfuse/context', first.id, {
+            userId: 'invalid-owner',
+            tags: ['invalid-tag'],
+            metadata: { invalidValue, privatePayload: 'invalid-metadata-private' },
+          }),
+        );
       } finally {
         console.error = originalError;
       }
-      assert.ok(diagnostics.some((line) => line.startsWith('[dsh-langfuse]')),
-        'invalid metadata must emit a diagnostic');
-      assert.doesNotMatch(diagnostics.join('\n'), /invalid-metadata-private|invalid-owner|invalid-tag/);
+      assert.ok(
+        diagnostics.some((line) => line.startsWith('[dsh-langfuse]')),
+        'invalid metadata must emit a diagnostic',
+      );
+      assert.doesNotMatch(
+        diagnostics.join('\n'),
+        /invalid-metadata-private|invalid-owner|invalid-tag/,
+      );
 
       const invalidOffset = captured.length;
       const turn = index + 2;
@@ -208,14 +256,25 @@ export async function checkMetadataWire({ require, connection, captured }) {
       first.append('turn/end', { turn, reason: { kind: 'completed' } });
       await ctx.parallel('session/flush', first);
       const rejected = captured.slice(invalidOffset);
-      assert.equal(rejected.length, 4, 'a rejected context must still export the turn, model, request and tool');
+      assert.equal(
+        rejected.length,
+        4,
+        'a rejected context must still export the turn, model, request and tool',
+      );
       for (const span of rejected) {
-        assert.ok(!span.attributes.some((attribute) => [
-          'user.id', 'langfuse.trace.tags', 'langfuse.observation.metadata',
-        ].includes(attribute.key)), 'invalid context must discard queued labels and metadata');
+        assert.ok(
+          !span.attributes.some((attribute) =>
+            ['user.id', 'langfuse.trace.tags', 'langfuse.observation.metadata'].includes(
+              attribute.key,
+            ),
+          ),
+          'invalid context must discard queued labels and metadata',
+        );
       }
-      assert.doesNotMatch(JSON.stringify(rejected),
-        /stale-owner|stale-tag|stale-request|invalid-owner|invalid-tag|invalid-metadata-private/);
+      assert.doesNotMatch(
+        JSON.stringify(rejected),
+        /stale-owner|stale-tag|stale-request|invalid-owner|invalid-tag|invalid-metadata-private/,
+      );
     }
   } finally {
     await ctx.fiber.dispose();

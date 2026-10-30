@@ -21,11 +21,15 @@
 import { type Message, type Task, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutor, ExecutionEventBus, RequestContext } from '@a2a-js/sdk/server';
 import { AgentEvent, STATE_HEADERS_KEY } from '@a2a-js/sdk/server';
+import { AdmissionGate } from './admission.js';
 import { ApprovalReplyError } from './approval.js';
 import type { A2aBridge } from './bridge.js';
 import { agentTextMessage, terminalStatusUpdate } from './translator.js';
 
 export class DshAgentExecutor implements AgentExecutor {
+  private readonly admissions = new AdmissionGate();
+  private readonly admissionFailures = new Map<string, number>();
+
   constructor(
     private readonly bridge: A2aBridge,
     private readonly suppressTask?: (taskId: string) => void,
@@ -40,14 +44,47 @@ export class DshAgentExecutor implements AgentExecutor {
     if (this.bridge.isClearing(requestContext.contextId)) {
       this.suppressTask?.(requestContext.taskId);
     }
-    return this.bridge.trackExecution(requestContext.contextId, () =>
-      this.executeInner(requestContext, eventBus),
-    );
+    const contextId = requestContext.contextId;
+    const failureVersion = this.admissionFailures.get(contextId) ?? 0;
+    const admission = this.admissions.acquire(contextId);
+    let accepted = false;
+    const accept = () => {
+      if (accepted) return;
+      accepted = true;
+      admission.release(() => this.admissionFailures.delete(contextId));
+    };
+    try {
+      return await this.bridge.trackExecution(contextId, async () => {
+        await admission.ready;
+        if ((this.admissionFailures.get(contextId) ?? 0) !== failureVersion) {
+          eventBus.publish(
+            taskEvent(requestContext.taskId, contextId, TaskState.TASK_STATE_FAILED),
+          );
+          eventBus.publish(
+            terminalStatusUpdate(
+              requestContext.taskId,
+              contextId,
+              'failed',
+              'Preceding queued turn failed.',
+            ),
+          );
+          eventBus.finished();
+          return;
+        }
+        await this.executeInner(requestContext, eventBus, accept, () => {
+          this.admissionFailures.set(contextId, (this.admissionFailures.get(contextId) ?? 0) + 1);
+        });
+      });
+    } finally {
+      accept();
+    }
   }
 
   private async executeInner(
     requestContext: RequestContext,
     eventBus: ExecutionEventBus,
+    accept: () => void,
+    fail: () => void,
   ): Promise<void> {
     const { userMessage, taskId, contextId } = requestContext;
     let anchored = false;
@@ -59,6 +96,7 @@ export class DshAgentExecutor implements AgentExecutor {
           anchored = true;
         } finally {
           approval.resume();
+          accept();
         }
         await this.bridge.waitForTurn(approval.entry);
         return;
@@ -77,9 +115,21 @@ export class DshAgentExecutor implements AgentExecutor {
       );
       anchored = true;
       const requestHeaders = requestContext.context.state.get(STATE_HEADERS_KEY);
-      await this.bridge.runTurn(entry, content, eventBus, taskId, userMessage, requestHeaders);
+      const turn = this.bridge.runTurn(
+        entry,
+        content,
+        eventBus,
+        taskId,
+        userMessage,
+        requestHeaders,
+      );
+      // runTurn registers synchronously before its first await. The next
+      // request may prepare now; the bridge FIFO still executes turns in order.
+      accept();
+      await turn;
     } catch (error) {
       if (error instanceof ApprovalReplyError) return;
+      fail();
       if (this.bridge.isClearing(contextId)) this.suppressTask?.(taskId);
       const message = error instanceof Error ? error.message : String(error);
       if (!anchored) {

@@ -5,18 +5,37 @@ import { DatabaseBackend } from './database.js';
 
 const prismaMock = vi.hoisted(() => {
   const instances: any[] = [];
+  const state = { connectError: undefined as Error | undefined };
   class PrismaClient {
-    aiMessage = { upsert: vi.fn(), findMany: vi.fn(), aggregate: vi.fn(), updateMany: vi.fn() };
-    aiChatHistory = { findFirst: vi.fn(), create: vi.fn(), update: vi.fn() };
+    aiMessage = {
+      upsert: vi.fn(),
+      findFirst: vi.fn(),
+      findMany: vi.fn(),
+      aggregate: vi.fn(),
+      updateMany: vi.fn(),
+    };
+    aiChatHistory = {
+      findFirst: vi.fn(),
+      findMany: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+      updateMany: vi.fn(),
+    };
     $queryRawUnsafe = vi.fn(async () => []);
     $transaction = vi.fn(async (run: (client: PrismaClient) => Promise<unknown>) => run(this));
-    $connect = vi.fn(async () => {});
+    $connect = vi.fn(async () => {
+      if (state.connectError) {
+        const error = state.connectError;
+        state.connectError = undefined;
+        throw error;
+      }
+    });
     $disconnect = vi.fn(async () => {});
     constructor(public options: unknown) {
       instances.push(this);
     }
   }
-  return { instances, PrismaClient };
+  return { instances, state, PrismaClient };
 });
 
 const adapterMocks = vi.hoisted(() => {
@@ -67,6 +86,7 @@ describe('DatabaseBackend', () => {
 
   beforeEach(() => {
     prismaMock.instances.length = 0;
+    prismaMock.state.connectError = undefined;
     for (const calls of Object.values(adapterMocks.calls)) calls.length = 0;
     vi.spyOn(DatabaseBackend.prototype as any, 'loadClient').mockResolvedValue(
       prismaMock.PrismaClient,
@@ -80,6 +100,18 @@ describe('DatabaseBackend', () => {
     expect(prisma.options).toEqual({ adapter: expect.any(adapterMocks.PrismaLibSql) });
     expect(adapterMocks.calls.sqlite).toEqual([{ url }]);
     expect(prisma.$connect).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retain a failed connection and can initialize again', async () => {
+    prismaMock.state.connectError = new Error('connect failed');
+    const connecting = backend.init();
+
+    await expect(connecting).rejects.toThrow('connect failed');
+    await expect(backend.readSession('s1')).rejects.toThrow('not initialized');
+
+    await backend.init();
+    await expect(backend.readSession('s1')).resolves.toBeNull();
+    expect(prismaMock.instances).toHaveLength(2);
   });
 
   it('reads persisted messages with logical ids and SQL Server JSON fields for a projector', async () => {
@@ -161,10 +193,9 @@ describe('DatabaseBackend', () => {
       expect(sql).not.toContain("call-'quoted");
       expect(params).toContain('s1');
       if (provider === 'sqlserver') {
-        expect(sql).toContain('session_id COLLATE Latin1_General_100_BIN2 = @P1');
-        expect(sql).toContain(
-          'DATALENGTH(CAST(session_id AS nvarchar(max))) = DATALENGTH(CAST(@P1 AS nvarchar(max)))',
-        );
+        expect(sql).toContain('session_id = @P1');
+        expect(sql).not.toContain('COLLATE');
+        expect(sql).not.toContain('DATALENGTH');
         expect(sql).not.toContain('OPENJSON');
       }
       expect(prisma.aiMessage.findMany).toHaveBeenCalledWith({
@@ -194,18 +225,18 @@ describe('DatabaseBackend', () => {
       await backend.init();
       const prisma = prismaMock.instances[0];
       const time = '2026-10-29T10:00:00.1234567';
-      prisma.$queryRawUnsafe
-        .mockResolvedValueOnce(
-          Array.from({ length: 100 }, (_, i) => ({
-            id: `row-${100 - i}`,
-            sort_time: time,
-            tool_calls: JSON.stringify([{ id: i % 2 ? 'C1' : 'c1 ' }]),
-          })),
-        )
-        .mockResolvedValueOnce([{ id: 'target', sort_time: time, tool_calls: '[{"id":"c1"}]' }]);
+      const pages = prisma.$queryRawUnsafe.mockResolvedValueOnce(
+        Array.from({ length: 100 }, (_, i) => ({
+          id: `row-${100 - i}`,
+          sort_time: time,
+          tool_calls: JSON.stringify([{ id: i % 2 ? 'C1' : 'c1 ' }]),
+        })),
+      );
+      if (provider === 'postgresql') pages.mockResolvedValueOnce([]);
+      pages.mockResolvedValueOnce([{ id: 'target', sort_time: time, tool_calls: '[{"id":"c1"}]' }]);
       prisma.aiMessage.findMany.mockResolvedValueOnce([]);
       await backend.readToolCallMessages('S1', 'c1');
-      expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(2);
+      expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(provider === 'postgresql' ? 3 : 2);
       for (const [sql] of prisma.$queryRawUnsafe.mock.calls) {
         expect(sql).not.toMatch(/JOIN|EXISTS|json_each|OPENJSON|\(SELECT/i);
         expect(sql).toMatch(/LIMIT 100|TOP 100/);
@@ -239,13 +270,13 @@ describe('DatabaseBackend', () => {
         )
         .mockResolvedValueOnce([]);
       await expect(backend.readToolCallMessages('S1', 'c1')).resolves.toEqual([]);
-      expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(2);
+      expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(provider === 'postgresql' ? 3 : 2);
       expect(prisma.aiMessage.findMany).not.toHaveBeenCalled();
       const sql = prisma.$queryRawUnsafe.mock.calls[0][0];
       expect(sql).not.toContain('content');
       const exactScope =
         provider === 'sqlserver'
-          ? 'session_id COLLATE Latin1_General_100_BIN2 = @P1'
+          ? 'session_id = @P1'
           : provider === 'sqlite'
             ? 'session_id COLLATE BINARY = ?'
             : provider === 'mysql'
@@ -264,25 +295,104 @@ describe('DatabaseBackend', () => {
       });
       await backend.init();
       const prisma = prismaMock.instances[0];
-      prisma.$queryRawUnsafe
-        .mockResolvedValueOnce(
-          Array.from({ length: 100 }, (_, i) => ({
-            id: `row-${100 - i}`,
-            sort_time: null,
-            tool_calls: '[{"id":"other"}]',
-          })),
-        )
-        .mockResolvedValueOnce([{ id: 'target', sort_time: null, tool_calls: '[{"id":"c1"}]' }]);
+      const pages = prisma.$queryRawUnsafe.mockResolvedValueOnce(
+        Array.from({ length: 100 }, (_, i) => ({
+          id: `row-${100 - i}`,
+          sort_time: null,
+          tool_calls: '[{"id":"other"}]',
+        })),
+      );
+      if (provider === 'postgresql') pages.mockResolvedValueOnce([]);
+      pages.mockResolvedValueOnce([{ id: 'target', sort_time: null, tool_calls: '[{"id":"c1"}]' }]);
       prisma.aiMessage.findMany.mockResolvedValueOnce([]);
       await backend.readToolCallMessages('s1', 'c1');
-      const [sql, ...params] = prisma.$queryRawUnsafe.mock.calls[1];
-      expect(sql).toContain('created_at IS NULL AND id <');
-      if (provider === 'postgresql') expect(sql).toContain('created_at IS NOT NULL OR');
-      expect(params.at(-1)).toBe('row-1');
+      const [sql, ...params] = prisma.$queryRawUnsafe.mock.calls[provider === 'postgresql' ? 2 : 1];
+      expect(sql).toContain('created_at IS NULL');
+      if (provider === 'postgresql') {
+        expect(sql).toContain('ORDER BY id DESC');
+        expect(params.at(-1)).toBe('s1');
+      } else {
+        expect(params.at(-1)).toBe('row-1');
+      }
       expect(params).not.toContain(null);
       expect(prisma.aiMessage.findMany.mock.calls[0][0].where.id).toBe('target');
     },
   );
+
+  it('keeps SQL Server datetime2 precision across a same-millisecond page boundary', async () => {
+    backend = new DatabaseBackend({
+      provider: 'sqlserver',
+      url: 'sqlserver://host;database=db;user=u;password=p',
+    });
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const boundary = '2026-10-29T10:00:00.1234567';
+    prisma.$queryRawUnsafe
+      .mockResolvedValueOnce(
+        Array.from({ length: 100 }, (_, i) => ({
+          id: `row-${i}`,
+          sort_time: boundary,
+          tool_calls: '[{"id":"other"}]',
+        })),
+      )
+      .mockResolvedValueOnce([
+        {
+          id: 'target',
+          sort_time: '2026-10-29T10:00:00.1234000',
+          tool_calls: '[{"id":"c1"}]',
+        },
+      ]);
+    prisma.aiMessage.findMany.mockResolvedValueOnce([]);
+
+    await backend.readToolCallMessages('s1', 'c1');
+
+    expect(prisma.$queryRawUnsafe.mock.calls[0][0]).toContain(
+      "FORMAT(created_at, 'yyyy-MM-ddTHH:mm:ss.fffffff') AS sort_time",
+    );
+    const [nextSql, ...params] = prisma.$queryRawUnsafe.mock.calls[1];
+    expect(nextSql).toContain('created_at < @P');
+    expect(params).toContainEqual(boundary);
+    expect(prisma.aiMessage.findMany.mock.calls[0][0].where.id).toBe('target');
+  });
+
+  it('rejects SQL Server collation near-matches before reading full rows', async () => {
+    backend = new DatabaseBackend({
+      provider: 'sqlserver',
+      url: 'sqlserver://host;database=db;user=u;password=p',
+    });
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    prisma.$queryRawUnsafe.mockResolvedValueOnce([
+      { id: 'near-match', session_id: 'S1', tool_calls: [{ id: 'c1' }] },
+    ]);
+
+    await expect(backend.readToolCallMessages('s1', 'c1')).resolves.toEqual([]);
+    expect(prisma.aiMessage.findMany).not.toHaveBeenCalled();
+  });
+
+  it('switches postgresql from non-null timestamps to the null-id page without duplicates', async () => {
+    backend = new DatabaseBackend({ provider: 'postgresql', url });
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    prisma.$queryRawUnsafe
+      .mockResolvedValueOnce(
+        Array.from({ length: 100 }, (_, i) => ({
+          id: `non-null-${i}`,
+          sort_time: new Date(1700000000000 + i),
+          tool_calls: '[{"id":"other"}]',
+        })),
+      )
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'target', sort_time: null, tool_calls: '[{"id":"c1"}]' }]);
+    prisma.aiMessage.findMany.mockResolvedValueOnce([]);
+
+    await backend.readToolCallMessages('s1', 'c1');
+
+    expect(prisma.$queryRawUnsafe.mock.calls[0][0]).toContain('created_at IS NOT NULL');
+    expect(prisma.$queryRawUnsafe.mock.calls[2][0]).toContain('created_at IS NULL');
+    expect(prisma.$queryRawUnsafe.mock.calls[2][0]).toContain('ORDER BY id DESC');
+    expect(prisma.aiMessage.findMany.mock.calls[0][0].where.id).toBe('target');
+  });
 
   it('builds the mysql adapter from a mariadb:// url', async () => {
     backend = new DatabaseBackend({ provider: 'mysql', url: 'mysql://u:p@host:3306/db' });
@@ -334,9 +444,12 @@ describe('DatabaseBackend', () => {
     await expect(backend.init()).rejects.not.toThrow(/s3cret/);
   });
 
-  it('no-ops writes before init', async () => {
-    await expect(backend.upsertMessage(messageRow)).resolves.toBeUndefined();
-    await expect(backend.upsertSession(sessionRow)).resolves.toBeUndefined();
+  it('rejects reads and writes before init instead of posing as an empty database', async () => {
+    await expect(backend.readSession('s1')).rejects.toThrow('not initialized');
+    await expect(backend.readMessages('s1', 'a1')).rejects.toThrow('not initialized');
+    await expect(backend.readToolCallMessages('s1', 'c1')).rejects.toThrow('not initialized');
+    await expect(backend.upsertMessage(messageRow)).rejects.toThrow('not initialized');
+    await expect(backend.upsertSession(sessionRow)).rejects.toThrow('not initialized');
     expect(prismaMock.instances).toHaveLength(0);
   });
 
@@ -421,7 +534,31 @@ describe('DatabaseBackend', () => {
     expect(prisma.aiChatHistory.create).not.toHaveBeenCalled();
   });
 
-  it('archives active messages with their rollup in one transaction', async () => {
+  it('writes one event message and its rollup through the Prisma transaction client', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+
+    await backend.upsertEvent(messageRow, sessionRow);
+
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.aiMessage.upsert).toHaveBeenCalledTimes(1);
+    expect(prisma.aiChatHistory.findFirst).toHaveBeenCalledTimes(1);
+    expect(prisma.aiChatHistory.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not write the rollup when the transactional message write fails', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    prisma.aiMessage.upsert.mockRejectedValueOnce(new Error('message write failed'));
+
+    await expect(backend.upsertEvent(messageRow, sessionRow)).rejects.toThrow(
+      'message write failed',
+    );
+    expect(prisma.aiChatHistory.findFirst).not.toHaveBeenCalled();
+    expect(prisma.aiChatHistory.create).not.toHaveBeenCalled();
+  });
+
+  it('archives active messages with their rollup in short transactions', async () => {
     await backend.init();
     const prisma = prismaMock.instances[0];
     const first = new Date(1700000000000);
@@ -433,10 +570,11 @@ describe('DatabaseBackend', () => {
     });
     prisma.aiChatHistory.findFirst.mockResolvedValue({ id: 'history-1' });
     prisma.aiChatHistory.update.mockResolvedValue({ id: 'history-1' });
+    prisma.aiMessage.findMany.mockResolvedValue([{ id: 'm1' }, { id: 'm2' }]);
     prisma.aiMessage.updateMany.mockResolvedValue({ count: 2 });
 
     await expect(backend.archiveSession('s1')).resolves.toBe('history-1');
-    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
     expect(prisma.aiMessage.aggregate).toHaveBeenCalledWith({
       where: { sessionId: 's1', historyId: null, deletedAt: null },
       _count: { _all: true },
@@ -445,15 +583,21 @@ describe('DatabaseBackend', () => {
     });
     expect(prisma.aiChatHistory.findFirst).toHaveBeenCalledWith({
       where: { sessionId: 's1', deletedAt: null, messages: { none: {} } },
-      select: { id: true },
+      select: { id: true, metadata: true, totalTokens: true },
     });
     expect(prisma.aiMessage.updateMany).toHaveBeenCalledWith({
-      where: { sessionId: 's1', historyId: null, deletedAt: null },
+      where: { id: { in: ['m1', 'm2'] } },
       data: { historyId: 'history-1' },
     });
     expect(prisma.aiChatHistory.update).toHaveBeenCalledWith({
       where: { id: 'history-1' },
-      data: { messageCount: 2, firstMessageAt: first, lastMessageAt: last },
+      data: {
+        messageCount: 2,
+        totalTokens: 0n,
+        firstMessageAt: first,
+        lastMessageAt: last,
+        metadata: {},
+      },
     });
   });
 
@@ -477,6 +621,7 @@ describe('DatabaseBackend', () => {
     });
     prisma.aiChatHistory.findFirst.mockResolvedValue(null);
     prisma.aiChatHistory.create.mockResolvedValue({ id: 'history-2' });
+    prisma.aiMessage.findMany.mockResolvedValue([{ id: 'm1' }]);
     prisma.aiMessage.updateMany.mockResolvedValue({ count: 1 });
 
     await expect(backend.archiveSession('s1')).resolves.toBe('history-2');
@@ -487,8 +632,366 @@ describe('DatabaseBackend', () => {
         totalTokens: 0n,
         firstMessageAt: new Date(1700000000000),
         lastMessageAt: new Date(1700000000000),
+        metadata: { 'dsh-storage:archive-in-progress': true },
       },
       select: { id: true },
+    });
+  });
+
+  it('archives a long session in bounded batches and finalizes its rollup', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const first = new Date(1700000000000);
+    const last = new Date(1700000001000);
+    prisma.aiMessage.aggregate.mockResolvedValue({
+      _count: { _all: 205 },
+      _min: { createdAt: first },
+      _max: { createdAt: last },
+    });
+    prisma.aiChatHistory.findFirst.mockResolvedValue({ id: 'history-1' });
+    prisma.aiChatHistory.update.mockResolvedValue({ id: 'history-1' });
+    prisma.aiMessage.findMany
+      .mockResolvedValueOnce(Array.from({ length: 100 }, (_, i) => ({ id: `b0-${i}` })))
+      .mockResolvedValueOnce(Array.from({ length: 100 }, (_, i) => ({ id: `b1-${i}` })))
+      .mockResolvedValueOnce(Array.from({ length: 5 }, (_, i) => ({ id: `b2-${i}` })));
+    prisma.aiMessage.updateMany
+      .mockResolvedValueOnce({ count: 100 })
+      .mockResolvedValueOnce({ count: 100 })
+      .mockResolvedValueOnce({ count: 5 });
+
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-1');
+    expect(prisma.aiMessage.findMany.mock.calls.every((call: any) => call[0].take === 100)).toBe(
+      true,
+    );
+    expect(prisma.aiMessage.updateMany).toHaveBeenCalledTimes(3);
+    expect(
+      prisma.aiMessage.updateMany.mock.calls.map((call: any) => call[0].where.id.in.length),
+    ).toEqual([100, 100, 5]);
+    for (const call of prisma.aiMessage.updateMany.mock.calls) {
+      expect(call[0].data).toEqual({ historyId: 'history-1' });
+    }
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+    expect(prisma.aiChatHistory.update).toHaveBeenLastCalledWith({
+      where: { id: 'history-1' },
+      data: {
+        messageCount: 205,
+        totalTokens: 0n,
+        firstMessageAt: first,
+        lastMessageAt: last,
+        metadata: {},
+      },
+    });
+  });
+
+  it('continues an interrupted archive without creating a duplicate history', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const first = new Date(1700000000000);
+    const last = new Date(1700000001000);
+    prisma.aiMessage.aggregate
+      .mockResolvedValueOnce({ _count: { _all: 150 }, _min: first, _max: last })
+      .mockResolvedValueOnce({ _count: { _all: 50 }, _min: first, _max: last })
+      .mockResolvedValueOnce({ _count: { _all: 50 }, _min: first, _max: last });
+    prisma.aiChatHistory.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'history-2',
+        metadata: { 'dsh-storage:archive-in-progress': true },
+      })
+      .mockResolvedValueOnce({ metadata: { 'dsh-storage:archive-in-progress': true } })
+      .mockResolvedValueOnce({ metadata: { 'dsh-storage:archive-in-progress': true } });
+    prisma.aiChatHistory.create
+      .mockResolvedValueOnce({ id: 'history-2' })
+      .mockResolvedValueOnce({ id: 'history-3' });
+    prisma.aiChatHistory.update.mockResolvedValue({ id: 'history-2' });
+    prisma.aiMessage.findFirst
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({ historyId: 'history-2' });
+    prisma.aiMessage.findMany
+      .mockResolvedValueOnce(Array.from({ length: 150 }, (_, i) => ({ id: `first-${i}` })))
+      .mockResolvedValueOnce(Array.from({ length: 50 }, (_, i) => ({ id: `second-${i}` })));
+    prisma.aiMessage.updateMany
+      .mockRejectedValueOnce(new Error('batch failed'))
+      .mockResolvedValueOnce({ count: 50 });
+
+    await expect(backend.archiveSession('s1')).rejects.toThrow('batch failed');
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-2');
+    expect(prisma.aiMessage.findFirst.mock.calls[1][0].orderBy).toEqual([
+      { updatedAt: 'desc' },
+      { id: 'desc' },
+    ]);
+    expect(prisma.aiChatHistory.create).toHaveBeenCalledTimes(1);
+    expect(prisma.aiMessage.updateMany).toHaveBeenCalledTimes(2);
+  });
+
+  it('resumes the interrupted history before a newer active rollup', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const first = new Date(1700000000000);
+    const last = new Date(1700000001000);
+    prisma.aiMessage.aggregate
+      .mockResolvedValueOnce({ _count: { _all: 150 }, _min: first, _max: last })
+      .mockResolvedValueOnce({ _count: { _all: 50 }, _min: first, _max: last })
+      .mockResolvedValueOnce({ _count: { _all: 150 }, _min: first, _max: last });
+    prisma.aiChatHistory.findFirst.mockImplementation(({ where }: any) =>
+      where.id === 'history-1'
+        ? { id: 'history-1', metadata: { 'dsh-storage:archive-in-progress': true } }
+        : null,
+    );
+    prisma.aiChatHistory.create
+      .mockResolvedValueOnce({ id: 'history-1' })
+      .mockResolvedValueOnce({ id: 'history-2' });
+    prisma.aiChatHistory.update.mockResolvedValue({ id: 'history-1' });
+    prisma.aiMessage.findFirst
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({ historyId: 'history-1' });
+    prisma.aiMessage.findMany
+      .mockResolvedValueOnce(Array.from({ length: 150 }, (_, i) => ({ id: `first-${i}` })))
+      .mockResolvedValueOnce(Array.from({ length: 50 }, (_, i) => ({ id: `second-${i}` })))
+      .mockResolvedValueOnce(Array.from({ length: 50 }, (_, i) => ({ id: `third-${i}` })));
+    prisma.aiMessage.updateMany
+      .mockResolvedValueOnce({ count: 100 })
+      .mockRejectedValueOnce(new Error('second batch failed'))
+      .mockResolvedValueOnce({ count: 50 });
+
+    await expect(backend.archiveSession('s1')).rejects.toThrow('second batch failed');
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-1');
+    expect(prisma.aiChatHistory.create).toHaveBeenCalledTimes(1);
+    expect(prisma.aiMessage.updateMany.mock.calls.map((call: any) => call[0].data)).toEqual([
+      { historyId: 'history-1' },
+      { historyId: 'history-1' },
+      { historyId: 'history-1' },
+    ]);
+  });
+
+  it('merges accumulated tokens from a real newer active rollup after recovery', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const first = new Date(1700000000000);
+    const last = new Date(1700000001000);
+    const newerActive = {
+      id: 'newer-active',
+      sessionId: 's1',
+      title: 'Keep this title',
+      messageCount: 50,
+      totalTokens: 110n,
+      firstMessageAt: first,
+      lastMessageAt: last,
+      metadata: {
+        custom: 'keep-me',
+        'dsh-storage:archive-in-progress': true,
+        'dsh-storage:token-baseline': 100,
+      },
+    };
+    prisma.aiMessage.aggregate
+      .mockResolvedValueOnce({ _count: { _all: 150 }, _min: first, _max: last })
+      .mockResolvedValueOnce({ _count: { _all: 50 }, _min: first, _max: last })
+      .mockResolvedValueOnce({ _count: { _all: 150 }, _min: first, _max: last });
+    prisma.aiChatHistory.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'history-1',
+        metadata: { 'dsh-storage:archive-in-progress': true },
+      })
+      .mockResolvedValueOnce({
+        metadata: { 'dsh-storage:archive-in-progress': true },
+        totalTokens: 100n,
+      })
+      .mockResolvedValueOnce(newerActive)
+      .mockResolvedValueOnce(newerActive);
+    const recovered = { id: 'history-1', totalTokens: 100n };
+    prisma.aiChatHistory.create.mockResolvedValueOnce(recovered);
+    prisma.aiChatHistory.findMany.mockResolvedValue([newerActive]);
+    prisma.aiChatHistory.update.mockImplementation(async ({ data }: any) => {
+      if (data.totalTokens?.increment) recovered.totalTokens += data.totalTokens.increment;
+      else if (data.totalTokens !== undefined) recovered.totalTokens = data.totalTokens;
+      if (data.metadata !== undefined && data.messageCount === undefined)
+        newerActive.metadata = data.metadata;
+      return recovered;
+    });
+    prisma.aiChatHistory.updateMany.mockImplementation(async ({ data }: any) => {
+      Object.assign(newerActive, data);
+      return { count: 1 };
+    });
+    prisma.aiMessage.findFirst
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({ historyId: 'history-1' });
+    prisma.aiMessage.findMany
+      .mockResolvedValueOnce(Array.from({ length: 150 }, (_, i) => ({ id: `first-${i}` })))
+      .mockResolvedValueOnce(Array.from({ length: 50 }, (_, i) => ({ id: `second-${i}` })))
+      .mockResolvedValueOnce(Array.from({ length: 50 }, (_, i) => ({ id: `third-${i}` })));
+    prisma.aiMessage.updateMany
+      .mockResolvedValueOnce({ count: 100 })
+      .mockRejectedValueOnce(new Error('second batch failed'))
+      .mockResolvedValueOnce({ count: 50 });
+
+    await expect(backend.archiveSession('s1')).rejects.toThrow('second batch failed');
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-1');
+    expect(recovered.totalTokens).toBe(110n);
+    const resumed = await backend.readSession('s1');
+    expect(resumed).toMatchObject({
+      title: 'Keep this title',
+      messageCount: 0,
+      totalTokens: 0,
+      firstMessageAt: null,
+      lastMessageAt: null,
+    });
+    expect(resumed?.metadata).toEqual({ custom: 'keep-me' });
+    expect(prisma.aiChatHistory.updateMany).toHaveBeenCalledWith({
+      where: {
+        sessionId: 's1',
+        id: { not: 'history-1' },
+        deletedAt: null,
+        messages: { none: {} },
+      },
+      data: { messageCount: 0, totalTokens: 0n, firstMessageAt: null, lastMessageAt: null },
+    });
+  });
+
+  it('adds restart-only token deltas to the interrupted history', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const first = new Date(1700000000000);
+    const last = new Date(1700000001000);
+    const newerActive = {
+      id: 'restart-active',
+      sessionId: 's1',
+      title: 'Restarted session',
+      messageCount: 1,
+      totalTokens: 10n,
+      firstMessageAt: first,
+      lastMessageAt: last,
+      metadata: { 'dsh-storage:token-baseline': 0 },
+    };
+    prisma.aiMessage.aggregate
+      .mockResolvedValueOnce({ _count: { _all: 150 }, _min: first, _max: last })
+      .mockResolvedValueOnce({ _count: { _all: 50 }, _min: first, _max: last })
+      .mockResolvedValueOnce({ _count: { _all: 150 }, _min: first, _max: last });
+    prisma.aiChatHistory.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'history-1',
+        metadata: { 'dsh-storage:archive-in-progress': true },
+      })
+      .mockResolvedValueOnce({
+        metadata: { 'dsh-storage:archive-in-progress': true },
+        totalTokens: 100n,
+      })
+      .mockResolvedValueOnce(newerActive)
+      .mockResolvedValueOnce(newerActive);
+    const recovered = { id: 'history-1', totalTokens: 100n };
+    prisma.aiChatHistory.create.mockResolvedValueOnce(recovered);
+    prisma.aiChatHistory.update.mockImplementation(async ({ data }: any) => {
+      if (data.totalTokens !== undefined) recovered.totalTokens = data.totalTokens;
+      return recovered;
+    });
+    prisma.aiChatHistory.updateMany.mockImplementation(async ({ data }: any) => {
+      Object.assign(newerActive, data);
+      return { count: 1 };
+    });
+    prisma.aiMessage.findFirst
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({ historyId: 'history-1' });
+    prisma.aiMessage.findMany
+      .mockResolvedValueOnce(Array.from({ length: 150 }, (_, i) => ({ id: `first-${i}` })))
+      .mockResolvedValueOnce(Array.from({ length: 50 }, (_, i) => ({ id: `second-${i}` })))
+      .mockResolvedValueOnce(Array.from({ length: 50 }, (_, i) => ({ id: `third-${i}` })));
+    prisma.aiMessage.updateMany
+      .mockResolvedValueOnce({ count: 100 })
+      .mockRejectedValueOnce(new Error('second batch failed'))
+      .mockResolvedValueOnce({ count: 50 });
+
+    await expect(backend.archiveSession('s1')).rejects.toThrow('second batch failed');
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-1');
+    expect(recovered.totalTokens).toBe(110n);
+    const resumed = await backend.readSession('s1');
+    expect(resumed).toMatchObject({
+      title: 'Restarted session',
+      messageCount: 0,
+      totalTokens: 0,
+      firstMessageAt: null,
+      lastMessageAt: null,
+      metadata: { 'dsh-storage:token-baseline': 0 },
+    });
+  });
+
+  it('creates a new history instead of merging into a completed archive', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const first = new Date(1700000000000);
+    const last = new Date(1700000001000);
+    prisma.aiMessage.aggregate.mockResolvedValue({
+      _count: { _all: 2 },
+      _min: { createdAt: first },
+      _max: { createdAt: last },
+    });
+    prisma.aiChatHistory.findFirst
+      .mockResolvedValueOnce({ id: 'history-old', metadata: {} })
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ metadata: { 'dsh-storage:archive-in-progress': true } });
+    prisma.aiChatHistory.create.mockResolvedValue({ id: 'history-new' });
+    prisma.aiMessage.findFirst.mockResolvedValue({ historyId: 'history-old' });
+    prisma.aiMessage.findMany.mockResolvedValue([{ id: 'a1' }, { id: 'a2' }]);
+    prisma.aiMessage.updateMany.mockResolvedValue({ count: 2 });
+
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-new');
+    expect(prisma.aiChatHistory.create).toHaveBeenCalledTimes(1);
+    expect(prisma.aiMessage.updateMany.mock.calls[0][0].data).toEqual({
+      historyId: 'history-new',
+    });
+  });
+
+  it('finalizes an interrupted archive after the active segment is already empty', async () => {
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const first = new Date(1700000000000);
+    const last = new Date(1700000001000);
+    prisma.aiMessage.aggregate
+      .mockResolvedValueOnce({
+        _count: { _all: 2 },
+        _min: { createdAt: first },
+        _max: { createdAt: last },
+      })
+      .mockResolvedValueOnce({
+        _count: { _all: 2 },
+        _min: { createdAt: first },
+        _max: { createdAt: last },
+      })
+      .mockResolvedValueOnce({
+        _count: { _all: 0 },
+        _min: { createdAt: null },
+        _max: { createdAt: null },
+      })
+      .mockResolvedValueOnce({
+        _count: { _all: 2 },
+        _min: { createdAt: first },
+        _max: { createdAt: last },
+      });
+    prisma.aiChatHistory.findFirst.mockImplementation(({ where }: any) =>
+      where.id === 'history-1'
+        ? { id: 'history-1', metadata: { 'dsh-storage:archive-in-progress': true } }
+        : { id: 'history-1', metadata: {} },
+    );
+    prisma.aiChatHistory.update
+      .mockRejectedValueOnce(new Error('final update failed'))
+      .mockResolvedValue({ id: 'history-1' });
+    prisma.aiMessage.findFirst.mockResolvedValue({ historyId: 'history-1' });
+    prisma.aiMessage.findMany.mockResolvedValue([{ id: 'a1' }, { id: 'a2' }]);
+    prisma.aiMessage.updateMany.mockResolvedValue({ count: 2 });
+
+    await expect(backend.archiveSession('s1')).rejects.toThrow('final update failed');
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-1');
+    expect(prisma.aiChatHistory.create).not.toHaveBeenCalled();
+    expect(prisma.aiMessage.updateMany).toHaveBeenCalledTimes(1);
+    expect(prisma.aiChatHistory.update).toHaveBeenLastCalledWith({
+      where: { id: 'history-1' },
+      data: {
+        messageCount: 2,
+        totalTokens: 0n,
+        firstMessageAt: first,
+        lastMessageAt: last,
+        metadata: {},
+      },
     });
   });
 
@@ -502,6 +1005,7 @@ describe('DatabaseBackend', () => {
     });
     prisma.aiChatHistory.findFirst.mockResolvedValue({ id: 'history-1' });
     prisma.aiChatHistory.update.mockResolvedValue({ id: 'history-1' });
+    prisma.aiMessage.findMany.mockResolvedValue([{ id: 'm1' }]);
     prisma.aiMessage.updateMany.mockResolvedValue({ count: 0 });
 
     await expect(backend.archiveSession('s1')).rejects.toThrow('active messages changed');
@@ -562,6 +1066,37 @@ describe('DatabaseBackend', () => {
     const prisma = prismaMock.instances[0];
     prisma.aiChatHistory.findFirst.mockResolvedValue(null);
     await expect(backend.readSession('s1')).resolves.toBeNull();
+  });
+
+  it('stores the archive token baseline as a JSON-safe number on sqlserver', async () => {
+    backend = new DatabaseBackend({
+      provider: 'sqlserver',
+      url: 'sqlserver://host:1433;database=dsh;user=sa;password=p',
+    });
+    await backend.init();
+    const prisma = prismaMock.instances[0];
+    const first = new Date(1700000000000);
+    const last = new Date(1700000001000);
+    prisma.aiMessage.aggregate.mockResolvedValue({
+      _count: { _all: 1 },
+      _min: { createdAt: first },
+      _max: { createdAt: last },
+    });
+    prisma.aiChatHistory.findFirst
+      .mockResolvedValueOnce({ id: 'history-1', metadata: {}, totalTokens: 100n })
+      .mockResolvedValueOnce({ metadata: {} })
+      .mockResolvedValueOnce(null);
+    prisma.aiMessage.findMany.mockResolvedValue([{ id: 'm1' }]);
+    prisma.aiMessage.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(backend.archiveSession('s1')).resolves.toBe('history-1');
+    const startUpdate = prisma.aiChatHistory.update.mock.calls[0][0];
+    const metadata =
+      typeof startUpdate.data.metadata === 'string'
+        ? JSON.parse(startUpdate.data.metadata)
+        : startUpdate.data.metadata;
+    expect(metadata['dsh-storage:token-baseline']).toBe(100);
+    expect(() => JSON.stringify(metadata)).not.toThrow();
   });
 
   it('serializes session metadata as text on sqlserver', async () => {

@@ -6,13 +6,19 @@ import {
   TaskState,
 } from '@a2a-js/sdk';
 import { ServerCallContext } from '@a2a-js/sdk/server';
-import { beforeEach, describe, expect, it, type Mock, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from 'vitest';
 import { listShells, MemoryTaskStore, SanitizedTaskStore, sanitizeTask } from './task-store.js';
 
 const mocks = vi.hoisted(() => {
   class MockRedis {
     static instances: MockRedis[] = [];
-    readonly calls = { set: [] as unknown[][], get: [] as string[], del: [] as string[], quit: 0 };
+    readonly calls = {
+      set: [] as unknown[][],
+      get: [] as string[],
+      mget: 0,
+      del: [] as string[],
+      quit: 0,
+    };
     private readonly data = new Map<string, string>();
     constructor(readonly url: string) {
       MockRedis.instances.push(this);
@@ -25,6 +31,10 @@ const mocks = vi.hoisted(() => {
     async get(key: string) {
       this.calls.get.push(key);
       return this.data.get(key) ?? null;
+    }
+    async mget(...keys: string[]) {
+      this.calls.mget += 1;
+      return keys.map((key) => this.data.get(key) ?? null);
     }
     async del(key: string) {
       this.calls.del.push(key);
@@ -47,13 +57,20 @@ vi.mock('ioredis', () => ({ Redis: mocks.MockRedis, default: mocks.MockRedis }))
 
 const gcs = vi.hoisted(() => {
   const files = new Map<string, Buffer>();
+  const activity = { active: 0, maxActive: 0 };
   const file = (name: string) => ({
     name,
     save: async (value: Buffer) => {
       files.set(name, value);
     },
     exists: async () => [files.has(name)],
-    download: async () => [files.get(name)],
+    download: async () => {
+      activity.active += 1;
+      activity.maxActive = Math.max(activity.maxActive, activity.active);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      activity.active -= 1;
+      return [files.get(name)];
+    },
     delete: async () => {
       files.delete(name);
     },
@@ -68,7 +85,7 @@ const gcs = vi.hoisted(() => {
       };
     }
   }
-  return { files, Storage };
+  return { files, activity, Storage };
 });
 vi.mock('@google-cloud/storage', () => ({ Storage: gcs.Storage }));
 
@@ -76,6 +93,7 @@ import { GcsTaskStore } from './stores/gcs.js';
 import { RedisTaskStore } from './stores/redis.js';
 
 const ctx = new ServerCallContext();
+afterEach(() => vi.useRealTimers());
 
 const task = (state: TaskState, extra: Partial<Task> = {}): Task => ({
   id: 't1',
@@ -374,6 +392,40 @@ describe('SanitizedTaskStore', () => {
     ]);
   });
 
+  it('expires terminal reopen guards instead of retaining them forever', async () => {
+    vi.useFakeTimers();
+    const store = new SanitizedTaskStore(inner);
+    await store.checkpoint(task(TaskState.TASK_STATE_CANCELED), ctx);
+    await vi.advanceTimersByTimeAsync(25 * 60 * 60 * 1000);
+    await store.save(task(TaskState.TASK_STATE_WORKING), ctx);
+    expect(inner.saved.map((entry) => entry.status?.state)).toEqual([
+      TaskState.TASK_STATE_CANCELED,
+      TaskState.TASK_STATE_WORKING,
+    ]);
+  });
+
+  it('refreshes repeated terminal guards in expiry order', async () => {
+    vi.useFakeTimers();
+    const hour = 60 * 60 * 1000;
+    const store = new SanitizedTaskStore(inner);
+    const first = task(TaskState.TASK_STATE_CANCELED, { id: 'first' });
+    await store.checkpoint(first, ctx);
+    await vi.advanceTimersByTimeAsync(hour);
+    await store.checkpoint(task(TaskState.TASK_STATE_FAILED, { id: 'second' }), ctx);
+    await vi.advanceTimersByTimeAsync(hour);
+    await store.checkpoint(first, ctx);
+    await vi.advanceTimersByTimeAsync(23 * hour);
+    await store.checkpoint(task(TaskState.TASK_STATE_CANCELED, { id: 'third' }), ctx);
+
+    await store.save(task(TaskState.TASK_STATE_WORKING, { id: 'first' }), ctx);
+    await store.save(task(TaskState.TASK_STATE_WORKING, { id: 'second' }), ctx);
+    expect(
+      inner.saved
+        .filter((entry) => entry.status?.state === TaskState.TASK_STATE_WORKING)
+        .map((entry) => entry.id),
+    ).toEqual(['second']);
+  });
+
   it('keeps the later terminal write registered until backend shutdown drains it', async () => {
     let releaseFirst!: () => void;
     let releaseSecond!: () => void;
@@ -502,6 +554,9 @@ describe('RedisTaskStore', () => {
     expect(all.totalSize).toBe(2);
     const filtered = await store.list(listParams({ contextId: 'c2' }), ctx);
     expect(filtered.tasks.map((t) => t.id)).toEqual(['t2']);
+    const redis = mocks.MockRedis.instances[0];
+    expect(redis.calls.mget).toBeGreaterThan(0);
+    expect(redis.calls.get).toHaveLength(0);
   });
 
   it('does not expose stored history across tenants', async () => {
@@ -532,5 +587,17 @@ describe('GcsTaskStore', () => {
     expect(await store.load('t1', other)).toBeUndefined();
     expect((await store.list(listParams(), other)).tasks).toEqual([]);
     expect((await store.load('t1', ctx))?.history[0].messageId).toBe('m1');
+  });
+
+  it('downloads list snapshots with bounded concurrency', async () => {
+    gcs.files.clear();
+    gcs.activity.maxActive = 0;
+    const store = new GcsTaskStore({ bucket: 'test' });
+    await store.init();
+    for (let index = 0; index < 20; index++)
+      await store.save(task(TaskState.TASK_STATE_INPUT_REQUIRED, { id: `t${index}` }), ctx);
+    expect((await store.list(listParams(), ctx)).totalSize).toBe(20);
+    expect(gcs.activity.maxActive).toBeGreaterThan(1);
+    expect(gcs.activity.maxActive).toBeLessThanOrEqual(16);
   });
 });

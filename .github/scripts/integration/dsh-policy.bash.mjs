@@ -44,7 +44,7 @@ await runPolicyScenario({
       problems.push('ci-allowed.txt missing — the allowed command did not run');
     }
     if (existsSync(join(workDir, 'ci-blocked.txt'))) {
-      problems.push('ci-blocked.txt exists — the denied command RAN');
+      throw new Error('ci-blocked.txt exists — the denied command RAN');
     }
     return problems;
   },

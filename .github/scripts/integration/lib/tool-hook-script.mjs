@@ -15,6 +15,13 @@ if (input.point === 'AfterTool') {
   assert.equal(input.toolResult.isError, false, 'marker tool must succeed');
   assert.ok(JSON.stringify(input.toolResult.content).includes(`${codeword}-content`));
 }
-process.stdout.write(JSON.stringify({ token: input.token, reason: 'marker-verified',
-  additionalContext: codeword, continue: true, padding: 'x'.repeat(4200) }));
+process.stdout.write(
+  JSON.stringify({
+    token: input.token,
+    reason: 'marker-verified',
+    additionalContext: codeword,
+    continue: true,
+    padding: 'x'.repeat(4200),
+  }),
+);
 process.stderr.write(`marker-verified:${input.point}`);

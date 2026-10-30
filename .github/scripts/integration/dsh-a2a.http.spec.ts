@@ -1,16 +1,21 @@
 import { ServerResponse } from 'node:http';
 import { Role, type Task, TaskState } from '@a2a-js/sdk';
-import type { AgentExecutor, ExecutionEventBus } from '@a2a-js/sdk/server';
-import { AgentEvent, type RequestContext } from '@a2a-js/sdk/server';
+import type { AgentExecutionEvent, AgentExecutor, ExecutionEventBus } from '@a2a-js/sdk/server';
+import { AgentEvent, type RequestContext, ServerCallContext } from '@a2a-js/sdk/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { type A2aServer, startA2aServer } from './server.js';
-import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
+import { type A2aServer, startA2aServer } from '../../../packages/dsh-a2a/src/server.js';
+import {
+  type ManagedTaskStore,
+  MemoryTaskStore,
+  SanitizedTaskStore,
+} from '../../../packages/dsh-a2a/src/task-store.js';
 
 // A stub executor with the same event contract the real one uses: a task
 // anchor first (A2A 1.0 stream ordering), then working, then input-required.
 const stubExecutor: AgentExecutor = {
   async execute(requestContext: RequestContext, bus: ExecutionEventBus): Promise<void> {
     const { userMessage, taskId, contextId } = requestContext;
+    const dataPart = userMessage.parts.find((part) => part.content?.$case === 'data');
     const now = new Date().toISOString();
     bus.publish(
       AgentEvent.task({
@@ -47,6 +52,19 @@ const stubExecutor: AgentExecutor = {
                 metadata: undefined,
                 filename: '',
                 mediaType: 'text/plain',
+              },
+              {
+                content: {
+                  $case: 'data',
+                  value: {
+                    callId: 'call-1',
+                    result: 'ok',
+                    received: dataPart?.content?.$case === 'data' ? dataPart.content.value : null,
+                  },
+                },
+                metadata: undefined,
+                filename: '',
+                mediaType: '',
               },
             ],
             metadata: undefined,
@@ -105,6 +123,31 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
 
   const json = (res: Response): Promise<any> => res.json();
 
+  const legacy = (method: string, params: unknown, id = 1) =>
+    fetch(`${base}/a2a/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+    });
+
+  const frames = async (res: Response): Promise<any[]> =>
+    (await res.text())
+      .split('\n\n')
+      .filter((frame) => frame.startsWith('data: '))
+      .map((frame) => JSON.parse(frame.slice(6)));
+
+  const legacyMessage = (text: string) => ({
+    message: {
+      kind: 'message',
+      messageId: `legacy-${text}`,
+      role: 'user',
+      parts: [
+        { kind: 'text', text },
+        { kind: 'data', data: { input: 1 } },
+      ],
+    },
+  });
+
   const v1Message = (text: string, extra: Record<string, unknown> = {}) => ({
     message: {
       messageId: `m-${Math.random()}`,
@@ -127,7 +170,7 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
       protocolBinding: 'JSONRPC',
       protocolVersion: '1.0',
     });
-    expect(interfaces[0].url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/a2a\/$/);
+    expect(interfaces[0].url).toBe(`${base}/a2a/`);
     // the legacyCompat mirror lets pre-1.0 clients in
     expect(interfaces[1]).toMatchObject({ protocolBinding: 'JSONRPC', protocolVersion: '0.3' });
   });
@@ -136,7 +179,9 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     const res = await fetch(`${base}/.well-known/agent-card.json`);
     const card = await json(res);
     expect(card.protocolVersion).toBe('0.3');
-    expect(card.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/a2a\/$/);
+    expect(card.url).toBe(`${base}/a2a/`);
+    expect(card.preferredTransport).toBe('JSONRPC');
+    expect(card.capabilities.streaming).toBe(true);
   });
 
   it('answers a blocking SendMessage with the final task state', async () => {
@@ -452,6 +497,25 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     }
   });
 
+  it('ends a legacy interaction explicitly and accepts a same-task follow-up', async () => {
+    const first = (await frames(await legacy('message/stream', legacyMessage('hello')))).at(
+      -1,
+    ).result;
+    expect(first).toMatchObject({
+      kind: 'status-update',
+      status: { state: 'input-required' },
+      final: true,
+    });
+    const next = legacyMessage('again');
+    Object.assign(next.message, { taskId: first.taskId, contextId: first.contextId });
+    const last = (await frames(await legacy('message/stream', next))).at(-1).result;
+    expect(last).toMatchObject({
+      taskId: first.taskId,
+      status: { state: 'input-required' },
+      final: true,
+    });
+  });
+
   it('returns live history in the first legacy resubscribe frame', async () => {
     const send = await fetch(`${base}/a2a/`, {
       method: 'POST',
@@ -491,7 +555,7 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     const first = JSON.parse(wire.split('\n\n')[0].slice(6));
     expect(first.result.history).toMatchObject([
       { role: 'user', parts: [{ kind: 'text', text: 'hello' }] },
-      { role: 'agent', parts: [{ kind: 'text', text: 'done' }] },
+      { role: 'agent', parts: expect.arrayContaining([{ kind: 'text', text: 'done' }]) },
     ]);
     await fetch(`${base}/a2a/`, {
       method: 'POST',
@@ -816,7 +880,7 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
       expect(first.result.task.status.state).toBe('TASK_STATE_SUBMITTED');
       expect(first.result.task.history).toMatchObject([
         { parts: [{ text: 'first' }] },
-        { parts: [{ text: 'done' }] },
+        { parts: expect.arrayContaining([expect.objectContaining({ text: 'done' })]) },
         { parts: [{ text: 'second' }] },
       ]);
       await reader.cancel();
@@ -824,6 +888,113 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
       await sendReader.cancel();
     },
   );
+
+  it('serializes same-task admission without losing history or reordering execution', async () => {
+    await server.close();
+    const inner = new MemoryTaskStore();
+    let armDelay = false;
+    const delayed: ManagedTaskStore = {
+      load: async (id, context) => {
+        const task = await inner.load(id, context);
+        if (armDelay && task) await new Promise((resolve) => setTimeout(resolve, 20));
+        return task;
+      },
+      save: (task, context) => inner.save(task, context),
+      list: (params, context) => inner.list(params, context),
+      delete: (id, context) => inner.delete(id, context),
+    };
+    const executor: AgentExecutor = {
+      execute: async (request, bus) => {
+        const text = request.userMessage.parts[0]?.content;
+        if (text?.$case === 'text' && text.value === 'slow') {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        const scopedBus = {
+          publish: (event: AgentExecutionEvent) => {
+            if (event.kind === 'task' && text?.$case === 'text' && text.value !== 'initial') {
+              event = {
+                ...event,
+                data: {
+                  ...event.data,
+                  status: {
+                    ...event.data.status,
+                    state: TaskState.TASK_STATE_WORKING,
+                    message: undefined,
+                    timestamp: event.data.status?.timestamp ?? new Date().toISOString(),
+                  },
+                  history: [],
+                },
+              };
+            }
+            bus.publish(event);
+          },
+          finished: () => bus.finished(),
+        } as unknown as ExecutionEventBus;
+        return stubExecutor.execute(request, scopedBus);
+      },
+      cancelTask: stubExecutor.cancelTask,
+    };
+    server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      card: { name: 'test', description: 'test', version: '0.0.1' },
+      executor,
+      taskStore: new SanitizedTaskStore(delayed),
+    });
+    base = `http://127.0.0.1:${server.port}`;
+    const initial = await json(await rpc('SendMessage', { tenant: '', ...v1Message('initial') }));
+    const taskId = initial.result.task.id;
+    const contextId = initial.result.task.contextId;
+    armDelay = true;
+    await Promise.all([
+      rpc('SendMessage', { tenant: '', ...v1Message('slow', { taskId, contextId }) }, 10),
+      rpc('SendMessage', { tenant: '', ...v1Message('fast', { taskId, contextId }) }, 11),
+    ]);
+    const got = await json(await rpc('GetTask', { tenant: '', id: taskId }, 12));
+    expect(got.result.history).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ parts: expect.arrayContaining([{ text: 'slow' }]) }),
+        expect.objectContaining({ parts: expect.arrayContaining([{ text: 'fast' }]) }),
+      ]),
+    );
+  });
+
+  it('does not serialize unrelated new contexts behind a stalled admission', async () => {
+    await server.close();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let started!: () => void;
+    const firstStarted = new Promise<void>((resolve) => (started = resolve));
+    const executor: AgentExecutor = {
+      execute: async (request, bus) => {
+        if (request.contextId === 'ctx-a') {
+          started();
+          await gate;
+        }
+        return stubExecutor.execute(request, bus);
+      },
+      cancelTask: stubExecutor.cancelTask,
+    };
+    server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      card: { name: 'test', description: 'test', version: '0.0.1' },
+      executor,
+      taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+    });
+    base = `http://127.0.0.1:${server.port}`;
+    const first = rpc('SendMessage', { tenant: '', ...v1Message('slow', { contextId: 'ctx-a' }) });
+    await firstStarted;
+    const second = await Promise.race([
+      rpc('SendMessage', { tenant: '', ...v1Message('fast', { contextId: 'ctx-b' }) }).then(json),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('ctx-b blocked')), 500)),
+    ]);
+    expect(second.result.task.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    release();
+    await first;
+  });
 
   it('lists tasks via ListTasks with settled history', async () => {
     await rpc('SendMessage', { tenant: '', ...v1Message('hello') });
@@ -834,6 +1005,79 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     expect(body.result.tasks[0].history).toHaveLength(2);
     expect(body.result.tasks[0].history[1].parts[0].text).toBe('done');
     expect(body.result.totalSize).toBe(1);
+  });
+
+  it('restores a cold working task before checking cancellation ownership', async () => {
+    await server.close();
+    const store = new SanitizedTaskStore(new MemoryTaskStore());
+    const context = new ServerCallContext({ tenant: '' });
+    const snapshot: Task = {
+      id: 'cold-working',
+      contextId: 'cold-context',
+      status: {
+        state: TaskState.TASK_STATE_WORKING,
+        message: undefined,
+        timestamp: new Date().toISOString(),
+      },
+      history: [],
+      artifacts: [],
+      metadata: undefined,
+    };
+    await store.save(snapshot, context);
+    const beforeTask = vi.fn(async (taskId: string, call: ServerCallContext) => {
+      expect(taskId).toBe(snapshot.id);
+      server.restoreTask(snapshot, call);
+    });
+    server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      card: { name: 'test', description: 'test', version: '0.0.1' },
+      executor: stubExecutor,
+      taskStore: store,
+      beforeTask,
+    });
+    base = `http://127.0.0.1:${server.port}`;
+
+    const canceled = await json(await rpc('CancelTask', { tenant: '', id: snapshot.id }, 20));
+    expect(beforeTask).toHaveBeenCalledOnce();
+    expect(canceled.error).toBeUndefined();
+    expect(canceled.result.status.state).toBe('TASK_STATE_CANCELED');
+  });
+
+  it('fails closed when a non-owner receives a working-task cancellation', async () => {
+    await server.close();
+    const store = new SanitizedTaskStore(new MemoryTaskStore());
+    const context = new ServerCallContext({ tenant: '' });
+    await store.save(
+      {
+        id: 'remote-working',
+        contextId: 'remote-context',
+        status: {
+          state: TaskState.TASK_STATE_WORKING,
+          message: undefined,
+          timestamp: new Date().toISOString(),
+        },
+        history: [],
+        artifacts: [],
+        metadata: undefined,
+      },
+      context,
+    );
+    server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      card: { name: 'test', description: 'test', version: '0.0.1' },
+      executor: stubExecutor,
+      taskStore: store,
+    });
+    base = `http://127.0.0.1:${server.port}`;
+
+    const canceled = await json(await rpc('CancelTask', { tenant: '', id: 'remote-working' }, 20));
+    expect(canceled.error?.message).toContain('another worker');
+    const got = await json(await rpc('GetTask', { tenant: '', id: 'remote-working' }, 21));
+    expect(got.result.status.state).toBe('TASK_STATE_WORKING');
   });
 
   it('round-trips GetTask and cancels via CancelTask', async () => {
@@ -851,29 +1095,92 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     expect(rejected.error.message).toMatch(/terminal state/);
   });
 
-  it('serves legacy 0.3 method spellings through the compat layer', async () => {
-    const res = await fetch(`${base}/a2a/`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 9,
-        method: 'message/send',
-        params: {
-          message: {
-            kind: 'message',
-            messageId: 'legacy-1',
-            role: 'user',
-            parts: [{ kind: 'text', text: 'hello' }],
-          },
-        },
-      }),
-    });
+  it('round-trips 0.3 send, get, and cancel with text and data parts', async () => {
+    const res = await legacy('message/send', legacyMessage('hello'), 9);
     expect(res.status).toBe(200);
     const body = await json(res);
     expect(body.error).toBeUndefined();
     expect(body.result.kind).toBe('task');
+    expect(body.result.id).toEqual(expect.any(String));
+    expect(body.result.contextId).toEqual(expect.any(String));
     expect(body.result.status.state).toBe('input-required');
+    expect(body.result.status.message.parts).toEqual([
+      { kind: 'text', text: 'done' },
+      { kind: 'data', data: { callId: 'call-1', result: 'ok', received: { input: 1 } } },
+    ]);
+    const id = body.result.id;
+    const got = await json(await legacy('tasks/get', { id }, 10));
+    expect(got.result).toMatchObject({ kind: 'task', id, status: { state: 'input-required' } });
+    const canceled = await json(await legacy('tasks/cancel', { id }, 11));
+    expect(canceled.result).toMatchObject({ kind: 'task', id, status: { state: 'canceled' } });
+    const rejected = await json(
+      await legacy('message/send', {
+        message: {
+          ...legacyMessage('again').message,
+          taskId: id,
+          contextId: body.result.contextId,
+        },
+      }),
+    );
+    expect(rejected.error).toBeDefined();
+  });
+
+  it('streams 0.3 envelopes and resubscribes until cancellation', async () => {
+    const streamed = await legacy('message/stream', legacyMessage('stream'));
+    expect(streamed.headers.get('content-type')).toContain('text/event-stream');
+    const events = await frames(streamed);
+    expect(events[0].result).toMatchObject({ kind: 'task', status: { state: 'submitted' } });
+    const { id, contextId } = events[0].result;
+    expect(events.at(-1).result).toMatchObject({
+      kind: 'status-update',
+      taskId: id,
+      contextId,
+      status: {
+        state: 'input-required',
+        message: {
+          parts: [
+            { kind: 'text', text: 'done' },
+            { kind: 'data', data: { received: { input: 1 } } },
+          ],
+        },
+      },
+      final: true,
+    });
+
+    const subscription = await legacy('tasks/resubscribe', { id }, 2);
+    expect(subscription.headers.get('content-type')).toContain('text/event-stream');
+    const reader = subscription.body!.getReader();
+    let received = '';
+    while (!received.includes('\n\n')) {
+      const next = await reader.read();
+      expect(next.done).toBe(false);
+      received += new TextDecoder().decode(next.value);
+    }
+    const first = JSON.parse(received.split('\n\n')[0].slice(6));
+    expect(first).toMatchObject({
+      jsonrpc: '2.0',
+      id: 2,
+      result: { kind: 'task', id, status: { state: 'input-required' } },
+    });
+    const canceled = await json(await legacy('tasks/cancel', { id }, 3));
+    expect(canceled.result.status.state).toBe('canceled');
+    while (
+      !received
+        .split('\n\n')
+        .slice(0, -1)
+        .some((frame) => frame.includes('"final":true'))
+    ) {
+      const next = await reader.read();
+      expect(next.done).toBe(false);
+      received += new TextDecoder().decode(next.value);
+    }
+    const last = JSON.parse(received.split('\n\n').filter(Boolean).at(-1)!.slice(6));
+    expect(last).toMatchObject({
+      jsonrpc: '2.0',
+      id: 2,
+      result: { kind: 'status-update', taskId: id, status: { state: 'canceled' }, final: true },
+    });
+    expect((await reader.read()).done).toBe(true);
   });
 
   it('finds the latest legacy task by contextId at the root JSON-RPC path', async () => {

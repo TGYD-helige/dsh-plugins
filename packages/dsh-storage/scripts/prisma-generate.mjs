@@ -17,7 +17,11 @@ const variants = readdirSync('prisma')
 
 for (const variant of variants) {
   console.log(`prisma generate: ${variant}`);
-  execFileSync('pnpm', ['exec', 'prisma', 'generate', '--schema', `prisma/schema.${variant}.prisma`], {
-    stdio: 'inherit',
-  });
+  execFileSync(
+    'pnpm',
+    ['exec', 'prisma', 'generate', '--schema', `prisma/schema.${variant}.prisma`],
+    {
+      stdio: 'inherit',
+    },
+  );
 }

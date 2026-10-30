@@ -14,8 +14,12 @@ vi.mock('./backends/database.js', () => ({
     readSession = vi.fn(async () => null);
     readMessages = vi.fn(async () => [] as any[]);
     readToolCallMessages = vi.fn(async () => [] as any[]);
-    upsertMessage = vi.fn(async () => {});
-    upsertSession = vi.fn(async () => {});
+    upsertMessage = vi.fn(async (_row: any) => {});
+    upsertSession = vi.fn(async (_row: any) => {});
+    upsertEvent = vi.fn(async (message: any, session: any) => {
+      if (message) await this.upsertMessage(message);
+      await this.upsertSession(session);
+    });
     archiveSession = vi.fn(async (): Promise<string | null> => 'history-1');
     close = vi.fn(async () => {});
     constructor(public config: unknown) {
@@ -242,6 +246,68 @@ describe('dsh-storage plugin', () => {
     expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(1);
   });
 
+  it('freezes the cumulative token baseline at archive start', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const session = { id: 's1' };
+    ctx.events.emit(
+      'session/event',
+      session,
+      assistantEvent('first', { inputTokens: 100, outputTokens: 0 }, 'a1'),
+    );
+
+    const service = ctx.get('dshStorage') as { archiveSession(id: string): Promise<string | null> };
+    backend.archiveSession.mockRejectedValueOnce(new Error('archive interrupted'));
+    await expect(service.archiveSession('s1')).rejects.toThrow('archive interrupted');
+    ctx.events.emit(
+      'session/event',
+      session,
+      assistantEvent('second', { inputTokens: 10, outputTokens: 0 }, 'a2'),
+    );
+    await ctx.events.parallel('session/flush', session);
+
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0]).toMatchObject({
+      totalTokens: 110,
+      metadata: { 'dsh-storage:token-baseline': 100 },
+    });
+  });
+
+  it('preserves the first baseline across consecutive archive failures', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const session = { id: 's1' };
+    ctx.events.emit(
+      'session/event',
+      session,
+      assistantEvent('first', { inputTokens: 100, outputTokens: 0 }, 'a1'),
+    );
+    await ctx.events.parallel('session/flush', session);
+
+    const service = ctx.get('dshStorage') as { archiveSession(id: string): Promise<string | null> };
+    backend.archiveSession
+      .mockRejectedValueOnce(new Error('first archive failure'))
+      .mockRejectedValueOnce(new Error('second archive failure'));
+    await expect(service.archiveSession('s1')).rejects.toThrow('first archive failure');
+    ctx.events.emit(
+      'session/event',
+      session,
+      assistantEvent('second', { inputTokens: 10, outputTokens: 0 }, 'a2'),
+    );
+    await ctx.events.parallel('session/flush', session);
+    await expect(service.archiveSession('s1')).rejects.toThrow('second archive failure');
+    ctx.events.emit(
+      'session/event',
+      session,
+      assistantEvent('third', { inputTokens: 5, outputTokens: 0 }, 'a3'),
+    );
+    await ctx.events.parallel('session/flush', session);
+
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0]).toMatchObject({
+      totalTokens: 115,
+      metadata: { 'dsh-storage:token-baseline': 100 },
+    });
+  });
+
   it('keeps the current rollup when archive fails', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
@@ -455,7 +521,11 @@ describe('dsh-storage plugin', () => {
     expect(rows.get('a0').toolCalls).toEqual([
       expect.objectContaining({
         id: 'c0',
-        result: { type: 'text', text: 'old result' },
+        result: expect.objectContaining({
+          type: 'tool-result',
+          toolCallId: 'c0',
+          content: [{ type: 'text', text: 'old result' }],
+        }),
       }),
     ]);
   });
@@ -567,16 +637,25 @@ describe('dsh-storage plugin', () => {
     expect(lastSession).toMatchObject({ sessionId: 's1', title: 'Prune a git branch' });
   });
 
-  it('swallows backend errors with a prefixed console.error', async () => {
+  it('does not advance the rollup when an event write fails, then retries cleanly', async () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
     backend.upsertMessage.mockRejectedValueOnce(new Error('db down'));
+    const session = { id: 's1' };
+    const event = userEvent('x');
 
-    expect(() => ctx.events.emit('session/event', { id: 's1' }, userEvent('x'))).not.toThrow();
+    expect(() => ctx.events.emit('session/event', session, event)).not.toThrow();
     await flush();
+    expect(backend.upsertSession).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/^\[dsh-storage\]/),
+      expect.any(Error),
+    );
 
-    expect(errorSpy).toHaveBeenCalledWith('[dsh-storage] database error:', expect.any(Error));
+    ctx.events.emit('session/event', session, event);
+    await flush();
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(1);
     errorSpy.mockRestore();
   });
 
@@ -603,6 +682,21 @@ describe('dsh-storage plugin', () => {
     expect(backend.close).toHaveBeenCalledTimes(1);
   });
 
+  it('closes the backend when init fails during unload', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let rejectInit!: (error: Error) => void;
+    backends.initImpl = () => new Promise<void>((_resolve, reject) => (rejectInit = reject));
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+
+    const disposal = ctx.fiber.dispose();
+    rejectInit(new Error('init failed during unload'));
+
+    await expect(disposal).resolves.toBeUndefined();
+    expect(backend.close).toHaveBeenCalledTimes(1);
+    errorSpy.mockRestore();
+  });
+
   it('drains in-flight row writes before closing on unload', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
@@ -622,6 +716,68 @@ describe('dsh-storage plugin', () => {
     release();
     await disposal;
     expect(backend.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('drains writes created after a delayed init before closing on unload', async () => {
+    let releaseInit!: () => void;
+    backends.initImpl = () => new Promise<void>((resolve) => (releaseInit = resolve));
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const order: string[] = [];
+    let releaseWrite!: () => void;
+    backend.upsertEvent.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          order.push('upsert:start');
+          releaseWrite = () => {
+            order.push('upsert:end');
+            resolve();
+          };
+        }),
+    );
+    backend.close.mockImplementation(async () => order.push('close'));
+    ctx.events.emit('session/event', { id: 's1' }, userEvent('first', 'm1'));
+
+    const disposal = ctx.fiber.dispose();
+    releaseInit();
+    await vi.waitFor(() => expect(backend.upsertEvent).toHaveBeenCalledOnce());
+    expect(backend.close).not.toHaveBeenCalled();
+    releaseWrite();
+    await disposal;
+    expect(order).toEqual(['upsert:start', 'upsert:end', 'close']);
+  });
+
+  it('drains writes created after a delayed seed read before closing on unload', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    await flush();
+    let releaseRead!: () => void;
+    backend.readSession.mockImplementationOnce(
+      () => new Promise<null>((resolve) => (releaseRead = () => resolve(null))),
+    );
+    const order: string[] = [];
+    let releaseWrite!: () => void;
+    backend.upsertEvent.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          order.push('upsert:start');
+          releaseWrite = () => {
+            order.push('upsert:end');
+            resolve();
+          };
+        }),
+    );
+    backend.close.mockImplementation(async () => order.push('close'));
+    ctx.events.emit('session/event', { id: 's1' }, userEvent('first', 'm1'));
+    await vi.waitFor(() => expect(backend.readSession).toHaveBeenCalledOnce());
+
+    const disposal = ctx.fiber.dispose();
+    releaseRead();
+    await vi.waitFor(() => expect(backend.upsertEvent).toHaveBeenCalledOnce());
+    expect(backend.close).not.toHaveBeenCalled();
+    releaseWrite();
+    await disposal;
+    expect(order).toEqual(['upsert:start', 'upsert:end', 'close']);
   });
 
   it('drains in-flight writes at the session/flush checkpoint', async () => {
@@ -645,6 +801,29 @@ describe('dsh-storage plugin', () => {
     release();
     await checkpoint;
     expect(flushed).toBe(true);
+  });
+
+  it('does not block one session flush on another session write', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    await flush();
+    let releaseB!: () => void;
+    backend.upsertSession.mockImplementationOnce(
+      () => new Promise<void>((resolve) => (releaseB = resolve)),
+    );
+    const a = { id: 'a' };
+    const b = { id: 'b' };
+    ctx.events.emit('session/event', b, userEvent('blocked', 'b1'));
+    ctx.events.emit('session/event', a, userEvent('ready', 'a1'));
+
+    let aFlushed = false;
+    const checkpointA = ctx.events.parallel('session/flush', a).then(() => (aFlushed = true));
+    await flush();
+    const flushedWhileBWasBlocked = aFlushed;
+
+    releaseB();
+    await Promise.all([checkpointA, ctx.events.parallel('session/flush', b)]);
+    expect(flushedWhileBWasBlocked).toBe(true);
   });
 
   it('seeds the rollup from the stored session row on resume', async () => {
@@ -704,6 +883,32 @@ describe('dsh-storage plugin', () => {
     });
   });
 
+  it('retries a failed backend init on a later event without zero-seeding', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let attempts = 0;
+    backends.initImpl = async () => {
+      attempts += 1;
+      if (attempts <= 2) throw new Error('database unavailable');
+    };
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    await flush();
+    expect(attempts).toBe(1);
+
+    ctx.events.emit('session/event', { id: 's1' }, userEvent('lost while down', 'm1'));
+    await flush();
+    expect(attempts).toBe(2);
+    expect(backend.readSession).not.toHaveBeenCalled();
+    expect(backend.upsertEvent).not.toHaveBeenCalled();
+
+    ctx.events.emit('session/event', { id: 's1' }, userEvent('stored after recovery', 'm2'));
+    await flush();
+    expect(attempts).toBe(3);
+    expect(backend.readSession).toHaveBeenCalledOnce();
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(1);
+    errorSpy.mockRestore();
+  });
+
   it('treats a seed read failure as failure (no zero-seed overwrite) and retries', async () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     apply(ctx, enabledConfig);
@@ -735,7 +940,7 @@ describe('dsh-storage plugin', () => {
     errorSpy.mockRestore();
   });
 
-  it('accounts usage per step with replacement across attempts and messages', async () => {
+  it('adds usage for every model call across attempts and messages', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
     const session = { id: 's1' };
@@ -747,8 +952,8 @@ describe('dsh-storage plugin', () => {
       session,
       attemptWithUsage(0, 0, { inputTokens: 10, outputTokens: 5 }),
     );
-    // Retry at the next step: a failed attempt's sample, then the settled
-    // message of the SAME step — the message replaces the attempt's sample.
+    // Retry at the next step: a failed attempt's call, then another model call
+    // whose settled message lands on the SAME step — both calls are billed.
     ctx.events.emit(
       'session/event',
       session,
@@ -778,18 +983,18 @@ describe('dsh-storage plugin', () => {
     const lastSession = backend.upsertSession.mock.calls.at(-1)?.[0];
     expect(lastSession).toMatchObject({
       messageCount: 1,
-      // step 0: 10+5 (failed attempt only); step 1: attempt 20+0 replaced by
-      // message 20+7 → 27. Total = 15 + 27 = 42.
-      totalTokens: 42,
+      // step 0: 10+5; step 1: failed call 20+0 plus successful call 20+7.
+      // Total = 15 + 20 + 27 = 62.
+      totalTokens: 62,
     });
   });
 
-  it('replaces an earlier attempt’s usage sample within one step instead of adding', async () => {
+  it('adds separate attempts even when they share one step', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
     const session = { id: 's1' };
 
-    // Two attempts at the same step (retry): the later sample wins.
+    // Two attempts at the same step are two model calls, not progressive snapshots.
     ctx.events.emit(
       'session/event',
       session,
@@ -802,7 +1007,22 @@ describe('dsh-storage plugin', () => {
     );
     await flush();
 
-    expect(backend.upsertSession.mock.calls.at(-1)?.[0].totalTokens).toBe(15);
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0].totalTokens).toBe(25);
+  });
+
+  it('does not count redelivered usage events again, including older sequences', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const first = attemptWithUsage(0, 0, { inputTokens: 10, outputTokens: 5 });
+    const second = attemptWithUsage(0, 0, { inputTokens: 20, outputTokens: 0 });
+
+    ctx.events.emit('session/event', { id: 's1' }, first);
+    ctx.events.emit('session/event', { id: 's1' }, second);
+    ctx.events.emit('session/event', { id: 's1' }, first);
+    ctx.events.emit('session/event', { id: 's1' }, second);
+    await flush();
+
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0].totalTokens).toBe(35);
   });
 
   it('folds cache buckets into the token total', async () => {
@@ -847,7 +1067,7 @@ describe('dsh-storage plugin', () => {
     expect(backend.upsertSession.mock.calls.map((c: any) => c[0].messageCount)).toEqual([1, 2, 1]);
   });
 
-  it('restores the last usage sample on resume and folds only the delta', async () => {
+  it('restores the usage sequence high-water mark and adds only unseen calls', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
     backend.readSession.mockResolvedValue({
@@ -857,12 +1077,12 @@ describe('dsh-storage plugin', () => {
       totalTokens: 120,
       metadata: {
         custom: 'keep-me',
-        'dsh-storage:lastUsage': { key: '0:0', input: 100, output: 20 },
+        'dsh-storage:lastUsage': { key: '0', input: 100, output: 20 },
       },
     });
 
-    // The in-flight step's final message arrives after the reload — only the
-    // delta over the stored sample counts: 120 + (150-100) + (30-20) = 180.
+    // Sequence 1 is a new model call after the reload, so all of its usage is
+    // added to the stored total: 120 + 150 + 30 = 300.
     ctx.events.emit(
       'session/event',
       { id: 's1' },
@@ -871,11 +1091,11 @@ describe('dsh-storage plugin', () => {
     await flush();
 
     const lastSession = backend.upsertSession.mock.calls.at(-1)?.[0];
-    expect(lastSession.totalTokens).toBe(180);
+    expect(lastSession.totalTokens).toBe(300);
     // Existing metadata fields survive our bookkeeping write.
     expect(lastSession.metadata).toMatchObject({
       custom: 'keep-me',
-      'dsh-storage:lastUsage': { key: '0:0', input: 150, output: 30 },
+      'dsh-storage:lastUsage': { key: '1', input: 150, output: 30 },
     });
   });
 

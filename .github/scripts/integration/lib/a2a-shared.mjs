@@ -146,7 +146,12 @@ export function a2aClient(a2a) {
     fetch(`${a2a}/a2a/`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: `r-${++id}`, method, params: { tenant: '', ...params } }),
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: `r-${++id}`,
+        method,
+        params: { tenant: '', ...params },
+      }),
     });
   return {
     userMessage,
