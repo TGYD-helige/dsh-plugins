@@ -738,6 +738,10 @@ async function backendOnlyLeg(dbProvider) {
         JSON.stringify(plan).includes('idx_archive_recovery'),
         'SQLite did not use the archive recovery index',
       );
+      assert(
+        !JSON.stringify(plan).includes('USE TEMP B-TREE'),
+        'archive recovery still sorts the history rows',
+      );
       console.log('archive recovery plan (sqlite):', JSON.stringify(plan).slice(0, 1200));
     } finally {
       planDb.close();

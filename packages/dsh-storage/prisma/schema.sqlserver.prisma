@@ -48,7 +48,7 @@ model AiMessage {
   @@index([agentId], map: "idx_agent")
   @@index([sessionId, agentId, type, createdAt], map: "idx_session_agent_type_created")
   @@index([sessionId, historyId, deletedAt, type, createdAt, id], map: "idx_tool_call_lookup")
-  @@index([sessionId, historyId, deletedAt, updatedAt, id], map: "idx_archive_recovery")
+  @@index([sessionId, deletedAt, updatedAt, id], map: "idx_archive_recovery")
   @@map("ai_messages")
 }
 

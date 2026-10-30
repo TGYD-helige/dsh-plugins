@@ -3805,6 +3805,15 @@ describe('LangfuseReporter', () => {
     await reporter.shutdown();
   });
 
+  it('keeps marker overlap checks linear with many existing redaction markers', async () => {
+    const reporter = new LangfuseReporter(config);
+    await reporter.ready;
+    const masked = reporter.mask(`${'[REDACTED]'.repeat(100)}sk`);
+    expect(reporter.mask(masked)).toBe(masked);
+    expect(masked.match(/\[REDACTED\]/g)).toHaveLength(101);
+    await reporter.shutdown();
+  });
+
   it('redacts processor environment/release labels, including SDK env fallbacks', async () => {
     vi.stubEnv('LANGFUSE_TRACING_ENVIRONMENT', 'sk-lf-environment');
     vi.stubEnv('LANGFUSE_RELEASE', 'sk-lf-release');

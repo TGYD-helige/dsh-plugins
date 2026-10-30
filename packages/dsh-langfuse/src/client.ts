@@ -172,9 +172,17 @@ export class LangfuseReporter {
         (match) => [match.index, match.index + match[0].length],
       );
       const ranges: Array<[number, number]> = [];
+      let markerIndex = 0;
       const addRange = (start: number, stop: number) => {
         // Existing markers are atomic: a second mask must never expand them.
-        if (markedRanges.some(([startMark, endMark]) => start < endMark && stop > startMark))
+        // Walk the sorted marker list once instead of rescanning it per match.
+        while (markerIndex < markedRanges.length && markedRanges[markerIndex][1] <= start)
+          markerIndex += 1;
+        if (
+          markerIndex < markedRanges.length &&
+          start < markedRanges[markerIndex][1] &&
+          stop > markedRanges[markerIndex][0]
+        )
           return;
         ranges.push([start, stop]);
       };
