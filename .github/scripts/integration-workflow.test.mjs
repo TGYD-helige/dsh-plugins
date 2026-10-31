@@ -1,10 +1,56 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { stopA2a } from './integration/lib/a2a-shared.mjs';
 import * as integration from './integration/lib/ci-shared.mjs';
 
 const workflow = readFileSync(new URL('../workflows/integration.yml', import.meta.url), 'utf8');
+
+test('A2A cleanup accepts a child that already exited', async (t) => {
+  const child = spawn(process.execPath, ['-e', '']);
+  await once(child, 'exit');
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let completed = false;
+  void stopA2a(child).then(() => {
+    completed = true;
+  });
+  await new Promise(setImmediate);
+  assert.equal(completed, true, 'cleanup must not wait for a second exit event');
+});
+
+test('A2A cleanup does not keep the scenario alive with its timeout', () => {
+  const helper = new URL('./integration/lib/a2a-shared.mjs', import.meta.url).href;
+  const script = `
+    import { spawn } from 'node:child_process';
+    import { once } from 'node:events';
+    import { stopA2a } from ${JSON.stringify(helper)};
+    const child = spawn(process.execPath, ['-e', 'process.stdout.write("ready"); setInterval(() => {}, 1000)']);
+    await once(child.stdout, 'data');
+    await stopA2a(child);
+  `;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+    timeout: 3000,
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+});
+
+test('A2A cleanup does not hide a child that crashed before cleanup', async () => {
+  const child = spawn(process.execPath, ['-e', 'process.exit(7)']);
+  await once(child, 'exit');
+  await assert.rejects(stopA2a(child), /code 7/);
+});
+
+test('A2A cleanup rejects a child that crashes during SIGTERM handling', async () => {
+  const child = spawn(process.execPath, [
+    '-e',
+    'process.on("SIGTERM", () => process.exit(7)); process.stdout.write("ready"); setInterval(() => {}, 1000)',
+  ]);
+  await once(child.stdout, 'data');
+  await assert.rejects(stopA2a(child), /code 7/);
+});
 
 test('Langfuse release identifies the tested PR head instead of the pull_request_target base', () => {
   const keys = ['INTEGRATION_CHECKOUT_REF', 'GITHUB_SHA'];
@@ -123,4 +169,13 @@ test('HTTP suite runs in the base scenario while redis stays the sole backend pr
     scenario.indexOf('const { a2a, proc, workDir }'),
   );
   assert.match(baseEntry, /runHttpSuite\(\)/, 'base scenario must run HTTP tests by default');
+});
+
+test('A2A protocol regressions run without the secret-backed approval gate', () => {
+  const job = workflow.match(/^ {2}a2a-protocol:\n[\s\S]*?(?=^ {2}[\w-]+:|$(?![\s\S]))/m)?.[0];
+  assert.ok(job, 'protocol bindings need a standalone E2E job');
+  assert.doesNotMatch(job, /secrets\.|integration-approval/);
+  assert.match(job, /DSH_PROVIDER: http/);
+  assert.match(job, /node \.github\/scripts\/integration\/dsh-a2a\.mjs/);
+  assert.match(job, /check-inbox\.mjs -t 'official protocol bindings'/);
 });

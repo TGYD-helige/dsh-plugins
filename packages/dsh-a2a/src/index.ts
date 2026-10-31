@@ -13,7 +13,7 @@
  */
 
 import { type Message, TaskState } from '@a2a-js/sdk';
-import { ServerCallContext } from '@a2a-js/sdk/server';
+import { type ExtendedAgentCardProvider, ServerCallContext } from '@a2a-js/sdk/server';
 import type { Context } from '@deepseek-ai/cordis';
 // Augmentation-only imports: pull ctx.agents and the session Events
 // declarations into the compilation (listeners are contextually typed).
@@ -30,6 +30,7 @@ import { GcsTaskStore } from './stores/gcs.js';
 import { RedisTaskStore } from './stores/redis.js';
 import { MemoryTaskStore, SanitizedTaskStore } from './task-store.js';
 
+export type { ExtendedAgentCardProvider } from '@a2a-js/sdk/server';
 export type { A2aApproval, A2aApprovalCodec, A2aApprovalReply } from './approval.js';
 export { defaultApprovalCodec } from './approval.js';
 export type { A2aFileMaterializer } from './content.js';
@@ -103,6 +104,15 @@ export const Config = Schema.object({
   host: Schema.string().default('127.0.0.1'),
   port: Schema.natural().default(41241),
   basePath: Schema.string().default('/a2a'),
+  rest: Schema.boolean().default(false),
+  grpc: Schema.object({
+    enabled: Schema.boolean().default(false),
+    port: Schema.natural().max(65535).default(41242),
+    publicUrl: Schema.string().default(''),
+  }),
+  pushNotifications: Schema.boolean()
+    .default(false)
+    .description('Enable standard A2A task webhook configuration and delivery through the SDK.'),
   heartbeat: Schema.object({
     enabled: Schema.boolean().default(false),
     intervalMs: Schema.natural().min(1).max(2_147_483_647).default(15_000),
@@ -168,7 +178,10 @@ export interface A2aPluginConfig {
   host: string;
   port: number;
   basePath: string;
+  rest?: boolean;
+  grpc?: { enabled: boolean; port: number; publicUrl?: string };
   heartbeat?: { enabled: boolean; intervalMs: number };
+  pushNotifications?: boolean;
   cwd: string;
   uploadsDir: string;
   urlDownloads?: { allowPrivate?: boolean; allowedHosts: string[] };
@@ -189,18 +202,19 @@ export interface A2aTasks {
 export function apply(
   ctx: Context,
   config: A2aPluginConfig,
-): Promise<{ port: number }> | undefined {
+): Promise<{ port: number; grpcPort?: number }> | undefined {
   if (!config.enabled) return;
 
   // This cordis fork has no ready/dispose events: startup runs inside
   // ctx.effect() (executed at fiber load) and its returned disposer runs on
   // fiber unload. apply() returns the startup promise so fiber readiness
   // covers the bind.
-  let ready!: Promise<{ port: number }>;
+  let ready!: Promise<{ port: number; grpcPort?: number }>;
   let serverPort = 0;
+  let grpcPort: number | undefined;
   ctx.effect(() => {
     const startup = start();
-    ready = startup.then(() => ({ port: serverPort }));
+    ready = startup.then(() => ({ port: serverPort, grpcPort }));
     return startup;
   });
   return ready;
@@ -268,7 +282,11 @@ export function apply(
       host: config.host,
       port: config.port,
       basePath: config.basePath,
+      rest: config.rest,
+      grpc: config.grpc,
+      extendedAgentCard: ctx.get('a2aExtendedCard') as ExtendedAgentCardProvider | undefined,
       heartbeat: config.heartbeat,
+      pushNotifications: config.pushNotifications,
       card: {
         name: config.card.name,
         description: config.card.description,
@@ -286,6 +304,7 @@ export function apply(
         bridge.beforeWorkingTaskMessage(message, headers),
     });
     serverPort = server.port;
+    grpcPort = server.grpcPort;
     if (inbox) inbox.server = server;
 
     console.log(

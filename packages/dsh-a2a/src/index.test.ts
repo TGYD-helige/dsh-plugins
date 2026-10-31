@@ -60,6 +60,45 @@ describe('dsh-a2a plugin', () => {
     expect(() => Config({ inbox: { shutdown: 'replay' as never } })).toThrow();
   });
 
+  it('enables standard push notifications only by explicit configuration', () => {
+    expect(Config({}).pushNotifications).toBe(false);
+    expect(Config({ pushNotifications: true }).pushNotifications).toBe(true);
+  });
+
+  it('defaults optional bindings off and validates the gRPC port', () => {
+    expect(Config({}).rest).toBe(false);
+    expect(Config({}).grpc).toEqual({ enabled: false, port: 41242, publicUrl: '' });
+    expect(Config({ grpc: { enabled: true, port: 0 } }).grpc.port).toBe(0);
+    expect(() => Config({ grpc: { port: 65536 } })).toThrow();
+  });
+
+  it('wires optional bindings and the host extended card provider into discovery', async () => {
+    const extendedAgentCard = vi.fn(async () => {
+      throw new Error('Unauthorized');
+    });
+    ctx.provide('a2aExtendedCard', extendedAgentCard);
+    const started = await apply(ctx, config({ rest: true, grpc: { enabled: true, port: 0 } }));
+    const card = (await (
+      await fetch(`http://127.0.0.1:${started!.port}/.well-known/agent-card.json`, {
+        headers: { 'A2A-Version': '1.0' },
+      })
+    ).json()) as {
+      supportedInterfaces: { protocolBinding: string; url: string }[];
+      capabilities: { extendedAgentCard: boolean };
+    };
+    expect(card.capabilities.extendedAgentCard).toBe(true);
+    expect(started!.grpcPort).toBeGreaterThan(0);
+    expect(card.supportedInterfaces).toContainEqual(
+      expect.objectContaining({ protocolBinding: 'GRPC', url: `127.0.0.1:${started!.grpcPort}` }),
+    );
+    const denied = await fetch(`http://127.0.0.1:${started!.port}/a2a/rest/extendedAgentCard`, {
+      headers: { 'A2A-Version': '1.0' },
+    });
+    expect(denied.status).toBe(500);
+    expect(extendedAgentCard).toHaveBeenCalledOnce();
+    await ctx.fiber.dispose();
+  });
+
   it('does nothing when disabled', () => {
     const result = apply(ctx, config({ enabled: false }));
     expect(result).toBeUndefined();
@@ -82,18 +121,24 @@ describe('dsh-a2a plugin', () => {
     ).toMatchObject({ allowedHosts: ['127.0.0.1', 'files.internal'] });
   });
 
-  it('serves the agent card while loaded and closes the server on fiber unload', async () => {
-    const started = await apply(ctx, config());
-    expect(console.log).toHaveBeenCalledWith(expect.stringContaining('[dsh-a2a] A2A endpoint:'));
+  it.each([false, true])(
+    'serves the agent card and unloads the server (push=%s)',
+    async (pushNotifications) => {
+      const started = await apply(ctx, config({ pushNotifications }));
+      expect(console.log).toHaveBeenCalledWith(expect.stringContaining('[dsh-a2a] A2A endpoint:'));
 
-    const port = started!.port;
-    const res = await fetch(`http://127.0.0.1:${port}/.well-known/agent-card.json`);
-    expect(res.status).toBe(200);
-    expect(((await res.json()) as { name: string }).name).toBe('test-agent');
+      const port = started!.port;
+      const res = await fetch(`http://127.0.0.1:${port}/.well-known/agent-card.json`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        name: 'test-agent',
+        capabilities: { pushNotifications },
+      });
 
-    await ctx.fiber.dispose();
-    await expect(fetch(`http://127.0.0.1:${port}/.well-known/agent-card.json`)).rejects.toThrow();
-  });
+      await ctx.fiber.dispose();
+      await expect(fetch(`http://127.0.0.1:${port}/.well-known/agent-card.json`)).rejects.toThrow();
+    },
+  );
 
   it("fails startup when taskStore is 'gcs' without a bucket", async () => {
     await expect(apply(ctx, config({ taskStore: 'gcs' }))).rejects.toThrow(

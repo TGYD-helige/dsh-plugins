@@ -13,6 +13,7 @@ export default defineConfig({
         if (
           source === 'vitest' ||
           source.startsWith('@a2a-js/') ||
+          source.startsWith('@grpc/') ||
           source.startsWith('@deepseek-ai/')
         ) {
           return require.resolve(source);

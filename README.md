@@ -8,7 +8,7 @@ Composable, config-driven plugins for [DeepSeek Harness (dsh)](https://github.co
 
 | Package | What it does | Primary seams |
 | --- | --- | --- |
-| [`@amaster.ai/dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) **1.0** (JSON-RPC + SSE, with a v0.3 compatibility layer): streaming turns, task cancel, task list, tool approvals, agent card, opt-in native inbox execution; pluggable task-state stores (memory/filesystem/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, `approval/request`, own HTTP server |
+| [`@amaster.ai/dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) **1.0** (JSON-RPC + SSE, opt-in HTTP+JSON/REST and gRPC, with v0.3 compatibility): all eleven standard operations, tool approvals, opt-in native inbox execution; pluggable task-state stores (memory/filesystem/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, `approval/request`, own protocol listeners |
 | [`@amaster.ai/dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
 | [`@amaster.ai/dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call (plus a nested `llm-request` span with the verbatim loop-built request), one span per tool call or hook run, one trace per turn; subagent child sessions nested under the parent's tree | `llm/stream`, `tools/pre-execute` → `tools/result`, `session/event` (including `hook/*`), `session/created` + `subagent/start`/`subagent/end` |
 | [`@amaster.ai/dsh-policy`](packages/dsh-policy) | Declarative tool-call policy: config-driven `allow`/`deny`/`ask` rules (tool name, args pattern, per-segment shell command prefix/regex, priority) — Gemini CLI-style policy files as plain plugin config | `tools/pre-execute` waterfall (`ask` rides dsh's approval seam) |
@@ -141,6 +141,8 @@ SQL Server note: Prisma's sqlserver connector has no `Json` type, so its variant
 - **`ai_chat_histories`** — per-session rollup (message count, total tokens, first/last message timestamps).
 
 The logical message id rides in `metadata.id`; message rows use a deterministic hash of `(session_id, message id)` as their primary key, so re-projected events upsert in place rather than duplicate — on every connector (the source project's `metadata.id` JSON-path lookup only works on PostgreSQL/MySQL). Session rows are matched by `session_id` and keep their cuid primary keys — the per-session serialization chain makes the find-then-write safe, and rows from the early scaffold (or the source project) are continued, never duplicated. Upgrade note: the early scaffold wrote messages with cuid keys; if you ran it, dedupe those by `metadata.id` before enabling this version.
+
+Task updates use standard A2A streaming/subscriptions, snapshots, and optional [official SDK Push Notifications](packages/dsh-a2a/README.md#standard-a2a-notifications). Enable `pushNotifications: true` to let clients register standard task webhooks.
 
 **Native inbox mode is opt-in and uses the official DSH APIs**; it is tested with the unmodified `0.2.1-rc.5` npm runtime. See [native inbox execution](packages/dsh-a2a/README.md#native-inbox-execution) for queueing, steering, pause/recovery semantics and the runtime integration checks.
 
