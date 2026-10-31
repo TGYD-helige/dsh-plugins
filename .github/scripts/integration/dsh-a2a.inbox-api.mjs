@@ -99,7 +99,7 @@ try {
       'https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md',
   )?.uri;
   assert(uri, 'agent card must advertise the native inbox extension');
-  const client = a2aClient(boot.a2a, { extensions: [uri], signal: AbortSignal.timeout(240_000) });
+  const client = a2aClient(boot.a2a, { signal: AbortSignal.timeout(240_000) });
   const rpc = async (method, params = {}) => {
     const { res, body } = await client.rpc(method, { contextId, ...params });
     assert(res.ok && !body.error, `${method}: ${JSON.stringify(body.error)}`);
@@ -131,7 +131,6 @@ try {
       response.ok && response.headers.get('content-type')?.includes('text/event-stream'),
       'inbox SSE response',
     );
-    assert(response.headers.get('A2A-Extensions') === uri, 'inbox extension activation response');
     const reader = response.body.getReader();
     const state = { version: -Infinity, error: undefined };
     const reading = (async () => {

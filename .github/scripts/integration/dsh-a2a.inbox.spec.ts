@@ -152,7 +152,7 @@ async function boot(
   cleanups.push(() => server.close());
   cleanups.push(() => bridge.dispose());
   const contextId = options.contextId ?? 'native-test';
-  const rpc = async (method: string, params: unknown, extensions = true) =>
+  const rpc = async (method: string, params: unknown, extensions = false) =>
     (
       await fetch(`http://127.0.0.1:${server.port}/a2a/`, {
         method: 'POST',
@@ -730,7 +730,6 @@ describe('official protocol bindings', () => {
         signal: controller.signal,
         headers: {
           'Content-Type': 'application/json',
-          'A2A-Extensions': INBOX_EXTENSION,
           'A2A-Version': '1.0',
         },
         body: JSON.stringify({
@@ -741,7 +740,7 @@ describe('official protocol bindings', () => {
         }),
       });
       expect(response.headers.get('content-type')).toContain('text/event-stream');
-      expect(response.headers.get('a2a-extensions')).toBe(INBOX_EXTENSION);
+      expect(response.headers.get('a2a-extensions')).toBeNull();
       const events: Array<{ contextId: string; version: number }> = [];
       const reading = (async () => {
         let buffer = '';
@@ -801,7 +800,7 @@ describe('official protocol bindings', () => {
     expect((await f.rpc('inbox/get', { contextId: 'native-test' })).result.nextTurn).toEqual([]);
   });
 
-  it('manages the native inbox through negotiated extension methods', async () => {
+  it('manages the native inbox without extension negotiation', async () => {
     const f = await boot();
     await f.send('parked-a', { wakeup: false });
     await f.send('parked-b', { wakeup: false });
@@ -811,8 +810,8 @@ describe('official protocol bindings', () => {
       'parked-a',
       'parked-b',
     ]);
-    const denied = await f.rpc('inbox/get', { contextId: 'native-test' }, false);
-    expect(denied.error).toBeDefined();
+    const negotiated = await f.rpc('inbox/get', { contextId: 'native-test' }, true);
+    expect(negotiated.error).toBeUndefined();
     const legacy = await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
     expect(legacy.error?.code).toBe(-32601);
     const [a, b] = get.result.nextTurn;
@@ -826,7 +825,8 @@ describe('official protocol bindings', () => {
       message: { ...a.message, parts: [{ text: 'edited input' }] },
     });
     expect(updated.error).toBeUndefined();
-    expect(editHeaders).toMatchObject({ 'a2a-version': '1.0', 'a2a-extensions': INBOX_EXTENSION });
+    expect(editHeaders).toMatchObject({ 'a2a-version': '1.0' });
+    expect(editHeaders).not.toHaveProperty('a2a-extensions');
     expect(updated.result.nextTurn[0].message.parts).toEqual([{ text: 'edited input' }]);
     const moved = await f.rpc('inbox/move', { contextId: 'native-test', id: b.id, index: 0 });
     expect(moved.result.nextTurn.map((item: any) => item.id)).toEqual([b.id, a.id]);
@@ -1548,7 +1548,7 @@ it('drains parked official inbox input on a real waking send in FIFO order', asy
   expect(messages.slice(0, 2).map((event) => event.data.id)).toEqual(ids);
 });
 
-it('requires negotiated extension controls and rejects steering without an active task', async () => {
+it('accepts controls without negotiation and rejects steering without an active task', async () => {
   const f = await boot();
   const task = await f.send('parked', { wakeup: false });
   const inactive = await f.rpc('SendMessage', {
@@ -1567,17 +1567,20 @@ it('requires negotiated extension controls and rejects steering without an activ
     {
       message: {
         messageId: 'unnegotiated',
+        contextId: 'native-test',
         role: 'ROLE_USER',
-        parts: [{ text: 'bad' }],
+        parts: [{ text: 'no negotiation' }],
         metadata: { [INBOX_EXTENSION]: { wakeup: false } },
       },
+      configuration: { returnImmediately: true },
     },
     false,
   );
-  expect(unnegotiated.error).toBeDefined();
+  expect(unnegotiated.error).toBeUndefined();
   const trigger = await f.send('trigger');
   await f.completed(task.id);
   await f.completed(trigger.id);
+  await f.completed(unnegotiated.result.task.id);
 });
 
 it('keeps CancelTask terminal and removes only its queued input', async () => {

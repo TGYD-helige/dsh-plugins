@@ -1,20 +1,9 @@
 /** JSON-RPC method extension; standard task methods stay with the official SDK. */
-import {
-  A2A_PROTOCOL_VERSION,
-  A2A_VERSION_HEADER,
-  type AgentCard,
-  Extensions,
-  HTTP_EXTENSION_HEADER,
-  Message,
-} from '@a2a-js/sdk';
-import {
-  ExtensionSupportRequiredError,
-  RequestMalformedError,
-  toJsonRpcError,
-} from '@a2a-js/sdk/errors';
+import { A2A_PROTOCOL_VERSION, A2A_VERSION_HEADER, type AgentCard, Message } from '@a2a-js/sdk';
+import { RequestMalformedError, toJsonRpcError } from '@a2a-js/sdk/errors';
 import { validateVersion } from '@a2a-js/sdk/server';
 import type { RequestHandler } from 'express';
-import { INBOX_EXTENSION, type NativeInbox, validateInboxPage } from './inbox.js';
+import { type NativeInbox, validateInboxPage } from './inbox.js';
 
 export function inboxRpcHandler(inbox: NativeInbox, card: AgentCard): RequestHandler {
   return async (req, res, next) => {
@@ -24,11 +13,6 @@ export function inboxRpcHandler(inbox: NativeInbox, card: AgentCard): RequestHan
       if (body.jsonrpc !== '2.0' || !['string', 'number'].includes(typeof body.id))
         throw new RequestMalformedError('A JSON-RPC 2.0 request id is required.');
       validateVersion(req.get(A2A_VERSION_HEADER) || A2A_PROTOCOL_VERSION, card, 'JSONRPC');
-      if (
-        !Extensions.parseServiceParameter(req.get(HTTP_EXTENSION_HEADER)).includes(INBOX_EXTENSION)
-      )
-        throw new ExtensionSupportRequiredError('Activate the native inbox extension.');
-      res.setHeader(HTTP_EXTENSION_HEADER, INBOX_EXTENSION);
       const params = body.params;
       if (
         !params ||

@@ -16,13 +16,13 @@ dsh plugin --profile my-agent add @amaster.ai/dsh-a2a
 
 `inbox.enabled: true` uses the official DSH inbox (`Agent.send`) for ordinary `next-turn` input and `next-step` steering. Tested with the unmodified npm runtime `0.2.1-rc.5`; no core patch is required. The queue and its durable projection belong to DSH. The plugin only materializes messages, attaches A2A task identities, and translates execution events.
 
-Standard `SendMessage` / `SendStreamingMessage`, task queries, cancellation and task subscriptions keep their official meanings. The negotiated inbox extension forwards `target` and `wakeup` to DSH. `wakeup: false` leaves an idle driver parked; it does not prevent an active driver from consuming pending input. A later real waking message releases pending input.
+Standard `SendMessage` / `SendStreamingMessage`, task queries, cancellation and task subscriptions keep their official meanings. Optional inbox metadata forwards `target` and `wakeup` to DSH. `wakeup: false` leaves an idle driver parked; it does not prevent an active driver from consuming pending input. A later real waking message releases pending input.
 
 The same-process `a2aInbox` service exposes `resolve`, `content`, `enqueue`, `promote`, `cancel`, `get`, `update`, `move`, `remove`, `clearPending`, and `executePending`, plus the existing pause/wake/resume controls. Pending-only clearing preserves active work; context clearing discards all work.
 
 Pause is process-local and writes no custom required session event. After restart, restored input stays parked until a waking admission or explicit execution. Retention recovery accepts snapshots under the historical extension URI as well as the current URI, writes only the current metadata key, and clears both keys after consumption. Explicit resume durably transfers input to a fresh task before waking it; retry after an interrupted cleanup reuses the existing replacement instead of replaying its input.
 
-For external clients, the [native inbox extension specification](#native-inbox-extension-v1) defines `inbox/get`, `update`, `move`, `remove`, `clear`, `execute`, `steer`, and `subscribe` at the advertised JSONRPC endpoint. Activate it with the `A2A-Extensions` header set to the extension URI. Updates use standard A2A 1.0 user Messages; operations address native inbox IDs. REST/gRPC clients use the advertised JSONRPC endpoint for these extension methods. No extra queue or consumer is created.
+For external clients, the [native inbox extension specification](#native-inbox-extension-v1) defines `inbox/get`, `update`, `move`, `remove`, `clear`, `execute`, `steer`, and `subscribe` at the advertised JSONRPC endpoint. No `A2A-Extensions` header or extension activation is required. Updates use standard A2A 1.0 user Messages; operations address native inbox IDs. REST/gRPC clients use the advertised JSONRPC endpoint for these extension methods. No extra queue or consumer is created.
 
 `inbox/subscribe` streams checkpointed invalidations `{contextId, version}` over SSE, including native consumption and edits. It registers before its initial checkpoint and sends only after owner-scoped `ctx.sessions.flush()` returns true. A false/rejected checkpoint sends no success notification. Re-read the live inbox on invalidation and reconnect; there is no replay or durable outbox. Slow clients disconnect instead of accumulating notifications. To publish the same invalidations to host listeners on `a2a/inbox-checkpointed` without an SSE subscriber, enable `inbox.notifications: true` (default false). Hosts retain authentication, authorization and product-specific fan-out.
 
@@ -81,14 +81,15 @@ DSH_NATIVE_OWNERSHIP_LANGFUSE_LIVE=true node .github/scripts/check-inbox.mjs -t 
 
 Protocol identifier: `https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md`
 
-This README contains the extension specification. The URI identifies the
-extension during negotiation; no additional documentation parameter is advertised.
+This README contains the extension specification. The URI remains a metadata
+namespace and discovery identifier for compatibility; callers do not need to send it.
 
 This is a project extension, not an official A2A extension. It follows the
 [A2A extension mechanism](https://a2a-protocol.org/v1.0.1/topics/extensions/).
-The Agent Card advertises it when `inbox.enabled` is true. Activate it with the
-`A2A-Extensions` HTTP header. Responses echo that header. Standard task methods,
-states, subscriptions and Push configurations keep their official meanings.
+The Agent Card advertises it when `inbox.enabled` is true. Inbox methods and
+optional admission controls do not require an `A2A-Extensions` header or an
+activation handshake. Standard task methods, states, subscriptions and Push
+configurations keep their official meanings.
 
 ### Methods
 
@@ -177,7 +178,7 @@ Closing the plugin unregisters observers/subscriptions and suppresses late sends
 
 Standard SendMessage/SendStreamingMessage continues to accept
 `metadata[URI] = {target: 'next-turn' | 'next-step', wakeup: boolean}` on its
-Message, negotiated as before. Prefer those standard methods for new input.
+Message, without extension negotiation. Prefer those standard methods for new input.
 The operations above control already queued input; they do not add another
 queue, consumer, task-state machine or webhook configuration store.
 
