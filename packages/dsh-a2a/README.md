@@ -152,9 +152,13 @@ matching SDK client rather than copying payloads between bindings.
 
 A small connection adapter releases an individual subscription's SDK queue when
 its client disconnects; it never cancels the task or other subscribers. Disconnected
-sends continue draining task events for persistence. Stream writes wait for
-`drain`, but the SDK's internal event queues are not bounded: this is not a bounded
-memory guarantee for indefinitely slow clients.
+sends continue draining task events for persistence, independently of client read
+speed. After a stream writer first reports backpressure, it may queue at most
+1 MiB of additional HTTP output or 16 additional gRPC messages (plus the frame
+that crosses the limit). A writer that exceeds this allowance is disconnected;
+clients can retrieve the persisted task or resubscribe. A single large frame is
+allowed, and a `drain` resets the allowance. This bounds the plugin's Node output
+backlog, not individual frame size or the SDK's internal event/push queues.
 
 The host can register an SDK `ExtendedAgentCardProvider` with
 `ctx.provide('a2aExtendedCard', provider)` **before loading this plugin**. The

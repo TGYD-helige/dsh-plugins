@@ -1,5 +1,5 @@
 import { getEventListeners, once } from 'node:events';
-import { createServer, ServerResponse } from 'node:http';
+import { createServer, request, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
   type AgentCard,
@@ -10,10 +10,11 @@ import {
   GetTaskRequest,
   ListTaskPushNotificationConfigsRequest,
   ListTasksRequest,
+  Message,
   Role,
   SendMessageRequest,
   SubscribeToTaskRequest,
-  type Task,
+  Task,
   TaskPushNotificationConfig,
   TaskState,
 } from '@a2a-js/sdk';
@@ -739,6 +740,107 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
       status: { state: 'TASK_STATE_CANCELED' },
     });
   });
+
+  it.each(['v1', 'legacy'])(
+    'persists completion independently of a paused %s HTTP reader',
+    async (wire) => {
+      await server.close();
+      let taskId = '';
+      let executed!: () => void;
+      const finished = new Promise<void>((resolve) => {
+        executed = resolve;
+      });
+      server = await startA2aServer({
+        host: '127.0.0.1',
+        port: 0,
+        basePath: '/a2a',
+        card: { name: 'slow-reader', description: '', version: '0.0.1' },
+        taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+        executor: {
+          async execute(context, bus) {
+            taskId = context.taskId;
+            bus.publish(
+              AgentEvent.task(
+                Task.fromJSON({
+                  id: taskId,
+                  contextId: context.contextId,
+                  status: { state: 'TASK_STATE_WORKING' },
+                  history: [],
+                }),
+              ),
+            );
+            for (let index = 0; index < 30; index++)
+              bus.publish(
+                AgentEvent.statusUpdate({
+                  taskId,
+                  contextId: context.contextId,
+                  metadata: undefined,
+                  status: {
+                    state: TaskState.TASK_STATE_WORKING,
+                    timestamp: undefined,
+                    message: Message.fromJSON({
+                      messageId: `chunk-${index}`,
+                      role: 'ROLE_AGENT',
+                      parts: [{ text: 'x'.repeat(512 * 1024) }],
+                    }),
+                  },
+                }),
+              );
+            bus.publish(
+              AgentEvent.statusUpdate({
+                taskId,
+                contextId: context.contextId,
+                metadata: undefined,
+                status: {
+                  state: TaskState.TASK_STATE_COMPLETED,
+                  message: undefined,
+                  timestamp: undefined,
+                },
+              }),
+            );
+            bus.finished();
+            executed();
+          },
+          cancelTask: async () => {},
+        },
+      });
+      base = `http://127.0.0.1:${server.port}`;
+      const body = JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: wire === 'v1' ? 'SendStreamingMessage' : 'message/stream',
+        params: wire === 'v1' ? v1Message('slow') : legacyMessage('slow'),
+      });
+      const client = request(
+        `${base}/a2a/`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'A2A-Version': wire === 'v1' ? '1.0' : '0.3',
+          },
+        },
+        (response) => {
+          response.on('error', () => {});
+          response.pause();
+        },
+      );
+      client.on('error', () => {});
+      client.end(body);
+      try {
+        await finished;
+        await vi.waitFor(
+          async () => {
+            const result = await json(await rpc('GetTask', { id: taskId, historyLength: 0 }));
+            expect(result.result.status.state).toBe('TASK_STATE_COMPLETED');
+          },
+          { timeout: 5000 },
+        );
+      } finally {
+        client.destroy();
+      }
+    },
+  );
 
   async function pushFixture() {
     await server.close();

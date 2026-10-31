@@ -6,7 +6,6 @@ import { DefaultExecutionEventBus, type DefaultRequestHandler } from '@a2a-js/sd
 interface Connection {
   signal: AbortSignal;
   subscription: boolean;
-  drain?: Promise<void>;
 }
 
 const connections = new AsyncLocalStorage<Connection>();
@@ -15,25 +14,27 @@ const connections = new AsyncLocalStorage<Connection>();
 export function withStreamConnection<T>(output: Writable, run: () => T): T {
   const controller = new AbortController();
   const connection: Connection = { signal: controller.signal, subscription: false };
+  let backlogLimit: number | undefined;
+  const drained = () => {
+    backlogLimit = undefined;
+  };
   const close = () => {
     controller.abort();
-    output.off('close', close).off('finish', close).off('cancelled', close);
+    output.off('close', close).off('finish', close).off('cancelled', close).off('drain', drained);
   };
   output.once('close', close).once('finish', close).once('cancelled', close);
   const write = output.write;
   output.write = ((...args: Parameters<Writable['write']>) => {
     const accepted = write.apply(output, args);
-    if (!accepted && !connection.drain && !controller.signal.aborted) {
-      connection.drain = new Promise<void>((resolve) => {
-        const ready = () => {
-          output.off('drain', ready);
-          controller.signal.removeEventListener('abort', ready);
-          connection.drain = undefined;
-          resolve();
-        };
-        output.once('drain', ready);
-        controller.signal.addEventListener('abort', ready, { once: true });
-      });
+    if (!accepted && !controller.signal.aborted) {
+      if (backlogLimit === undefined) {
+        // Allow one large frame, then at most 1 MiB or 16 additional gRPC messages.
+        backlogLimit = output.writableLength + (output.writableObjectMode ? 16 : 1024 * 1024);
+        output.once('drain', drained);
+      } else if (output.writableLength >= backlogLimit) {
+        close();
+        output.destroy();
+      }
     }
     return accepted;
   }) as Writable['write'];
@@ -67,8 +68,6 @@ async function* connectedStream(
   for await (const event of stream) {
     // Disconnected sends still drain the SDK ResultManager for persistence.
     if (!connection?.signal.aborted) yield event;
-    // shortcut: SDK event queues remain unbounded behind slow writers; use bounded delivery if load requires it.
-    await connection?.drain;
   }
 }
 

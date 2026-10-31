@@ -230,7 +230,7 @@ it('ends a cold resubscription with a final status after its task snapshot', asy
   }
 });
 
-it('waits for drain before pulling another legacy stream event', async () => {
+it('continues consuming legacy events when the writer reports backpressure', async () => {
   let pulls = 0;
   const event = {
     jsonrpc: '2.0',
@@ -243,13 +243,10 @@ it('waits for drain before pulling another legacy stream event', async () => {
     pulls++;
   })();
   const write = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
-  const { res, run } = directLegacy(stream, write);
-  const running = run();
-  await vi.waitFor(() => expect(write).toHaveBeenCalled());
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  expect(pulls).toBe(1);
-  res.emit('drain');
-  await running;
+  const { run } = directLegacy(stream, write);
+  await run();
+  expect(write).toHaveBeenCalled();
+  expect(pulls).toBe(2);
 });
 
 it('stops a disconnected resubscription instead of draining it forever', async () => {

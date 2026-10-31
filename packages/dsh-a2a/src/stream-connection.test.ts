@@ -1,7 +1,8 @@
 import { once } from 'node:events';
 import { Writable } from 'node:stream';
-import { AgentCard, type StreamResponse, Task } from '@a2a-js/sdk';
+import { AgentCard, Message, type StreamResponse, Task, TaskState } from '@a2a-js/sdk';
 import {
+  AgentEvent,
   DefaultExecutionEventBus,
   DefaultRequestHandler,
   InMemoryTaskStore,
@@ -23,48 +24,99 @@ const handler = () =>
     cancelTask: async () => {},
   });
 
-it.each([false, true])(
-  'waits for drain and keeps consuming disconnected sends (disconnect=%s)',
-  async (disconnect) => {
-    let release!: () => void;
-    const output = new Writable({
-      objectMode: true,
-      highWaterMark: 1,
-      write(_chunk, _encoding, callback) {
-        release = callback;
+it('persists completion while the sending client is stalled', async () => {
+  const store = new InMemoryTaskStore();
+  const context = new ServerCallContext();
+  let taskId = '';
+  const sdk = new DefaultRequestHandler(
+    AgentCard.fromJSON({ capabilities: { streaming: true } }),
+    store,
+    {
+      execute: async (request, bus) => {
+        taskId = request.taskId;
+        bus.publish(
+          AgentEvent.task(
+            Task.fromJSON({
+              id: taskId,
+              contextId: request.contextId,
+              status: { state: 'TASK_STATE_WORKING' },
+            }),
+          ),
+        );
+        bus.publish(
+          AgentEvent.statusUpdate({
+            taskId,
+            contextId: request.contextId,
+            status: {
+              state: TaskState.TASK_STATE_COMPLETED,
+              message: undefined,
+              timestamp: undefined,
+            },
+            metadata: undefined,
+          }),
+        );
+        bus.finished();
       },
-    });
+      cancelTask: async () => {},
+    },
+  );
+  const output = new Writable({ objectMode: true, highWaterMark: 1, write() {} });
+  const consuming = withStreamConnection(output, async () => {
+    for await (const event of connectedRequestHandler(sdk).sendMessageStream(
+      {
+        tenant: '',
+        message: Message.fromJSON({
+          messageId: 'slow',
+          role: 'ROLE_USER',
+          parts: [{ text: 'test' }],
+        }),
+        configuration: undefined,
+        metadata: undefined,
+      },
+      context,
+    ))
+      output.write(event);
+  });
+  try {
+    await vi.waitFor(async () =>
+      expect((await store.load(taskId, context))?.status?.state).toBe(
+        TaskState.TASK_STATE_COMPLETED,
+      ),
+    );
+  } finally {
+    output.destroy();
+    await consuming;
+  }
+});
+
+it.each([false, true])(
+  'bounds slow writer backlog and drains the task (objectMode=%s)',
+  async (objectMode) => {
+    const output = new Writable({ objectMode, highWaterMark: 1, write() {} });
     const sdk = handler();
-    let persisted = 0;
+    let consumed = 0;
     vi.spyOn(sdk, 'sendMessageStream').mockImplementation(async function* () {
-      persisted++;
-      yield frame('first');
-      persisted++;
-      yield frame('second');
+      for (let index = 0; index < 100; index++) {
+        consumed++;
+        yield frame(String(index));
+      }
     });
     const connected = connectedRequestHandler(sdk);
-    const delivered: string[] = [];
-    const consuming = withStreamConnection(output, async () => {
+    let delivered = 0;
+    await withStreamConnection(output, async () => {
       for await (const event of connected.sendMessageStream(
         { tenant: '', message: undefined, configuration: undefined, metadata: undefined },
         new ServerCallContext(),
       )) {
-        delivered.push(event.payload!.$case);
-        output.write(event);
+        delivered++;
+        output.write(objectMode ? event : Buffer.alloc(64 * 1024));
       }
     });
-    await vi.waitFor(() => expect(delivered).toHaveLength(1));
-    expect(persisted).toBe(1);
-    if (disconnect) output.destroy();
-    else {
-      release();
-      await vi.waitFor(() => expect(delivered).toHaveLength(2));
-      release();
-    }
-    await consuming;
-    expect(persisted).toBe(2);
-    expect(delivered).toHaveLength(disconnect ? 1 : 2);
-    output.destroy();
+    expect(consumed).toBe(100);
+    expect(delivered).toBeGreaterThan(1);
+    expect(delivered).toBeLessThanOrEqual(18);
+    expect(output.destroyed).toBe(true);
+    expect(output.listenerCount('drain')).toBe(0);
   },
 );
 

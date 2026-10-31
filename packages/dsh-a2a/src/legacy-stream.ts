@@ -62,7 +62,7 @@ export function legacyStreamHandler(requestHandler: A2ARequestHandler): RequestH
         if (!first) return;
         if (!res.headersSent) startStream();
         let last: Exclude<typeof first.value, void> | undefined;
-        const write = async (event: Exclude<typeof first.value, void>) => {
+        const write = (event: Exclude<typeof first.value, void>) => {
           last = event;
           const result = event.result as
             | { kind?: string; status?: { state?: string }; final?: boolean }
@@ -71,33 +71,23 @@ export function legacyStreamHandler(requestHandler: A2ARequestHandler): RequestH
           // A task snapshot on resubscribe does not close it and is left intact.
           if (result?.kind === 'status-update' && result.status?.state === 'input-required')
             result.final = true;
-          if (!res.write(`data: ${JSON.stringify(event)}\n\n`)) {
-            await new Promise<void>((resolve) => {
-              const ready = () => {
-                res.off('drain', ready);
-                res.off('close', ready);
-                resolve();
-              };
-              res.once('drain', ready);
-              res.once('close', ready);
-            });
-          }
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
           return result?.kind === 'status-update' && result.final;
         };
-        if (!first.done && (await write(first.value))) return;
+        if (!first.done && write(first.value)) return;
         while (true) {
           const nextEvent = await next();
           if (!nextEvent || nextEvent.done) break;
           if (res.destroyed && !resubscribing) continue; // Sends still drain for persistence.
           if (res.destroyed) break;
-          if (await write(nextEvent.value)) return;
+          if (write(nextEvent.value)) return;
         }
         // A cold subscription has no live bus: the SDK ends after the snapshot.
         const snapshot = last?.result as
           | { kind?: string; id?: string; contextId?: string; status?: unknown; metadata?: unknown }
           | undefined;
         if (!res.destroyed && snapshot?.kind === 'task')
-          await write({
+          write({
             ...last!,
             result: {
               kind: 'status-update',
