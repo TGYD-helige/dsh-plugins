@@ -10,7 +10,11 @@
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./notifications": {
+      "types": "./lib/types/notifications.d.ts",
+      "default": "./lib/notifications.js"
+    }
   },
   "files": [
     "lib",

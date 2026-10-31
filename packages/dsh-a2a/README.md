@@ -195,3 +195,134 @@ Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#comp
 ## License
 
 MIT
+
+### Optional checkpointed notifications
+
+Import `installNotifications`, `httpNotificationSender`, and their types from
+`@amaster.ai/dsh-a2a/notifications`. Nothing is installed or sent by default.
+Call the installer once on a dedicated plugin-scoped Cordis Context with the
+`sessions` service available; unload its fiber to unregister and abort work.
+The existing DSH peer floors apply (agent `0.2.0-rc.2`, session `0.2.0-rc.1`;
+tested with `0.2.1-rc.5`). No new service or package dependency is required.
+
+```ts
+import { installNotifications, httpNotificationSender } from '@amaster.ai/dsh-a2a/notifications';
+
+// Coding: host validates the application and explicitly resolves its own identity.
+installNotifications(ctx, {
+  message: httpNotificationSender(detail => ({
+    url: 'https://coding.example.invalid/broadcast',
+    headers: { 'x-host-user': codingIdentity(detail) },
+    body: {
+      from: 'a2a-server', topic: 'messages', scope: detail.contextId,
+      type: 'message.created',
+      data: { messageId: detail.messageId, taskId: detail.taskId },
+    },
+  })),
+  inbox: httpNotificationSender(detail => ({
+    url: 'https://coding.example.invalid/broadcast',
+    headers: { 'x-host-user': codingOwner(detail.contextId) },
+    body: {
+      from: 'dsh', topic: 'conversation-queue',
+      scope: authorizedApplicationScope(detail.contextId), type: 'queue.changed',
+      data: detail,
+    },
+  })),
+});
+
+// Copilot: independent destination/identity; no implicit queue channel.
+installNotifications(copilotCtx, {
+  message: copilotDestination ? httpNotificationSender(detail => ({
+    url: copilotDestination,
+    headers: { 'x-host-user': copilotIdentity(detail) },
+    body: { contextId: detail.contextId, messageId: detail.messageId, taskId: detail.taskId },
+  })) : undefined,
+});
+```
+
+Identity functions and destinations above are host-owned placeholders. A message
+adapter receives `requestHeaders` from admission, if available, and `source`
+from the committed native message. Restored input can resolve identity from its
+persisted A2A source. Only explicitly selected headers should be forwarded;
+missing identity must follow the host's own authorization policy. The module
+never reads environment identity, invents permissions, or chooses an endpoint.
+Use temporary directories such as `/tmp/dsh-notification-example` for examples'
+session state, never production credentials or history.
+
+Each channel is independently enabled by providing its sender. A custom sender
+is `(detail, signal) => Promise<boolean>`: return true only for success, false or
+throw for failure. Honor cancellation and bound execution time. The provided
+HTTP adapter POSTs JSON, combines disposal cancellation with a five-second
+request timeout, cancels response bodies, and returns the HTTP success status.
+It forwards no request headers unless the host explicitly maps them.
+
+Committed messages are matched by context and native ID, using selected task
+identity where present, and sent once after a successful `sessions.flush`.
+They are not retried. Inbox signals observe all native `agent/inbox/spliced`
+records, including native consumption and steering, coalesce synchronous
+changes, and serialize delivery per context. `version` is the originating
+session event sequence. Each captured version gets at most three attempts,
+with 250/500 ms waits and a successful checkpoint before every send. A newer
+pending version gets its own budget even if the old version exhausts retries.
+Other contexts progress independently. False/rejected checkpoints never send.
+Disposal aborts requests and retry waits; late checkpoint completion cannot send.
+
+Resource limits apply per installer across both channels: at most 16 active
+checkpoint/delivery operations, one per context per channel, plus 128 waiting
+operations. A slow chat destination does not occupy its context's inbox slot.
+Waiting work is canceled on context or plugin disposal, and an unresolved
+checkpoint cannot retain its delivery slot after cancellation. Saturation skips
+excess chat notifications; inbox capacity failures use the existing bounded
+retry budget. This can lose invalidations under sustained overload: it never
+blocks admission, changes task settlement, or delays the agent loop waiting
+for a notification slot.
+
+Deduplication keeps one processed event-sequence watermark per context, relying
+on the native ordered append feed; replayed observations retain their original
+sequence. It does not retain all historical native message IDs. Correlation
+records are capped at 256 per context; saturation evicts the oldest uncommitted
+record, never one awaiting delivery. Native selection can restore an evicted
+association; its identity then comes from the persisted source where available.
+All correlation and watermark state is removed on context disposal.
+
+These are best-effort invalidations, not snapshots or an exactly-once protocol.
+An unchanged version can remain undelivered after exhaustion. Hosts must read
+authoritative history/inbox snapshots on initial connection and reconnection,
+authorize subscriptions and publication, and validate application/context scope.
+No persistent outbox, queue store, polling, or storage-plugin changes are added.
+
+The runtime contract check uses real Cordis, SessionStore append/checkpoint, and
+AgentRegistry disposal; A2A observations are supplied at the public event seam.
+It has passed at the declared agent/session floors and at the pinned runtime.
+After `pnpm build`, run it against the installed pinned runtime:
+
+```sh
+node .github/scripts/notification-runtime-check.mjs
+```
+
+To reproduce the minimum-version check without changing this workspace's dependencies:
+
+```sh
+npm install --prefix /tmp/dsh-notification-minimum --save-exact --ignore-scripts --legacy-peer-deps \
+  @deepseek-ai/cordis@4.0.4 @deepseek-ai/dsh-agent@0.2.0-rc.2 \
+  @deepseek-ai/dsh-session@0.2.0-rc.1 @deepseek-ai/dsh-scope@0.2.0-rc.1 \
+  @deepseek-ai/dsh-session-projection@0.2.0-rc.2 @deepseek-ai/dsh-system-prompt@0.2.0-rc.2 \
+  @deepseek-ai/dsh-invariants@0.2.0-rc.2 @deepseek-ai/dsh-typert-protocol@0.2.0-rc.2 \
+  @deepseek-ai/dsh-util-values@0.2.0-rc.2
+node .github/scripts/notification-runtime-check.mjs /tmp/dsh-notification-minimum
+```
+
+Cordis 4.0.4 satisfies the tested DSH packages' own `~4.0.4` peer requirement.
+The check covers notification seams, not a model execution or a complete minimum-version
+DSH deployment; upstream DSH packages retain their own transitive peer constraints.
+
+To check notification memory independently of a database or network, build the
+package and run:
+
+```sh
+node --expose-gc .github/scripts/notification-memory-check.mjs
+```
+
+The check delivers 50,000 distinct messages to one long-lived context and
+asserts that retained heap growth after warmup stays below 4 MiB. It is a
+regression guard for historical-ID retention, not a production latency benchmark.

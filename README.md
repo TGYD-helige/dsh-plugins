@@ -142,6 +142,8 @@ SQL Server note: Prisma's sqlserver connector has no `Json` type, so its variant
 
 The logical message id rides in `metadata.id`; message rows use a deterministic hash of `(session_id, message id)` as their primary key, so re-projected events upsert in place rather than duplicate — on every connector (the source project's `metadata.id` JSON-path lookup only works on PostgreSQL/MySQL). Session rows are matched by `session_id` and keep their cuid primary keys — the per-session serialization chain makes the find-then-write safe, and rows from the early scaffold (or the source project) are continued, never duplicated. Upgrade note: the early scaffold wrote messages with cuid keys; if you ran it, dedupe those by `metadata.id` before enabling this version.
 
+Optional [checkpointed notifications](packages/dsh-a2a/README.md#optional-checkpointed-notifications) expose independent committed-message and native-inbox invalidations through a host-owned adapter. Both channels are disabled by default.
+
 **Native inbox mode is opt-in and uses the official DSH APIs**; it is tested with the unmodified `0.2.1-rc.5` npm runtime. See [native inbox execution](packages/dsh-a2a/README.md#native-inbox-execution) for queueing, steering, pause/recovery semantics and the runtime integration checks.
 
 Opt into `inbox: { enabled: true, shutdown: retain-pending }` to retain unclaimed A2A steering and future turns across graceful host restarts. Retain both the session persistence and TaskStore storage; hosts still discover and wake eligible work. Explicit cancellation and context clearing remain terminal. See [the shutdown contract](packages/dsh-a2a/README.md#graceful-host-shutdown).
