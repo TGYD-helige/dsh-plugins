@@ -43,6 +43,15 @@ test('A2A cleanup does not hide a child that crashed before cleanup', async () =
   await assert.rejects(stopA2a(child), /code 7/);
 });
 
+test('A2A cleanup rejects a child that crashes during SIGTERM handling', async () => {
+  const child = spawn(process.execPath, [
+    '-e',
+    'process.on("SIGTERM", () => process.exit(7)); process.stdout.write("ready"); setInterval(() => {}, 1000)',
+  ]);
+  await once(child.stdout, 'data');
+  await assert.rejects(stopA2a(child), /code 7/);
+});
+
 test('Langfuse release identifies the tested PR head instead of the pull_request_target base', () => {
   const keys = ['INTEGRATION_CHECKOUT_REF', 'GITHUB_SHA'];
   const previous = keys.map((key) => process.env[key]);

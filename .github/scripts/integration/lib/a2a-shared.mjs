@@ -108,36 +108,35 @@ ${extraPatch}`,
 
 /** SIGTERM, escalate to SIGKILL after 15s, fail loudly on a hung shutdown. */
 export async function stopA2a(proc) {
-  if (proc.exitCode !== null || proc.signalCode !== null) {
-    assert(
-      proc.exitCode === 0 || proc.signalCode === 'SIGTERM',
-      `dsh web exited before cleanup (code ${proc.exitCode}, signal ${proc.signalCode})`,
-    );
-    return;
-  }
-  let timer;
-  let onExit;
-  try {
-    const exited = new Promise((resolveExit) => {
-      onExit = () => resolveExit(true);
-      proc.once('exit', onExit);
-    });
-    proc.kill('SIGTERM');
-    if (
-      !(await Promise.race([
-        exited,
-        new Promise((resolveTimeout) => {
-          timer = setTimeout(() => resolveTimeout(false), 15_000);
-        }),
-      ]))
-    ) {
-      proc.kill('SIGKILL');
-      throw new Error('dsh web did not exit within 15s of SIGTERM');
+  if (proc.exitCode === null && proc.signalCode === null) {
+    let timer;
+    let onExit;
+    try {
+      const exited = new Promise((resolveExit) => {
+        onExit = () => resolveExit(true);
+        proc.once('exit', onExit);
+      });
+      proc.kill('SIGTERM');
+      if (
+        !(await Promise.race([
+          exited,
+          new Promise((resolveTimeout) => {
+            timer = setTimeout(() => resolveTimeout(false), 15_000);
+          }),
+        ]))
+      ) {
+        proc.kill('SIGKILL');
+        throw new Error('dsh web did not exit within 15s of SIGTERM');
+      }
+    } finally {
+      clearTimeout(timer);
+      proc.off('exit', onExit);
     }
-  } finally {
-    clearTimeout(timer);
-    proc.off('exit', onExit);
   }
+  assert(
+    proc.exitCode === 0 || proc.signalCode === 'SIGTERM',
+    `dsh web exited during cleanup (code ${proc.exitCode}, signal ${proc.signalCode})`,
+  );
 }
 
 /** A2A 1.0 wire states (proto-JSON enum names). */
