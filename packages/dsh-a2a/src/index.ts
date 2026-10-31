@@ -103,6 +103,9 @@ export const Config = Schema.object({
   host: Schema.string().default('127.0.0.1'),
   port: Schema.natural().default(41241),
   basePath: Schema.string().default('/a2a'),
+  pushNotifications: Schema.boolean()
+    .default(false)
+    .description('Enable standard A2A task webhook configuration and delivery through the SDK.'),
   heartbeat: Schema.object({
     enabled: Schema.boolean().default(false),
     intervalMs: Schema.natural().min(1).max(2_147_483_647).default(15_000),
@@ -169,6 +172,7 @@ export interface A2aPluginConfig {
   port: number;
   basePath: string;
   heartbeat?: { enabled: boolean; intervalMs: number };
+  pushNotifications?: boolean;
   cwd: string;
   uploadsDir: string;
   urlDownloads?: { allowPrivate?: boolean; allowedHosts: string[] };
@@ -269,6 +273,7 @@ export function apply(
       port: config.port,
       basePath: config.basePath,
       heartbeat: config.heartbeat,
+      pushNotifications: config.pushNotifications,
       card: {
         name: config.card.name,
         description: config.card.description,

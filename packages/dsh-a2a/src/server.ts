@@ -27,6 +27,7 @@ import {
   TaskState,
 } from '@a2a-js/sdk';
 import { duplicateInterfacesForLegacy } from '@a2a-js/sdk/compat/v0_3';
+import { createLegacyAwarePushNotificationSender } from '@a2a-js/sdk/compat/v0_3/server';
 import { RequestMalformedError, UnsupportedOperationError } from '@a2a-js/sdk/errors';
 import {
   type AgentExecutionEvent,
@@ -34,6 +35,7 @@ import {
   DefaultExecutionEventBus,
   DefaultRequestHandler,
   ExecutionEventQueue,
+  InMemoryPushNotificationStore,
   ResultManager,
   ServerCallContext,
   STATE_HEADERS_KEY,
@@ -59,6 +61,7 @@ export interface A2aServerOptions {
   executor: AgentExecutor;
   taskStore: TaskStore;
   heartbeat?: { enabled: boolean; intervalMs: number };
+  pushNotifications?: boolean;
   approvalGuard?: (message: Message) => undefined | (() => void);
   beforeWorkingTaskMessage?: (message: Message, requestHeaders: unknown) => Promise<void>;
   beforeMessage?: (
@@ -118,7 +121,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     provider: undefined,
     capabilities: {
       streaming: true,
-      pushNotifications: false,
+      pushNotifications: options.pushNotifications ?? false,
       extensions: options.extensions ?? [],
       extendedAgentCard: false,
     },
@@ -287,6 +290,10 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     load: (taskId, context) => options.taskStore.load(taskId, context),
     list: (params, context) => options.taskStore.list(params, context),
   };
+  const pushStore = options.pushNotifications ? new InMemoryPushNotificationStore() : undefined;
+  const pushSender = pushStore ? createLegacyAwarePushNotificationSender(pushStore) : undefined;
+  const restoredPushFailed = (error: unknown) =>
+    console.error('[dsh-a2a] restored task push failed:', error);
   const requestHandler = new (class extends DefaultRequestHandler {
     private async beforeMessage(message: Message | undefined, context: ServerCallContext) {
       if (!message) return;
@@ -456,7 +463,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
         await stream.return(undefined);
       }
     }
-  })(card, admissionStore, options.executor, busManager);
+  })(card, admissionStore, options.executor, busManager, pushStore, pushSender);
 
   const app = express();
   // The SDK's jsonRpcHandler parses bodies with express.json()'s 100kb default;
@@ -609,7 +616,24 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       const result = new ResultManager(options.taskStore, context);
       void (async () => {
         try {
-          for await (const event of queue.events()) await result.processEvent(event);
+          for await (const event of queue.events()) {
+            await result.processEvent(event);
+            if (pushSender) {
+              try {
+                const snapshot = structuredClone(result.getCurrentTask());
+                // SDK execution-event kinds match the StreamResponse oneof cases.
+                const response = {
+                  payload: {
+                    $case: event.kind,
+                    value: event.kind === 'task' ? (snapshot ?? event.data) : event.data,
+                  },
+                } as StreamResponse;
+                void pushSender.send(response, context, snapshot).catch(restoredPushFailed);
+              } catch (error) {
+                restoredPushFailed(error);
+              }
+            }
+          }
         } catch (error) {
           console.error('[dsh-a2a] restored task persistence failed:', error);
         } finally {

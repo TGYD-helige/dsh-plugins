@@ -10,11 +10,7 @@
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
-    "./package.json": "./package.json",
-    "./inbox-notifications": {
-      "types": "./lib/types/inbox-notifications.d.ts",
-      "default": "./lib/inbox-notifications.js"
-    }
+    "./package.json": "./package.json"
   },
   "files": [
     "lib",

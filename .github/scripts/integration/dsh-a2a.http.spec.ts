@@ -1,4 +1,6 @@
-import { ServerResponse } from 'node:http';
+import { once } from 'node:events';
+import { createServer, ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { Role, type Task, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutionEvent, AgentExecutor, ExecutionEventBus } from '@a2a-js/sdk/server';
 import { AgentEvent, type RequestContext, ServerCallContext } from '@a2a-js/sdk/server';
@@ -228,6 +230,329 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
       taskId: id,
       status: { state: 'TASK_STATE_CANCELED' },
     });
+  });
+
+  async function pushFixture() {
+    await server.close();
+    const received: Array<{
+      body: any;
+      contentType: string | undefined;
+      authorization: string | undefined;
+      token: string | string[] | undefined;
+    }> = [];
+    let status = 204;
+    const receiver = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      received.push({
+        body: JSON.parse(Buffer.concat(chunks).toString()),
+        contentType: request.headers['content-type'],
+        authorization: request.headers.authorization,
+        token: request.headers['x-a2a-notification-token'],
+      });
+      response.writeHead(status).end();
+    });
+    receiver.listen(0, '127.0.0.1');
+    await once(receiver, 'listening');
+    const url = `http://127.0.0.1:${(receiver.address() as AddressInfo).port}/a2a-notifications`;
+    const store = new SanitizedTaskStore(new MemoryTaskStore());
+    server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      card: { name: 'test', description: '', version: '1' },
+      executor: stubExecutor,
+      taskStore: store,
+      pushNotifications: true,
+    });
+    base = `http://127.0.0.1:${server.port}`;
+    return {
+      store,
+      received,
+      url,
+      fail: () => {
+        status = 503;
+      },
+      close: async () => {
+        receiver.closeAllConnections();
+        await new Promise<void>((resolve) => receiver.close(() => resolve()));
+      },
+    };
+  }
+
+  it('delivers official A2A webhook payloads configured through SendMessage', async () => {
+    const f = await pushFixture();
+    try {
+      const card = await json(
+        await fetch(`${base}/.well-known/agent-card.json`, { headers: { 'A2A-Version': '1.0' } }),
+      );
+      expect(card.capabilities.pushNotifications).toBe(true);
+      const sent = await json(
+        await rpc('SendMessage', {
+          tenant: '',
+          ...v1Message('official-push'),
+          configuration: {
+            taskPushNotificationConfig: {
+              url: f.url,
+              authentication: { scheme: 'Bearer', credentials: 'fixture-token' },
+            },
+          },
+        }),
+      );
+      expect(sent.error).toBeUndefined();
+      const id = sent.result.task.id;
+      await vi.waitFor(() =>
+        expect(
+          f.received.some(
+            (event) => event.body.statusUpdate?.status?.state === 'TASK_STATE_INPUT_REQUIRED',
+          ),
+        ).toBe(true),
+      );
+      expect(
+        f.received.every(
+          (event) =>
+            event.contentType === 'application/a2a+json' &&
+            event.authorization === 'Bearer fixture-token',
+        ),
+      ).toBe(true);
+      expect(f.received[0].body.task).toMatchObject({ id, contextId: sent.result.task.contextId });
+      expect(f.received.at(-1)!.body.statusUpdate).toMatchObject({
+        taskId: id,
+        status: { message: { parts: [{ text: 'done' }, expect.anything()] } },
+      });
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('registers, reads, lists and deletes official webhook configs for an existing task', async () => {
+    const f = await pushFixture();
+    try {
+      const sent = await json(
+        await rpc('SendMessage', { tenant: 'owner', ...v1Message('before-registration') }),
+      );
+      const { id, contextId } = sent.result.task;
+      expect(f.received).toEqual([]);
+      const created = await json(
+        await rpc(
+          'CreateTaskPushNotificationConfig',
+          {
+            tenant: 'owner',
+            taskId: id,
+            url: f.url,
+            authentication: { scheme: 'Bearer', credentials: 'fixture-token' },
+          },
+          41,
+        ),
+      );
+      expect(created.error).toBeUndefined();
+      const configId = created.result.id;
+      expect(configId).toEqual(expect.any(String));
+      expect(configId.length).toBeGreaterThan(0);
+      const configs = await json(
+        await rpc('ListTaskPushNotificationConfigs', { tenant: 'owner', taskId: id }, 42),
+      );
+      expect(configs.result.configs).toHaveLength(1);
+      const got = await json(
+        await rpc(
+          'GetTaskPushNotificationConfig',
+          { tenant: 'owner', taskId: id, id: configId },
+          43,
+        ),
+      );
+      expect(got.result).toMatchObject({ id: configId, url: f.url });
+      expect(
+        (
+          await json(
+            await rpc(
+              'GetTaskPushNotificationConfig',
+              { tenant: 'other', taskId: id, id: configId },
+              44,
+            ),
+          )
+        ).error,
+      ).toBeDefined();
+      await rpc(
+        'SendMessage',
+        { tenant: 'owner', ...v1Message('after-registration', { taskId: id, contextId }) },
+        45,
+      );
+      await vi.waitFor(() =>
+        expect(
+          f.received.some(
+            (event) => event.body.statusUpdate?.status?.state === 'TASK_STATE_INPUT_REQUIRED',
+          ),
+        ).toBe(true),
+      );
+      await rpc(
+        'DeleteTaskPushNotificationConfig',
+        { tenant: 'owner', taskId: id, id: configId },
+        46,
+      );
+      expect(
+        (
+          await json(
+            await rpc('ListTaskPushNotificationConfigs', { tenant: 'owner', taskId: id }, 47),
+          )
+        ).result.configs ?? [],
+      ).toEqual([]);
+      const count = f.received.length;
+      await rpc(
+        'SendMessage',
+        { tenant: 'owner', ...v1Message('after-deletion', { taskId: id, contextId }) },
+        48,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(f.received).toHaveLength(count);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('pushes native restored task progress and completion through the official sender', async () => {
+    const f = await pushFixture();
+    try {
+      const context = new ServerCallContext({ tenant: '' });
+      const task: Task = {
+        id: 'restored-push',
+        contextId: 'restored-context',
+        status: {
+          state: TaskState.TASK_STATE_WORKING,
+          message: undefined,
+          timestamp: new Date().toISOString(),
+        },
+        history: [],
+        artifacts: [],
+        metadata: undefined,
+      };
+      await f.store.save(task, context);
+      const bus = server.restoreTask(task, context);
+      const created = await json(
+        await rpc(
+          'CreateTaskPushNotificationConfig',
+          {
+            taskId: task.id,
+            url: f.url,
+            authentication: { scheme: 'Bearer', credentials: 'fixture-restored' },
+          },
+          52,
+        ),
+      );
+      expect(created.error).toBeUndefined();
+      bus.publish(AgentEvent.task(task));
+      for (const state of [TaskState.TASK_STATE_WORKING, TaskState.TASK_STATE_COMPLETED])
+        bus.publish(
+          AgentEvent.statusUpdate({
+            taskId: task.id,
+            contextId: task.contextId,
+            status: { state, message: undefined, timestamp: new Date().toISOString() },
+            metadata: undefined,
+          }),
+        );
+      bus.finished();
+      await vi.waitFor(() => expect(f.received).toHaveLength(3));
+      expect(f.received[0].body.task.id).toBe(task.id);
+      expect(f.received.slice(1).map((event) => event.body.statusUpdate.status.state)).toEqual([
+        'TASK_STATE_WORKING',
+        'TASK_STATE_COMPLETED',
+      ]);
+      expect(
+        f.received.every(
+          (event) =>
+            event.authorization === 'Bearer fixture-restored' &&
+            event.contentType === 'application/a2a+json',
+        ),
+      ).toBe(true);
+      expect((await json(await rpc('GetTask', { id: task.id }, 53))).result.status.state).toBe(
+        'TASK_STATE_COMPLETED',
+      );
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('uses the official v0.3 push serializer for a legacy client', async () => {
+    const f = await pushFixture();
+    try {
+      const sent = await json(
+        await legacy('message/send', {
+          ...legacyMessage('legacy-push'),
+          configuration: { pushNotificationConfig: { url: f.url, token: 'fixture-legacy-token' } },
+        }),
+      );
+      expect(sent.error).toBeUndefined();
+      await vi.waitFor(() =>
+        expect(
+          f.received.some(
+            (event) => event.body.kind === 'task' && event.body.status?.state === 'input-required',
+          ),
+        ).toBe(true),
+      );
+      expect(
+        f.received.every(
+          (event) =>
+            event.contentType === 'application/json' && event.token === 'fixture-legacy-token',
+        ),
+      ).toBe(true);
+      expect(f.received[0].body).toMatchObject({ kind: 'task', id: sent.result.id });
+      await vi.waitFor(() => expect(f.received).toHaveLength(3));
+      await rpc(
+        'SendMessage',
+        {
+          tenant: '',
+          ...v1Message('v1-follow-up', {
+            taskId: sent.result.id,
+            contextId: sent.result.contextId,
+          }),
+        },
+        51,
+      );
+      await vi.waitFor(() => expect(f.received).toHaveLength(6));
+      expect(
+        f.received.every(
+          (event) => event.body.kind === 'task' && event.contentType === 'application/json',
+        ),
+      ).toBe(true);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('rejects official push registration when the capability is disabled', async () => {
+    const sent = await json(await rpc('SendMessage', { tenant: '', ...v1Message('no-push') }));
+    const config = await json(
+      await rpc(
+        'CreateTaskPushNotificationConfig',
+        { taskId: sent.result.task.id, url: 'https://unused.example.invalid/push' },
+        49,
+      ),
+    );
+    expect(config.error?.message).toMatch(/push.*not supported/i);
+  });
+
+  it('does not fail the task when the official webhook endpoint fails', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const f = await pushFixture();
+    f.fail();
+    try {
+      const sent = await json(
+        await rpc('SendMessage', {
+          tenant: '',
+          ...v1Message('endpoint-down'),
+          configuration: { taskPushNotificationConfig: { url: f.url } },
+        }),
+      );
+      expect(sent.error).toBeUndefined();
+      expect(sent.result.task.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+      await vi.waitFor(() => expect(error).toHaveBeenCalled());
+      await vi.waitFor(() => expect(f.received).toHaveLength(3));
+      expect(
+        (await json(await rpc('GetTask', { id: sent.result.task.id }, 50))).result.status.state,
+      ).toBe('TASK_STATE_INPUT_REQUIRED');
+    } finally {
+      await f.close();
+      error.mockRestore();
+    }
   });
 
   it.each([0, -1, 1.5, NaN, Infinity, 2_147_483_648])(

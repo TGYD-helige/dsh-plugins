@@ -192,107 +192,91 @@ Optional Goal integration requires `@deepseek-ai/dsh-goal >=0.2.0-rc.2 || >=0.2.
 
 Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment,tools}@0.2.1-rc.5` — the attachment store is an optional peer) — the session peer floor is `>=0.2.0-rc.1` because child attribution uses `firstLifecycleSeq` to reject restored sessions; check the `TODO(verify)` markers in `src/` before upgrading dsh.
 
-## Task updates: use standard A2A
+## Standard A2A notifications
 
-Use `SendStreamingMessage` to send and stream a task, `SubscribeToTask` to
-subscribe to a known task, and `GetTask` to read its authoritative snapshot and
-history. Use `ListTasks` scoped by `contextId` to discover task IDs before
-subscribing or when reconnecting. The same task may have multiple subscribers. The existing v0.3
-compatibility methods (`message/stream`, `tasks/resubscribe`, `tasks/get`)
-remain available. See the [official task update mechanisms](https://a2a-protocol.org/v1.0.1/specification/#35-task-update-delivery-mechanisms).
+Use `SendStreamingMessage` / `SubscribeToTask` for live task updates, `GetTask`
+for task snapshots/history, and `ListTasks` scoped by `contextId` for discovery.
+Multiple clients can subscribe independently. Use streaming for interactive UI;
+use official task Push Notifications for a receiver that cannot keep a stream open.
+See the [official streaming and push guide](https://a2a-protocol.org/v1.0.1/topics/streaming-and-async/).
 
-The A2A standard also defines task Push Notifications. This server currently
-advertises `pushNotifications: false`; the inbox adapter below does not
-implement or enable that capability. Standard task history and event delivery
-also do not promise that a host's separate application database mirror has
-finished writing. A host requiring that guarantee must coordinate its own reads.
+Enable the SDK's standard push capability explicitly (default: `false`):
 
-## Optional native inbox invalidations
-
-A2A task events do not describe native inbox edits, reordering, clearing, steering,
-or consumption. For those operations only, import `installInboxNotifications`
-and `httpInboxNotificationSender` from `@amaster.ai/dsh-a2a/inbox-notifications`.
-This is a local host integration for a DSH-specific capability, not an A2A event
-or webhook protocol. No custom chat/message-created channel is provided.
-
-```ts
-import {
-  installInboxNotifications,
-  httpInboxNotificationSender,
-} from '@amaster.ai/dsh-a2a/inbox-notifications';
-
-// Install once on a plugin-scoped Context. Undefined sender means disabled.
-installInboxNotifications(ctx, inboxDestination ? httpInboxNotificationSender(detail => ({
-  url: inboxDestination,
-  headers: { 'x-host-user': authorizedOwner(detail.contextId) },
-  body: { type: 'inbox.changed', scope: authorizedScope(detail.contextId), data: detail },
-})) : undefined);
+```yaml
+config:
+  enabled: true
+  pushNotifications: true
 ```
 
-The destination, envelope, scope and identity functions above are host-owned
-placeholders. The module never reads application environment variables,
-credentials or request headers, and never invents permission grants. Hosts
-validate contexts, authorize subscriptions/publication, and explicitly select
-headers. Keep identities and configuration separate for separate applications.
-Use temporary directories such as `/tmp/dsh-inbox-example` for local session data.
+The Agent Card then advertises `capabilities.pushNotifications: true`. This plugin
+passes the official SDK's `InMemoryPushNotificationStore` and
+`createLegacyAwarePushNotificationSender` into its `DefaultRequestHandler`.
+Configuration CRUD, dispatch, authentication headers, serialization and timeouts
+are SDK behavior. Restored native task events use that same sender after their
+existing SDK ResultManager persistence drain; there is no separate notification protocol, sender adapter,
+queue-change channel, message correlation cache or plugin retry scheduler.
 
-The Context must provide `sessions` plus participating durability listeners
-(such as native persistence or `dsh-storage`). The module observes
-`agent/inbox/spliced`, retains only the latest pending invalidation per context,
-and waits for a successful `sessions.flush` before each send. False/rejected
-checkpoints do not deliver. `version` is the originating native session event
-sequence, not queue length or a global counter.
+A v1.0 client can register its webhook while sending a message:
 
-A custom `InboxNotificationSender` is `(detail, signal) => Promise<boolean>`;
-`detail` contains `{ contextId, version }`. Return true only for delivery success,
-false or throw on failure. Honor cancellation and bound execution time. The
-optional HTTP adapter POSTs the host-mapped JSON with explicit headers, a
-five-second request timeout, disposal cancellation, response-body cleanup, and
-an observable HTTP success/failure result. It is not standard A2A Push Notifications.
-
-Synchronous changes coalesce; each context delivers serially. A captured version
-gets at most three attempts with 250/500 ms retry waits. A newer pending version
-keeps its own budget after either success or exhaustion of the older version.
-Completed batches rotate behind waiting contexts so a busy inbox cannot starve
-another context. Per installer, at most 16 contexts drain concurrently and at
-most 128 contexts retain pending invalidations, including active deliveries.
-At capacity, existing contexts still update their latest version; additional
-contexts' invalidations are skipped rather than creating another work queue.
-
-Unloading the plugin unregisters listeners, clears pending state and aborts
-requests/retry waits. Disposing a session or agent drops its pending state and
-immediately releases its delivery slot, even if its native checkpoint is still
-unresolved. Its late continuation cannot deliver or affect a replacement context.
-Native flush itself has no cancellation API.
-
-Delivery remains best effort. An unchanged version may remain undelivered after
-retry exhaustion or overload. Notifications only invalidate a display; read an
-authoritative inbox snapshot on initial connection and reconnection. There is no
-persistent outbox, polling, message correlation cache or history-ID deduplication.
-
-The existing agent/session peer floors apply without new dependencies. After
-`pnpm build`, validate native SessionStore checkpointing and AgentRegistry
-disposal with:
-
-```sh
-node .github/scripts/inbox-notification-runtime-check.mjs
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "fixture-message-1",
+      "role": "user",
+      "parts": [{ "text": "Run this task" }]
+    },
+    "configuration": {
+      "taskPushNotificationConfig": {
+        "url": "https://receiver.example.invalid/a2a-notifications",
+        "authentication": { "scheme": "Bearer", "credentials": "placeholder-token" }
+      }
+    }
+  }
+}
 ```
 
-To reproduce the tested minimum session/agent versions in an isolated directory:
+Send `A2A-Version: 1.0`. For an existing task use
+`CreateTaskPushNotificationConfig` with `{ taskId, url, authentication }`.
+The SDK assigns the returned config ID. Manage it with
+`GetTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs` and
+`DeleteTaskPushNotificationConfig` (Get and Delete use
+`{ taskId, id }`). Configuration access uses the SDK's tenant/owner scope.
+The existing legacy methods and `configuration.pushNotificationConfig` are
+handled by the SDK's v0.3 compatibility layer.
 
-```sh
-npm install --prefix /tmp/dsh-inbox-minimum --save-exact --ignore-scripts --legacy-peer-deps \
-  @deepseek-ai/cordis@4.0.4 @deepseek-ai/dsh-agent@0.2.0-rc.2 \
-  @deepseek-ai/dsh-session@0.2.0-rc.1 @deepseek-ai/dsh-scope@0.2.0-rc.1 \
-  @deepseek-ai/dsh-session-projection@0.2.0-rc.2 @deepseek-ai/dsh-system-prompt@0.2.0-rc.2 \
-  @deepseek-ai/dsh-invariants@0.2.0-rc.2 @deepseek-ai/dsh-typert-protocol@0.2.0-rc.2 \
-  @deepseek-ai/dsh-util-values@0.2.0-rc.2
-node .github/scripts/inbox-notification-runtime-check.mjs /tmp/dsh-inbox-minimum
-```
+The receiver gets HTTP POSTs with `Content-Type: application/a2a+json` and a
+standard `StreamResponse`: `{ task }`, `{ message }`, `{ statusUpdate }` or
+`{ artifactUpdate }`. The configured Bearer credentials become `Authorization`;
+incoming application identity headers are not automatically forwarded. A webhook
+registered over v0.3 receives the SDK's v0.3 task snapshots and `application/json`,
+even if a later triggering request uses a different wire version.
 
-Cordis 4.0.4 satisfies those DSH packages' own peer requirement. This checks the
-inbox notification integration, not a complete minimum-version model execution.
-The pinned runtime is also tested at DSH `0.2.1-rc.5` / Cordis `4.0.5`.
+The host verifies webhook authentication and resolves application/context
+ownership before bridging the update to its existing WebSocket/UI refresh
+logic. Product topics, permission rules, and snapshot selection stay in the
+host. Native queue editing/reordering still uses the existing inbox API and
+snapshots; this plugin does not manufacture new A2A task states for queue edits.
+A task update does not promise that a separate application database mirror has
+flushed. `GetTask` returns the authoritative A2A task snapshot instead.
+
+The official store is in memory. Configs and their credentials are lost on
+restart, independently of the chosen durable TaskStore backend; clients must
+register again. Delete configurations that are no longer needed. The SDK uses
+its default five-second webhook request timeout and logs delivery failures
+without failing task execution. No plugin-level retries, shutdown drain or
+persistent delivery guarantee are added. Read task snapshots on initial
+connection/reconnection and tolerate missing or duplicate notifications.
+
+Keep the loopback default. Push registration lets callers choose outbound
+webhook destinations; enable it only behind host authentication/authorization
+and an appropriate outbound-network policy. The SDK wiring does not add an
+application identity provider or a webhook URL allowlist. Use placeholder
+credentials and temporary session directories such as `/tmp/dsh-a2a-example`
+when testing locally.
 
 ## License
 

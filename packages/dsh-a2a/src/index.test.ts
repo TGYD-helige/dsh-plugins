@@ -60,6 +60,11 @@ describe('dsh-a2a plugin', () => {
     expect(() => Config({ inbox: { shutdown: 'replay' as never } })).toThrow();
   });
 
+  it('enables standard push notifications only by explicit configuration', () => {
+    expect(Config({}).pushNotifications).toBe(false);
+    expect(Config({ pushNotifications: true }).pushNotifications).toBe(true);
+  });
+
   it('does nothing when disabled', () => {
     const result = apply(ctx, config({ enabled: false }));
     expect(result).toBeUndefined();
@@ -82,18 +87,24 @@ describe('dsh-a2a plugin', () => {
     ).toMatchObject({ allowedHosts: ['127.0.0.1', 'files.internal'] });
   });
 
-  it('serves the agent card while loaded and closes the server on fiber unload', async () => {
-    const started = await apply(ctx, config());
-    expect(console.log).toHaveBeenCalledWith(expect.stringContaining('[dsh-a2a] A2A endpoint:'));
+  it.each([false, true])(
+    'serves the agent card and unloads the server (push=%s)',
+    async (pushNotifications) => {
+      const started = await apply(ctx, config({ pushNotifications }));
+      expect(console.log).toHaveBeenCalledWith(expect.stringContaining('[dsh-a2a] A2A endpoint:'));
 
-    const port = started!.port;
-    const res = await fetch(`http://127.0.0.1:${port}/.well-known/agent-card.json`);
-    expect(res.status).toBe(200);
-    expect(((await res.json()) as { name: string }).name).toBe('test-agent');
+      const port = started!.port;
+      const res = await fetch(`http://127.0.0.1:${port}/.well-known/agent-card.json`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        name: 'test-agent',
+        capabilities: { pushNotifications },
+      });
 
-    await ctx.fiber.dispose();
-    await expect(fetch(`http://127.0.0.1:${port}/.well-known/agent-card.json`)).rejects.toThrow();
-  });
+      await ctx.fiber.dispose();
+      await expect(fetch(`http://127.0.0.1:${port}/.well-known/agent-card.json`)).rejects.toThrow();
+    },
+  );
 
   it("fails startup when taskStore is 'gcs' without a bucket", async () => {
     await expect(apply(ctx, config({ taskStore: 'gcs' }))).rejects.toThrow(
