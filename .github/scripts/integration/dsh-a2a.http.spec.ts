@@ -1,9 +1,32 @@
 import { once } from 'node:events';
 import { createServer, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { Role, type Task, TaskState } from '@a2a-js/sdk';
+import {
+  type AgentCard,
+  CancelTaskRequest,
+  DeleteTaskPushNotificationConfigRequest,
+  GetExtendedAgentCardRequest,
+  GetTaskPushNotificationConfigRequest,
+  GetTaskRequest,
+  ListTaskPushNotificationConfigsRequest,
+  ListTasksRequest,
+  Role,
+  SendMessageRequest,
+  SubscribeToTaskRequest,
+  type Task,
+  TaskPushNotificationConfig,
+  TaskState,
+} from '@a2a-js/sdk';
+import { LegacyA2AService } from '@a2a-js/sdk/compat/v0_3/server/grpc';
 import type { AgentExecutionEvent, AgentExecutor, ExecutionEventBus } from '@a2a-js/sdk/server';
-import { AgentEvent, type RequestContext, ServerCallContext } from '@a2a-js/sdk/server';
+import {
+  AgentEvent,
+  type RequestContext,
+  ServerCallContext,
+  STATE_HEADERS_KEY,
+} from '@a2a-js/sdk/server';
+import { A2AService } from '@a2a-js/sdk/server/grpc';
+import { credentials, Metadata, makeGenericClientConstructor } from '@grpc/grpc-js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type A2aServer, startA2aServer } from '../../../packages/dsh-a2a/src/server.js';
 import {
@@ -159,6 +182,331 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     },
   });
 
+  it('shares task state between the official REST and JSON-RPC bindings', async () => {
+    await server.close();
+    server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      rest: true,
+      pushNotifications: true,
+      card: { name: 'test-agent', description: 'test', version: '0.0.1' },
+      executor: stubExecutor,
+      taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+    });
+    base = `http://127.0.0.1:${server.port}`;
+    const sent = await fetch(`${base}/a2a/rest/message:send`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/a2a+json', 'A2A-Version': '1.0' },
+      body: JSON.stringify(v1Message('rest')),
+    });
+    expect(sent.status).toBe(200);
+    const { task } = await json(sent);
+    expect(task.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    expect((await json(await rpc('GetTask', { id: task.id }))).result.id).toBe(task.id);
+    const listed = await json(
+      await fetch(`${base}/a2a/rest/tasks?contextId=${task.contextId}`, {
+        headers: { 'A2A-Version': '1.0' },
+      }),
+    );
+    expect(listed.tasks.map((item: any) => item.id)).toEqual([task.id]);
+    const card = await json(
+      await fetch(`${base}/.well-known/agent-card.json`, {
+        headers: { 'A2A-Version': '1.0' },
+      }),
+    );
+    expect(card.supportedInterfaces).toContainEqual(
+      expect.objectContaining({
+        protocolBinding: 'HTTP+JSON',
+        protocolVersion: '1.0',
+        url: `${base}/a2a/rest`,
+      }),
+    );
+    const rest = (path: string, method = 'GET', body?: unknown) =>
+      fetch(`${base}/a2a/rest${path}`, {
+        method,
+        headers: { 'A2A-Version': '1.0', 'content-type': 'application/a2a+json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    expect((await json(await rest(`/tasks/${task.id}`))).id).toBe(task.id);
+    expect((await rest(`/other/tasks/${task.id}`)).status).toBe(404);
+    const config = await json(
+      await rest(`/tasks/${task.id}/pushNotificationConfigs`, 'POST', {
+        taskId: task.id,
+        url: 'http://127.0.0.1:1/callback',
+      }),
+    );
+    expect(config.id).toBeTruthy();
+    expect(
+      (await json(await rpc('GetTaskPushNotificationConfig', { taskId: task.id, id: config.id })))
+        .result.url,
+    ).toBe(config.url);
+    expect(
+      (await json(await rest(`/tasks/${task.id}/pushNotificationConfigs`))).configs,
+    ).toHaveLength(1);
+    expect(
+      (await json(await rest(`/tasks/${task.id}/pushNotificationConfigs/${config.id}`))).id,
+    ).toBe(config.id);
+    expect(
+      (await rest(`/tasks/${task.id}/pushNotificationConfigs/${config.id}`, 'DELETE')).status,
+    ).toBe(204);
+    const stream = await frames(await rest('/message:stream', 'POST', v1Message('rest-stream')));
+    expect(stream[0].task).toBeDefined();
+    expect(stream.at(-1).statusUpdate.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+    const subscription = await rest(`/tasks/${task.id}:subscribe`);
+    const canceled = await json(await rest(`/tasks/${task.id}:cancel`, 'POST', {}));
+    expect(canceled.status.state).toBe('TASK_STATE_CANCELED');
+    expect((await frames(subscription)).at(-1).statusUpdate.status.state).toBe(
+      'TASK_STATE_CANCELED',
+    );
+    const oldResponse = await fetch(`${base}/a2a/rest/v1/message:send`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'A2A-Version': '0.3' },
+      body: JSON.stringify(v1Message('legacy-rest', { role: 'ROLE_USER' })),
+    });
+    expect(oldResponse.status).toBe(201);
+    const old = await json(oldResponse);
+    expect(old.task.id).toBeTruthy();
+  });
+
+  it('serves the host-authorized extended card without leaking it in discovery', async () => {
+    let publicCard: AgentCard;
+    await server.close();
+    server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      rest: true,
+      card: { name: 'public-agent', description: 'test', version: '0.0.1' },
+      executor: stubExecutor,
+      taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+      extendedAgentCard: async (context) => {
+        const headers = context.state.get(STATE_HEADERS_KEY) as Record<string, string>;
+        if (headers.authorization !== 'Bearer card-reader') throw new Error('Unauthorized');
+        return { ...publicCard, name: 'private-agent' };
+      },
+    });
+    base = `http://127.0.0.1:${server.port}`;
+    publicCard = await json(
+      await fetch(`${base}/.well-known/agent-card.json`, {
+        headers: { 'A2A-Version': '1.0' },
+      }),
+    );
+    expect(publicCard.capabilities?.extendedAgentCard).toBe(true);
+    expect(publicCard.name).toBe('public-agent');
+    const denied = await json(await rpc('GetExtendedAgentCard', {}));
+    expect(denied.error).toBeDefined();
+    expect(denied.result).toBeUndefined();
+    for (const transport of ['rpc', 'rest']) {
+      const res = await fetch(
+        transport === 'rpc' ? `${base}/a2a/` : `${base}/a2a/rest/extendedAgentCard`,
+        {
+          method: transport === 'rpc' ? 'POST' : 'GET',
+          headers: {
+            'content-type': 'application/json',
+            'A2A-Version': '1.0',
+            authorization: 'Bearer card-reader',
+          },
+          body:
+            transport === 'rpc'
+              ? JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: 1,
+                  method: 'GetExtendedAgentCard',
+                  params: {},
+                })
+              : undefined,
+        },
+      );
+      expect(res.status).toBe(200);
+      const body = await json(res);
+      expect((transport === 'rpc' ? body.result : body).name).toBe('private-agent');
+    }
+  });
+
+  it('shares tasks with the official gRPC service and closes its listener', async () => {
+    let publicCard: AgentCard;
+    await server.close();
+    server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      grpc: { enabled: true, port: 0 },
+      pushNotifications: true,
+      card: { name: 'grpc-agent', description: 'test', version: '0.0.1' },
+      extendedAgentCard: async (context) => {
+        const headers = context.state.get(STATE_HEADERS_KEY) as Record<string, string>;
+        if (headers.authorization !== 'Bearer grpc-reader') throw new Error('Unauthorized');
+        return { ...publicCard, name: 'private-grpc-agent' };
+      },
+      executor: stubExecutor,
+      taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+    });
+    base = `http://127.0.0.1:${server.port}`;
+    expect(server.grpcPort).toBeGreaterThan(0);
+    const Client = makeGenericClientConstructor(A2AService, 'A2AService');
+    const client = new Client(`127.0.0.1:${server.grpcPort}`, credentials.createInsecure());
+    const metadata = new Metadata();
+    metadata.set('a2a-version', '1.0');
+    const call = (method: string, params: unknown): Promise<any> =>
+      new Promise((resolve, reject) => {
+        client[method](
+          params,
+          metadata,
+          { deadline: Date.now() + 2000 },
+          (error: Error | null, value: unknown) => (error ? reject(error) : resolve(value)),
+        );
+      });
+    try {
+      const sent = await call('sendMessage', SendMessageRequest.fromJSON(v1Message('grpc')));
+      expect(sent.payload.$case).toBe('task');
+      const task = sent.payload.value;
+      expect(task.status.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
+      expect((await json(await rpc('GetTask', { id: task.id }))).result.id).toBe(task.id);
+      const listed = await call(
+        'listTasks',
+        ListTasksRequest.fromJSON({ contextId: task.contextId }),
+      );
+      expect(listed.tasks.map((item: Task) => item.id)).toEqual([task.id]);
+      const card = await json(
+        await fetch(`${base}/.well-known/agent-card.json`, { headers: { 'A2A-Version': '1.0' } }),
+      );
+      publicCard = card;
+      expect(card.supportedInterfaces).toContainEqual(
+        expect.objectContaining({
+          protocolBinding: 'GRPC',
+          protocolVersion: '1.0',
+          url: `127.0.0.1:${server.grpcPort}`,
+        }),
+      );
+      expect((await call('getTask', GetTaskRequest.fromJSON({ id: task.id }))).id).toBe(task.id);
+      await expect(
+        call('getTask', GetTaskRequest.fromJSON({ tenant: 'other', id: task.id })),
+      ).rejects.toThrow();
+      const config = await call(
+        'createTaskPushNotificationConfig',
+        TaskPushNotificationConfig.fromJSON({
+          taskId: task.id,
+          url: 'http://127.0.0.1:1/callback',
+        }),
+      );
+      expect(
+        (
+          await call(
+            'getTaskPushNotificationConfig',
+            GetTaskPushNotificationConfigRequest.fromJSON({ taskId: task.id, id: config.id }),
+          )
+        ).id,
+      ).toBe(config.id);
+      expect(
+        (
+          await call(
+            'listTaskPushNotificationConfigs',
+            ListTaskPushNotificationConfigsRequest.fromJSON({ taskId: task.id }),
+          )
+        ).configs,
+      ).toHaveLength(1);
+      await call(
+        'deleteTaskPushNotificationConfig',
+        DeleteTaskPushNotificationConfigRequest.fromJSON({ taskId: task.id, id: config.id }),
+      );
+      expect(
+        (
+          await call(
+            'listTaskPushNotificationConfigs',
+            ListTaskPushNotificationConfigsRequest.fromJSON({ taskId: task.id }),
+          )
+        ).configs,
+      ).toHaveLength(0);
+      await expect(
+        call('getExtendedAgentCard', GetExtendedAgentCardRequest.fromJSON({})),
+      ).rejects.toThrow();
+      metadata.set('authorization', 'Bearer grpc-reader');
+      expect(
+        (await call('getExtendedAgentCard', GetExtendedAgentCardRequest.fromJSON({}))).name,
+      ).toBe('private-grpc-agent');
+      const streamed: any[] = [];
+      await new Promise<void>((resolve, reject) => {
+        client
+          .sendStreamingMessage(SendMessageRequest.fromJSON(v1Message('grpc-stream')), metadata)
+          .on('data', (event: unknown) => streamed.push(event))
+          .on('end', resolve)
+          .on('error', reject);
+      });
+      expect(streamed[0].payload.$case).toBe('task');
+      expect(streamed.at(-1).payload.value.status.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
+      const subscription = client.subscribeToTask(
+        SubscribeToTaskRequest.fromJSON({ id: task.id }),
+        metadata,
+      );
+      const events: any[] = [];
+      subscription.on('data', (event: unknown) => events.push(event));
+      const ended = once(subscription, 'end');
+      await once(subscription, 'data');
+      expect(
+        (await call('cancelTask', CancelTaskRequest.fromJSON({ id: task.id }))).status.state,
+      ).toBe(TaskState.TASK_STATE_CANCELED);
+      await ended;
+      expect(events.at(-1).payload.value.status.state).toBe(TaskState.TASK_STATE_CANCELED);
+      const LegacyClient = makeGenericClientConstructor(LegacyA2AService, 'LegacyA2AService');
+      const legacyClient = new LegacyClient(
+        `127.0.0.1:${server.grpcPort}`,
+        credentials.createInsecure(),
+      );
+      try {
+        const legacyMetadata = new Metadata();
+        legacyMetadata.set('a2a-version', '0.3');
+        legacyMetadata.set('authorization', 'Bearer grpc-reader');
+        const legacyCard = await new Promise<any>((resolve, reject) =>
+          legacyClient.getAgentCard({}, legacyMetadata, (error: Error | null, value: unknown) =>
+            error ? reject(error) : resolve(value),
+          ),
+        );
+        expect(legacyCard.name).toBe('private-grpc-agent');
+      } finally {
+        legacyClient.close();
+      }
+      const live = client.subscribeToTask(
+        SubscribeToTaskRequest.fromJSON({ id: streamed[0].payload.value.id }),
+        metadata,
+      );
+      await once(live, 'data');
+      const disconnected = once(live, 'error');
+      await server.close();
+      expect((await disconnected)[0].code).toBeGreaterThan(0);
+      await expect(call('getTask', GetTaskRequest.fromJSON({ id: task.id }))).rejects.toThrow();
+    } finally {
+      client.close();
+    }
+  });
+
+  it('releases the HTTP listener if the optional gRPC bind fails', async () => {
+    const httpPort = server.port;
+    await server.close();
+    const occupied = createServer();
+    occupied.listen(0, '127.0.0.1');
+    await once(occupied, 'listening');
+    const grpcPort = (occupied.address() as AddressInfo).port;
+    const options = {
+      host: '127.0.0.1',
+      port: httpPort,
+      basePath: '/a2a',
+      card: { name: 'bind-failure', description: '', version: '0.0.1' },
+      executor: stubExecutor,
+      taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+    };
+    try {
+      await expect(
+        startA2aServer({ ...options, grpc: { enabled: true, port: grpcPort } }),
+      ).rejects.toThrow();
+      server = await startA2aServer(options);
+      expect(server.port).toBe(httpPort);
+      expect(server.grpcPort).toBeUndefined();
+    } finally {
+      await new Promise<void>((resolve) => occupied.close(() => resolve()));
+    }
+  });
+
   it('serves the v1 agent card on the well-known path', async () => {
     const res = await fetch(`${base}/.well-known/agent-card.json`, {
       headers: { 'A2A-Version': '1.0' },
@@ -176,6 +524,75 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     expect(interfaces[0].url).toBe(`${base}/a2a/`);
     // the legacyCompat mirror lets pre-1.0 clients in
     expect(interfaces[1]).toMatchObject({ protocolBinding: 'JSONRPC', protocolVersion: '0.3' });
+  });
+
+  it.each(['', '/v1'])('uses REST SSE frames for idle heartbeats (%s)', async (prefix) => {
+    await server.close();
+    let resume!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    server = await startA2aServer({
+      host: '127.0.0.1',
+      port: 0,
+      basePath: '/a2a',
+      rest: true,
+      heartbeat: { enabled: true, intervalMs: 10 },
+      card: { name: 'rest-heartbeat', description: '', version: '0.0.1' },
+      taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+      executor: {
+        ...stubExecutor,
+        async execute(request, bus) {
+          bus.publish(
+            AgentEvent.task({
+              id: request.taskId,
+              contextId: request.contextId,
+              status: {
+                state: TaskState.TASK_STATE_WORKING,
+                message: undefined,
+                timestamp: new Date().toISOString(),
+              },
+              history: [],
+              artifacts: [],
+              metadata: undefined,
+            }),
+          );
+          await paused;
+          await stubExecutor.execute(request, bus);
+        },
+      },
+    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2000);
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:${server.port}/a2a/rest${prefix}/message:stream`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'A2A-Version': prefix ? '0.3' : '1.0' },
+          body: JSON.stringify(v1Message('heartbeat', prefix ? { role: 'ROLE_USER' } : {})),
+          signal: controller.signal,
+        },
+      );
+      if (!response.headers.get('content-type')?.includes('text/event-stream'))
+        throw new Error(await response.text());
+      const reader = response.body!.getReader();
+      let wire = '';
+      while (!wire.includes('"artifactId":"heartbeat"'))
+        wire += new TextDecoder().decode((await reader.read()).value);
+      const events = wire
+        .split('\n\n')
+        .filter((frame) => frame.startsWith('data: '))
+        .map((frame) => JSON.parse(frame.slice(6)));
+      expect(events.some((event) => event.artifactUpdate?.artifact?.name === 'heartbeat')).toBe(
+        true,
+      );
+      expect(events.every((event) => event.jsonrpc === undefined)).toBe(true);
+      await reader.cancel();
+    } finally {
+      clearTimeout(timer);
+      resume();
+    }
   });
 
   it('serves a 0.3-shaped card to clients without an A2A-Version header', async () => {

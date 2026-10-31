@@ -65,6 +65,40 @@ describe('dsh-a2a plugin', () => {
     expect(Config({ pushNotifications: true }).pushNotifications).toBe(true);
   });
 
+  it('defaults optional bindings off and validates the gRPC port', () => {
+    expect(Config({}).rest).toBe(false);
+    expect(Config({}).grpc).toEqual({ enabled: false, port: 41242, publicUrl: '' });
+    expect(Config({ grpc: { enabled: true, port: 0 } }).grpc.port).toBe(0);
+    expect(() => Config({ grpc: { port: 65536 } })).toThrow();
+  });
+
+  it('wires optional bindings and the host extended card provider into discovery', async () => {
+    const extendedAgentCard = vi.fn(async () => {
+      throw new Error('Unauthorized');
+    });
+    ctx.provide('a2aExtendedCard', extendedAgentCard);
+    const started = await apply(ctx, config({ rest: true, grpc: { enabled: true, port: 0 } }));
+    const card = (await (
+      await fetch(`http://127.0.0.1:${started!.port}/.well-known/agent-card.json`, {
+        headers: { 'A2A-Version': '1.0' },
+      })
+    ).json()) as {
+      supportedInterfaces: { protocolBinding: string; url: string }[];
+      capabilities: { extendedAgentCard: boolean };
+    };
+    expect(card.capabilities.extendedAgentCard).toBe(true);
+    expect(started!.grpcPort).toBeGreaterThan(0);
+    expect(card.supportedInterfaces).toContainEqual(
+      expect.objectContaining({ protocolBinding: 'GRPC', url: `127.0.0.1:${started!.grpcPort}` }),
+    );
+    const denied = await fetch(`http://127.0.0.1:${started!.port}/a2a/rest/extendedAgentCard`, {
+      headers: { 'A2A-Version': '1.0' },
+    });
+    expect(denied.status).toBe(500);
+    expect(extendedAgentCard).toHaveBeenCalledOnce();
+    await ctx.fiber.dispose();
+  });
+
   it('does nothing when disabled', () => {
     const result = apply(ctx, config({ enabled: false }));
     expect(result).toBeUndefined();

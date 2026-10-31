@@ -35,13 +35,19 @@ import {
   DefaultExecutionEventBus,
   DefaultRequestHandler,
   ExecutionEventQueue,
+  type ExtendedAgentCardProvider,
   InMemoryPushNotificationStore,
   ResultManager,
   ServerCallContext,
   STATE_HEADERS_KEY,
   type TaskStore,
 } from '@a2a-js/sdk/server';
-import { agentCardHandler, jsonRpcHandler, UserBuilder } from '@a2a-js/sdk/server/express';
+import {
+  agentCardHandler,
+  jsonRpcHandler,
+  restHandler,
+  UserBuilder,
+} from '@a2a-js/sdk/server/express';
 import express, { type RequestHandler } from 'express';
 import { AdmissionGate } from './admission.js';
 import { legacyStreamHandler } from './legacy-stream.js';
@@ -62,6 +68,10 @@ export interface A2aServerOptions {
   taskStore: TaskStore;
   heartbeat?: { enabled: boolean; intervalMs: number };
   pushNotifications?: boolean;
+  rest?: boolean;
+  grpc?: { enabled: boolean; port: number; publicUrl?: string };
+  /** Host provider must authorize the request before returning private card data. */
+  extendedAgentCard?: ExtendedAgentCardProvider;
   approvalGuard?: (message: Message) => undefined | (() => void);
   beforeWorkingTaskMessage?: (message: Message, requestHeaders: unknown) => Promise<void>;
   beforeMessage?: (
@@ -76,6 +86,7 @@ export interface A2aServer {
   restoreTask(task: Task, context: ServerCallContext): DefaultExecutionEventBus;
   /** The bound port (differs from options.port when 0). */
   port: number;
+  grpcPort?: number;
   close(): Promise<void>;
 }
 
@@ -111,19 +122,25 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       protocolVersion: A2A_PROTOCOL_VERSION,
     },
   ];
+  if (options.rest)
+    interfaces.push({
+      ...interfaces[0],
+      url: `${publicUrl}${base}/rest`,
+      protocolBinding: 'HTTP+JSON',
+    });
   const card: AgentCard = {
     name: options.card.name,
     description: options.card.description,
     version: options.card.version,
     // The v0.3 mirror entries let pre-1.0 clients keep working through the
     // legacyCompat layer (they discover the card without an A2A-Version header).
-    supportedInterfaces: duplicateInterfacesForLegacy(interfaces, ['JSONRPC']),
+    supportedInterfaces: duplicateInterfacesForLegacy(interfaces, ['JSONRPC', 'HTTP+JSON']),
     provider: undefined,
     capabilities: {
       streaming: true,
       pushNotifications: options.pushNotifications ?? false,
       extensions: options.extensions ?? [],
-      extendedAgentCard: false,
+      extendedAgentCard: !!options.extendedAgentCard,
     },
     securitySchemes: {},
     securityRequirements: [],
@@ -463,15 +480,24 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
         await stream.return(undefined);
       }
     }
-  })(card, admissionStore, options.executor, busManager, pushStore, pushSender);
+  })(
+    card,
+    admissionStore,
+    options.executor,
+    busManager,
+    pushStore,
+    pushSender,
+    options.extendedAgentCard,
+  );
 
   const app = express();
   // The SDK's jsonRpcHandler parses bodies with express.json()'s 100kb default;
   // raise the ceiling here — body-parser skips re-parsing an already-read body.
-  app.use(express.json({ limit: '16mb' }));
+  app.use(express.json({ limit: '16mb', type: ['application/json', 'application/a2a+json'] }));
   if (options.heartbeat?.enabled) {
     app.use((req, res, next) => {
       const task: { taskId?: string; contextId?: string } = {};
+      const rest = options.rest && req.path.startsWith(`${base}/rest/`);
       const legacy =
         req.body?.method === 'message/stream' || req.body?.method === 'tasks/resubscribe';
       const flushHeaders = res.flushHeaders;
@@ -492,14 +518,19 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
               append: false,
               lastChunk: false,
             };
+            const result = legacy
+              ? { kind: 'artifact-update', ...update }
+              : { artifactUpdate: update };
             res.write(
-              `data: ${JSON.stringify({
-                jsonrpc: '2.0',
-                id: req.body.id ?? null,
-                result: legacy
-                  ? { kind: 'artifact-update', ...update }
-                  : { artifactUpdate: update },
-              })}\n\n`,
+              `data: ${JSON.stringify(
+                rest
+                  ? result
+                  : {
+                      jsonrpc: '2.0',
+                      id: req.body.id ?? null,
+                      result,
+                    },
+              )}\n\n`,
             );
           } catch (error) {
             stop();
@@ -530,6 +561,15 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
   app.use(`/${AGENT_CARD_PATH}`, cardHandler);
   // Pre-1.0 discovery path, kept as a convenience alias.
   app.use('/.well-known/agent.json', cardHandler);
+  if (options.rest)
+    app.use(
+      `${base}/rest`,
+      restHandler({
+        requestHandler,
+        userBuilder: UserBuilder.noAuthentication,
+        legacyCompat: { enabled: true },
+      }),
+    );
   const contextLookup: RequestHandler = async (req, res, next) => {
     const body = req.body as {
       jsonrpc?: string;
@@ -606,7 +646,50 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
   const actualPort = (server.address() as AddressInfo).port;
   if (options.port === 0 && options.card.publicUrl === undefined) {
     const actualBase = `http://${options.host}:${actualPort}`;
-    for (const endpoint of card.supportedInterfaces) endpoint.url = `${actualBase}${base}/`;
+    for (const endpoint of card.supportedInterfaces)
+      endpoint.url = endpoint.url.replace(publicUrl, actualBase);
+  }
+
+  let grpcServer: import('@grpc/grpc-js').Server | undefined;
+  let grpcPort: number | undefined;
+  if (options.grpc?.enabled) {
+    try {
+      const [grpc, sdk, legacy] = await Promise.all([
+        import('@grpc/grpc-js'),
+        import('@a2a-js/sdk/server/grpc'),
+        import('@a2a-js/sdk/compat/v0_3/server/grpc'),
+      ]);
+      grpcServer = new grpc.Server();
+      const handlers = { requestHandler, userBuilder: sdk.UserBuilder.noAuthentication };
+      grpcServer.addService(sdk.A2AService, sdk.grpcService(handlers));
+      grpcServer.addService(legacy.LegacyA2AService, legacy.legacyGrpcService(handlers));
+      const listener = grpcServer;
+      grpcPort = await new Promise<number>((resolve, reject) => {
+        listener.bindAsync(
+          `${options.host}:${options.grpc!.port}`,
+          grpc.ServerCredentials.createInsecure(),
+          (error, port) => (error ? reject(error) : resolve(port)),
+        );
+      });
+      card.supportedInterfaces.push(
+        ...duplicateInterfacesForLegacy(
+          [
+            {
+              url: options.grpc.publicUrl || `${options.host}:${grpcPort}`,
+              protocolBinding: 'GRPC',
+              protocolVersion: A2A_PROTOCOL_VERSION,
+              tenant: '',
+            },
+          ],
+          ['GRPC'],
+        ),
+      );
+    } catch (error) {
+      grpcServer?.forceShutdown();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      throw error;
+    }
   }
 
   return {
@@ -643,9 +726,11 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       return bus;
     },
     port: actualPort,
+    grpcPort,
     close: () =>
       new Promise<void>((resolve) => {
         for (const stop of stopHeartbeats) stop();
+        grpcServer?.forceShutdown();
         server.closeAllConnections?.();
         server.close(() => resolve());
       }),

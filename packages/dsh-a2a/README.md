@@ -112,6 +112,60 @@ Disabled by default. Configure via the profile's `cordis.patch.yml`:
 
 ## Endpoints
 
+All eleven A2A 1.0 operations use the official `@a2a-js/sdk` handlers. JSON-RPC
+is the default binding; HTTP+JSON/REST and gRPC are opt-in and share the same
+TaskStore, executor, subscriptions, and push configuration store.
+
+| Operation | JSON-RPC | HTTP+JSON/REST, relative to `<basePath>/rest` | gRPC |
+| --- | --- | --- | --- |
+| Send message | `SendMessage` | `POST /message:send` | `SendMessage` |
+| Stream message | `SendStreamingMessage` | `POST /message:stream` | `SendStreamingMessage` |
+| Get / list tasks | `GetTask`, `ListTasks` | `GET /tasks/{id}`, `GET /tasks` | `GetTask`, `ListTasks` |
+| Cancel task | `CancelTask` | `POST /tasks/{id}:cancel` | `CancelTask` |
+| Subscribe | `SubscribeToTask` | `GET` or `POST /tasks/{id}:subscribe` | `SubscribeToTask` |
+| Create / list push configs | `CreateTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs` | `POST` / `GET /tasks/{id}/pushNotificationConfigs` | Same operation names |
+| Get / delete push config | `GetTaskPushNotificationConfig`, `DeleteTaskPushNotificationConfig` | `GET` / `DELETE /tasks/{id}/pushNotificationConfigs/{configId}` | Same operation names |
+| Extended card | `GetExtendedAgentCard` | `GET /extendedAgentCard` | `GetExtendedAgentCard` |
+
+Push operations require `pushNotifications: true`. The extended card operation
+requires a host provider; otherwise the SDK returns its standard unsupported
+error. Requests use `A2A-Version: 1.0` and JSON bodies accept
+`application/a2a+json` or `application/json`. REST SSE carries event objects
+directly, while JSON-RPC SSE carries JSON-RPC response envelopes. REST tenant
+routes prepend `/{tenant}`; gRPC requests carry the standard `tenant` field.
+
+```yaml
+rest: true                 # default: false; uses the HTTP listener
+grpc:
+  enabled: true            # default: false; separate plaintext HTTP/2 listener
+  port: 41242              # same bind host as HTTP, default 127.0.0.1
+  publicUrl: ''            # advertised gRPC host:port; empty uses bound address
+```
+
+Install `@grpc/grpc-js` and `@bufbuild/protobuf` in the host when enabling gRPC.
+They are optional peer dependencies and are loaded only when gRPC is enabled.
+Both gRPC versions use the SDK service descriptors and coexist on this listener;
+the Agent Card advertises only enabled bindings, including their v0.3 mirrors.
+REST v0.3 uses the SDK's `/v1/...` routes and protobuf JSON shapes (for example,
+`ROLE_USER`); it is distinct from v0.3 JSON-RPC `kind`-tagged messages. Use the
+matching SDK client rather than copying payloads between bindings.
+
+The host can register an SDK `ExtendedAgentCardProvider` with
+`ctx.provide('a2aExtendedCard', provider)` **before loading this plugin**. The
+type is also exported by this package. The provider receives the SDK
+`ServerCallContext` and must authenticate and authorize the caller before
+returning private card data. The SDK stores HTTP headers or gRPC metadata at
+`context.state.get(STATE_HEADERS_KEY)` (`STATE_HEADERS_KEY` is exported by
+`@a2a-js/sdk/server`); tenant and requested version are also available. A rejected
+provider call returns an error, and the public discovery card stays public.
+Enabling the provider advertises `capabilities.extendedAgentCard: true`.
+
+The plugin does not supply an identity provider or TLS certificates. Keep the
+loopback default or use a host gateway for authentication, authorization and TLS
+on **every enabled listener**. Application session listing, queue editing and
+optional card signing are separate from these eleven operations. This support
+matrix describes the wired SDK surface, not independent protocol certification.
+
 - `GET /.well-known/agent-card.json` — agent card: A2A 1.0 shape for `A2A-Version: 1.0` clients, the 0.3 shape for headerless clients (the legacy `/.well-known/agent.json` path is served as an alias)
 - `POST <basePath>/` — JSON-RPC. v1 methods: `SendMessage` (blocking by default, `configuration.returnImmediately: true` returns after the first event), `SendStreamingMessage` (SSE), `GetTask`, `ListTasks` (filter + cursor pagination), `CancelTask`, `SubscribeToTask` (the current task is the first event; the bus stays alive while the task is interrupted, so interrupted tasks can be re-followed live). v0.3 spellings (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`) keep working through the compat layer. Legacy SSE status updates that end an interaction carry `final: true`, including `input-required` after a completed turn or an approval wait; this ends the stream without making the task terminal. Resubscribe snapshots keep waiting for future events while a live task bus exists. Legacy `tasks/get` also accepts `contextId` without `id` on this path or root `/`, returning the latest stored task or `result: null` when absent.
 
