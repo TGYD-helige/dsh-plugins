@@ -639,6 +639,39 @@ try {
   );
   assert.doesNotMatch(JSON.stringify(captured.slice(hookOffset)), /PRIVATE/);
   await ctx.fiber.dispose();
+  // Completed idle wakes must not reach the wire; abnormal exits remain visible.
+  const idleOffset = captured.length;
+  ctx = new Context();
+  new SessionStore(ctx);
+  await apply(ctx, {
+    ...connection,
+    enabled: true,
+    traceName: 'idle-turn-check',
+    captureContent: false,
+  });
+  const idleSession = ctx.sessions.create();
+  for (let turn = 0; turn < 3; turn++) {
+    idleSession.append('turn/start', { turn });
+    idleSession.append('turn/end', { turn, reason: { kind: 'completed' } });
+  }
+  await ctx.parallel('session/flush', idleSession);
+  assert.equal(captured.length, idleOffset, 'empty successful turns must export no observations');
+  const canceledStart = idleSession.append('turn/start', { turn: 3 });
+  idleSession.append('turn/end', { turn: 3, reason: { kind: 'aborted' } });
+  await ctx.parallel('session/flush', idleSession);
+  assert.equal(captured.length, idleOffset + 1, 'an idle canceled turn must still export its root');
+  assert.equal(attribute(captured[idleOffset], keys.OBSERVATION_LEVEL), 'WARNING');
+  assert.equal(
+    Number(BigInt(captured[idleOffset].startTimeUnixNano) / 1_000_000n),
+    canceledStart.time,
+  );
+  idleSession.append('turn/start', { turn: 4 });
+  await ctx.fiber.dispose();
+  assert.equal(
+    captured.length,
+    idleOffset + 1,
+    'disposing a pending idle turn must not create a root',
+  );
   await checkMetadataWire({ require, connection, captured });
   console.log('real Langfuse SDK / OTLP checks passed');
 } finally {

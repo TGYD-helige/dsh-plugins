@@ -7,7 +7,7 @@ Langfuse observability for [DeepSeek Harness (dsh)](https://github.com/deepseek-
 - one **generation** per LLM call (`llm/stream` waterfall), plus a nested `llm-request` span carrying the verbatim loop-built request
 - one **tool observation** per tool call (`tools/pre-execute` through `tools/result`)
 - one **span** per `hook/invoked` / `hook/result` pair, with hook point, decision, exit code, and duration (stderr summary follows `captureContent`)
-- one **trace** per session turn (`session/event`) — in the v5 SDK the trace IS its root span, ended (and thereby exported) at `turn/end`
+- one **trace** per session turn with observed activity (`session/event`) — the root is created on the first message or observed operation, retains the original turn start time, and ends at `turn/end`; completed turns without activity export nothing, while errors and cancellation remain visible
 - subagent child sessions nested under the parent's tree (`session/created` header link + `subagent/start` / `subagent/end`)
 - structured reasoning in generation output, optional image display, inherited user/tags, and final turn severity
 - optional W3C parent context supplied per session, without adopting the host's ambient OTEL context
