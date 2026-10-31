@@ -192,137 +192,108 @@ Optional Goal integration requires `@deepseek-ai/dsh-goal >=0.2.0-rc.2 || >=0.2.
 
 Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment,tools}@0.2.1-rc.5` — the attachment store is an optional peer) — the session peer floor is `>=0.2.0-rc.1` because child attribution uses `firstLifecycleSeq` to reject restored sessions; check the `TODO(verify)` markers in `src/` before upgrading dsh.
 
-## License
+## Task updates: use standard A2A
 
-MIT
+Use `SendStreamingMessage` to send and stream a task, `SubscribeToTask` to
+subscribe to a known task, and `GetTask` to read its authoritative snapshot and
+history. Use `ListTasks` scoped by `contextId` to discover task IDs before
+subscribing or when reconnecting. The same task may have multiple subscribers. The existing v0.3
+compatibility methods (`message/stream`, `tasks/resubscribe`, `tasks/get`)
+remain available. See the [official task update mechanisms](https://a2a-protocol.org/v1.0.1/specification/#35-task-update-delivery-mechanisms).
 
-### Optional checkpointed notifications
+The A2A standard also defines task Push Notifications. This server currently
+advertises `pushNotifications: false`; the inbox adapter below does not
+implement or enable that capability. Standard task history and event delivery
+also do not promise that a host's separate application database mirror has
+finished writing. A host requiring that guarantee must coordinate its own reads.
 
-Import `installNotifications`, `httpNotificationSender`, and their types from
-`@amaster.ai/dsh-a2a/notifications`. Nothing is installed or sent by default.
-Call the installer once on a dedicated plugin-scoped Cordis Context with the
-`sessions` service available; unload its fiber to unregister and abort work.
-The existing DSH peer floors apply (agent `0.2.0-rc.2`, session `0.2.0-rc.1`;
-tested with `0.2.1-rc.5`). No new service or package dependency is required.
+## Optional native inbox invalidations
+
+A2A task events do not describe native inbox edits, reordering, clearing, steering,
+or consumption. For those operations only, import `installInboxNotifications`
+and `httpInboxNotificationSender` from `@amaster.ai/dsh-a2a/inbox-notifications`.
+This is a local host integration for a DSH-specific capability, not an A2A event
+or webhook protocol. No custom chat/message-created channel is provided.
 
 ```ts
-import { installNotifications, httpNotificationSender } from '@amaster.ai/dsh-a2a/notifications';
+import {
+  installInboxNotifications,
+  httpInboxNotificationSender,
+} from '@amaster.ai/dsh-a2a/inbox-notifications';
 
-// Coding: host validates the application and explicitly resolves its own identity.
-installNotifications(ctx, {
-  message: httpNotificationSender(detail => ({
-    url: 'https://coding.example.invalid/broadcast',
-    headers: { 'x-host-user': codingIdentity(detail) },
-    body: {
-      from: 'a2a-server', topic: 'messages', scope: detail.contextId,
-      type: 'message.created',
-      data: { messageId: detail.messageId, taskId: detail.taskId },
-    },
-  })),
-  inbox: httpNotificationSender(detail => ({
-    url: 'https://coding.example.invalid/broadcast',
-    headers: { 'x-host-user': codingOwner(detail.contextId) },
-    body: {
-      from: 'dsh', topic: 'conversation-queue',
-      scope: authorizedApplicationScope(detail.contextId), type: 'queue.changed',
-      data: detail,
-    },
-  })),
-});
-
-// Copilot: independent destination/identity; no implicit queue channel.
-installNotifications(copilotCtx, {
-  message: copilotDestination ? httpNotificationSender(detail => ({
-    url: copilotDestination,
-    headers: { 'x-host-user': copilotIdentity(detail) },
-    body: { contextId: detail.contextId, messageId: detail.messageId, taskId: detail.taskId },
-  })) : undefined,
-});
+// Install once on a plugin-scoped Context. Undefined sender means disabled.
+installInboxNotifications(ctx, inboxDestination ? httpInboxNotificationSender(detail => ({
+  url: inboxDestination,
+  headers: { 'x-host-user': authorizedOwner(detail.contextId) },
+  body: { type: 'inbox.changed', scope: authorizedScope(detail.contextId), data: detail },
+})) : undefined);
 ```
 
-Identity functions and destinations above are host-owned placeholders. A message
-adapter receives `requestHeaders` from admission, if available, and `source`
-from the committed native message. Restored input can resolve identity from its
-persisted A2A source. Only explicitly selected headers should be forwarded;
-missing identity must follow the host's own authorization policy. The module
-never reads environment identity, invents permissions, or chooses an endpoint.
-Use temporary directories such as `/tmp/dsh-notification-example` for examples'
-session state, never production credentials or history.
+The destination, envelope, scope and identity functions above are host-owned
+placeholders. The module never reads application environment variables,
+credentials or request headers, and never invents permission grants. Hosts
+validate contexts, authorize subscriptions/publication, and explicitly select
+headers. Keep identities and configuration separate for separate applications.
+Use temporary directories such as `/tmp/dsh-inbox-example` for local session data.
 
-Each channel is independently enabled by providing its sender. A custom sender
-is `(detail, signal) => Promise<boolean>`: return true only for success, false or
-throw for failure. Honor cancellation and bound execution time. The provided
-HTTP adapter POSTs JSON, combines disposal cancellation with a five-second
-request timeout, cancels response bodies, and returns the HTTP success status.
-It forwards no request headers unless the host explicitly maps them.
+The Context must provide `sessions` plus participating durability listeners
+(such as native persistence or `dsh-storage`). The module observes
+`agent/inbox/spliced`, retains only the latest pending invalidation per context,
+and waits for a successful `sessions.flush` before each send. False/rejected
+checkpoints do not deliver. `version` is the originating native session event
+sequence, not queue length or a global counter.
 
-Committed messages are matched by context and native ID, using selected task
-identity where present, and sent once after a successful `sessions.flush`.
-They are not retried. Inbox signals observe all native `agent/inbox/spliced`
-records, including native consumption and steering, coalesce synchronous
-changes, and serialize delivery per context. `version` is the originating
-session event sequence. Each captured version gets at most three attempts,
-with 250/500 ms waits and a successful checkpoint before every send. A newer
-pending version gets its own budget even if the old version exhausts retries.
-Other contexts progress independently. False/rejected checkpoints never send.
-Disposal aborts requests and retry waits; late checkpoint completion cannot send.
+A custom `InboxNotificationSender` is `(detail, signal) => Promise<boolean>`;
+`detail` contains `{ contextId, version }`. Return true only for delivery success,
+false or throw on failure. Honor cancellation and bound execution time. The
+optional HTTP adapter POSTs the host-mapped JSON with explicit headers, a
+five-second request timeout, disposal cancellation, response-body cleanup, and
+an observable HTTP success/failure result. It is not standard A2A Push Notifications.
 
-Resource limits apply per installer across both channels: at most 16 active
-checkpoint/delivery operations, one per context per channel, plus 128 waiting
-operations. A slow chat destination does not occupy its context's inbox slot.
-Waiting work is canceled on context or plugin disposal, and an unresolved
-checkpoint cannot retain its delivery slot after cancellation. Saturation skips
-excess chat notifications; inbox capacity failures use the existing bounded
-retry budget. This can lose invalidations under sustained overload: it never
-blocks admission, changes task settlement, or delays the agent loop waiting
-for a notification slot.
+Synchronous changes coalesce; each context delivers serially. A captured version
+gets at most three attempts with 250/500 ms retry waits. A newer pending version
+keeps its own budget after either success or exhaustion of the older version.
+Completed batches rotate behind waiting contexts so a busy inbox cannot starve
+another context. Per installer, at most 16 contexts drain concurrently and at
+most 128 contexts retain pending invalidations, including active deliveries.
+At capacity, existing contexts still update their latest version; additional
+contexts' invalidations are skipped rather than creating another work queue.
 
-Deduplication keeps one processed event-sequence watermark per context, relying
-on the native ordered append feed; replayed observations retain their original
-sequence. It does not retain all historical native message IDs. Correlation
-records are capped at 256 per context; saturation evicts the oldest uncommitted
-record, never one awaiting delivery. Native selection can restore an evicted
-association; its identity then comes from the persisted source where available.
-All correlation and watermark state is removed on context disposal.
+Unloading the plugin unregisters listeners, clears pending state and aborts
+requests/retry waits. Disposing a session or agent drops its pending state and
+immediately releases its delivery slot, even if its native checkpoint is still
+unresolved. Its late continuation cannot deliver or affect a replacement context.
+Native flush itself has no cancellation API.
 
-These are best-effort invalidations, not snapshots or an exactly-once protocol.
-An unchanged version can remain undelivered after exhaustion. Hosts must read
-authoritative history/inbox snapshots on initial connection and reconnection,
-authorize subscriptions and publication, and validate application/context scope.
-No persistent outbox, queue store, polling, or storage-plugin changes are added.
+Delivery remains best effort. An unchanged version may remain undelivered after
+retry exhaustion or overload. Notifications only invalidate a display; read an
+authoritative inbox snapshot on initial connection and reconnection. There is no
+persistent outbox, polling, message correlation cache or history-ID deduplication.
 
-The runtime contract check uses real Cordis, SessionStore append/checkpoint, and
-AgentRegistry disposal; A2A observations are supplied at the public event seam.
-It has passed at the declared agent/session floors and at the pinned runtime.
-After `pnpm build`, run it against the installed pinned runtime:
+The existing agent/session peer floors apply without new dependencies. After
+`pnpm build`, validate native SessionStore checkpointing and AgentRegistry
+disposal with:
 
 ```sh
-node .github/scripts/notification-runtime-check.mjs
+node .github/scripts/inbox-notification-runtime-check.mjs
 ```
 
-To reproduce the minimum-version check without changing this workspace's dependencies:
+To reproduce the tested minimum session/agent versions in an isolated directory:
 
 ```sh
-npm install --prefix /tmp/dsh-notification-minimum --save-exact --ignore-scripts --legacy-peer-deps \
+npm install --prefix /tmp/dsh-inbox-minimum --save-exact --ignore-scripts --legacy-peer-deps \
   @deepseek-ai/cordis@4.0.4 @deepseek-ai/dsh-agent@0.2.0-rc.2 \
   @deepseek-ai/dsh-session@0.2.0-rc.1 @deepseek-ai/dsh-scope@0.2.0-rc.1 \
   @deepseek-ai/dsh-session-projection@0.2.0-rc.2 @deepseek-ai/dsh-system-prompt@0.2.0-rc.2 \
   @deepseek-ai/dsh-invariants@0.2.0-rc.2 @deepseek-ai/dsh-typert-protocol@0.2.0-rc.2 \
   @deepseek-ai/dsh-util-values@0.2.0-rc.2
-node .github/scripts/notification-runtime-check.mjs /tmp/dsh-notification-minimum
+node .github/scripts/inbox-notification-runtime-check.mjs /tmp/dsh-inbox-minimum
 ```
 
-Cordis 4.0.4 satisfies the tested DSH packages' own `~4.0.4` peer requirement.
-The check covers notification seams, not a model execution or a complete minimum-version
-DSH deployment; upstream DSH packages retain their own transitive peer constraints.
+Cordis 4.0.4 satisfies those DSH packages' own peer requirement. This checks the
+inbox notification integration, not a complete minimum-version model execution.
+The pinned runtime is also tested at DSH `0.2.1-rc.5` / Cordis `4.0.5`.
 
-To check notification memory independently of a database or network, build the
-package and run:
+## License
 
-```sh
-node --expose-gc .github/scripts/notification-memory-check.mjs
-```
-
-The check delivers 50,000 distinct messages to one long-lived context and
-asserts that retained heap growth after warmup stays below 4 MiB. It is a
-regression guard for historical-ID retention, not a production latency benchmark.
+MIT

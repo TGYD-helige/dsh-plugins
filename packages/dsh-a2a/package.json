@@ -11,9 +11,9 @@
       "default": "./lib/index.js"
     },
     "./package.json": "./package.json",
-    "./notifications": {
-      "types": "./lib/types/notifications.d.ts",
-      "default": "./lib/notifications.js"
+    "./inbox-notifications": {
+      "types": "./lib/types/inbox-notifications.d.ts",
+      "default": "./lib/inbox-notifications.js"
     }
   },
   "files": [

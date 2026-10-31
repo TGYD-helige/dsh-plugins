@@ -164,6 +164,7 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     expect(res.status).toBe(200);
     const card = await json(res);
     expect(card.name).toBe('test-agent');
+    expect(card.capabilities).toMatchObject({ streaming: true, pushNotifications: false });
     const interfaces = card.supportedInterfaces;
     expect(interfaces).toHaveLength(2);
     expect(interfaces[0]).toMatchObject({
@@ -204,6 +205,29 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     expect(frames[0].result.task.status.state).toBe('TASK_STATE_SUBMITTED');
     const last = frames.at(-1);
     expect(last.result.statusUpdate.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
+  });
+
+  it('uses standard task subscriptions for two clients and reads history with GetTask', async () => {
+    const sent = await json(await rpc('SendMessage', { tenant: '', ...v1Message('shared') }));
+    const id = sent.result.task.id;
+    const subscriptions = await Promise.all([
+      rpc('SubscribeToTask', { tenant: '', id }, 31),
+      rpc('SubscribeToTask', { tenant: '', id }, 32),
+    ]);
+    for (const response of subscriptions) {
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toContain('text/event-stream');
+    }
+    const history = await json(await rpc('GetTask', { tenant: '', id, historyLength: 10 }, 33));
+    expect(history.result.history[0].parts[0].text).toBe('shared');
+    const updates = subscriptions.map(frames);
+    await rpc('CancelTask', { tenant: '', id }, 34);
+    const [first, second] = await Promise.all(updates);
+    expect(first.map((frame) => frame.result)).toEqual(second.map((frame) => frame.result));
+    expect(first.at(-1).result.statusUpdate).toMatchObject({
+      taskId: id,
+      status: { state: 'TASK_STATE_CANCELED' },
+    });
   });
 
   it.each([0, -1, 1.5, NaN, Infinity, 2_147_483_648])(
