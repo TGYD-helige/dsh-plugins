@@ -1101,7 +1101,9 @@ describe('dsh-langfuse plugin', () => {
         userId: 'bob',
       });
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/event', sessionOf('s1'), userMessage('turn input'));
       ctx.emit('session/event', sessionOf('s2'), turnStart(0));
+      ctx.emit('session/event', sessionOf('s2'), userMessage('turn input'));
       expect(mocks.roots[0].parentContext).toEqual({
         traceId: '1234567890abcdef1234567890abcdef',
         spanId: '1234567890abcdef',
@@ -1118,6 +1120,7 @@ describe('dsh-langfuse plugin', () => {
       expect(mocks.roots[0].spans[0].attributes['langfuse.trace.tags']).toEqual(['request-a']);
       ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
       ctx.emit('session/event', sessionOf('s1'), turnStart(1));
+      ctx.emit('session/event', sessionOf('s1'), userMessage('turn input'));
       expect(mocks.roots[2].parentContext).toEqual({
         traceId: '0'.repeat(32),
         spanId: '0'.repeat(16),
@@ -1196,7 +1199,9 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit('langfuse/context', 's1', { metadata: { requestId: 'first' } });
       ctx.emit('langfuse/context', 's2', { metadata: { requestId: 'second' } });
       ctx.emit('session/event', first, turnStart(0));
+      ctx.emit('session/event', first, userMessage('turn input'));
       ctx.emit('session/event', second, turnStart(0));
+      ctx.emit('session/event', second, userMessage('turn input'));
       ctx.emit('langfuse/context', 's1', { metadata: { requestId: 'next' } });
       await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(finishStop())));
       await drain(
@@ -1208,8 +1213,10 @@ describe('dsh-langfuse plugin', () => {
       );
       ctx.emit('session/event', first, turnEnd(0));
       ctx.emit('session/event', first, turnStart(1));
+      ctx.emit('session/event', first, userMessage('turn input'));
       ctx.emit('session/event', first, turnEnd(1));
       ctx.emit('session/event', first, turnStart(2));
+      ctx.emit('session/event', first, userMessage('turn input'));
       ctx.emit('session/event', first, turnEnd(2));
       ctx.emit('session/event', second, turnEnd(0));
 
@@ -1527,7 +1534,9 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit('langfuse/context', surviving.id, { metadata: { requestId: 'surviving' } });
       ctx.emit('session/disposed', discarded);
       ctx.emit('session/event', discarded, turnStart(0));
+      ctx.emit('session/event', discarded, userMessage('turn input'));
       ctx.emit('session/event', surviving, turnStart(0));
+      ctx.emit('session/event', surviving, userMessage('turn input'));
       ctx.emit('session/event', discarded, turnEnd(0));
       ctx.emit('session/event', surviving, turnEnd(0));
 
@@ -1669,6 +1678,7 @@ describe('dsh-langfuse plugin', () => {
       ]) {
         ctx.emit('langfuse/context', 's1', { traceparent });
         ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+        ctx.emit('session/event', sessionOf('s1'), userMessage('turn input'));
         expect(mocks.roots.at(-1)?.parentContext).toMatchObject({ traceId: '0'.repeat(32) });
       }
       expect(errors).toHaveBeenCalledWith(
@@ -2113,6 +2123,7 @@ describe('dsh-langfuse plugin', () => {
       await setup();
       const session = sessionOf('custom');
       ctx.emit('session/event', session, turnStart(0));
+      ctx.emit('session/event', session, userMessage('turn input'));
       const invoked = {
         turn: 0,
         point: 'UserCancel',
@@ -2124,6 +2135,7 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit('session/event', session, turnEnd(0));
       expect(mocks.roots[0].spans[0].ended).toBe(0);
       ctx.emit('session/event', session, turnStart(1));
+      ctx.emit('session/event', session, userMessage('turn input'));
       ctx.emit(
         'session/event',
         session,
@@ -2204,6 +2216,7 @@ describe('dsh-langfuse plugin', () => {
       await setup({ ...enabledConfig, secretKey: 'sk-lf-private', redactFields: ['name'] });
       const session = sessionOf('custom');
       ctx.emit('session/event', session, turnStart(0));
+      ctx.emit('session/event', session, userMessage('turn input'));
       ctx.emit(
         'session/event',
         session,
@@ -2288,6 +2301,7 @@ describe('dsh-langfuse plugin', () => {
       await setup();
       const session = sessionOf('custom');
       ctx.emit('session/event', session, turnStart(0));
+      ctx.emit('session/event', session, userMessage('turn input'));
       ctx.emit(
         'session/event',
         session,
@@ -2342,8 +2356,10 @@ describe('dsh-langfuse plugin', () => {
       const parent = sessionOf('parent');
       const child = childSessionOf('child', 'parent');
       ctx.emit('session/event', parent, turnStart(0));
+      ctx.emit('session/event', parent, userMessage('turn input'));
       ctx.emit('session/created', child);
       ctx.emit('session/event', child, turnStart(0));
+      ctx.emit('session/event', child, userMessage('turn input'));
       ctx.emit(
         'session/event',
         child,
@@ -2358,6 +2374,7 @@ describe('dsh-langfuse plugin', () => {
       ctx.emit('session/event', child, turnEnd(0));
       ctx.emit('session/event', parent, turnEnd(0));
       ctx.emit('session/event', parent, turnStart(1));
+      ctx.emit('session/event', parent, userMessage('turn input'));
       ctx.emit(
         'session/event',
         child,
@@ -2424,6 +2441,7 @@ describe('dsh-langfuse plugin', () => {
         }),
       );
       ctx.emit('session/event', session, turnStart(1));
+      ctx.emit('session/event', session, userMessage('turn input'));
       expect(mocks.roots[1].parentContext).toMatchObject({
         traceId: '1234567890abcdef1234567890abcdef',
         spanId: '1234567890abcdef',
@@ -2438,6 +2456,7 @@ describe('dsh-langfuse plugin', () => {
       await setup();
       const session = sessionOf('custom');
       ctx.emit('session/event', session, turnStart(0));
+      ctx.emit('session/event', session, userMessage('turn input'));
       ctx.emit('session/event', session, turnEnd(0));
       const root = mocks.roots[0];
       const endedAt = root.endedAt;
@@ -2456,6 +2475,7 @@ describe('dsh-langfuse plugin', () => {
       expect(mocks.roots).toHaveLength(1);
       expect(root.spans[0].name).toBe('hook:UserCancel');
       ctx.emit('session/event', session, turnStart(1));
+      ctx.emit('session/event', session, userMessage('turn input'));
       expect(mocks.roots[1].attributes['user.id']).toBe('next-turn-owner');
       expect(root.endedAt).toBe(endedAt);
       expect(root.ended).toBe(1);
@@ -2467,6 +2487,7 @@ describe('dsh-langfuse plugin', () => {
       for (let index = 0; index < 129; index++) {
         const session = sessionOf(`session-${index}`);
         ctx.emit('session/event', session, turnStart(0));
+        ctx.emit('session/event', session, userMessage('turn input'));
         ctx.emit('session/event', session, turnEnd(0));
       }
       ctx.emit(
@@ -2598,10 +2619,32 @@ describe('dsh-langfuse plugin', () => {
       expect(JSON.stringify(hook)).not.toContain('secret output');
     });
 
+    it.each([true, false])(
+      'does not export empty completed turns (captureContent=%s)',
+      async (captureContent) => {
+        await setup({ ...enabledConfig, captureContent });
+        ctx.emit('langfuse/context', 's1', { metadata: { requestId: 'empty' } });
+        for (let turn = 0; turn < 3; turn++) {
+          ctx.emit('session/event', sessionOf('s1'), turnStart(turn));
+          ctx.emit('session/event', sessionOf('s1'), turnEnd(turn));
+        }
+        expect(mocks.roots).toHaveLength(0);
+        ctx.emit('session/event', sessionOf('s1'), turnStart(3));
+        ctx.emit('session/event', sessionOf('s1'), userMessage('real input'));
+        ctx.emit('session/event', sessionOf('s1'), turnEnd(3));
+        expect(mocks.roots).toHaveLength(1);
+        expect(metadataOf(mocks.roots[0])).not.toHaveProperty('requestId');
+        expect(mocks.roots[0].ended).toBe(1);
+      },
+    );
+
     it('opens a root span per turn, feeds it the first user message, ends it on turn/end', async () => {
       await setup();
 
-      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      const started = turnStart(0);
+      ctx.emit('session/event', sessionOf('s1'), started);
+      expect(mocks.roots).toHaveLength(0);
+      ctx.emit('session/event', sessionOf('s1'), userMessage('fix the bug'));
       expect(mocks.roots).toHaveLength(1);
       const root = fakeObs(mocks.roots[0]);
       expect(root.name).toBe('dsh-turn');
@@ -2612,7 +2655,6 @@ describe('dsh-langfuse plugin', () => {
       expect(root.attributes['session.id']).toBe('s1');
       expect(root.attributes['langfuse.trace.name']).toBe('dsh-turn');
 
-      ctx.emit('session/event', sessionOf('s1'), userMessage('fix the bug'));
       ctx.emit('session/event', sessionOf('s1'), userMessage('ignored second'));
       expect(root.updates).toEqual([{ input: 'fix the bug' }]);
       // The trace-level input also rides the deprecated langfuse.trace.* keys
@@ -2633,13 +2675,16 @@ describe('dsh-langfuse plugin', () => {
 
       // The next turn opens a fresh trace.
       ctx.emit('session/event', sessionOf('s1'), turnStart(1));
+      expect(mocks.roots).toHaveLength(1);
+      ctx.emit('session/event', sessionOf('s1'), userMessage('next turn'));
       expect(mocks.roots).toHaveLength(2);
-      expect(fakeObs(mocks.roots[1]).body).toEqual({ metadata: { turn: 1 } });
+      expect(fakeObs(mocks.roots[1]).body).toMatchObject({ metadata: { turn: 1 } });
     });
 
     it('forces a fresh trace root instead of adopting an ambient OTEL parent', async () => {
       await setup();
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/event', sessionOf('s1'), userMessage('turn input'));
       // OTEL's canonical invalid span context: the SDK starts a new traceId.
       expect(fakeObs(mocks.roots[0]).parentContext).toEqual({
         traceId: '0'.repeat(32),
@@ -2668,6 +2713,7 @@ describe('dsh-langfuse plugin', () => {
     it('ends the abandoned root on session/disposed (un-ended spans never export)', async () => {
       await setup();
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/event', sessionOf('s1'), userMessage('turn input'));
       const root = fakeObs(mocks.roots[0]);
       ctx.emit('session/disposed', sessionOf('s1'));
       expect(root.ended).toBe(1);
@@ -2717,6 +2763,7 @@ describe('dsh-langfuse plugin', () => {
     it('ends a stale root when the next turn replaces it', async () => {
       await setup();
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/event', sessionOf('s1'), userMessage('turn input'));
       const stale = fakeObs(mocks.roots[0]);
       ctx.emit(
         'session/event',
@@ -2730,6 +2777,7 @@ describe('dsh-langfuse plugin', () => {
       );
       const hook = stale.spans[0];
       ctx.emit('session/event', sessionOf('s1'), turnStart(1));
+      ctx.emit('session/event', sessionOf('s1'), userMessage('turn input'));
       expect(hook.ended).toBe(1);
       expect(lastUpdate(hook)).toMatchObject({ level: 'WARNING' });
       expect(stale.ended).toBe(1);
@@ -3293,6 +3341,7 @@ describe('dsh-langfuse plugin', () => {
       expect(fakeObs(mocks.roots[1]).attributes['session.id']).toBe('s1');
       expect(mocks.roots).toHaveLength(2);
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/event', sessionOf('s1'), userMessage('turn input'));
       expect(mocks.roots).toHaveLength(3);
     });
 
@@ -3596,9 +3645,11 @@ describe('dsh-langfuse plugin', () => {
     it('does not mark a new parent turn when an old subagent fails', async () => {
       await setup();
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/event', sessionOf('s1'), userMessage('turn input'));
       ctx.emit('session/created', childSessionOf('c1', 's1'));
       ctx.emit('session/event', sessionOf('s1'), turnEnd(0));
       ctx.emit('session/event', sessionOf('s1'), turnStart(1));
+      ctx.emit('session/event', sessionOf('s1'), userMessage('turn input'));
       const nextRoot = fakeObs(mocks.roots[1]);
 
       ctx.emit('subagent/end', subagentEnd('c1', 'error'));

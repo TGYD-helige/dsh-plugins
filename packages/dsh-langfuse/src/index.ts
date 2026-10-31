@@ -13,7 +13,7 @@
  *   shared identity).
  * - `hook/invoked` / `hook/result` session records → one **span** per hook run.
  * - `session/event` emit    → one Langfuse **trace** per agent turn
- *   (`turn/start` opens a root span — in the v5 SDK the root observation IS
+ *   (`turn/start` records the start; actual activity opens the root — in v5 it IS
  *   the trace — the turn's first `user/message` sets the input, `turn/end`
  *   stamps the end reason and ends the root, which is what exports it).
  * - Native A2A inbox tasks own a trace spanning admission through task termination;
@@ -665,7 +665,10 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   const reporter = new LangfuseReporter(config);
   const sessions = new Map<string, SessionTrace>();
   const nativeInboxes = new Set<string>();
-  const pendingTurns = new Map<string, { turn: number; startTime: Date }>();
+  const pendingTurns = new Map<
+    string,
+    { turn: number; startTime: Date; context?: LangfuseTraceContext }
+  >();
   const inboxInputs = new Map<string, A2aInboxEvent[]>();
   const inboxTasks = new Map<string, InboxTaskTrace>();
   const children = new Map<string, ChildSession>();
@@ -773,8 +776,13 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     metadata?: Record<string, unknown>,
     startTime?: Date,
   ) {
-    const context = sessionId ? traceContexts.get(sessionId) : undefined;
-    if (sessionId) traceContexts.delete(sessionId);
+    const pending = sessionId ? pendingTurns.get(sessionId) : undefined;
+    const context = pending
+      ? pending.context
+      : sessionId
+        ? traceContexts.get(sessionId)
+        : undefined;
+    if (sessionId && !pending) traceContexts.delete(sessionId);
     return reporter.openTrace({ name: config.traceName, sessionId, metadata, context, startTime });
   }
 
@@ -1333,16 +1341,18 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         const stale = sessions.get(sessionId);
         if (stale) endTurn(stale);
         inboxInputs.delete(sessionId);
-        if (nativeInboxes.has(sessionId)) {
-          sessions.delete(sessionId);
-          pendingTurns.set(sessionId, { turn: event.data.turn, startTime: new Date(event.time) });
-          break;
-        }
-        const trace = openTrace(sessionId, { turn: event.data.turn });
-        if (trace) sessions.set(sessionId, { trace, hasInput: false, turn: event.data.turn });
+        sessions.delete(sessionId);
+        pendingTurns.set(sessionId, {
+          turn: event.data.turn,
+          startTime: new Date(event.time),
+          context: nativeInboxes.has(sessionId) ? undefined : traceContexts.get(sessionId),
+        });
+        // Ordinary turns consume request context at start, even if they remain empty.
+        if (!nativeInboxes.has(sessionId)) traceContexts.delete(sessionId);
         break;
       }
       case 'user/message': {
+        if (pendingTurns.has(sessionId)) traceFor(sessionId);
         const state = sessions.get(sessionId);
         if (state && !state.hasInput && config.captureContent) {
           setMessageInput(state.trace, event.data.content);
@@ -1351,6 +1361,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         break;
       }
       case 'assistant/message': {
+        if (pendingTurns.has(sessionId)) traceFor(sessionId);
         const state = sessions.get(sessionId);
         if (state && config.captureContent) {
           state.lastAssistantText = messageText(event.data.message) ?? state.lastAssistantText;
@@ -1358,7 +1369,12 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         break;
       }
       case 'turn/end': {
-        if (pendingTurns.has(sessionId)) traceFor(sessionId);
+        if (
+          pendingTurns.has(sessionId) &&
+          (nativeInboxes.has(sessionId) || event.data.reason.kind !== 'completed')
+        )
+          traceFor(sessionId);
+        pendingTurns.delete(sessionId);
         const state = sessions.get(sessionId);
         if (state) {
           sessions.delete(sessionId);
