@@ -33,11 +33,17 @@ export class InboxChanges {
       ctx.on('session/event', (session, event) => {
         if (
           this.stopped ||
+          this.disposed.has(session) ||
           event.type !== 'agent/inbox/spliced' ||
           !managed(session.id) ||
           (!enabled && !this.listeners.has(session))
         )
           return;
+        const pending = this.states.get(session);
+        if (pending?.job) {
+          pending.requested = Math.max(pending.requested, session.seq - 1);
+          return;
+        }
         void this.checkpoint(session).catch((error) => {
           if (!this.stopped)
             console.error('[dsh-a2a] inbox checkpoint notification failed:', error);
@@ -76,8 +82,8 @@ export class InboxChanges {
     state.requested = Math.max(state.requested, session.seq - 1);
     const pending = state;
     if (!pending.job)
-      pending.job = Promise.resolve()
-        .then(async () => {
+      pending.job = Promise.resolve().then(async () => {
+        try {
           let version: number;
           do {
             if (this.stopped || this.disposed.has(session))
@@ -103,10 +109,10 @@ export class InboxChanges {
             });
           } while (pending.requested > version);
           return { contextId: session.id, version };
-        })
-        .finally(() => {
+        } finally {
           pending.job = undefined;
-        });
+        }
+      });
     return pending.job;
   }
 

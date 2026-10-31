@@ -197,6 +197,85 @@ async function boot(
 }
 
 describe('official protocol bindings', () => {
+  it('bounds paged bytes while preserving an oversized individual A2A message', async () => {
+    const f = await boot();
+    for (let index = 0; index < 20; index++)
+      await f.send(`large-page-${index}`, { wakeup: false }, undefined, 'x'.repeat(128 * 1024));
+    const first = (await f.rpc('dsh/inbox/get', { contextId: 'native-test', pageSize: 100 }))
+      .result;
+    expect(first.nextTurn.length).toBeLessThan(20);
+    expect(
+      Buffer.byteLength(JSON.stringify([...first.nextStep, ...first.nextTurn])),
+    ).toBeLessThanOrEqual(1024 * 1024);
+    expect(first.nextPageToken).not.toBe('');
+    await f.rpc('dsh/inbox/clear', { contextId: 'native-test' });
+    await f.send('oversize-single', { wakeup: false }, undefined, 'z'.repeat(2 * 1024 * 1024));
+    await f.send('after-oversize', { wakeup: false });
+    const oversized = (await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result;
+    expect(oversized.nextTurn).toHaveLength(1);
+    expect(oversized.nextTurn[0].message.parts[0].text.length).toBe(2 * 1024 * 1024);
+    const next = (
+      await f.rpc('dsh/inbox/get', { contextId: 'native-test', pageToken: oversized.nextPageToken })
+    ).result;
+    expect(next.nextTurn[0].message.messageId).toBe('after-oversize');
+  });
+
+  it('bounds inbox pages and mutation responses without decoding the entire pending queue', async () => {
+    const f = await boot();
+    for (let index = 0; index < 55; index++) await f.send(`page-${index}`, { wakeup: false });
+    const agent = await f.inbox.resolve('native-test');
+    for (const text of ['native-step-one', 'native-step-two'])
+      agent.inbox.append(
+        'next-step',
+        createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }),
+      );
+    const first = (await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result;
+    expect(first.nextStep.length + first.nextTurn.length).toBe(50);
+    expect(first.totalSize).toBe(57);
+    const second = (
+      await f.rpc('dsh/inbox/get', {
+        contextId: 'native-test',
+        pageToken: first.nextPageToken,
+        pageSize: 4,
+      })
+    ).result;
+    expect(second.nextStep).toEqual([]);
+    expect(second.nextTurn).toHaveLength(4);
+    const last = (
+      await f.rpc('dsh/inbox/get', { contextId: 'native-test', pageToken: second.nextPageToken })
+    ).result;
+    expect(last.nextTurn).toHaveLength(3);
+    expect(last.nextPageToken).toBe('');
+    const ids = [...first.nextStep, ...first.nextTurn, ...second.nextTurn, ...last.nextTurn].map(
+      (item) => item.id,
+    );
+    expect(ids).toEqual(
+      [...agent.inbox.nextStep, ...agent.inbox.nextTurn].map((message) => message.id),
+    );
+    expect((await f.inbox.get('native-test')).nextTurn).toHaveLength(55);
+    const before = agent.session.seq;
+    const invalid = await f.rpc('dsh/inbox/remove', {
+      contextId: 'native-test',
+      id: ids.at(-1),
+      pageSize: 0,
+    });
+    expect(invalid.error).toBeDefined();
+    expect(agent.session.seq).toBe(before);
+    const moved = await f.rpc('dsh/inbox/move', {
+      contextId: 'native-test',
+      id: ids.at(-1),
+      index: 53,
+      pageSize: 1,
+    });
+    expect(moved.result.nextStep).toHaveLength(1);
+    expect(moved.result.nextTurn).toEqual([]);
+    expect(moved.result.totalSize).toBe(57);
+    expect(
+      (await f.rpc('dsh/inbox/get', { contextId: 'native-test', pageToken: first.nextPageToken }))
+        .error,
+    ).toBeDefined();
+  });
+
   it('cancels a borrowed A2A turn before awaiting shutdown without canceling later native work', async () => {
     const root = await mkdtemp(join(tmpdir(), 'a2a-borrowed-active-stop-'));
     cleanups.push(() => rm(root, { recursive: true, force: true }));

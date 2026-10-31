@@ -261,6 +261,91 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
 }
 
 describe('native A2A inbox', () => {
+  it('bounds parallel task checkpoints and drains all bulk-clear writes before reporting failure', async () => {
+    const store = new MemoryTaskStore();
+    const f = harness([], store);
+    const queued = Array.from({ length: 12 }, (_, index) =>
+      f.send(`bulk-${index}`, { parked: true }),
+    );
+    await vi.waitFor(() => expect(f.agent.inbox.nextTurn).toHaveLength(12));
+    const save = store.save.bind(store);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let active = 0,
+      peak = 0,
+      writes = 0;
+    let failedId = '';
+    vi.spyOn(store, 'save').mockImplementation(async (task, context) => {
+      writes++;
+      active++;
+      peak = Math.max(peak, active);
+      const fail = !failedId;
+      if (fail) failedId = task.id;
+      try {
+        await gate;
+        if (fail) throw new Error('one checkpoint failed');
+        await save(task, context);
+      } finally {
+        active--;
+      }
+    });
+    const clearing = f.native.clearPending('context').then(
+      () => undefined,
+      (error) => error,
+    );
+    try {
+      await vi.waitFor(() => expect(active).toBeGreaterThan(1));
+      expect(peak).toBeLessThanOrEqual(4);
+      release();
+      expect(await clearing).toMatchObject({ message: 'one checkpoint failed' });
+      expect(writes).toBe(12);
+      expect(active).toBe(0);
+      expect(peak).toBeLessThanOrEqual(4);
+      await f.native.cancel(failedId);
+      expect((await store.load(failedId, new ServerCallContext()))?.status?.state).toBe(
+        TaskState.TASK_STATE_CANCELED,
+      );
+      await Promise.all(queued.map((request) => request.execution));
+    } finally {
+      release();
+      await clearing;
+      await f.native.shutdown();
+    }
+  });
+
+  it('records only the moved interval and skips a redundant head reorder during execute', async () => {
+    const f = harness();
+    const queued = ['one', 'two', 'three', 'four'].map((id) => f.send(id, { parked: true }));
+    await vi.waitFor(() => expect(f.agent.inbox.nextTurn).toHaveLength(4));
+    const original = f.agent.inbox.nextTurn.map((message) => message.id);
+    const offset = f.log.length;
+    await f.native.move('context', original[2], 1);
+    const events = f.log.slice(offset).filter((event) => event.type === 'agent/inbox/spliced');
+    expect(events).toHaveLength(1);
+    expect(events[0].data).toMatchObject({ start: 1, removedCount: 2 });
+    expect(events[0].data.inserted.map((message) => message.id)).toEqual([
+      original[2],
+      original[1],
+    ]);
+    expect(f.agent.inbox.nextTurn.map((message) => message.id)).toEqual([
+      original[0],
+      original[2],
+      original[1],
+      original[3],
+    ]);
+    const executing = f.log.length;
+    await f.native.executePending('context', original[0]);
+    await Promise.all(queued.map((request) => request.execution));
+    expect(
+      f.log
+        .slice(executing)
+        .filter((event) => event.type === 'agent/inbox/spliced')
+        .some((event) => event.data.inserted.length > 1),
+    ).toBe(false);
+  });
+
   it('clears a batch without a durability flush per queued task', async () => {
     const f = harness();
     const flush = vi.fn(async () => true);

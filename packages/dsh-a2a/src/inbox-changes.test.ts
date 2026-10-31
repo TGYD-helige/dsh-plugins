@@ -3,6 +3,82 @@ import type { Session } from '@deepseek-ai/dsh-session';
 import { expect, it, vi } from 'vitest';
 import { InboxChanges } from './inbox-changes.js';
 
+it.each([0, 1, 2, 3, 4])(
+  'publishes changes arriving while a checkpoint job completes (%s microtasks)',
+  async (depth) => {
+    const ctx = new Context();
+    const flush = vi.fn(async () => true);
+    ctx.provide('sessions', { flush } as never);
+    const session = { id: 'completion', seq: 1 } as unknown as Session;
+    const changes = new InboxChanges(ctx, () => true, true);
+    const versions: number[] = [];
+    changes.watch(
+      session,
+      (change) => versions.push(change.version),
+      () => {},
+    );
+    ctx.on('a2a/inbox-checkpointed', (change) => {
+      if (change.version !== 0) return;
+      let pending = Promise.resolve();
+      for (let index = 0; index < depth; index++) pending = pending.then(() => {});
+      void pending.then(() => {
+        Object.assign(session, { seq: 2 });
+        ctx.emit('session/event', session, { type: 'agent/inbox/spliced' } as never);
+      });
+    });
+    try {
+      await changes.checkpoint(session);
+      await new Promise(setImmediate);
+      expect(versions).toEqual([0, 1]);
+      expect(flush).toHaveBeenCalledTimes(2);
+    } finally {
+      changes.close();
+      await ctx.fiber.dispose();
+    }
+  },
+);
+
+it('coalesces a blocked burst into one failure report and retries on a later change', async () => {
+  const ctx = new Context();
+  let fail!: (error: Error) => void;
+  const flush = vi
+    .fn()
+    .mockImplementationOnce(
+      () =>
+        new Promise<boolean>((_resolve, reject) => {
+          fail = reject;
+        }),
+    )
+    .mockResolvedValue(true);
+  ctx.provide('sessions', { flush } as never);
+  const session = { id: 'burst', seq: 1 } as unknown as Session;
+  const changes = new InboxChanges(ctx, () => true, true);
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const seen = vi.fn();
+  changes.watch(session, seen, () => {});
+  try {
+    ctx.emit('session/event', session, { type: 'agent/inbox/spliced' } as never);
+    await vi.waitFor(() => expect(flush).toHaveBeenCalledOnce());
+    for (let seq = 2; seq <= 1000; seq++) {
+      Object.assign(session, { seq });
+      ctx.emit('session/event', session, { type: 'agent/inbox/spliced' } as never);
+    }
+    fail(new Error('storage unavailable'));
+    await vi.waitFor(() => expect(errors).toHaveBeenCalled());
+    expect(errors).toHaveBeenCalledTimes(1);
+    expect(seen).not.toHaveBeenCalled();
+    Object.assign(session, { seq: 1001 });
+    ctx.emit('session/event', session, { type: 'agent/inbox/spliced' } as never);
+    await vi.waitFor(() =>
+      expect(seen).toHaveBeenCalledWith({ contextId: 'burst', version: 1000 }),
+    );
+  } finally {
+    changes.close();
+    await ctx.fiber.dispose();
+    errors.mockRestore();
+  }
+});
+
 it('publishes only after a successful checkpoint and keeps changes arriving during it', async () => {
   const ctx = new Context();
   let release!: (value: boolean) => void;

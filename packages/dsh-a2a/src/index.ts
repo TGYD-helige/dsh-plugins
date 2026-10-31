@@ -34,7 +34,7 @@ export type { ExtendedAgentCardProvider } from '@a2a-js/sdk/server';
 export type { A2aApproval, A2aApprovalCodec, A2aApprovalReply } from './approval.js';
 export { defaultApprovalCodec } from './approval.js';
 export type { A2aFileMaterializer } from './content.js';
-export type { A2aInbox, A2aInboxEvent, InboxSnapshot } from './inbox.js';
+export type { A2aInbox, A2aInboxEvent, InboxPageOptions, InboxSnapshot } from './inbox.js';
 export { INBOX_EXTENSION } from './inbox.js';
 export type { InboxChange } from './inbox-changes.js';
 export type { SubagentToolSource } from './translator.js';
@@ -288,7 +288,10 @@ export function apply(
               uri: INBOX_EXTENSION,
               description: 'Native inbox management, steering and checkpointed invalidation',
               required: false,
-              params: undefined,
+              params: {
+                documentationUrl:
+                  'https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md#native-inbox-extension-v1',
+              },
             },
           ]
         : [],
