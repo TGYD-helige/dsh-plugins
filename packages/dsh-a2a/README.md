@@ -20,13 +20,13 @@ Standard `SendMessage` / `SendStreamingMessage`, task queries, cancellation and 
 
 The same-process `a2aInbox` service exposes `resolve`, `content`, `enqueue`, `promote`, `cancel`, `get`, `update`, `move`, `remove`, `clearPending`, and `executePending`, plus the existing pause/wake/resume controls. Pending-only clearing preserves active work; context clearing discards all work.
 
-For external clients, the [native inbox extension specification](#native-inbox-extension-v1) defines `dsh/inbox/get`, `update`, `move`, `remove`, `clear`, `execute`, `steer`, and `subscribe` at the advertised JSONRPC endpoint. Activate it with the `A2A-Extensions` header set to the extension URI. Updates use standard A2A 1.0 user Messages; operations address native inbox IDs. REST/gRPC clients use the advertised JSONRPC endpoint for these extension methods. No extra queue or consumer is created.
+For external clients, the [native inbox extension specification](#native-inbox-extension-v1) defines `inbox/get`, `update`, `move`, `remove`, `clear`, `execute`, `steer`, and `subscribe` at the advertised JSONRPC endpoint. Activate it with the `A2A-Extensions` header set to the extension URI. Updates use standard A2A 1.0 user Messages; operations address native inbox IDs. REST/gRPC clients use the advertised JSONRPC endpoint for these extension methods. No extra queue or consumer is created.
 
-`dsh/inbox/subscribe` streams checkpointed invalidations `{contextId, version}` over SSE, including native consumption and edits. It registers before its initial checkpoint and sends only after owner-scoped `ctx.sessions.flush()` returns true. A false/rejected checkpoint sends no success notification. Re-read the live inbox on invalidation and reconnect; there is no replay or durable outbox. Slow clients disconnect instead of accumulating notifications. To publish the same invalidations to host listeners on `a2a/inbox-checkpointed` without an SSE subscriber, enable `inbox.notifications: true` (default false). Hosts retain authentication, authorization and product-specific fan-out.
+`inbox/subscribe` streams checkpointed invalidations `{contextId, version}` over SSE, including native consumption and edits. It registers before its initial checkpoint and sends only after owner-scoped `ctx.sessions.flush()` returns true. A false/rejected checkpoint sends no success notification. Re-read the live inbox on invalidation and reconnect; there is no replay or durable outbox. Slow clients disconnect instead of accumulating notifications. To publish the same invalidations to host listeners on `a2a/inbox-checkpointed` without an SSE subscriber, enable `inbox.notifications: true` (default false). Hosts retain authentication, authorization and product-specific fan-out.
 
 Existing native agents keep their setup and lifecycle owner. Reading/subscribing does not block their producers. Plugin shutdown detaches its own queued A2A inputs from a borrowed agent, retaining recovery data when configured; native work and the caller's agent remain available.
 
-Wire snapshots are paginated: 50 entries by default, `pageSize: 1..100`, with `totalSize` and `nextPageToken`. Read `dsh/inbox/get` until the token is empty, traversing next-step before next-turn. Any session-version change invalidates the cursor; restart from the first page. Mutations accept `pageSize` and return the first page. Same-process calls without page options still return the full snapshot. Adjacent reorders log only their affected interval, and slow notification checkpoints keep one pending version/error observer per batch.
+Wire snapshots are paginated: 50 entries by default, `pageSize: 1..100`, with `totalSize` and `nextPageToken`. Read `inbox/get` until the token is empty, traversing next-step before next-turn. Any session-version change invalidates the cursor; restart from the first page. Mutations accept `pageSize` and return the first page. Same-process calls without page options still return the full snapshot. Adjacent reorders log only their affected interval, and slow notification checkpoints keep one pending version/error observer per batch.
 
 The `E2E (dsh-a2a.inbox-api)` matrix leg installs the packed plugin into the pinned CLI and uses the real model gateway. It checks queue editing/reordering/removal/clearing, execution and steering, two checkpointed SSE subscribers, native consumption, and model recall in a subsequent context turn. A local loopback forwarder only gates the first model request to make steering deterministic; it never generates model responses.
 
@@ -77,10 +77,9 @@ DSH_NATIVE_OWNERSHIP_LANGFUSE_LIVE=true node .github/scripts/check-inbox.mjs -t 
 
 ## Native inbox extension v1
 
-Stable protocol identifier: `https://github.com/TGYD-helige/dsh-plugins/blob/main/docs/protocol/inbox-v1.md`
+Protocol identifier: `https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md#native-inbox-extension-v1`
 
-The identifier stays unchanged for existing messages and retained task metadata;
-this README is the canonical specification. Agent Card extension params advertise
+This README is the canonical specification. Agent Card extension params advertise
 `documentationUrl` pointing to this section.
 
 This is a project extension, not an official A2A extension. It follows the
@@ -91,6 +90,8 @@ states, subscriptions and Push configurations keep their official meanings.
 
 ### Methods
 
+Methods use the implementation-neutral `inbox/` namespace.
+
 Send JSON-RPC 2.0 requests to the advertised JSONRPC endpoint. All methods take
 `contextId`. IDs named `id` below are **native inbox message IDs**, not task IDs.
 The extension adds no REST or gRPC service; those clients can discover and use
@@ -98,14 +99,14 @@ the advertised JSONRPC endpoint for these operations.
 
 | Method | Additional parameters | Result |
 | --- | --- | --- |
-| `dsh/inbox/get` | Optional `pageSize`, `pageToken` | Live inbox snapshot page |
-| `dsh/inbox/update` | `id`, `message` (A2A 1.0 user Message) | Updated snapshot |
-| `dsh/inbox/move` | `id`, `index` (zero-based destination in the same list) | Updated snapshot |
-| `dsh/inbox/remove` | `id` | Updated snapshot |
-| `dsh/inbox/clear` | — | Snapshot after clearing pending input |
-| `dsh/inbox/execute` | Optional `id` to move first in the next-turn list | Snapshot after waking pending work |
-| `dsh/inbox/steer` | `id`, `taskId` (active target) | Snapshot after promotion |
-| `dsh/inbox/subscribe` | — | SSE JSON-RPC result stream of `{contextId, version}` |
+| `inbox/get` | Optional `pageSize`, `pageToken` | Live inbox snapshot page |
+| `inbox/update` | `id`, `message` (A2A 1.0 user Message) | Updated snapshot |
+| `inbox/move` | `id`, `index` (zero-based destination in the same list) | Updated snapshot |
+| `inbox/remove` | `id` | Updated snapshot |
+| `inbox/clear` | — | Snapshot after clearing pending input |
+| `inbox/execute` | Optional `id` to move first in the next-turn list | Snapshot after waking pending work |
+| `inbox/steer` | `id`, `taskId` (active target) | Snapshot after promotion |
+| `inbox/subscribe` | — | SSE JSON-RPC result stream of `{contextId, version}` |
 
 A snapshot is `{contextId, version, nextTurn, nextStep, totalSize, nextPageToken}`. Each entry is
 `{id, message, editable}`: `message` uses the standard A2A 1.0 Message JSON shape.
@@ -129,7 +130,7 @@ limit serialized entries to about 1 MiB; one oversized Message is returned intac
 to ensure progress, so a page may contain fewer items than requested. All mutation
 methods accept `pageSize` for their returned first page; invalid values reject
 before changing the queue. Pages traverse `nextStep` before `nextTurn`, keeping
-native order within each list. Continue via `dsh/inbox/get` and `nextPageToken`
+native order within each list. Continue via `inbox/get` and `nextPageToken`
 until the token is empty. Tokens bind the context and session version; a changed
 version rejects stale tokens instead of silently skipping or duplicating input.
 Re-read from the first page after invalidation. Same-process `get(contextId)`
@@ -165,7 +166,7 @@ coalesce changes per context, and checkpoint before publishing. A rejected or
 false checkpoint produces no success notification. Later changes or reconnects
 retry the current state; there is no durable outbox, replay or exactly-once
 delivery. A host can consume the same feed through `a2a/inbox-checkpointed`.
-Notification data contains no message bodies. Re-read `dsh/inbox/get` after an
+Notification data contains no message bodies. Re-read `inbox/get` after an
 invalidation and on reconnect. Each context checkpoints independently; slow SSE
 clients disconnect instead of creating an unbounded notification backlog.
 Closing the plugin unregisters observers/subscriptions and suppresses late sends.

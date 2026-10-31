@@ -19,7 +19,7 @@ import { INBOX_EXTENSION, type NativeInbox, validateInboxPage } from './inbox.js
 export function inboxRpcHandler(inbox: NativeInbox, card: AgentCard): RequestHandler {
   return async (req, res, next) => {
     const body = req.body;
-    if (typeof body?.method !== 'string' || !body.method.startsWith('dsh/inbox/')) return next();
+    if (typeof body?.method !== 'string' || !body.method.startsWith('inbox/')) return next();
     try {
       if (body.jsonrpc !== '2.0' || !['string', 'number'].includes(typeof body.id))
         throw new RequestMalformedError('A JSON-RPC 2.0 request id is required.');
@@ -39,7 +39,7 @@ export function inboxRpcHandler(inbox: NativeInbox, card: AgentCard): RequestHan
         (params.tenant !== undefined && params.tenant !== '')
       )
         throw new RequestMalformedError('A contextId and the default tenant are required.');
-      const method = body.method.slice('dsh/inbox/'.length);
+      const method = body.method.slice('inbox/'.length);
       const page = { pageSize: params.pageSize, pageToken: params.pageToken };
       validateInboxPage(page);
       if (method !== 'get' && page.pageToken)

@@ -201,21 +201,20 @@ describe('official protocol bindings', () => {
     const f = await boot();
     for (let index = 0; index < 20; index++)
       await f.send(`large-page-${index}`, { wakeup: false }, undefined, 'x'.repeat(128 * 1024));
-    const first = (await f.rpc('dsh/inbox/get', { contextId: 'native-test', pageSize: 100 }))
-      .result;
+    const first = (await f.rpc('inbox/get', { contextId: 'native-test', pageSize: 100 })).result;
     expect(first.nextTurn.length).toBeLessThan(20);
     expect(
       Buffer.byteLength(JSON.stringify([...first.nextStep, ...first.nextTurn])),
     ).toBeLessThanOrEqual(1024 * 1024);
     expect(first.nextPageToken).not.toBe('');
-    await f.rpc('dsh/inbox/clear', { contextId: 'native-test' });
+    await f.rpc('inbox/clear', { contextId: 'native-test' });
     await f.send('oversize-single', { wakeup: false }, undefined, 'z'.repeat(2 * 1024 * 1024));
     await f.send('after-oversize', { wakeup: false });
-    const oversized = (await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result;
+    const oversized = (await f.rpc('inbox/get', { contextId: 'native-test' })).result;
     expect(oversized.nextTurn).toHaveLength(1);
     expect(oversized.nextTurn[0].message.parts[0].text.length).toBe(2 * 1024 * 1024);
     const next = (
-      await f.rpc('dsh/inbox/get', { contextId: 'native-test', pageToken: oversized.nextPageToken })
+      await f.rpc('inbox/get', { contextId: 'native-test', pageToken: oversized.nextPageToken })
     ).result;
     expect(next.nextTurn[0].message.messageId).toBe('after-oversize');
   });
@@ -229,11 +228,11 @@ describe('official protocol bindings', () => {
         'next-step',
         createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }),
       );
-    const first = (await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result;
+    const first = (await f.rpc('inbox/get', { contextId: 'native-test' })).result;
     expect(first.nextStep.length + first.nextTurn.length).toBe(50);
     expect(first.totalSize).toBe(57);
     const second = (
-      await f.rpc('dsh/inbox/get', {
+      await f.rpc('inbox/get', {
         contextId: 'native-test',
         pageToken: first.nextPageToken,
         pageSize: 4,
@@ -242,7 +241,7 @@ describe('official protocol bindings', () => {
     expect(second.nextStep).toEqual([]);
     expect(second.nextTurn).toHaveLength(4);
     const last = (
-      await f.rpc('dsh/inbox/get', { contextId: 'native-test', pageToken: second.nextPageToken })
+      await f.rpc('inbox/get', { contextId: 'native-test', pageToken: second.nextPageToken })
     ).result;
     expect(last.nextTurn).toHaveLength(3);
     expect(last.nextPageToken).toBe('');
@@ -254,14 +253,14 @@ describe('official protocol bindings', () => {
     );
     expect((await f.inbox.get('native-test')).nextTurn).toHaveLength(55);
     const before = agent.session.seq;
-    const invalid = await f.rpc('dsh/inbox/remove', {
+    const invalid = await f.rpc('inbox/remove', {
       contextId: 'native-test',
       id: ids.at(-1),
       pageSize: 0,
     });
     expect(invalid.error).toBeDefined();
     expect(agent.session.seq).toBe(before);
-    const moved = await f.rpc('dsh/inbox/move', {
+    const moved = await f.rpc('inbox/move', {
       contextId: 'native-test',
       id: ids.at(-1),
       index: 53,
@@ -271,7 +270,7 @@ describe('official protocol bindings', () => {
     expect(moved.result.nextTurn).toEqual([]);
     expect(moved.result.totalSize).toBe(57);
     expect(
-      (await f.rpc('dsh/inbox/get', { contextId: 'native-test', pageToken: first.nextPageToken }))
+      (await f.rpc('inbox/get', { contextId: 'native-test', pageToken: first.nextPageToken }))
         .error,
     ).toBeDefined();
   });
@@ -285,7 +284,7 @@ describe('official protocol bindings', () => {
       meta: { cwd: '/tmp' },
       agentOptions: { provider: 'mock', model: 'mock' },
     });
-    await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    await f.rpc('inbox/get', { contextId: 'native-test' });
     let releaseFirst!: () => void, releaseNative!: () => void, releaseStorage!: () => void;
     const firstGate = new Promise<void>((resolve) => {
       releaseFirst = resolve;
@@ -359,7 +358,7 @@ describe('official protocol bindings', () => {
       meta: { cwd: '/tmp' },
       agentOptions: { provider: 'mock', model: 'mock' },
     });
-    await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    await f.rpc('inbox/get', { contextId: 'native-test' });
     const save = f.backend.save.bind(f.backend);
     let entered = false;
     let taskId = '';
@@ -414,7 +413,7 @@ describe('official protocol bindings', () => {
       meta: { cwd: '/tmp' },
       agentOptions: { provider: 'mock', model: 'mock' },
     });
-    await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    await f.rpc('inbox/get', { contextId: 'native-test' });
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -459,7 +458,7 @@ describe('official protocol bindings', () => {
       source: { kind: 'user' },
     });
     handle.agent.inbox.append('next-turn', native);
-    const snapshot = await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    const snapshot = await f.rpc('inbox/get', { contextId: 'native-test' });
     expect(snapshot.error).toBeUndefined();
     expect(snapshot.result.nextTurn[0].id).toBe(native.id);
     let release!: () => void;
@@ -473,7 +472,7 @@ describe('official protocol bindings', () => {
       await gate;
       return next();
     });
-    expect((await f.rpc('dsh/inbox/execute', { contextId: 'native-test' })).error).toBeUndefined();
+    expect((await f.rpc('inbox/execute', { contextId: 'native-test' })).error).toBeUndefined();
     await f.inbox.shutdown();
     await f.bridge.dispose();
     expect(f.ctx.agents.get('native-test')).toBe(handle.agent);
@@ -492,7 +491,7 @@ describe('official protocol bindings', () => {
 
   it('does not interfere with native producers after reading their inbox', async () => {
     const f = await boot();
-    expect((await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).error).toBeUndefined();
+    expect((await f.rpc('inbox/get', { contextId: 'native-test' })).error).toBeUndefined();
     const agent = f.ctx.agents.get('native-test')!;
     const native = createUserMessage({
       content: [{ type: 'text', text: 'native producer' }],
@@ -540,10 +539,10 @@ describe('official protocol bindings', () => {
       source: { kind: 'user' },
     });
     agent.inbox.append('next-turn', native);
-    expect((await f.rpc('dsh/inbox/execute', { contextId: 'native-test' })).error).toBeUndefined();
+    expect((await f.rpc('inbox/execute', { contextId: 'native-test' })).error).toBeUndefined();
     await expect.poll(() => entered).toBe(true);
     expect(agent.inbox.nextTurn).toEqual([]);
-    expect((await f.rpc('dsh/inbox/execute', { contextId: 'native-test' })).error).toBeUndefined();
+    expect((await f.rpc('inbox/execute', { contextId: 'native-test' })).error).toBeUndefined();
     release();
     await agent.whenIdle();
     expect(f.adapter.requests).toHaveLength(1);
@@ -586,7 +585,7 @@ describe('official protocol bindings', () => {
     });
     agent.inbox.append('next-turn', native);
     expect(
-      (await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: native.id })).error,
+      (await f.rpc('inbox/execute', { contextId: 'native-test', id: native.id })).error,
     ).toBeUndefined();
     release();
     await agent.whenIdle();
@@ -615,7 +614,7 @@ describe('official protocol bindings', () => {
     });
     agent.inbox.append('next-turn', native);
     expect(
-      (await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: native.id })).error,
+      (await f.rpc('inbox/execute', { contextId: 'native-test', id: native.id })).error,
     ).toBeUndefined();
     release();
     await maintenance;
@@ -637,7 +636,7 @@ describe('official protocol bindings', () => {
     });
     agent.inbox.append('next-turn', native);
     expect(
-      (await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: native.id })).error,
+      (await f.rpc('inbox/execute', { contextId: 'native-test', id: native.id })).error,
     ).toBeUndefined();
     await agent.whenIdle();
     expect(f.adapter.requests).toHaveLength(1);
@@ -650,7 +649,7 @@ describe('official protocol bindings', () => {
     const b = await f.send('b', { wakeup: false });
     const last = agent.inbox.nextTurn.at(-1)!;
     expect(
-      (await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: last.id })).error,
+      (await f.rpc('inbox/execute', { contextId: 'native-test', id: last.id })).error,
     ).toBeUndefined();
     await agent.whenIdle();
     await f.completed(a.id);
@@ -681,7 +680,7 @@ describe('official protocol bindings', () => {
     });
     const active = await f.send('active');
     const queued = await f.send('queued', { wakeup: false });
-    const cleared = await f.rpc('dsh/inbox/clear', { contextId: 'native-test' });
+    const cleared = await f.rpc('inbox/clear', { contextId: 'native-test' });
     expect(cleared.error).toBeUndefined();
     expect(cleared.result.nextTurn).toEqual([]);
     expect((await f.rpc('GetTask', { id: active.id })).result.status.state).toBe(
@@ -697,7 +696,7 @@ describe('official protocol bindings', () => {
   it('rejects malformed inbox edits and subscriptions without durability', async () => {
     const f = await boot();
     await f.send('queued', { wakeup: false });
-    const snapshot = (await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result;
+    const snapshot = (await f.rpc('inbox/get', { contextId: 'native-test' })).result;
     const item = snapshot.nextTurn[0];
     for (const message of [
       { ...item.message, messageId: 'changed' },
@@ -705,16 +704,16 @@ describe('official protocol bindings', () => {
       { ...item.message, parts: [{ text: null }] },
       { ...item.message, role: 'ROLE_AGENT' },
     ]) {
-      const edited = await f.rpc('dsh/inbox/update', {
+      const edited = await f.rpc('inbox/update', {
         contextId: 'native-test',
         id: item.id,
         message,
       });
       expect(edited.error.code).toBe(-32602);
     }
-    const subscription = await f.rpc('dsh/inbox/subscribe', { contextId: 'native-test' });
+    const subscription = await f.rpc('inbox/subscribe', { contextId: 'native-test' });
     expect(subscription.error).toBeDefined();
-    expect((await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result).toEqual(snapshot);
+    expect((await f.rpc('inbox/get', { contextId: 'native-test' })).result).toEqual(snapshot);
   });
 
   it('notifies two inbox subscribers only after checkpoint and includes native consumption', async () => {
@@ -736,7 +735,7 @@ describe('official protocol bindings', () => {
         body: JSON.stringify({
           jsonrpc: '2.0',
           id: 7,
-          method: 'dsh/inbox/subscribe',
+          method: 'inbox/subscribe',
           params: { contextId: 'native-test' },
         }),
       });
@@ -789,7 +788,7 @@ describe('official protocol bindings', () => {
     release();
     await expect.poll(() => a.at(-1)?.version).toBeGreaterThanOrEqual(editedVersion);
     await expect.poll(() => b.at(-1)?.version).toBeGreaterThanOrEqual(editedVersion);
-    const execution = await f.rpc('dsh/inbox/execute', { contextId: 'native-test' });
+    const execution = await f.rpc('inbox/execute', { contextId: 'native-test' });
     expect(execution.error).toBeUndefined();
     await f.completed(task.id);
     const consumed = agent.session
@@ -798,29 +797,29 @@ describe('official protocol bindings', () => {
       .at(-1)!;
     await expect.poll(() => a.at(-1)?.version).toBeGreaterThanOrEqual(consumed.seq);
     await expect.poll(() => b.at(-1)?.version).toBeGreaterThanOrEqual(consumed.seq);
-    expect((await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result.nextTurn).toEqual(
-      [],
-    );
+    expect((await f.rpc('inbox/get', { contextId: 'native-test' })).result.nextTurn).toEqual([]);
   });
 
   it('manages the native inbox through negotiated extension methods', async () => {
     const f = await boot();
     await f.send('parked-a', { wakeup: false });
     await f.send('parked-b', { wakeup: false });
-    const get = await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    const get = await f.rpc('inbox/get', { contextId: 'native-test' });
     expect(get.error).toBeUndefined();
     expect(get.result.nextTurn.map((item: any) => item.message.messageId)).toEqual([
       'parked-a',
       'parked-b',
     ]);
-    const denied = await f.rpc('dsh/inbox/get', { contextId: 'native-test' }, false);
+    const denied = await f.rpc('inbox/get', { contextId: 'native-test' }, false);
     expect(denied.error).toBeDefined();
+    const legacy = await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    expect(legacy.error?.code).toBe(-32601);
     const [a, b] = get.result.nextTurn;
     let editHeaders: unknown;
     f.ctx.on('a2a/before-followup', (detail) => {
       editHeaders = detail.requestHeaders;
     });
-    const updated = await f.rpc('dsh/inbox/update', {
+    const updated = await f.rpc('inbox/update', {
       contextId: 'native-test',
       id: a.id,
       message: { ...a.message, parts: [{ text: 'edited input' }] },
@@ -828,16 +827,16 @@ describe('official protocol bindings', () => {
     expect(updated.error).toBeUndefined();
     expect(editHeaders).toMatchObject({ 'a2a-version': '1.0', 'a2a-extensions': INBOX_EXTENSION });
     expect(updated.result.nextTurn[0].message.parts).toEqual([{ text: 'edited input' }]);
-    const moved = await f.rpc('dsh/inbox/move', { contextId: 'native-test', id: b.id, index: 0 });
+    const moved = await f.rpc('inbox/move', { contextId: 'native-test', id: b.id, index: 0 });
     expect(moved.result.nextTurn.map((item: any) => item.id)).toEqual([b.id, a.id]);
-    const stale = await f.rpc('dsh/inbox/move', { contextId: 'native-test', id: b.id, index: 9 });
+    const stale = await f.rpc('inbox/move', { contextId: 'native-test', id: b.id, index: 9 });
     expect(stale.error).toBeDefined();
-    const removed = await f.rpc('dsh/inbox/remove', { contextId: 'native-test', id: b.id });
+    const removed = await f.rpc('inbox/remove', { contextId: 'native-test', id: b.id });
     expect(removed.result.nextTurn.map((item: any) => item.id)).toEqual([a.id]);
     await expect
       .poll(async () => (await f.rpc('GetTask', { id: b.message.taskId })).result.status.state)
       .toBe('TASK_STATE_CANCELED');
-    const executed = await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: a.id });
+    const executed = await f.rpc('inbox/execute', { contextId: 'native-test', id: a.id });
     expect(executed.error).toBeUndefined();
     await f.completed(a.message.taskId);
     expect(
@@ -846,7 +845,7 @@ describe('official protocol bindings', () => {
       ),
     ).toBe(true);
     await f.send('parked-c', { wakeup: false });
-    const cleared = await f.rpc('dsh/inbox/clear', { contextId: 'native-test' });
+    const cleared = await f.rpc('inbox/clear', { contextId: 'native-test' });
     expect(cleared.result.nextTurn).toEqual([]);
   });
 
@@ -2300,7 +2299,7 @@ describe('native ownership', () => {
     const agent = await f.inbox.resolve('native-test');
     const b = await f.send('queued', { wakeup: false });
     const nativeId = agent.inbox.nextTurn[0].id;
-    const steered = await f.rpc('dsh/inbox/steer', {
+    const steered = await f.rpc('inbox/steer', {
       contextId: 'native-test',
       id: nativeId,
       taskId: a.id,
