@@ -36,6 +36,10 @@ evaluated after removing the selected item. Execute preserves other pending
 items and their order; steer reuses the existing task-ownership promotion rules.
 Explicit execution also drives native-producer input without inventing an A2A
 Task for it; its conversation events remain in the native session history.
+Reading or subscribing does not gate input from native producers. An already
+live native agent is reused with its existing setup and lifecycle owner. Plugin
+shutdown leaves native work running; it detaches plugin-owned queued A2A input,
+retaining it in task metadata only under the configured retention policy.
 Clearing pending input does not cancel an active turn; use standard CancelTask
 for task cancellation. Removed independent queued tasks become canceled.
 

@@ -143,6 +143,8 @@ jobs:
           grep -F "name: '$package_name'" /tmp/dsh-config.yml
 
       # Stage B: the package's scenario script — the real LLM round-trip.
+      # dsh-a2a.inbox-api is auto-discovered here: packed plugin + real model,
+      # with inbox editing, steering and checkpointed multi-client invalidation.
       # Secrets are scoped to this step only.
       - name: Stage B — run scenario
         if: env.DSH_SECRETS_AVAILABLE == 'true'

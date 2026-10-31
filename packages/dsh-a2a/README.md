@@ -24,6 +24,10 @@ For external clients, the [native inbox extension specification](../../docs/prot
 
 `dsh/inbox/subscribe` streams checkpointed invalidations `{contextId, version}` over SSE, including native consumption and edits. It registers before its initial checkpoint and sends only after owner-scoped `ctx.sessions.flush()` returns true. A false/rejected checkpoint sends no success notification. Re-read the live inbox on invalidation and reconnect; there is no replay or durable outbox. Slow clients disconnect instead of accumulating notifications. To publish the same invalidations to host listeners on `a2a/inbox-checkpointed` without an SSE subscriber, enable `inbox.notifications: true` (default false). Hosts retain authentication, authorization and product-specific fan-out.
 
+Existing native agents keep their setup and lifecycle owner. Reading/subscribing does not block their producers. Plugin shutdown detaches its own queued A2A inputs from a borrowed agent, retaining recovery data when configured; native work and the caller's agent remain available.
+
+The `E2E (dsh-a2a.inbox-api)` matrix leg installs the packed plugin into the pinned CLI and uses the real model gateway. It checks queue editing/reordering/removal/clearing, execution and steering, two checkpointed SSE subscribers, native consumption, and model recall in a subsequent context turn. A local loopback forwarder only gates the first model request to make steering deterministic; it never generates model responses.
+
 `a2a/before-followup` validates admission; `a2a/before-step` runs at the official pre-step boundary, after system-prompt assembly and before model execution. It cannot change the already assembled system prompt. Original request headers remain process-local. DSH persistence restores its own pending projection; the plugin does not replay splice logs or recover consumed claims. Graceful disposal cancels tasks by default; `inbox.shutdown: retain-pending` opts into the retention policy below. Durable A2A task snapshots require a filesystem, Redis or GCS TaskStore; an in-memory store is sufficient without restart requirements.
 
 ### Goal rounds

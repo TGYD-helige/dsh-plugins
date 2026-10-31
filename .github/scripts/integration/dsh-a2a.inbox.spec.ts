@@ -92,6 +92,7 @@ async function boot(
     langfuse?: Langfuse.LangfusePluginConfig;
     contextId?: string;
     protocols?: boolean;
+    retainPending?: boolean;
   } = {},
 ) {
   const ctx = new Context();
@@ -129,7 +130,7 @@ async function boot(
   });
   const backend = options.backend ?? new MemoryTaskStore();
   const store = options.store ?? new SanitizedTaskStore(backend);
-  const inbox = new NativeInbox(ctx, bridge, store);
+  const inbox = new NativeInbox(ctx, bridge, store, options.retainPending);
   const server = await startA2aServer({
     inbox,
     extensions: [{ uri: INBOX_EXTENSION, description: '', required: false, params: undefined }],
@@ -196,6 +197,249 @@ async function boot(
 }
 
 describe('official protocol bindings', () => {
+  it('cancels a borrowed A2A turn before awaiting shutdown without canceling later native work', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-borrowed-active-stop-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const f = await boot({ root });
+    const handle = await f.ctx.agents.create({
+      sessionId: 'native-test',
+      meta: { cwd: '/tmp' },
+      agentOptions: { provider: 'mock', model: 'mock' },
+    });
+    await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    let releaseFirst!: () => void, releaseNative!: () => void, releaseStorage!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const nativeGate = new Promise<void>((resolve) => {
+      releaseNative = resolve;
+    });
+    const storageGate = new Promise<void>((resolve) => {
+      releaseStorage = resolve;
+    });
+    let firstSignal: AbortSignal | undefined, nativeSignal: AbortSignal | undefined;
+    f.ctx.on('agent/request', async (detail, next) => {
+      if (!firstSignal) {
+        firstSignal = detail.signal;
+        await firstGate;
+      } else {
+        nativeSignal = detail.signal;
+        await nativeGate;
+      }
+      detail.signal.throwIfAborted();
+      return next();
+    });
+    cleanups.push(async () => {
+      releaseFirst();
+      releaseNative();
+      releaseStorage();
+    });
+    await f.send('active');
+    await expect.poll(() => Boolean(firstSignal)).toBe(true);
+    let blocked = false;
+    const flush = f.ctx.sessionPersistence.flush.bind(f.ctx.sessionPersistence);
+    const barrier = vi.spyOn(f.ctx.sessionPersistence, 'flush').mockImplementation(async () => {
+      if (!blocked) {
+        blocked = true;
+        await storageGate;
+      }
+      await flush();
+    });
+    const stopping = f.inbox.shutdown();
+    try {
+      await expect.poll(() => blocked).toBe(true);
+      expect(firstSignal!.aborted).toBe(true);
+      releaseFirst();
+      await handle.agent.whenIdle();
+      handle.agent.followup(
+        createUserMessage({
+          content: [{ type: 'text', text: 'native during shutdown' }],
+          source: { kind: 'user' },
+        }),
+      );
+      await expect.poll(() => Boolean(nativeSignal)).toBe(true);
+      releaseStorage();
+      await stopping;
+      expect(nativeSignal!.aborted).toBe(false);
+      releaseNative();
+      await handle.agent.whenIdle();
+      expect(f.adapter.requests).toHaveLength(1);
+    } finally {
+      releaseFirst();
+      releaseNative();
+      releaseStorage();
+      await stopping;
+      barrier.mockRestore();
+    }
+  });
+
+  it('retains late committed admissions without inserting them into a detached borrowed queue', async () => {
+    const f = await boot({ retainPending: true });
+    const handle = await f.ctx.agents.create({
+      sessionId: 'native-test',
+      meta: { cwd: '/tmp' },
+      agentOptions: { provider: 'mock', model: 'mock' },
+    });
+    await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    const save = f.backend.save.bind(f.backend);
+    let entered = false;
+    let taskId = '';
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    vi.spyOn(f.backend, 'save').mockImplementation(async (task, context) => {
+      if (!entered && task.history.some((message) => message.messageId === 'late-A2A')) {
+        entered = true;
+        taskId = task.id;
+        await gate;
+      }
+      await save(task, context);
+    });
+    const sending = f.rpc('SendMessage', {
+      message: {
+        messageId: 'late-A2A',
+        role: 'ROLE_USER',
+        contextId: 'native-test',
+        parts: [{ text: 'late borrowed input' }],
+        metadata: { [INBOX_EXTENSION]: { wakeup: false } },
+      },
+      configuration: { returnImmediately: true },
+    });
+    await expect.poll(() => entered).toBe(true);
+    const stopping = f.inbox.shutdown();
+    release();
+    await stopping;
+    await f.bridge.dispose();
+    await sending;
+    expect(handle.agent.inbox.nextTurn).toEqual([]);
+    const task = await f.store.load(taskId, new ServerCallContext());
+    expect(task.metadata[`${INBOX_EXTENSION}#retained-inputs`]).toContain('late borrowed input');
+    handle.agent.followup(
+      createUserMessage({
+        content: [{ type: 'text', text: 'native after stop' }],
+        source: { kind: 'user' },
+      }),
+    );
+    await handle.agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+  });
+
+  it('retains owned input without leaving it executable on a borrowed native agent', async () => {
+    const f = await boot({ retainPending: true });
+    const handle = await f.ctx.agents.create({
+      sessionId: 'native-test',
+      meta: { cwd: '/tmp' },
+      agentOptions: { provider: 'mock', model: 'mock' },
+    });
+    await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    let entered = false;
+    f.ctx.on('agent/request', async (_detail, next) => {
+      entered = true;
+      await gate;
+      return next();
+    });
+    handle.agent.followup(
+      createUserMessage({
+        content: [{ type: 'text', text: 'native turn' }],
+        source: { kind: 'user' },
+      }),
+    );
+    await expect.poll(() => entered).toBe(true);
+    const queued = await f.send('retained A2A', { wakeup: false });
+    await f.inbox.shutdown();
+    await f.bridge.dispose();
+    release();
+    await handle.agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+    expect(handle.agent.inbox.nextTurn).toEqual([]);
+    const retained = await f.store.load(queued.id, new ServerCallContext());
+    expect(retained.status.state).toBe(TaskState.TASK_STATE_SUBMITTED);
+    expect(retained.metadata[`${INBOX_EXTENSION}#retained-inputs`]).toContain('retained A2A');
+  });
+
+  it('observes an existing native agent without taking its lifecycle ownership', async () => {
+    const f = await boot();
+    const handle = await f.ctx.agents.create({
+      sessionId: 'native-test',
+      meta: { cwd: '/tmp' },
+      agentOptions: { provider: 'mock', model: 'mock' },
+    });
+    const native = createUserMessage({
+      content: [{ type: 'text', text: 'existing producer' }],
+      source: { kind: 'user' },
+    });
+    handle.agent.inbox.append('next-turn', native);
+    const snapshot = await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    expect(snapshot.error).toBeUndefined();
+    expect(snapshot.result.nextTurn[0].id).toBe(native.id);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    f.ctx.on('agent/request', async (_detail, next) => {
+      await gate;
+      return next();
+    });
+    expect((await f.rpc('dsh/inbox/execute', { contextId: 'native-test' })).error).toBeUndefined();
+    await f.inbox.shutdown();
+    await f.bridge.dispose();
+    expect(f.ctx.agents.get('native-test')).toBe(handle.agent);
+    release();
+    await handle.agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+    handle.agent.followup(
+      createUserMessage({
+        content: [{ type: 'text', text: 'after plugin stop' }],
+        source: { kind: 'user' },
+      }),
+    );
+    await handle.agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(2);
+  });
+
+  it('does not interfere with native producers after reading their inbox', async () => {
+    const f = await boot();
+    expect((await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).error).toBeUndefined();
+    const agent = f.ctx.agents.get('native-test')!;
+    const native = createUserMessage({
+      content: [{ type: 'text', text: 'native producer' }],
+      source: { kind: 'user' },
+    });
+    agent.send(native, 'next-turn', true);
+    await agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+    const task = await f.send('A2A input');
+    await f.completed(task.id);
+    agent.followup(
+      createUserMessage({
+        content: [{ type: 'text', text: 'native again' }],
+        source: { kind: 'user' },
+      }),
+    );
+    await agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(3);
+    expect(
+      agent.session
+        .snapshotEvents()
+        .filter((event) => event.type === 'user/message')
+        .map((event) => event.data.content[0].text),
+    ).toEqual(['native producer', 'A2A input', 'native again']);
+  });
+
   it('keeps a claimed native input executable when another window executes again', async () => {
     const f = await boot();
     const agent = await f.inbox.resolve('native-test');
@@ -2656,6 +2900,25 @@ describe('graceful retention', () => {
     };
     return { ctx, adapter, rpc, send, inbox: ctx.a2aInbox, plugin };
   }
+
+  it('drains a completed cancel-mode host without flushing detached session writers', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-cancel-host-stop-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const first = await host(root, [textResponse('done')], 'cancel');
+    const task = await first.send('complete');
+    await expect
+      .poll(async () => (await first.rpc('GetTask', { id: task.id })).result.status.state)
+      .toBe('TASK_STATE_COMPLETED');
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await first.ctx.fiber.dispose();
+      expect(
+        errors.mock.calls.filter(([message]) => String(message).includes('[dsh-a2a]')),
+      ).toEqual([]);
+    } finally {
+      errors.mockRestore();
+    }
+  });
 
   it('retains unclaimed steering and independent turns through public plugin disposal', async () => {
     const root = await mkdtemp(join(tmpdir(), 'a2a-graceful-'));

@@ -88,6 +88,8 @@ export interface TaskEntry {
   taskId: string;
   sessionId: SessionId;
   handle: AgentHandle;
+  /** An existing native producer retains agent lifecycle ownership. */
+  borrowed?: boolean;
   translator: SessionTranslator;
   /** The in-flight execute()'s bus; null between turns. */
   bus: ExecutionEventBus | null;
@@ -264,6 +266,32 @@ export class A2aBridge {
     }
 
     const sessionId = SessionId(contextId);
+    const borrowed = this.inbox ? this.ctx.agents.get?.(sessionId) : undefined;
+    const handle = borrowed
+      ? { agent: borrowed, dispose: async () => {} }
+      : await this.createAgent(sessionId);
+    const entry: TaskEntry = {
+      taskId,
+      sessionId,
+      handle,
+      borrowed: !!borrowed,
+      translator: new SessionTranslator(taskId, contextId, this.options.agentOptions?.model),
+      bus: null,
+      turnActive: false,
+      staleTurn: false,
+      settled: [],
+      running: new Set(),
+      pendingMessageAborts: new Set(),
+      settlementAbort: new AbortController(),
+      settling: false,
+      interrupted: false,
+    };
+    this.tasks.set(taskId, entry);
+    this.bySession.set(contextId, entry);
+    return { entry, freshTask: true };
+  }
+
+  private async createAgent(sessionId: SessionId): Promise<AgentHandle> {
     const selection = this.resolveSelection();
 
     // The web profile disables the host-plane tool plugins — agents get tools
@@ -305,7 +333,7 @@ export class A2aBridge {
       | { stat(id: SessionId): Promise<unknown> }
       | undefined;
     const persisted = await persistence?.stat(sessionId);
-    const handle = persisted
+    return persisted
       ? await this.ctx.agents.resume({
           resumeSessionId: sessionId,
           agentOptions,
@@ -319,24 +347,6 @@ export class A2aBridge {
           setup,
           ...(this.inbox ? { keepInboxOnDispose: true } : {}),
         });
-    const entry: TaskEntry = {
-      taskId,
-      sessionId,
-      handle,
-      translator: new SessionTranslator(taskId, contextId, this.options.agentOptions?.model),
-      bus: null,
-      turnActive: false,
-      staleTurn: false,
-      settled: [],
-      running: new Set(),
-      pendingMessageAborts: new Set(),
-      settlementAbort: new AbortController(),
-      settling: false,
-      interrupted: false,
-    };
-    this.tasks.set(taskId, entry);
-    this.bySession.set(contextId, entry);
-    return { entry, freshTask: true };
   }
 
   /** A2A parts → dsh content blocks; throws only when no part is usable. */

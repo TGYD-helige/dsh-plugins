@@ -142,9 +142,6 @@ interface ContextRun {
   entry: TaskEntry;
   /** Pause blocks new admissions and pre-step claims without clearing retained input. */
   paused: boolean;
-  /** Explicitly selected native input survives a deferred driver wake. */
-  nativeExecutions?: Set<UserMessage['id']>;
-  nativeClaims?: Set<UserMessage['id']>;
   /** Context clear discards late commits after the clearing flag itself resets. */
   discardInput?: boolean;
   /** Full admission commits, drained before shutdown disposal. */
@@ -234,10 +231,6 @@ export class NativeInbox implements A2aInbox {
     ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
       const run = this.contexts.get(agent.session.id);
       if (!run) return;
-      if (run.nativeExecutions?.has(message.id)) {
-        run.nativeClaims ??= new Set();
-        run.nativeClaims.add(message.id);
-      }
       const task = this.owner(run, message);
       if (task && !task.settled) {
         run.claimed.add(task);
@@ -453,12 +446,6 @@ export class NativeInbox implements A2aInbox {
         items.unshift(queued.message);
         queued.agent.inbox.splice(queued.target, 0, queued.items.length, items);
       }
-      run.nativeExecutions = new Set([
-        ...(run.nativeClaims ?? []),
-        ...this.pending(run)
-          .filter((message) => !this.owner(run, message))
-          .map((message) => message.id),
-      ]);
       await this.wake(contextId);
     });
   }
@@ -975,6 +962,8 @@ export class NativeInbox implements A2aInbox {
   }
 
   private async flush(session: Session): Promise<void> {
+    // Core teardown closes handles concurrently; the service-wide barrier drains only live writers.
+    if (this.stopping && this.persistence) return this.persistence.flush();
     const sessions = this.ctx.get('sessions');
     if (sessions) await sessions.flush(session);
     else await this.ctx.parallel('session/flush', session);
@@ -1183,6 +1172,11 @@ export class NativeInbox implements A2aInbox {
       task.task.history = acceptedHistory;
       task.headers.set(message.id, headers);
       accepted?.();
+      if (this.stopping && run.entry.borrowed) {
+        if (this.retainPending && !task.discardInput && !run.discardInput)
+          run.retained[target].push(structuredClone(message));
+        return;
+      }
       run.entry.handle.agent.send(message, target, wakeup);
       // Explicit discard markers survive cancel/clear state resets. Disposal
       // and retain-pending shutdown deliberately leave them unset.
@@ -1401,13 +1395,6 @@ export class NativeInbox implements A2aInbox {
       }
       if (run.rolledBack.delete(message.source.promotionId)) detail.messages.splice(index, 1);
     }
-    if (
-      !run.active &&
-      detail.messages.some(
-        (message) => !this.owner(run, message) && !run.nativeExecutions?.has(message.id),
-      )
-    )
-      throw new Error('Native host input requires task-attributed a2aInbox.enqueue().');
     // Restarted steering and an ordinary queued turn may be claimed together by the core.
     // Requeue other owners before committing any user message, keeping task lifecycles separate.
     const owner = detail.messages.find((message) => message.source.kind === 'a2a');
@@ -1475,15 +1462,6 @@ export class NativeInbox implements A2aInbox {
   onSessionEvent(session: Session, event: SessionEvent): boolean {
     const run = this.contexts.get(session.id);
     if (!run) return false;
-    if (event.type === 'user/message') {
-      run.nativeExecutions?.delete(event.data.id);
-      run.nativeClaims?.delete(event.data.id);
-    }
-    if (event.type === 'turn/end' && run.nativeExecutions?.size) {
-      const pending = new Set(this.pending(run).map((message) => message.id));
-      for (const id of run.nativeExecutions) if (!pending.has(id)) run.nativeExecutions.delete(id);
-      run.nativeClaims?.clear();
-    }
     if (event.type === 'turn/start') {
       run.claimed.clear();
       run.turnStart = event;
@@ -1825,27 +1803,59 @@ export class NativeInbox implements A2aInbox {
     this.changes.close();
     if (this.shutdownPromise) return this.shutdownPromise;
     this.stopping = true;
+    const failures: unknown[] = [];
+    const borrowed = new Set<ContextRun>();
+    const detachBorrowed = () => {
+      for (const run of this.contexts.values()) {
+        if (!run.entry.borrowed) continue;
+        borrowed.add(run);
+        this.contexts.delete(run.entry.sessionId);
+        // Freeze retention before detaching owned input from a still-live native driver.
+        try {
+          const agent = run.entry.handle.agent;
+          if (run.active) {
+            agent.cancel({ kind: 'disposed' }, { keepInbox: true });
+            run.active = undefined;
+          }
+          for (const target of ['next-step', 'next-turn'] as const) {
+            const items = target === 'next-step' ? agent.inbox.nextStep : agent.inbox.nextTurn;
+            if (!items.some((message) => message.source.kind === 'a2a')) continue;
+            agent.session.append('agent/inbox/spliced', {
+              target,
+              start: 0,
+              removedCount: items.length,
+              inserted: items.filter((message) => message.source.kind !== 'a2a'),
+            });
+          }
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+    };
+    detachBorrowed();
     this.shutdownPromise = (async () => {
-      const failures: unknown[] = [];
       await Promise.allSettled([...this.resolving.values()]);
-      const cancellations = [...this.contexts.values()].flatMap((run) =>
+      detachBorrowed();
+      const runs = [...borrowed, ...this.contexts.values()];
+      const cancellations = runs.flatMap((run) =>
         [...run.tasks.values()].flatMap((task) => (task.cancellation ? [task.cancellation] : [])),
       );
       for (const outcome of await Promise.allSettled(cancellations))
         if (outcome.status === 'rejected') failures.push(outcome.reason);
-      for (const run of this.contexts.values()) {
+      for (const run of runs) {
         for (const admission of run.admissions) admission.abort();
         // An aborted caller may already have settled, but its durable commit can
         // still be in flight. Finish that work before agent/session disposal.
         for (const outcome of await Promise.allSettled([...run.commits]))
           if (outcome.status === 'rejected') failures.push(outcome.reason);
         try {
-          run.entry.handle.agent.cancel({ kind: 'disposed' }, { keepInbox: this.retainPending });
+          if (!run.entry.borrowed)
+            run.entry.handle.agent.cancel({ kind: 'disposed' }, { keepInbox: this.retainPending });
         } catch (error) {
           failures.push(error);
         }
         try {
-          await run.entry.handle.agent.whenIdle();
+          if (!run.entry.borrowed) await run.entry.handle.agent.whenIdle();
         } catch (error) {
           failures.push(error);
         }

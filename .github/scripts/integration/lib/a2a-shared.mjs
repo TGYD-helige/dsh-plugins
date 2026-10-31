@@ -46,7 +46,7 @@ export async function waitFor(url, timeoutMs) {
  * deepseek-v4-flash; legs pass extraPatch for e.g. the thinking rows), boot
  * `dsh web`, and wait for the agent card to answer.
  */
-export async function bootA2a({ tag, extraPatch = '', reuse = false }) {
+export async function bootA2a({ tag, extraPatch = '', reuse = false, inbox = false }) {
   requireEnv(['DSH_INTEGRATION_BASE_URL', 'DSH_INTEGRATION_API_KEY', 'DSH_PKG_TARBALL']);
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-a2a-e2e-${tag}`);
   mkdirSync(workDir, { recursive: true });
@@ -73,6 +73,8 @@ export async function bootA2a({ tag, extraPatch = '', reuse = false }) {
     host: 127.0.0.1
     port: ${a2aPort}
     basePath: /a2a
+    inbox:
+      enabled: ${inbox}
     cwd: ${workDir}
     card:
       name: ci-a2a-agent
@@ -154,7 +156,7 @@ export const STATES = {
  * by method name, and the `A2A-Version: 1.0` header passes card version
  * validation).
  */
-export function a2aClient(a2a) {
+export function a2aClient(a2a, { extensions = [], signal } = {}) {
   let id = 0;
   const userMessage = (text, extra = {}) => ({
     messageId: `m-${++id}`,
@@ -165,7 +167,12 @@ export function a2aClient(a2a) {
   const call = (method, params) =>
     fetch(`${a2a}/a2a/`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
+      headers: {
+        'content-type': 'application/json',
+        'A2A-Version': '1.0',
+        ...(extensions.length ? { 'A2A-Extensions': extensions.join(', ') } : {}),
+      },
+      signal,
       body: JSON.stringify({
         jsonrpc: '2.0',
         id: `r-${++id}`,
