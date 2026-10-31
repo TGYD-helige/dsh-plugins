@@ -32,7 +32,7 @@ permissions:
 
 env:
   # dsh is developer preview — pin the CLI under test (AGENTS.md compat stance).
-  DSH_CLI_VERSION: 0.2.1-rc.4
+  DSH_CLI_VERSION: 0.2.1-rc.5
   INTEGRATION_CHECKOUT_REPOSITORY: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name || github.repository }}
   INTEGRATION_CHECKOUT_REF: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
 
