@@ -473,6 +473,99 @@ describe('native A2A inbox', () => {
     expect(replacement?.history[0].referenceTaskIds).toContain('task-one');
   });
 
+  it.each([
+    { restart: false, consumed: false, claimed: false },
+    { restart: false, consumed: true, claimed: false },
+    { restart: true, consumed: false, claimed: false },
+    { restart: true, consumed: true, claimed: false },
+    { restart: false, consumed: false, claimed: true },
+  ])(
+    'reuses resumed input after cleanup failure (restart=$restart, consumed=$consumed, claimed=$claimed)',
+    async ({ restart, consumed, claimed }) => {
+      const store = new MemoryTaskStore();
+      const first = harness([], store, true);
+      first.send('one', { parked: true });
+      await vi.waitFor(() => expect(first.agent.inbox.nextTurn).toHaveLength(1));
+      await first.native.shutdown();
+      const call = new ServerCallContext();
+      const previous = (await store.load('task-one', call))!;
+      previous.status!.state = TaskState.TASK_STATE_CANCELED;
+      await store.save(previous, call);
+      const second = harness([], store, true);
+      await second.start();
+      const save = store.save.bind(store);
+      const canonical = `${INBOX_EXTENSION}#retained-inputs`;
+      const failure = vi.spyOn(store, 'save').mockImplementation(async (task, context) => {
+        if (task.id === 'task-one' && !task.metadata?.[canonical])
+          throw new Error('source cleanup failed');
+        await save(task, context);
+      });
+      await expect(second.native.resume('context', 'task-one')).rejects.toThrow(
+        'source cleanup failed',
+      );
+      failure.mockRestore();
+      const third = restart ? harness(structuredClone(second.log), store, true) : second;
+      if (restart) await third.start();
+      await third.native.resolve('context');
+      const resumed = third.agent.inbox.nextTurn[0].source;
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let preparing = false;
+      if (claimed) {
+        third.ctx.on('a2a/before-step', async () => {
+          preparing = true;
+          await gate;
+        });
+        third.agent.drive();
+        await vi.waitFor(() => expect(preparing).toBe(true));
+      } else if (consumed) {
+        third.agent.drive();
+        await third.agent.whenIdle();
+      }
+      expect(third.consumed).toHaveLength(consumed ? 1 : 0);
+      expect(resumed.kind).toBe('a2a');
+      let id: string;
+      try {
+        id = await third.native.resume('context', 'task-one');
+      } finally {
+        release();
+      }
+      await third.agent.whenIdle();
+      expect(id).toBe(resumed.kind === 'a2a' ? resumed.taskId : undefined);
+      expect(third.consumed).toHaveLength(1);
+      expect((await store.load('task-one', call))?.metadata).not.toHaveProperty(canonical);
+      expect((await store.load(id, call))?.metadata).not.toHaveProperty(canonical);
+      await vi.waitFor(async () =>
+        expect((await store.load(id, call))?.status?.state).toBe(TaskState.TASK_STATE_COMPLETED),
+      );
+      await expect(third.native.resume('context', id)).rejects.toThrow('no retained input');
+    },
+  );
+
+  it('does not transfer the same retained input twice concurrently', async () => {
+    const store = new MemoryTaskStore();
+    const first = harness([], store, true);
+    first.send('one', { parked: true });
+    await vi.waitFor(() => expect(first.agent.inbox.nextTurn).toHaveLength(1));
+    await first.native.shutdown();
+    const call = new ServerCallContext();
+    const previous = (await store.load('task-one', call))!;
+    previous.status!.state = TaskState.TASK_STATE_CANCELED;
+    await store.save(previous, call);
+    const restored = harness([], store, true);
+    await restored.start();
+    const results = await Promise.allSettled([
+      restored.native.resume('context', 'task-one'),
+      restored.native.resume('context', 'task-one'),
+    ]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    await restored.agent.whenIdle();
+    expect(restored.consumed).toHaveLength(1);
+  });
+
   it('keeps moved existing inputs in retained insertion indexes', async () => {
     const store = new MemoryTaskStore();
     const first = harness([], store, true);

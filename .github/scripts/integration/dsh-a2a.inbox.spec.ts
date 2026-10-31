@@ -24,6 +24,7 @@ import { DshAgentExecutor } from '../../../packages/dsh-a2a/src/executor.js';
 import { INBOX_EXTENSION, NativeInbox } from '../../../packages/dsh-a2a/src/inbox.js';
 import * as A2aPlugin from '../../../packages/dsh-a2a/src/index.js';
 import { startA2aServer } from '../../../packages/dsh-a2a/src/server.js';
+import { FilesystemTaskStore } from '../../../packages/dsh-a2a/src/stores/filesystem.js';
 import { MemoryTaskStore, SanitizedTaskStore } from '../../../packages/dsh-a2a/src/task-store.js';
 import * as Langfuse from '../../../packages/dsh-langfuse/src/index.js';
 import { freePort } from './lib/a2a-shared.mjs';
@@ -3034,6 +3035,177 @@ describe('graceful retention', () => {
     };
     return { ctx, adapter, rpc, send, inbox: ctx.a2aInbox, plugin };
   }
+
+  it.each(['execute', 'pause'] as const)(
+    'restores the unmodified published JSONL runtime after inbox %s',
+    async (operation) => {
+      const root = await mkdtemp(join(tmpdir(), 'a2a-pause-restart-'));
+      cleanups.push(() => rm(root, { recursive: true, force: true }));
+      const first = await host(root, [textResponse('done')]);
+      const task = await first.send('first', { wakeup: false });
+      if (operation === 'execute') {
+        await first.inbox.executePending('graceful');
+        await expect
+          .poll(async () => (await first.rpc('GetTask', { id: task.id })).result.status.state)
+          .toBe('TASK_STATE_COMPLETED');
+        await first.send('future', { wakeup: false });
+      } else await first.inbox.pause('graceful');
+      const agent = await first.inbox.resolve('graceful');
+      const expected = structuredClone(agent.inbox.nextTurn);
+      await first.ctx.sessions.flush(agent.session);
+      await first.ctx.fiber.dispose();
+      const second = await host(root);
+      const restored = await second.inbox.resolve('graceful');
+      expect(restored.inbox.nextTurn).toEqual(expected);
+      expect(
+        restored.session
+          .snapshotEvents()
+          .some((event) => String(event.type) === 'agent/inbox/paused'),
+      ).toBe(false);
+    },
+  );
+
+  it.each([false, true])(
+    'migrates legacy retained snapshots across two restarts (both keys=%s)',
+    async (bothKeys) => {
+      const root = await mkdtemp(join(tmpdir(), 'a2a-legacy-retained-'));
+      cleanups.push(() => rm(root, { recursive: true, force: true }));
+      const canonical = `${INBOX_EXTENSION}#retained-inputs`;
+      const legacy =
+        'https://github.com/TGYD-helige/dsh-plugins/blob/main/docs/protocol/inbox-v1.md#retained-inputs';
+      const first = await host(root);
+      const active = await first.send('committed');
+      await expect.poll(() => first.adapter.requests.length).toBe(1);
+      await first.send('steering', { target: 'next-step' }, active.id);
+      const a = await first.send('first', { wakeup: false });
+      const b = await first.send('second', { wakeup: false });
+      const agent = await first.inbox.resolve('graceful');
+      const page = await first.inbox.get('graceful');
+      const edited = await first.rpc('inbox/update', {
+        contextId: 'graceful',
+        id: page.nextTurn[0].id,
+        message: { ...page.nextTurn[0].message, parts: [{ text: 'edited first' }] },
+      });
+      expect(edited.error).toBeUndefined();
+      await first.inbox.move('graceful', page.nextTurn[1].id, 0);
+      const expected = structuredClone({ step: agent.inbox.nextStep, turn: agent.inbox.nextTurn });
+      const committed = agent.session
+        .snapshotEvents()
+        .find((event) => event.type === 'user/message')!.data;
+      await first.inbox.shutdown();
+      // Old graceful snapshots can outlive the native queue's teardown splice.
+      agent.inbox.clear();
+      await first.ctx.sessions.flush(agent.session);
+      await first.ctx.fiber.dispose();
+      const disk = new FilesystemTaskStore({ root: join(root, 'tasks') });
+      const call = new ServerCallContext();
+      for (const taskId of [active.id, a.id, b.id]) {
+        const task = (await disk.load(taskId, call))!;
+        const inputs = JSON.parse(task.metadata![canonical] as string);
+        if (taskId === active.id)
+          inputs.unshift({ position: -1, target: 'next-turn', message: committed });
+        task.metadata![legacy] = JSON.stringify(inputs);
+        if (!bothKeys) delete task.metadata![canonical];
+        await disk.save(task, call);
+      }
+      const second = await host(root);
+      const restored = await second.inbox.resolve('graceful');
+      expect({ step: restored.inbox.nextStep, turn: restored.inbox.nextTurn }).toEqual(expected);
+      for (const taskId of [active.id, a.id, b.id]) {
+        const saved = await disk.load(taskId, call);
+        expect(saved!.metadata).not.toHaveProperty(legacy);
+        expect(saved!.metadata).not.toHaveProperty(canonical);
+      }
+      await second.ctx.fiber.dispose();
+      const third = await host(root);
+      const again = await third.inbox.resolve('graceful');
+      expect({ step: again.inbox.nextStep, turn: again.inbox.nextTurn }).toEqual(expected);
+      expect(
+        again.session.snapshotEvents().filter((event) => event.type === 'user/message'),
+      ).toHaveLength(1);
+    },
+  );
+
+  it.each([false, true])(
+    'resumes a terminal legacy retained snapshot once (cleanup failure=%s)',
+    async (failCleanup) => {
+      const root = await mkdtemp(join(tmpdir(), 'a2a-legacy-resume-'));
+      cleanups.push(() => rm(root, { recursive: true, force: true }));
+      const canonical = `${INBOX_EXTENSION}#retained-inputs`;
+      const legacy =
+        'https://github.com/TGYD-helige/dsh-plugins/blob/main/docs/protocol/inbox-v1.md#retained-inputs';
+      const first = await host(root);
+      const task = await first.send('resume input', { wakeup: false });
+      const agent = await first.inbox.resolve('graceful');
+      const nativeId = agent.inbox.nextTurn[0].id;
+      await first.inbox.shutdown();
+      agent.inbox.clear();
+      await first.ctx.sessions.flush(agent.session);
+      await first.ctx.fiber.dispose();
+      const disk = new FilesystemTaskStore({ root: join(root, 'tasks') });
+      const call = new ServerCallContext();
+      const previous = (await disk.load(task.id, call))!;
+      previous.metadata![legacy] = previous.metadata![canonical];
+      delete previous.metadata![canonical];
+      previous.status!.state = TaskState.TASK_STATE_CANCELED;
+      await disk.save(previous, call);
+      let second = await host(root, [textResponse('resumed')]);
+      let resumed: string;
+      if (failCleanup) {
+        const save = FilesystemTaskStore.prototype.save;
+        const failure = vi
+          .spyOn(FilesystemTaskStore.prototype, 'save')
+          .mockImplementation(async function (snapshot, context) {
+            if (snapshot.id === task.id && !snapshot.metadata?.[legacy])
+              throw new Error('source cleanup failed');
+            await save.call(this, snapshot, context);
+          });
+        try {
+          await expect(second.inbox.resume('graceful', task.id)).rejects.toThrow(
+            'source cleanup failed',
+          );
+        } finally {
+          failure.mockRestore();
+        }
+        await second.ctx.fiber.dispose();
+        second = await host(root, [textResponse('resumed')]);
+        const recovered = await second.inbox.resolve('graceful');
+        const source = recovered.inbox.nextTurn[0].source;
+        expect(source.kind).toBe('a2a');
+        resumed = source.kind === 'a2a' ? source.taskId : '';
+        await second.inbox.executePending('graceful');
+        await expect
+          .poll(async () => (await second.rpc('GetTask', { id: resumed })).result.status.state)
+          .toBe('TASK_STATE_COMPLETED');
+        expect(await second.inbox.resume('graceful', task.id)).toBe(resumed);
+      } else resumed = await second.inbox.resume('graceful', task.id);
+      expect(resumed).not.toBe(task.id);
+      await expect
+        .poll(async () => (await second.rpc('GetTask', { id: resumed })).result.status.state)
+        .toBe('TASK_STATE_COMPLETED');
+      const restored = await second.inbox.resolve('graceful');
+      const messages = restored.session
+        .snapshotEvents()
+        .filter((event) => event.type === 'user/message');
+      expect(messages.map((event) => event.data.id)).toEqual([nativeId]);
+      expect(messages[0].data.source).toMatchObject({ kind: 'a2a', taskId: resumed });
+      const replacement = await disk.load(resumed, call);
+      expect(replacement!.history[0].referenceTaskIds).toContain(task.id);
+      for (const id of [task.id, resumed]) {
+        const saved = await disk.load(id, call);
+        expect(saved!.metadata).not.toHaveProperty(legacy);
+        expect(saved!.metadata).not.toHaveProperty(canonical);
+      }
+      await second.ctx.fiber.dispose();
+      const third = await host(root);
+      const again = await third.inbox.resolve('graceful');
+      expect(again.inbox.hasPending).toBe(false);
+      expect(
+        again.session.snapshotEvents().filter((event) => event.type === 'user/message'),
+      ).toHaveLength(1);
+      await expect(third.inbox.resume('graceful', task.id)).rejects.toThrow('no retained input');
+    },
+  );
 
   it('drains a completed cancel-mode host without flushing detached session writers', async () => {
     const root = await mkdtemp(join(tmpdir(), 'a2a-cancel-host-stop-'));
