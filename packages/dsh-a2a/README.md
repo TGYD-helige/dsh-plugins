@@ -176,6 +176,11 @@ on **every enabled listener**. Application session listing, queue editing and
 optional card signing are separate from these eleven operations. This support
 matrix describes the wired SDK surface, not independent protocol certification.
 
+The secret-free `E2E (dsh-a2a protocol bindings)` job runs HTTP/gRPC contract tests
+and real DSH runtime turns with scripted model responses. It covers cross-binding
+task state, authenticated push callbacks, extended cards, reconnect cleanup and
+slow readers independently of the LLM/Langfuse integration gate.
+
 - `GET /.well-known/agent-card.json` — agent card: A2A 1.0 shape for `A2A-Version: 1.0` clients, the 0.3 shape for headerless clients (the legacy `/.well-known/agent.json` path is served as an alias)
 - `POST <basePath>/` — JSON-RPC. v1 methods: `SendMessage` (blocking by default, `configuration.returnImmediately: true` returns after the first event), `SendStreamingMessage` (SSE), `GetTask`, `ListTasks` (filter + cursor pagination), `CancelTask`, `SubscribeToTask` (the current task is the first event; the bus stays alive while the task is interrupted, so interrupted tasks can be re-followed live). v0.3 spellings (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`) keep working through the compat layer. Legacy SSE status updates that end an interaction carry `final: true`, including `input-required` after a completed turn or an approval wait; this ends the stream without making the task terminal. Resubscribe snapshots keep waiting for future events while a live task bus exists. Legacy `tasks/get` also accepts `contextId` without `id` on this path or root `/`, returning the latest stored task or `result: null` when absent.
 

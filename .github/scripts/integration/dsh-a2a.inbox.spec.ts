@@ -1,6 +1,7 @@
 /** Real loop, A2A HTTP, and JSONL restart; only model responses are scripted. */
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
@@ -90,6 +91,7 @@ async function boot(
     langfuseUrl?: string;
     langfuse?: Langfuse.LangfusePluginConfig;
     contextId?: string;
+    protocols?: boolean;
   } = {},
 ) {
   const ctx = new Context();
@@ -133,6 +135,9 @@ async function boot(
     host: '127.0.0.1',
     port: 0,
     basePath: '/a2a',
+    rest: options.protocols,
+    grpc: { enabled: options.protocols ?? false, port: 0 },
+    pushNotifications: options.protocols,
     card: { name: 'test', description: '', version: '1' },
     taskStore: store,
     executor: new DshAgentExecutor(bridge),
@@ -188,6 +193,142 @@ async function boot(
   };
   return { ctx, adapter, bridge, inbox, store, backend, server, rpc, send, completed };
 }
+
+describe('official protocol bindings', () => {
+  it('executes real DSH turns over REST and gRPC with shared task state', async () => {
+    const sdk = await import(pathToFileURL(require.resolve('@a2a-js/sdk')).href);
+    const { A2AService } = await import(
+      pathToFileURL(require.resolve('@a2a-js/sdk/server/grpc')).href
+    );
+    const grpc = await import(pathToFileURL(require.resolve('@grpc/grpc-js')).href);
+    const f = await boot({
+      protocols: true,
+      script: [textResponse('rest-first'), textResponse('grpc-followup')],
+    });
+    const base = `http://127.0.0.1:${f.server.port}`;
+    const sent = await fetch(`${base}/a2a/rest/message:send`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/a2a+json', 'A2A-Version': '1.0' },
+      body: JSON.stringify({
+        message: {
+          messageId: 'rest-entry',
+          contextId: 'native-test',
+          role: 'ROLE_USER',
+          parts: [{ text: 'first' }],
+        },
+        configuration: { returnImmediately: true },
+      }),
+    });
+    expect(sent.status).toBe(200);
+    const { task } = await sent.json();
+    await f.completed(task.id);
+    const Client = grpc.makeGenericClientConstructor(A2AService, 'A2AService');
+    const client = new Client(`127.0.0.1:${f.server.grpcPort}`, grpc.credentials.createInsecure());
+    const metadata = new grpc.Metadata();
+    metadata.set('a2a-version', '1.0');
+    try {
+      const loaded = await new Promise<any>((resolve, reject) =>
+        client.getTask(
+          sdk.GetTaskRequest.fromJSON({ id: task.id }),
+          metadata,
+          { deadline: Date.now() + 5000 },
+          (error, value) => (error ? reject(error) : resolve(value)),
+        ),
+      );
+      expect(loaded.status.state).toBe(TaskState.TASK_STATE_COMPLETED);
+      const events: any[] = [];
+      await new Promise<void>((resolve, reject) => {
+        client
+          .sendStreamingMessage(
+            sdk.SendMessageRequest.fromJSON({
+              message: {
+                messageId: 'grpc-entry',
+                contextId: 'native-test',
+                role: 'ROLE_USER',
+                parts: [{ text: 'second' }],
+              },
+            }),
+            metadata,
+            { deadline: Date.now() + 5000 },
+          )
+          .on('data', (event) => events.push(event))
+          .on('end', resolve)
+          .on('error', reject);
+      });
+      expect(events[0].payload.$case).toBe('task');
+      expect(events.at(-1).payload.value.status.state).toBe(TaskState.TASK_STATE_COMPLETED);
+      const final = await f.rpc('GetTask', { id: events[0].payload.value.id });
+      expect(JSON.stringify(final.result.history)).toContain('grpc-followup');
+      const listing = await (
+        await fetch(`${base}/a2a/rest/tasks?contextId=native-test`, {
+          headers: { 'A2A-Version': '1.0' },
+        })
+      ).json();
+      expect(listing.tasks.map((item) => item.id)).toEqual(
+        expect.arrayContaining([task.id, events[0].payload.value.id]),
+      );
+      expect(f.adapter.requests).toHaveLength(2);
+      const agent = await f.inbox.resolve('native-test');
+      const log = JSON.stringify(agent.session.snapshotEvents());
+      expect(log).toContain('rest-first');
+      expect(log).toContain('grpc-followup');
+    } finally {
+      client.close();
+    }
+  });
+
+  it('delivers authenticated official push callbacks from a real DSH turn', async () => {
+    const received: Array<{ body: any; authorization: string | undefined }> = [];
+    const receiver = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      received.push({
+        body: JSON.parse(Buffer.concat(chunks).toString()),
+        authorization: request.headers.authorization,
+      });
+      response.writeHead(204).end();
+    });
+    receiver.listen(0, '127.0.0.1');
+    await once(receiver, 'listening');
+    cleanups.push(async () => {
+      receiver.closeAllConnections();
+      await new Promise<void>((resolve) => receiver.close(() => resolve()));
+    });
+    const f = await boot({ protocols: true, script: [textResponse('push-completed')] });
+    const sent = await f.rpc('SendMessage', {
+      message: {
+        messageId: 'push-entry',
+        contextId: 'native-test',
+        role: 'ROLE_USER',
+        parts: [{ text: 'run' }],
+      },
+      configuration: {
+        returnImmediately: true,
+        taskPushNotificationConfig: {
+          url: `http://127.0.0.1:${receiver.address().port}/callback`,
+          authentication: { scheme: 'Bearer', credentials: 'integration-callback' },
+        },
+      },
+    });
+    expect(sent.error).toBeUndefined();
+    const id = sent.result.task.id;
+    await f.completed(id);
+    await expect
+      .poll(() =>
+        received.some(
+          ({ body }) =>
+            body.statusUpdate?.taskId === id &&
+            body.statusUpdate.status.state === 'TASK_STATE_COMPLETED',
+        ),
+      )
+      .toBe(true);
+    expect(received.every((event) => event.authorization === 'Bearer integration-callback')).toBe(
+      true,
+    );
+    const saved = await f.rpc('GetTask', { id });
+    expect(JSON.stringify(saved.result.history)).toContain('push-completed');
+  });
+});
 
 it('removes failed admission input from the official queue after a flush error', async () => {
   const f = await boot();

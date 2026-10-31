@@ -193,6 +193,32 @@ jobs:
           echo "::error::DSH_INTEGRATION_BASE_URL and DSH_INTEGRATION_API_KEY are required for Stage B."
           exit 1
 
+  a2a-protocol:
+    name: E2E (dsh-a2a protocol bindings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.INTEGRATION_CHECKOUT_REPOSITORY }}
+          ref: ${{ env.INTEGRATION_CHECKOUT_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Verify REST, gRPC, push callbacks, extended cards and slow readers
+        env:
+          DSH_PROVIDER: http
+        run: node .github/scripts/integration/dsh-a2a.mjs
+
+      - name: Verify protocol bindings with the official DSH runtime
+        run: node .github/scripts/check-inbox.mjs -t 'official protocol bindings'
+
   native-inbox:
     name: E2E (dsh-a2a.inbox)
     needs: integration-approval

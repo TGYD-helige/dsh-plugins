@@ -124,3 +124,12 @@ test('HTTP suite runs in the base scenario while redis stays the sole backend pr
   );
   assert.match(baseEntry, /runHttpSuite\(\)/, 'base scenario must run HTTP tests by default');
 });
+
+test('A2A protocol regressions run without the secret-backed approval gate', () => {
+  const job = workflow.match(/^ {2}a2a-protocol:\n[\s\S]*?(?=^ {2}[\w-]+:|$(?![\s\S]))/m)?.[0];
+  assert.ok(job, 'protocol bindings need a standalone E2E job');
+  assert.doesNotMatch(job, /secrets\.|integration-approval/);
+  assert.match(job, /DSH_PROVIDER: http/);
+  assert.match(job, /node \.github\/scripts\/integration\/dsh-a2a\.mjs/);
+  assert.match(job, /check-inbox\.mjs -t 'official protocol bindings'/);
+});
