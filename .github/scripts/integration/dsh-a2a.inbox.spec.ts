@@ -1308,6 +1308,61 @@ it('persists completion when a legacy streaming send disconnects', async () => {
   }
 });
 
+it.each([false, true])(
+  'distinguishes Langfuse resource-limit 422 from malformed queries (%s)',
+  async (resourceLimit) => {
+    let reads = 0;
+    const server = createServer((request, response) => {
+      const url = new URL(request.url!, 'http://localhost');
+      if (url.pathname.includes('/v2/')) {
+        response.writeHead(404).end();
+        return;
+      }
+      reads++;
+      if (reads === 1 || !resourceLimit) {
+        response.writeHead(422, { 'content-type': 'application/json' }).end(
+          JSON.stringify({
+            message: resourceLimit
+              ? 'Your query could not be completed. Please narrow your request by adding more specific filters (e.g., a shorter date range).'
+              : 'Invalid query: unknown observation type',
+          }),
+        );
+        return;
+      }
+      response.setHeader('content-type', 'application/json');
+      response.end(
+        JSON.stringify({
+          data: [{ id: 'obs', traceId: 'trace', name: 'run-specific-root', input: 'marker' }],
+          meta: { totalPages: 1 },
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const realTimeout = globalThis.setTimeout;
+    const timer = vi
+      .spyOn(globalThis, 'setTimeout')
+      .mockImplementation((handler, ms, ...args) =>
+        realTimeout(handler, ms === 15_000 ? 0 : ms, ...args),
+      );
+    try {
+      const result = await runVerification({
+        baseUrl: `http://127.0.0.1:${server.address().port}`,
+        publicKey: 'fixture',
+        secretKey: 'fixture',
+        fromStartTime: new Date(Date.now() - 60_000).toISOString(),
+        codeword: 'marker',
+        observationName: 'run-specific-root',
+        evaluate: () => [],
+      });
+      expect(result.ok).toBe(resourceLimit);
+      expect(reads).toBe(resourceLimit ? 3 : 1);
+    } finally {
+      timer.mockRestore();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  },
+);
+
 it('rediscovers late inbox traces and filters admissions through the Langfuse read-back API', async () => {
   const queries: URLSearchParams[] = [];
   const maxRangeMs = 5 * 60 * 1000;
@@ -1919,6 +1974,7 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')(
     const runId = process.env.GITHUB_RUN_ID ?? Date.now().toString();
     const attempt = process.env.GITHUB_RUN_ATTEMPT ?? '1';
     const contextId = `ci-inbox-${runId}-${attempt}-${randomUUID()}`;
+    const traceName = `dsh-inbox:${contextId}`;
     const fromStartTime = new Date(Date.now() - 60_000).toISOString();
     const replies = [
       '发布前检查待办：\n1. 构建项目\n2. 运行测试\n3. 检查发布说明',
@@ -1933,7 +1989,7 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')(
         publicKey,
         secretKey,
         baseUrl,
-        traceName: 'dsh-inbox',
+        traceName,
         captureContent: true,
         environment: 'ci',
         release: integrationRevision(),
@@ -1988,9 +2044,9 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')(
           fromStartTime,
           toStartTime,
           codeword,
-          observationName: 'inbox:admitted',
+          observationName: traceName,
           evaluate(observations) {
-            const root = observations.find((observation) => observation.name === 'dsh-inbox');
+            const root = observations.find((observation) => observation.name === traceName);
             const problems = [];
             if (!root?.endTime || root.metadata?.taskId !== tasks[index].id)
               problems.push('missing ended task-attributed root');
@@ -2065,11 +2121,11 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')(
       fromStartTime,
       toStartTime,
       codeword: canceled.id,
-      observationName: 'inbox:canceled',
+      observationName: traceName,
       evaluate(observations) {
         const root = observations.find(
           (observation) =>
-            observation.name === 'dsh-inbox' && observation.metadata?.taskId === canceled.id,
+            observation.name === traceName && observation.metadata?.taskId === canceled.id,
         );
         const phases = observations
           .filter((observation) => observation.parentObservationId === root?.id)

@@ -47,7 +47,7 @@ import { integrationModel, integrationRevision, netEnv, requireEnv, run } from '
 // for self-hosted v3; the deprecated /api/public/traces path is never used). Ingestion lands
 // piecemeal, so a poll that finds the trace but not the full shape is
 // retried, never failed immediately; 429s honor Retry-After (org-shared rate
-// limits); other 4xx are unhealable client errors and fail fast with a
+// limits), and resource-limit 422s retry within the same deadline. Other 4xx fail fast with a
 // bounded slice of the validation body. Ported from pi's
 // telemetry-langfuse-verify.mjs.
 // ---------------------------------------------------------------------------
@@ -534,11 +534,26 @@ export async function runVerification({
         page = 0;
         continue;
       }
-      // 4xx is a client error that never heals by retrying — fail fast, and
-      // include a bounded slice of the validation body (it quotes the query,
-      // never the auth header) so the CI log shows the actual complaint.
+      // Langfuse also maps ClickHouse resource exhaustion to 422; it is not
+      // a malformed query. Retry only that documented error within the same deadline.
       if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-        const detail = (await response.text()).slice(0, 300);
+        const body = await response.text();
+        let message;
+        try {
+          message = JSON.parse(body).message;
+        } catch {
+          /* Non-JSON validation errors stay fatal. */
+        }
+        if (
+          response.status === 422 &&
+          typeof message === 'string' &&
+          message.startsWith('Your query could not be completed. Please narrow your request')
+        ) {
+          throw new Error(
+            'Langfuse query hit server resource limits (HTTP 422); retrying bounded query',
+          );
+        }
+        const detail = body.slice(0, 300);
         throw Object.assign(
           new Error(
             `Langfuse observations v${apiVersion} query rejected (HTTP ${response.status}): ${detail}`,
