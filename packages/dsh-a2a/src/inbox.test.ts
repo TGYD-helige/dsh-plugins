@@ -430,7 +430,7 @@ describe('native A2A inbox', () => {
     const snapshot = await store.load('task-one', new ServerCallContext());
     expect(snapshot?.status?.state).toBe(TaskState.TASK_STATE_SUBMITTED);
     expect(snapshot?.metadata).toHaveProperty(
-      'https://github.com/TGYD-helige/dsh-plugins/blob/main/docs/protocol/inbox-v1.md#retained-inputs',
+      'https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md#retained-inputs',
     );
 
     const restored = harness(structuredClone(f.log), store, true);
@@ -498,7 +498,7 @@ describe('native A2A inbox', () => {
     const snapshot = await store.load('task-one', context);
     snapshot!.metadata = {
       ...snapshot!.metadata,
-      'https://github.com/TGYD-helige/dsh-plugins/blob/main/docs/protocol/inbox-v1.md#retained-inputs':
+      'https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md#retained-inputs':
         JSON.stringify([
           { position: 0, target: 'next-turn', message: missing },
           { position: 1, target: 'next-turn', message: moved },

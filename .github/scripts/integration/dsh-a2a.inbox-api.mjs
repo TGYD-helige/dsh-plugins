@@ -93,8 +93,10 @@ try {
       signal: AbortSignal.timeout(10_000),
     })
   ).json();
-  const uri = card.capabilities?.extensions?.find((extension) =>
-    extension.uri.endsWith('/inbox-v1.md'),
+  const uri = card.capabilities?.extensions?.find(
+    (extension) =>
+      extension.uri ===
+      'https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md',
   )?.uri;
   assert(uri, 'agent card must advertise the native inbox extension');
   const client = a2aClient(boot.a2a, { extensions: [uri], signal: AbortSignal.timeout(240_000) });
@@ -103,7 +105,7 @@ try {
     assert(res.ok && !body.error, `${method}: ${JSON.stringify(body.error)}`);
     return body.result;
   };
-  const inbox = () => rpc('dsh/inbox/get');
+  const inbox = () => rpc('inbox/get');
   const park = async (text) =>
     (
       await rpc('SendMessage', {
@@ -124,7 +126,7 @@ try {
     return task;
   };
   const subscribe = async () => {
-    const response = await client.stream('dsh/inbox/subscribe', { contextId });
+    const response = await client.stream('inbox/subscribe', { contextId });
     assert(
       response.ok && response.headers.get('content-type')?.includes('text/event-stream'),
       'inbox SSE response',
@@ -178,7 +180,7 @@ try {
     );
 
   const cleared = await park('This queued message must be cleared without model execution.');
-  const empty = await rpc('dsh/inbox/clear');
+  const empty = await rpc('inbox/clear');
   assert(empty.nextTurn.length === 0, 'clear leaves an empty queue');
   await settled(cleared.id, 'TASK_STATE_CANCELED');
   await notified(empty.version);
@@ -194,7 +196,7 @@ try {
   const toRemove = snapshot.nextTurn.find((item) => item.message.taskId === removed.id);
   const toSteer = snapshot.nextTurn.find((item) => item.message.taskId === steered.id);
   assert(entry && toRemove && toSteer, 'get returns all parked native identities');
-  snapshot = await rpc('dsh/inbox/update', {
+  snapshot = await rpc('inbox/update', {
     id: entry.id,
     message: {
       ...entry.message,
@@ -206,17 +208,17 @@ try {
       snapshot.nextTurn[0].message.messageId === entry.message.messageId,
     'editing preserves native/protocol identity',
   );
-  snapshot = await rpc('dsh/inbox/move', { id: toSteer.id, index: 0 });
+  snapshot = await rpc('inbox/move', { id: toSteer.id, index: 0 });
   assert(snapshot.nextTurn[0].id === toSteer.id, 'move uses the requested queue index');
-  snapshot = await rpc('dsh/inbox/remove', { id: toRemove.id });
+  snapshot = await rpc('inbox/remove', { id: toRemove.id });
   assert(!snapshot.nextTurn.some((item) => item.id === toRemove.id), 'remove updates native queue');
   await settled(removed.id, 'TASK_STATE_CANCELED');
   await notified(snapshot.version);
   assert(!held && forwarded === 0, 'parked/edited input must not call the model');
 
-  await rpc('dsh/inbox/execute', { id: entry.id });
+  await rpc('inbox/execute', { id: entry.id });
   await eventually(() => held, 'edited request reaches the real model boundary');
-  snapshot = await rpc('dsh/inbox/steer', { id: toSteer.id, taskId: active.id });
+  snapshot = await rpc('inbox/steer', { id: toSteer.id, taskId: active.id });
   assert(
     snapshot.nextStep.some((item) => item.id === toSteer.id),
     'steer transfers input to next-step',

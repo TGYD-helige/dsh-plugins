@@ -288,10 +288,7 @@ export function apply(
               uri: INBOX_EXTENSION,
               description: 'Native inbox management, steering and checkpointed invalidation',
               required: false,
-              params: {
-                documentationUrl:
-                  'https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md#native-inbox-extension-v1',
-              },
+              params: undefined,
             },
           ]
         : [],
