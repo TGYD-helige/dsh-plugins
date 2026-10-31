@@ -138,8 +138,13 @@ try {
   const toStartTime = new Date().toISOString();
   const queries = [];
   const readback = createServer((request, response) => {
-    const params = new URL(request.url, 'http://localhost').searchParams;
+    const url = new URL(request.url, 'http://localhost');
+    const params = url.searchParams;
     queries.push(params);
+    if (url.pathname !== '/api/public/v2/observations') {
+      response.writeHead(422).end('{"message":"Use the efficient observations API"}');
+      return;
+    }
     if (
       params.get('fromStartTime') !== fromStartTime ||
       params.get('toStartTime') !== toStartTime
@@ -148,7 +153,12 @@ try {
       return;
     }
     response.setHeader('content-type', 'application/json');
-    const rows = observations.map((o) => ({ ...o, traceId: 'sdk-trace' }));
+    const rows = observations.map((o) => ({
+      ...o,
+      traceId: 'sdk-trace',
+      input: JSON.stringify(o.input),
+      output: JSON.stringify(o.output),
+    }));
     if (params.get('type') === 'GENERATION')
       rows.unshift({
         name: 'llm-call [session-title]',
@@ -156,7 +166,17 @@ try {
         traceId: 'purpose-trace',
         metadata: { purpose: 'session-title' },
       });
-    response.end(JSON.stringify({ data: rows }));
+    const split = Math.ceil(rows.length / 2);
+    response.end(
+      JSON.stringify(
+        params.has('traceId')
+          ? {
+              data: params.has('cursor') ? rows.slice(split) : rows.slice(0, split),
+              meta: { cursor: params.has('cursor') ? null : 'second-page' },
+            }
+          : { data: rows },
+      ),
+    );
   });
   await new Promise((resolve) => readback.listen(0, '127.0.0.1', resolve));
   try {
@@ -170,11 +190,54 @@ try {
       evaluate: evaluateTrace,
     });
     assert.equal(result.ok, true, result.state);
-    assert.equal(queries.length, 2, 'discover once, then query that trace');
-    assert.equal(queries[0].get('model'), integrationModel());
+    assert.equal(queries.length, 3, 'discover once, then paginate that trace');
+    assert.equal(
+      JSON.parse(queries[0].get('filter')).find((item) => item.column === 'model').value,
+      integrationModel(),
+    );
+    assert.ok(queries.every((query) => query.get('fields').includes('io')));
     assert.equal(queries[1].get('traceId'), 'sdk-trace');
+    assert.equal(queries[2].get('cursor'), 'second-page');
   } finally {
     await new Promise((resolve) => readback.close(resolve));
+  }
+
+  const legacyQueries = [];
+  const legacyReadback = createServer((request, response) => {
+    const url = new URL(request.url, 'http://localhost');
+    legacyQueries.push(url);
+    if (url.pathname === '/api/public/v2/observations') {
+      response.writeHead(404).end();
+      return;
+    }
+    response.setHeader('content-type', 'application/json');
+    response.end(
+      JSON.stringify({
+        data: observations.map((row) => ({ ...row, traceId: 'v3-trace' })),
+        meta: { totalPages: 1 },
+      }),
+    );
+  });
+  await new Promise((resolve) => legacyReadback.listen(0, '127.0.0.1', resolve));
+  try {
+    const result = await runVerification({
+      baseUrl: `http://127.0.0.1:${legacyReadback.address().port}`,
+      publicKey: 'fixture',
+      secretKey: 'fixture',
+      fromStartTime,
+      toStartTime,
+      codeword: 'sdk-marker',
+      evaluate: evaluateTrace,
+    });
+    assert.equal(result.ok, true, result.state);
+    assert.deepEqual(
+      legacyQueries.map((url) => url.pathname),
+      ['/api/public/v2/observations', '/api/public/observations', '/api/public/observations'],
+    );
+    assert.equal(legacyQueries[1].searchParams.get('page'), '1');
+    assert.equal(legacyQueries[1].searchParams.get('model'), integrationModel());
+  } finally {
+    await new Promise((resolve) => legacyReadback.close(resolve));
   }
 
   const legacyTools = observations.map((observation) =>

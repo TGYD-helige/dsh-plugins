@@ -801,9 +801,17 @@ it('rediscovers late inbox traces and filters admissions through the Langfuse re
     });
     expect(result.ok, result.state).toBe(true);
   }
-  expect(queries[0].get('model')).toBe('mock');
+  expect(JSON.parse(queries[0].get('filter')!).find((item) => item.column === 'model').value).toBe(
+    'mock',
+  );
   expect(queries[0].get('type')).toBe('GENERATION');
-  expect(queries.filter((query) => query.get('model') === 'mock')).toHaveLength(2);
+  expect(
+    queries.filter((query) =>
+      JSON.parse(query.get('filter') ?? '[]').some(
+        (item) => item.column === 'model' && item.value === 'mock',
+      ),
+    ),
+  ).toHaveLength(2);
   const admission = queries.find((query) => query.get('name') === 'inbox:admitted');
   expect(admission?.has('model')).toBe(false);
   expect(admission?.get('type')).toBe('SPAN');

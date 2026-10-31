@@ -43,9 +43,8 @@ import { join, resolve } from 'node:path';
 import { integrationModel, integrationRevision, netEnv, requireEnv, run } from './ci-shared.mjs';
 
 // ---------------------------------------------------------------------------
-// Real-Langfuse verification (v1 Observations API — v2 observations is
-// cloud/self-hosted-v4 only, and the deprecated /api/public/traces read path
-// is never used; works on self-hosted v3 and cloud alike). Ingestion lands
+// Real-Langfuse verification (efficient v2 Observations API, with v1 fallback
+// for self-hosted v3; the deprecated /api/public/traces path is never used). Ingestion lands
 // piecemeal, so a poll that finds the trace but not the full shape is
 // retried, never failed immediately; 429s honor Retry-After (org-shared rate
 // limits); other 4xx are unhealable client errors and fail fast with a
@@ -463,6 +462,7 @@ export async function runVerification({
   const origin = baseUrl.replace(/\/+$/, '');
   const deadline = Date.now() + VERIFY_DEADLINE_MS;
   const auth = `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString('base64')}`;
+  let apiVersion = 2;
   // Full observation IO is expensive. Keep every discovery/read-back request
   // inside one short, non-future window even if a caller supplied a wide range.
   function timeRange() {
@@ -482,28 +482,67 @@ export async function runVerification({
 
   async function fetchObservations(params) {
     const rows = [];
+    let cursor;
     for (let page = 1; page <= MAX_PAGES; page += 1) {
       // Small pages on purpose: the API docs warn that large page sizes
       // trigger request errors on some deployments.
       const query = new URLSearchParams({
         ...timeRange(),
         limit: QUERY_PAGE_LIMIT,
-        page: String(page),
         ...params,
       });
+      if (apiVersion === 2) {
+        query.set('fields', 'core,basic,io,metadata,model,usage');
+        if (cursor) query.set('cursor', cursor);
+        if (params.model) {
+          query.delete('model');
+          // v2 advanced filters override fixed filters, so retain time/type bounds.
+          query.set(
+            'filter',
+            JSON.stringify([
+              {
+                type: 'datetime',
+                column: 'startTime',
+                operator: '>=',
+                value: query.get('fromStartTime'),
+              },
+              {
+                type: 'datetime',
+                column: 'startTime',
+                operator: '<',
+                value: query.get('toStartTime'),
+              },
+              { type: 'stringOptions', column: 'type', operator: 'any of', value: [params.type] },
+              { type: 'string', column: 'model', operator: '=', value: params.model },
+            ]),
+          );
+        }
+      } else query.set('page', String(page));
       // A hung fetch must not outlive the polling deadline.
       const remaining = deadline - Date.now();
-      const response = await fetch(`${origin}/api/public/observations?${query}`, {
+      const path = apiVersion === 2 ? '/api/public/v2/observations' : '/api/public/observations';
+      const response = await fetch(`${origin}${path}?${query}`, {
         headers: { authorization: auth, accept: 'application/json' },
         signal: AbortSignal.timeout(Math.min(REQUEST_TIMEOUT_MS, Math.max(1000, remaining))),
       });
+      if (apiVersion === 2 && (response.status === 404 || response.status === 405)) {
+        await response.body?.cancel();
+        apiVersion = 1;
+        rows.length = 0;
+        cursor = undefined;
+        console.log('Langfuse Observations v2 unavailable; using the v1 compatibility API');
+        page = 0;
+        continue;
+      }
       // 4xx is a client error that never heals by retrying — fail fast, and
       // include a bounded slice of the validation body (it quotes the query,
       // never the auth header) so the CI log shows the actual complaint.
       if (response.status >= 400 && response.status < 500 && response.status !== 429) {
         const detail = (await response.text()).slice(0, 300);
         throw Object.assign(
-          new Error(`Langfuse observations query rejected (HTTP ${response.status}): ${detail}`),
+          new Error(
+            `Langfuse observations v${apiVersion} query rejected (HTTP ${response.status}): ${detail}`,
+          ),
           { fatal: true },
         );
       }
@@ -529,10 +568,25 @@ export async function runVerification({
       try {
         body = JSON.parse(await response.text());
       } catch {
-        throw new Error('Langfuse observations query returned invalid JSON');
+        throw new Error(`Langfuse observations v${apiVersion} query returned invalid JSON`);
       }
-      rows.push(...(body.data ?? []));
-      if (page >= (body.meta?.totalPages ?? 1)) return rows;
+      for (const row of body.data ?? []) {
+        if (apiVersion === 2) {
+          for (const field of ['input', 'output']) {
+            if (typeof row[field] !== 'string') continue;
+            try {
+              row[field] = JSON.parse(row[field]);
+            } catch {
+              /* Plain text IO remains text. */
+            }
+          }
+        }
+        rows.push(row);
+      }
+      if (apiVersion === 2) {
+        cursor = body.meta?.cursor;
+        if (!cursor) return rows;
+      } else if (page >= (body.meta?.totalPages ?? 1)) return rows;
     }
     throw new Error(`Langfuse observations query exceeded ${MAX_PAGES} pages`);
   }
