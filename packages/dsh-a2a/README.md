@@ -150,6 +150,12 @@ REST v0.3 uses the SDK's `/v1/...` routes and protobuf JSON shapes (for example,
 `ROLE_USER`); it is distinct from v0.3 JSON-RPC `kind`-tagged messages. Use the
 matching SDK client rather than copying payloads between bindings.
 
+A small connection adapter releases an individual subscription's SDK queue when
+its client disconnects; it never cancels the task or other subscribers. Disconnected
+sends continue draining task events for persistence. Stream writes wait for
+`drain`, but the SDK's internal event queues are not bounded: this is not a bounded
+memory guarantee for indefinitely slow clients.
+
 The host can register an SDK `ExtendedAgentCardProvider` with
 `ctx.provide('a2aExtendedCard', provider)` **before loading this plugin**. The
 type is also exported by this package. The provider receives the SDK

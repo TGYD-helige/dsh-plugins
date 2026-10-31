@@ -1,4 +1,4 @@
-import { once } from 'node:events';
+import { getEventListeners, once } from 'node:events';
 import { createServer, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
@@ -507,6 +507,95 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     }
   });
 
+  it.each(['rest', 'grpc'])(
+    'releases disconnected %s subscribers without canceling the task',
+    async (transport) => {
+      const buses = new Set<EventTarget>();
+      const add = EventTarget.prototype.addEventListener;
+      const tracking = vi
+        .spyOn(EventTarget.prototype, 'addEventListener')
+        .mockImplementation(function (
+          this: EventTarget,
+          ...args: Parameters<EventTarget['addEventListener']>
+        ) {
+          if (args[0] === 'event' || args[0] === 'finished') buses.add(this);
+          return add.apply(this, args);
+        });
+      const listeners = () =>
+        [...buses].reduce(
+          (count, bus) =>
+            count +
+            getEventListeners(bus, 'event').length +
+            getEventListeners(bus, 'finished').length,
+          0,
+        );
+      await server.close();
+      const store = new SanitizedTaskStore(new MemoryTaskStore());
+      const context = new ServerCallContext({ tenant: '' });
+      const task: Task = {
+        id: 'idle-subscription',
+        contextId: 'idle-context',
+        status: {
+          state: TaskState.TASK_STATE_INPUT_REQUIRED,
+          message: undefined,
+          timestamp: new Date().toISOString(),
+        },
+        history: [],
+        artifacts: [],
+        metadata: undefined,
+      };
+      await store.save(task, context);
+      server = await startA2aServer({
+        host: '127.0.0.1',
+        port: 0,
+        basePath: '/a2a',
+        rest: true,
+        grpc: { enabled: transport === 'grpc', port: 0 },
+        card: { name: 'disconnect', description: '', version: '0.0.1' },
+        executor: stubExecutor,
+        taskStore: store,
+      });
+      const bus = server.restoreTask(task, context);
+      base = `http://127.0.0.1:${server.port}`;
+      const Client = makeGenericClientConstructor(A2AService, 'A2AService');
+      const client = new Client(`127.0.0.1:${server.grpcPort || 1}`, credentials.createInsecure());
+      const metadata = new Metadata();
+      metadata.set('a2a-version', '1.0');
+      try {
+        const baseline = listeners();
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (transport === 'grpc') {
+            const subscription = client.subscribeToTask(
+              SubscribeToTaskRequest.fromJSON({ id: task.id }),
+              metadata,
+            );
+            const failed = once(subscription, 'error');
+            await once(subscription, 'data');
+            expect(listeners()).toBeGreaterThan(baseline);
+            subscription.cancel();
+            await failed;
+          } else {
+            const response = await fetch(`${base}/a2a/rest/tasks/${task.id}:subscribe`, {
+              headers: { 'A2A-Version': '1.0' },
+            });
+            const reader = response.body!.getReader();
+            await reader.read();
+            expect(listeners()).toBeGreaterThan(baseline);
+            await reader.cancel();
+          }
+          await vi.waitFor(() => expect(listeners()).toBe(baseline));
+        }
+        expect((await json(await rpc('GetTask', { id: task.id }))).result.status.state).toBe(
+          'TASK_STATE_INPUT_REQUIRED',
+        );
+      } finally {
+        bus.finished();
+        client.close();
+        tracking.mockRestore();
+      }
+    },
+  );
+
   it('serves the v1 agent card on the well-known path', async () => {
     const res = await fetch(`${base}/.well-known/agent-card.json`, {
       headers: { 'A2A-Version': '1.0' },
@@ -640,6 +729,8 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     const history = await json(await rpc('GetTask', { tenant: '', id, historyLength: 10 }, 33));
     expect(history.result.history[0].parts[0].text).toBe('shared');
     const updates = subscriptions.map(frames);
+    const abandoned = await rpc('SubscribeToTask', { tenant: '', id }, 35);
+    await abandoned.body!.cancel();
     await rpc('CancelTask', { tenant: '', id }, 34);
     const [first, second] = await Promise.all(updates);
     expect(first.map((frame) => frame.result)).toEqual(second.map((frame) => frame.result));

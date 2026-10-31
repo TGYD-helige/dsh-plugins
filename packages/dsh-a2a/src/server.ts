@@ -51,6 +51,11 @@ import {
 import express, { type RequestHandler } from 'express';
 import { AdmissionGate } from './admission.js';
 import { legacyStreamHandler } from './legacy-stream.js';
+import {
+  connectedRequestHandler,
+  subscriptionBus,
+  withStreamConnection,
+} from './stream-connection.js';
 
 export interface A2aServerOptions {
   extensions?: AgentExtension[];
@@ -270,7 +275,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       requestBus.on('finished', () => task.requests.delete(requestBus));
       return requestBus;
     },
-    getByTaskId: (taskId: string) => taskBuses.get(taskId)?.broadcast,
+    getByTaskId: (taskId: string) => subscriptionBus(taskBuses.get(taskId)?.broadcast),
     cleanupByTaskId(taskId: string) {
       const task = taskBuses.get(taskId);
       task?.broadcast.finished();
@@ -311,7 +316,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
   const pushSender = pushStore ? createLegacyAwarePushNotificationSender(pushStore) : undefined;
   const restoredPushFailed = (error: unknown) =>
     console.error('[dsh-a2a] restored task push failed:', error);
-  const requestHandler = new (class extends DefaultRequestHandler {
+  const handler = new (class extends DefaultRequestHandler {
     private async beforeMessage(message: Message | undefined, context: ServerCallContext) {
       if (!message) return;
       try {
@@ -489,8 +494,10 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     pushSender,
     options.extendedAgentCard,
   );
+  const requestHandler = connectedRequestHandler(handler);
 
   const app = express();
+  app.use((_req, res, next) => withStreamConnection(res, next));
   // The SDK's jsonRpcHandler parses bodies with express.json()'s 100kb default;
   // raise the ceiling here — body-parser skips re-parsing an already-read body.
   app.use(express.json({ limit: '16mb', type: ['application/json', 'application/a2a+json'] }));
@@ -661,8 +668,22 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       ]);
       grpcServer = new grpc.Server();
       const handlers = { requestHandler, userBuilder: sdk.UserBuilder.noAuthentication };
-      grpcServer.addService(sdk.A2AService, sdk.grpcService(handlers));
-      grpcServer.addService(legacy.LegacyA2AService, legacy.legacyGrpcService(handlers));
+      for (const [descriptor, service] of [
+        [sdk.A2AService, sdk.grpcService(handlers)],
+        [legacy.LegacyA2AService, legacy.legacyGrpcService(handlers)],
+      ] as const) {
+        for (const [method, definition] of Object.entries(descriptor)) {
+          if (!definition.responseStream) continue;
+          const stream = service[method] as import('@grpc/grpc-js').handleServerStreamingCall<
+            unknown,
+            unknown
+          >;
+          service[method] = (
+            call: import('@grpc/grpc-js').ServerWritableStream<unknown, unknown>,
+          ) => withStreamConnection(call, () => stream(call));
+        }
+        grpcServer.addService(descriptor, service);
+      }
       const listener = grpcServer;
       grpcPort = await new Promise<number>((resolve, reject) => {
         listener.bindAsync(
