@@ -77,10 +77,10 @@ DSH_NATIVE_OWNERSHIP_LANGFUSE_LIVE=true node .github/scripts/check-inbox.mjs -t 
 
 ## Native inbox extension v1
 
-Protocol identifier: `https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md#native-inbox-extension-v1`
+Protocol identifier: `https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md`
 
-This README is the canonical specification. Agent Card extension params advertise
-`documentationUrl` pointing to this section.
+This README contains the extension specification. The URI identifies the
+extension during negotiation; no additional documentation parameter is advertised.
 
 This is a project extension, not an official A2A extension. It follows the
 [A2A extension mechanism](https://a2a-protocol.org/v1.0.1/topics/extensions/).

@@ -93,8 +93,10 @@ try {
       signal: AbortSignal.timeout(10_000),
     })
   ).json();
-  const uri = card.capabilities?.extensions?.find((extension) =>
-    extension.uri.endsWith('#native-inbox-extension-v1'),
+  const uri = card.capabilities?.extensions?.find(
+    (extension) =>
+      extension.uri ===
+      'https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md',
   )?.uri;
   assert(uri, 'agent card must advertise the native inbox extension');
   const client = a2aClient(boot.a2a, { extensions: [uri], signal: AbortSignal.timeout(240_000) });

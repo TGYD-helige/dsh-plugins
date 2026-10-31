@@ -288,9 +288,7 @@ export function apply(
               uri: INBOX_EXTENSION,
               description: 'Native inbox management, steering and checkpointed invalidation',
               required: false,
-              params: {
-                documentationUrl: INBOX_EXTENSION,
-              },
+              params: undefined,
             },
           ]
         : [],

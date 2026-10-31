@@ -25,7 +25,7 @@ import { commitInboxInput, type ManagedTaskStore, markInboxInputPending } from '
 import { agentTextMessage, SessionTranslator, terminalStatusUpdate } from './translator.js';
 
 export const INBOX_EXTENSION =
-  'https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md#native-inbox-extension-v1';
+  'https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md';
 
 export interface A2aInboxEvent {
   phase: string;
