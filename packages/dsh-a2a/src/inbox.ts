@@ -48,6 +48,18 @@ export interface A2aInboxEvent {
 }
 
 const RETAINED_INPUTS = `${INBOX_EXTENSION}#retained-inputs`;
+const LEGACY_RETAINED_INPUTS =
+  'https://github.com/TGYD-helige/dsh-plugins/blob/main/docs/protocol/inbox-v1.md#retained-inputs';
+
+function retainedSnapshot(task: Task) {
+  return task.metadata?.[RETAINED_INPUTS] ?? task.metadata?.[LEGACY_RETAINED_INPUTS];
+}
+
+function clearRetainedSnapshot(task: Task): void {
+  if (!task.metadata) return;
+  delete task.metadata[RETAINED_INPUTS];
+  delete task.metadata[LEGACY_RETAINED_INPUTS];
+}
 
 interface InboxSource {
   kind: 'a2a';
@@ -66,12 +78,6 @@ declare module '@deepseek-ai/dsh-llm/types' {
     goal: GoalMessageSource;
   }
 }
-declare module '@deepseek-ai/dsh-session/types' {
-  interface SessionEventMap {
-    'agent/inbox/paused': { paused: boolean };
-  }
-}
-
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /** Native inbox lifecycle; content consumers must honor their capture settings. */
@@ -733,58 +739,110 @@ export class NativeInbox implements A2aInbox {
 
   async resume(contextId: string, taskId: string): Promise<string> {
     const context = new ServerCallContext();
-    const previous = await this.store.load(taskId, context);
-    if (!previous || previous.contextId !== contextId || !this.terminal(previous))
-      throw new Error('Resume requires a terminal retained task.');
-    const retained = previous.metadata?.[RETAINED_INPUTS];
-    if (typeof retained !== 'string') throw new Error('Task has no retained input to resume.');
-    const inputs = JSON.parse(retained) as Array<{
-      position: number;
-      target: InboxTarget;
-      message: UserMessage;
-    }>;
-    if (!inputs.length) throw new Error('Task has no retained input to resume.');
     const run = await this.context(contextId, context);
-    const id = randomUUID();
-    const replacement: Task = {
-      ...previous,
-      id,
-      status: {
-        state: TaskState.TASK_STATE_SUBMITTED,
-        timestamp: new Date().toISOString(),
-        message: undefined,
-      },
-      history: [],
-      metadata: { ...previous.metadata },
-    };
-    delete replacement.metadata![RETAINED_INPUTS];
-    const retainedInputs = inputs.map((input) => {
-      if (input.message.source.kind !== 'a2a')
-        throw new Error('Retained input has invalid task ownership.');
-      const original = Message.fromJSON(JSON.parse(input.message.source.message));
-      original.taskId = id;
-      original.referenceTaskIds = [...new Set([...original.referenceTaskIds, taskId])];
-      replacement.history.push(markInboxInputPending(original));
-      return {
-        ...input,
-        message: {
-          ...input.message,
-          source: {
-            ...input.message.source,
-            taskId: id,
-            message: JSON.stringify(Message.toJSON(original)),
-          },
+    const operation = run.admissionTail.then(async () => {
+      if (this.stopping || this.bridge.isClearing(contextId))
+        throw new Error('Context is unavailable.');
+      const previous = await this.store.load(taskId, context);
+      if (!previous || previous.contextId !== contextId || !this.terminal(previous))
+        throw new Error('Resume requires a terminal retained task.');
+      const retained = retainedSnapshot(previous);
+      if (typeof retained !== 'string') throw new Error('Task has no retained input to resume.');
+      const inputs = JSON.parse(retained) as Array<{
+        position: number;
+        target: InboxTarget;
+        message: UserMessage;
+      }>;
+      if (!inputs.length) throw new Error('Task has no retained input to resume.');
+      const nativeIds = new Set(inputs.map((input) => input.message.id));
+      const resumed = new Map<string, string>();
+      const messages = [
+        ...run.entry.handle.agent.session
+          .snapshotEvents()
+          .flatMap((event) => (event.type === 'user/message' ? [event.data] : [])),
+        ...this.pending(run),
+        ...[...run.tasks.values()].flatMap((task) => task.claimedInputs ?? []),
+      ];
+      for (const message of messages) {
+        if (!nativeIds.has(message.id) || message.source.kind !== 'a2a') continue;
+        const original = Message.fromJSON(JSON.parse(message.source.message));
+        if (message.source.taskId !== taskId && original.referenceTaskIds.includes(taskId))
+          resumed.set(message.id, message.source.taskId);
+      }
+      if (resumed.size) {
+        const replacements = new Set(resumed.values());
+        if (resumed.size !== nativeIds.size || replacements.size !== 1)
+          throw new Error('Retained input has already been partially resumed.');
+        const id = resumed.values().next().value!;
+        await this.flush(run.entry.handle.agent.session);
+        const replacement = run.tasks.get(id)?.task ?? (await this.store.load(id, context));
+        if (!replacement) throw new Error('Resumed task is unavailable.');
+        clearRetainedSnapshot(replacement);
+        await this.checkpoint(replacement, context);
+        clearRetainedSnapshot(previous);
+        await this.checkpoint(previous, context);
+        if (
+          this.pending(run).some(
+            (message) => message.source.kind === 'a2a' && message.source.taskId === id,
+          )
+        )
+          await this.wake(contextId);
+        return id;
+      }
+      const id = randomUUID();
+      const replacement: Task = {
+        ...previous,
+        id,
+        status: {
+          state: TaskState.TASK_STATE_SUBMITTED,
+          timestamp: new Date().toISOString(),
+          message: undefined,
         },
+        history: [],
+        metadata: { ...previous.metadata },
       };
+      clearRetainedSnapshot(replacement);
+      const retainedInputs = inputs.map((input) => {
+        if (input.message.source.kind !== 'a2a')
+          throw new Error('Retained input has invalid task ownership.');
+        const original = Message.fromJSON(JSON.parse(input.message.source.message));
+        original.taskId = id;
+        original.referenceTaskIds = [...new Set([...original.referenceTaskIds, taskId])];
+        replacement.history.push(markInboxInputPending(original));
+        return {
+          ...input,
+          message: {
+            ...input.message,
+            source: {
+              ...input.message.source,
+              taskId: id,
+              message: JSON.stringify(Message.toJSON(original)),
+            },
+          },
+        };
+      });
+      replacement.metadata![RETAINED_INPUTS] = JSON.stringify(retainedInputs);
+      await this.checkpoint(replacement, context);
+      for (const input of retainedInputs) {
+        if (this.pending(run).some((pending) => pending.id === input.message.id))
+          run.entry.handle.agent.inbox.remove(input.message.id);
+        run.entry.handle.agent.send(input.message, input.target, false);
+      }
+      this.restoreTask(run, replacement, context);
+      // Consume the old snapshot only after its replacement input is durable.
+      await this.flush(run.entry.handle.agent.session);
+      clearRetainedSnapshot(replacement);
+      await this.checkpoint(replacement, context);
+      clearRetainedSnapshot(previous);
+      await this.checkpoint(previous, context);
+      await this.wake(contextId);
+      return id;
     });
-    await this.checkpoint(replacement, context);
-    for (const [index, input] of retainedInputs.entries()) {
-      if (this.pending(run).some((pending) => pending.id === input.message.id))
-        run.entry.handle.agent.inbox.remove(input.message.id);
-      run.entry.handle.agent.send(input.message, input.target, index === retainedInputs.length - 1);
-    }
-    this.restoreTask(run, replacement, context);
-    return id;
+    run.admissionTail = operation.then(
+      () => {},
+      () => {},
+    );
+    return operation;
   }
 
   /** Repair only an incomplete ownership move, never an ordinary DSH claim. */
@@ -865,7 +923,7 @@ export class NativeInbox implements A2aInbox {
         context,
       );
       for (const task of page.tasks) {
-        const retained = task.metadata?.[RETAINED_INPUTS];
+        const retained = retainedSnapshot(task);
         if (typeof retained !== 'string') continue;
         // Terminal snapshots belong to explicit resume(); do not consume their
         // retained metadata during ordinary context recovery.
@@ -967,7 +1025,7 @@ export class NativeInbox implements A2aInbox {
     if (!snapshots.length) return;
     await this.flush(agent.session);
     for (const task of snapshots) {
-      delete task.metadata![RETAINED_INPUTS];
+      clearRetainedSnapshot(task);
       await this.checkpoint(task, context);
     }
   }
@@ -992,10 +1050,6 @@ export class NativeInbox implements A2aInbox {
           rolledBack: new Set(),
           retained: { 'next-step': [], 'next-turn': [] },
         };
-        const pause = [...run.entry.handle.agent.session.snapshotEvents()]
-          .reverse()
-          .find((event) => event.type === 'agent/inbox/paused');
-        if (pause) run.paused = pause.data.paused;
         await this.recoverRetained(run, context);
         await this.recoverPromotions(run, context);
         const snapshots = new Map<string, Task>();
@@ -1834,7 +1888,6 @@ export class NativeInbox implements A2aInbox {
     const run = await this.context(contextId);
     if (run.paused) return;
     run.paused = true;
-    run.entry.handle.agent.session.append('agent/inbox/paused', { paused: true });
     for (const admission of run.admissions) admission.abort();
     run.entry.handle.agent.cancel({ kind: 'user' }, { keepInbox: true });
     await run.entry.handle.agent.whenIdle();
@@ -1846,7 +1899,6 @@ export class NativeInbox implements A2aInbox {
     const agent = run.entry.handle.agent;
     const pending = this.pending(run);
     run.paused = false;
-    agent.session.append('agent/inbox/paused', { paused: false });
     const target = agent.inbox.nextTurn.length ? 'next-turn' : 'next-step';
     const items = target === 'next-turn' ? agent.inbox.nextTurn : agent.inbox.nextStep;
     const input = items.at(-1);
@@ -2018,6 +2070,7 @@ export class NativeInbox implements A2aInbox {
                 if (this.retainPending) {
                   const pending = retainedByTask.get(task.task.id) ?? [];
                   if (pending.length) {
+                    clearRetainedSnapshot(task.task);
                     task.task.metadata = {
                       ...task.task.metadata,
                       [RETAINED_INPUTS]: JSON.stringify(pending),
