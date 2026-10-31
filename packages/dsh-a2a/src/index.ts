@@ -34,8 +34,9 @@ export type { ExtendedAgentCardProvider } from '@a2a-js/sdk/server';
 export type { A2aApproval, A2aApprovalCodec, A2aApprovalReply } from './approval.js';
 export { defaultApprovalCodec } from './approval.js';
 export type { A2aFileMaterializer } from './content.js';
-export type { A2aInbox, A2aInboxEvent } from './inbox.js';
+export type { A2aInbox, A2aInboxEvent, InboxPageOptions, InboxSnapshot } from './inbox.js';
 export { INBOX_EXTENSION } from './inbox.js';
+export type { InboxChange } from './inbox-changes.js';
 export type { SubagentToolSource } from './translator.js';
 
 /** Event emitted when one A2A user message enters the dsh inbox. */
@@ -96,6 +97,11 @@ export const inject = ['agents'];
 export const Config = Schema.object({
   inbox: Schema.object({
     enabled: Schema.boolean().default(false),
+    notifications: Schema.boolean()
+      .default(false)
+      .description(
+        'Publish checkpointed inbox invalidations to same-process host observers; SSE subscriptions also activate their own feed.',
+      ),
     shutdown: Schema.union([Schema.const('cancel'), Schema.const('retain-pending')]).default(
       'cancel',
     ),
@@ -173,7 +179,7 @@ export const Config = Schema.object({
 });
 
 export interface A2aPluginConfig {
-  inbox?: { enabled: boolean; shutdown?: 'cancel' | 'retain-pending' };
+  inbox?: { enabled: boolean; notifications?: boolean; shutdown?: 'cancel' | 'retain-pending' };
   enabled: boolean;
   host: string;
   port: number;
@@ -235,7 +241,13 @@ export function apply(
 
     const store = createTaskStore(config);
     const inbox = config.inbox?.enabled
-      ? new NativeInbox(ctx, bridge, store, config.inbox.shutdown === 'retain-pending')
+      ? new NativeInbox(
+          ctx,
+          bridge,
+          store,
+          config.inbox.shutdown === 'retain-pending',
+          config.inbox.notifications,
+        )
       : undefined;
     await store.init?.();
     if (inbox) ctx.provide('a2aInbox', inbox);
@@ -269,13 +281,17 @@ export function apply(
 
     const executor = new DshAgentExecutor(bridge, (taskId) => store.suppress(taskId));
     const server = await startA2aServer({
+      inbox,
       extensions: inbox
         ? [
             {
               uri: INBOX_EXTENSION,
-              description: 'Native inbox steering and parked admission',
+              description: 'Native inbox management, steering and checkpointed invalidation',
               required: false,
-              params: undefined,
+              params: {
+                documentationUrl:
+                  'https://github.com/TGYD-helige/dsh-plugins/blob/main/packages/dsh-a2a/README.md#native-inbox-extension-v1',
+              },
             },
           ]
         : [],

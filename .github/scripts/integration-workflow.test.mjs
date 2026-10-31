@@ -1,12 +1,35 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { stopA2a } from './integration/lib/a2a-shared.mjs';
 import * as integration from './integration/lib/ci-shared.mjs';
 
 const workflow = readFileSync(new URL('../workflows/integration.yml', import.meta.url), 'utf8');
+
+test('native inbox model E2E is discovered as a packed-plugin gateway scenario', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'inbox-model-matrix-'));
+  try {
+    const output = join(directory, 'output');
+    const result = spawnSync(process.execPath, ['.github/scripts/integration-matrix.mjs'], {
+      env: { ...process.env, GITHUB_OUTPUT: output },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const line = readFileSync(output, 'utf8')
+      .split('\n')
+      .find((value) => value.startsWith('matrix='));
+    const matrix = JSON.parse(line.slice('matrix='.length));
+    assert.ok(
+      matrix.include.some((leg) => leg.name === 'dsh-a2a.inbox-api' && leg.package === 'dsh-a2a'),
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test('A2A cleanup accepts a child that already exited', async (t) => {
   const child = spawn(process.execPath, ['-e', '']);

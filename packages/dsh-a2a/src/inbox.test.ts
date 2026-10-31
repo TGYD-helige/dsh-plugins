@@ -30,6 +30,9 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
   const nextStep: UserMessage[] = [];
   const session = {
     id: 'context',
+    get seq() {
+      return log.length;
+    },
     snapshotEvents: () => log.slice(),
     append(type: string, data: unknown) {
       const event = {
@@ -39,6 +42,11 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
         time: Date.now(),
       };
       log.push(event as SessionEvent);
+      if (event.type === 'agent/inbox/spliced') {
+        const splice = event.data as any;
+        const items = splice.target === 'next-turn' ? nextTurn : nextStep;
+        items.splice(splice.start, splice.removedCount ?? 0, ...splice.inserted);
+      }
       ctx.emit('session/event', session as never, event as never);
       return event;
     },
@@ -50,7 +58,6 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
       start: items.length,
       inserted: [message],
     } as never);
-    items.push(message);
     ctx.emit('agent/inbox/inserted', { agent, message });
   };
   let activity: Promise<void> | undefined;
@@ -74,19 +81,14 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
             inserted: [],
             outcome: 'canceled',
           } as never);
-          items.splice(0);
         }
       },
       append,
       prepend(target: string, message: UserMessage) {
-        const items = target === 'next-turn' ? nextTurn : nextStep;
         session.append('agent/inbox/spliced', { target, start: 0, inserted: [message] } as never);
-        items.unshift(message);
       },
       splice(target: string, start: number, removedCount: number, inserted: UserMessage[]) {
-        const items = target === 'next-turn' ? nextTurn : nextStep;
         session.append('agent/inbox/spliced', { target, start, removedCount, inserted } as never);
-        items.splice(start, removedCount, ...inserted);
       },
       replace(id: string, message: UserMessage) {
         const items = nextTurn.some((m) => m.id === id) ? nextTurn : nextStep;
@@ -99,14 +101,19 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
           inserted: [message],
           outcome: 'canceled',
         });
-        items[index] = message;
         return true;
       },
       remove(id: string) {
         for (const items of [nextTurn, nextStep]) {
           const index = items.findIndex((m) => m.id === id);
           if (index >= 0) {
-            items.splice(index, 1);
+            session.append('agent/inbox/spliced', {
+              target: items === nextTurn ? 'next-turn' : 'next-step',
+              start: index,
+              removedCount: 1,
+              inserted: [],
+              outcome: 'canceled',
+            } as never);
             return true;
           }
         }
@@ -132,7 +139,7 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
               ['next-step', nextStep, nextStep.length],
               ['next-turn', nextTurn, Math.min(1, nextTurn.length)],
             ] as const) {
-              const removed = items.splice(0, count);
+              const removed = items.slice(0, count);
               session.append('agent/inbox/spliced', {
                 target,
                 start: 0,
@@ -254,6 +261,107 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
 }
 
 describe('native A2A inbox', () => {
+  it('bounds parallel task checkpoints and drains all bulk-clear writes before reporting failure', async () => {
+    const store = new MemoryTaskStore();
+    const f = harness([], store);
+    const queued = Array.from({ length: 12 }, (_, index) =>
+      f.send(`bulk-${index}`, { parked: true }),
+    );
+    await vi.waitFor(() => expect(f.agent.inbox.nextTurn).toHaveLength(12));
+    const save = store.save.bind(store);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let active = 0,
+      peak = 0,
+      writes = 0;
+    let failedId = '';
+    vi.spyOn(store, 'save').mockImplementation(async (task, context) => {
+      writes++;
+      active++;
+      peak = Math.max(peak, active);
+      const fail = !failedId;
+      if (fail) failedId = task.id;
+      try {
+        await gate;
+        if (fail) throw new Error('one checkpoint failed');
+        await save(task, context);
+      } finally {
+        active--;
+      }
+    });
+    const clearing = f.native.clearPending('context').then(
+      () => undefined,
+      (error) => error,
+    );
+    try {
+      await vi.waitFor(() => expect(active).toBeGreaterThan(1));
+      expect(peak).toBeLessThanOrEqual(4);
+      release();
+      expect(await clearing).toMatchObject({ message: 'one checkpoint failed' });
+      expect(writes).toBe(12);
+      expect(active).toBe(0);
+      expect(peak).toBeLessThanOrEqual(4);
+      await f.native.cancel(failedId);
+      expect((await store.load(failedId, new ServerCallContext()))?.status?.state).toBe(
+        TaskState.TASK_STATE_CANCELED,
+      );
+      await Promise.all(queued.map((request) => request.execution));
+    } finally {
+      release();
+      await clearing;
+      await f.native.shutdown();
+    }
+  });
+
+  it('records only the moved interval and skips a redundant head reorder during execute', async () => {
+    const f = harness();
+    const queued = ['one', 'two', 'three', 'four'].map((id) => f.send(id, { parked: true }));
+    await vi.waitFor(() => expect(f.agent.inbox.nextTurn).toHaveLength(4));
+    const original = f.agent.inbox.nextTurn.map((message) => message.id);
+    const offset = f.log.length;
+    await f.native.move('context', original[2], 1);
+    const events = f.log.slice(offset).filter((event) => event.type === 'agent/inbox/spliced');
+    expect(events).toHaveLength(1);
+    expect(events[0].data).toMatchObject({ start: 1, removedCount: 2 });
+    expect(events[0].data.inserted.map((message) => message.id)).toEqual([
+      original[2],
+      original[1],
+    ]);
+    expect(f.agent.inbox.nextTurn.map((message) => message.id)).toEqual([
+      original[0],
+      original[2],
+      original[1],
+      original[3],
+    ]);
+    const executing = f.log.length;
+    await f.native.executePending('context', original[0]);
+    await Promise.all(queued.map((request) => request.execution));
+    expect(
+      f.log
+        .slice(executing)
+        .filter((event) => event.type === 'agent/inbox/spliced')
+        .some((event) => event.data.inserted.length > 1),
+    ).toBe(false);
+  });
+
+  it('clears a batch without a durability flush per queued task', async () => {
+    const f = harness();
+    const flush = vi.fn(async () => true);
+    f.ctx.provide('sessions', { flush } as never);
+    const queued = Array.from({ length: 20 }, (_, index) =>
+      f.send(`queued-${index}`, { parked: true }),
+    );
+    await vi.waitFor(() => expect(f.agent.inbox.nextTurn).toHaveLength(20));
+    flush.mockClear();
+    const snapshot = await f.native.clearPending('context');
+    expect(snapshot.nextTurn).toEqual([]);
+    await Promise.all(queued.map((request) => request.execution));
+    expect(flush.mock.calls.length).toBeGreaterThan(0);
+    expect(flush.mock.calls.length).toBeLessThan(5);
+  });
+
   async function abortAtCheckpoint(
     action: 'cancel' | 'clear' | 'dispose' | 'shutdown',
     settleOperationFirst = false,

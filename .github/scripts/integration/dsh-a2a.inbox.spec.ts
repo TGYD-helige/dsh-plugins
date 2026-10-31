@@ -92,6 +92,7 @@ async function boot(
     langfuse?: Langfuse.LangfusePluginConfig;
     contextId?: string;
     protocols?: boolean;
+    retainPending?: boolean;
   } = {},
 ) {
   const ctx = new Context();
@@ -129,8 +130,9 @@ async function boot(
   });
   const backend = options.backend ?? new MemoryTaskStore();
   const store = options.store ?? new SanitizedTaskStore(backend);
-  const inbox = new NativeInbox(ctx, bridge, store);
+  const inbox = new NativeInbox(ctx, bridge, store, options.retainPending);
   const server = await startA2aServer({
+    inbox,
     extensions: [{ uri: INBOX_EXTENSION, description: '', required: false, params: undefined }],
     host: '127.0.0.1',
     port: 0,
@@ -195,6 +197,659 @@ async function boot(
 }
 
 describe('official protocol bindings', () => {
+  it('bounds paged bytes while preserving an oversized individual A2A message', async () => {
+    const f = await boot();
+    for (let index = 0; index < 20; index++)
+      await f.send(`large-page-${index}`, { wakeup: false }, undefined, 'x'.repeat(128 * 1024));
+    const first = (await f.rpc('dsh/inbox/get', { contextId: 'native-test', pageSize: 100 }))
+      .result;
+    expect(first.nextTurn.length).toBeLessThan(20);
+    expect(
+      Buffer.byteLength(JSON.stringify([...first.nextStep, ...first.nextTurn])),
+    ).toBeLessThanOrEqual(1024 * 1024);
+    expect(first.nextPageToken).not.toBe('');
+    await f.rpc('dsh/inbox/clear', { contextId: 'native-test' });
+    await f.send('oversize-single', { wakeup: false }, undefined, 'z'.repeat(2 * 1024 * 1024));
+    await f.send('after-oversize', { wakeup: false });
+    const oversized = (await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result;
+    expect(oversized.nextTurn).toHaveLength(1);
+    expect(oversized.nextTurn[0].message.parts[0].text.length).toBe(2 * 1024 * 1024);
+    const next = (
+      await f.rpc('dsh/inbox/get', { contextId: 'native-test', pageToken: oversized.nextPageToken })
+    ).result;
+    expect(next.nextTurn[0].message.messageId).toBe('after-oversize');
+  });
+
+  it('bounds inbox pages and mutation responses without decoding the entire pending queue', async () => {
+    const f = await boot();
+    for (let index = 0; index < 55; index++) await f.send(`page-${index}`, { wakeup: false });
+    const agent = await f.inbox.resolve('native-test');
+    for (const text of ['native-step-one', 'native-step-two'])
+      agent.inbox.append(
+        'next-step',
+        createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }),
+      );
+    const first = (await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result;
+    expect(first.nextStep.length + first.nextTurn.length).toBe(50);
+    expect(first.totalSize).toBe(57);
+    const second = (
+      await f.rpc('dsh/inbox/get', {
+        contextId: 'native-test',
+        pageToken: first.nextPageToken,
+        pageSize: 4,
+      })
+    ).result;
+    expect(second.nextStep).toEqual([]);
+    expect(second.nextTurn).toHaveLength(4);
+    const last = (
+      await f.rpc('dsh/inbox/get', { contextId: 'native-test', pageToken: second.nextPageToken })
+    ).result;
+    expect(last.nextTurn).toHaveLength(3);
+    expect(last.nextPageToken).toBe('');
+    const ids = [...first.nextStep, ...first.nextTurn, ...second.nextTurn, ...last.nextTurn].map(
+      (item) => item.id,
+    );
+    expect(ids).toEqual(
+      [...agent.inbox.nextStep, ...agent.inbox.nextTurn].map((message) => message.id),
+    );
+    expect((await f.inbox.get('native-test')).nextTurn).toHaveLength(55);
+    const before = agent.session.seq;
+    const invalid = await f.rpc('dsh/inbox/remove', {
+      contextId: 'native-test',
+      id: ids.at(-1),
+      pageSize: 0,
+    });
+    expect(invalid.error).toBeDefined();
+    expect(agent.session.seq).toBe(before);
+    const moved = await f.rpc('dsh/inbox/move', {
+      contextId: 'native-test',
+      id: ids.at(-1),
+      index: 53,
+      pageSize: 1,
+    });
+    expect(moved.result.nextStep).toHaveLength(1);
+    expect(moved.result.nextTurn).toEqual([]);
+    expect(moved.result.totalSize).toBe(57);
+    expect(
+      (await f.rpc('dsh/inbox/get', { contextId: 'native-test', pageToken: first.nextPageToken }))
+        .error,
+    ).toBeDefined();
+  });
+
+  it('cancels a borrowed A2A turn before awaiting shutdown without canceling later native work', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-borrowed-active-stop-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const f = await boot({ root });
+    const handle = await f.ctx.agents.create({
+      sessionId: 'native-test',
+      meta: { cwd: '/tmp' },
+      agentOptions: { provider: 'mock', model: 'mock' },
+    });
+    await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    let releaseFirst!: () => void, releaseNative!: () => void, releaseStorage!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const nativeGate = new Promise<void>((resolve) => {
+      releaseNative = resolve;
+    });
+    const storageGate = new Promise<void>((resolve) => {
+      releaseStorage = resolve;
+    });
+    let firstSignal: AbortSignal | undefined, nativeSignal: AbortSignal | undefined;
+    f.ctx.on('agent/request', async (detail, next) => {
+      if (!firstSignal) {
+        firstSignal = detail.signal;
+        await firstGate;
+      } else {
+        nativeSignal = detail.signal;
+        await nativeGate;
+      }
+      detail.signal.throwIfAborted();
+      return next();
+    });
+    cleanups.push(async () => {
+      releaseFirst();
+      releaseNative();
+      releaseStorage();
+    });
+    await f.send('active');
+    await expect.poll(() => Boolean(firstSignal)).toBe(true);
+    let blocked = false;
+    const flush = f.ctx.sessionPersistence.flush.bind(f.ctx.sessionPersistence);
+    const barrier = vi.spyOn(f.ctx.sessionPersistence, 'flush').mockImplementation(async () => {
+      if (!blocked) {
+        blocked = true;
+        await storageGate;
+      }
+      await flush();
+    });
+    const stopping = f.inbox.shutdown();
+    try {
+      await expect.poll(() => blocked).toBe(true);
+      expect(firstSignal!.aborted).toBe(true);
+      releaseFirst();
+      await handle.agent.whenIdle();
+      handle.agent.followup(
+        createUserMessage({
+          content: [{ type: 'text', text: 'native during shutdown' }],
+          source: { kind: 'user' },
+        }),
+      );
+      await expect.poll(() => Boolean(nativeSignal)).toBe(true);
+      releaseStorage();
+      await stopping;
+      expect(nativeSignal!.aborted).toBe(false);
+      releaseNative();
+      await handle.agent.whenIdle();
+      expect(f.adapter.requests).toHaveLength(1);
+    } finally {
+      releaseFirst();
+      releaseNative();
+      releaseStorage();
+      await stopping;
+      barrier.mockRestore();
+    }
+  });
+
+  it('retains late committed admissions without inserting them into a detached borrowed queue', async () => {
+    const f = await boot({ retainPending: true });
+    const handle = await f.ctx.agents.create({
+      sessionId: 'native-test',
+      meta: { cwd: '/tmp' },
+      agentOptions: { provider: 'mock', model: 'mock' },
+    });
+    await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    const save = f.backend.save.bind(f.backend);
+    let entered = false;
+    let taskId = '';
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    vi.spyOn(f.backend, 'save').mockImplementation(async (task, context) => {
+      if (!entered && task.history.some((message) => message.messageId === 'late-A2A')) {
+        entered = true;
+        taskId = task.id;
+        await gate;
+      }
+      await save(task, context);
+    });
+    const sending = f.rpc('SendMessage', {
+      message: {
+        messageId: 'late-A2A',
+        role: 'ROLE_USER',
+        contextId: 'native-test',
+        parts: [{ text: 'late borrowed input' }],
+        metadata: { [INBOX_EXTENSION]: { wakeup: false } },
+      },
+      configuration: { returnImmediately: true },
+    });
+    await expect.poll(() => entered).toBe(true);
+    const stopping = f.inbox.shutdown();
+    release();
+    await stopping;
+    await f.bridge.dispose();
+    await sending;
+    expect(handle.agent.inbox.nextTurn).toEqual([]);
+    const task = await f.store.load(taskId, new ServerCallContext());
+    expect(task.metadata[`${INBOX_EXTENSION}#retained-inputs`]).toContain('late borrowed input');
+    handle.agent.followup(
+      createUserMessage({
+        content: [{ type: 'text', text: 'native after stop' }],
+        source: { kind: 'user' },
+      }),
+    );
+    await handle.agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+  });
+
+  it('retains owned input without leaving it executable on a borrowed native agent', async () => {
+    const f = await boot({ retainPending: true });
+    const handle = await f.ctx.agents.create({
+      sessionId: 'native-test',
+      meta: { cwd: '/tmp' },
+      agentOptions: { provider: 'mock', model: 'mock' },
+    });
+    await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    let entered = false;
+    f.ctx.on('agent/request', async (_detail, next) => {
+      entered = true;
+      await gate;
+      return next();
+    });
+    handle.agent.followup(
+      createUserMessage({
+        content: [{ type: 'text', text: 'native turn' }],
+        source: { kind: 'user' },
+      }),
+    );
+    await expect.poll(() => entered).toBe(true);
+    const queued = await f.send('retained A2A', { wakeup: false });
+    await f.inbox.shutdown();
+    await f.bridge.dispose();
+    release();
+    await handle.agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+    expect(handle.agent.inbox.nextTurn).toEqual([]);
+    const retained = await f.store.load(queued.id, new ServerCallContext());
+    expect(retained.status.state).toBe(TaskState.TASK_STATE_SUBMITTED);
+    expect(retained.metadata[`${INBOX_EXTENSION}#retained-inputs`]).toContain('retained A2A');
+  });
+
+  it('observes an existing native agent without taking its lifecycle ownership', async () => {
+    const f = await boot();
+    const handle = await f.ctx.agents.create({
+      sessionId: 'native-test',
+      meta: { cwd: '/tmp' },
+      agentOptions: { provider: 'mock', model: 'mock' },
+    });
+    const native = createUserMessage({
+      content: [{ type: 'text', text: 'existing producer' }],
+      source: { kind: 'user' },
+    });
+    handle.agent.inbox.append('next-turn', native);
+    const snapshot = await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    expect(snapshot.error).toBeUndefined();
+    expect(snapshot.result.nextTurn[0].id).toBe(native.id);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    f.ctx.on('agent/request', async (_detail, next) => {
+      await gate;
+      return next();
+    });
+    expect((await f.rpc('dsh/inbox/execute', { contextId: 'native-test' })).error).toBeUndefined();
+    await f.inbox.shutdown();
+    await f.bridge.dispose();
+    expect(f.ctx.agents.get('native-test')).toBe(handle.agent);
+    release();
+    await handle.agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+    handle.agent.followup(
+      createUserMessage({
+        content: [{ type: 'text', text: 'after plugin stop' }],
+        source: { kind: 'user' },
+      }),
+    );
+    await handle.agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(2);
+  });
+
+  it('does not interfere with native producers after reading their inbox', async () => {
+    const f = await boot();
+    expect((await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).error).toBeUndefined();
+    const agent = f.ctx.agents.get('native-test')!;
+    const native = createUserMessage({
+      content: [{ type: 'text', text: 'native producer' }],
+      source: { kind: 'user' },
+    });
+    agent.send(native, 'next-turn', true);
+    await agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+    const task = await f.send('A2A input');
+    await f.completed(task.id);
+    agent.followup(
+      createUserMessage({
+        content: [{ type: 'text', text: 'native again' }],
+        source: { kind: 'user' },
+      }),
+    );
+    await agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(3);
+    expect(
+      agent.session
+        .snapshotEvents()
+        .filter((event) => event.type === 'user/message')
+        .map((event) => event.data.content[0].text),
+    ).toEqual(['native producer', 'A2A input', 'native again']);
+  });
+
+  it('keeps a claimed native input executable when another window executes again', async () => {
+    const f = await boot();
+    const agent = await f.inbox.resolve('native-test');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    let entered = false;
+    f.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+      entered = true;
+      await gate;
+      return next();
+    });
+    const native = createUserMessage({
+      content: [{ type: 'text', text: 'claimed' }],
+      source: { kind: 'user' },
+    });
+    agent.inbox.append('next-turn', native);
+    expect((await f.rpc('dsh/inbox/execute', { contextId: 'native-test' })).error).toBeUndefined();
+    await expect.poll(() => entered).toBe(true);
+    expect(agent.inbox.nextTurn).toEqual([]);
+    expect((await f.rpc('dsh/inbox/execute', { contextId: 'native-test' })).error).toBeUndefined();
+    release();
+    await agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+  });
+
+  it('preserves explicit native execution while a canceled driver drains', async () => {
+    const f = await boot();
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    let first = true;
+    f.ctx.on('agent/request', async (detail, next) => {
+      if (first) {
+        first = false;
+        entered();
+        await new Promise<void>((resolve) => {
+          if (detail.signal.aborted) resolve();
+          else detail.signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+        await gate;
+        detail.signal.throwIfAborted();
+      }
+      return next();
+    });
+    const active = await f.send('active');
+    await started;
+    expect((await f.rpc('CancelTask', { id: active.id })).error).toBeUndefined();
+    const agent = await f.inbox.resolve('native-test');
+    const native = createUserMessage({
+      content: [{ type: 'text', text: 'after cancellation' }],
+      source: { kind: 'user' },
+    });
+    agent.inbox.append('next-turn', native);
+    expect(
+      (await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: native.id })).error,
+    ).toBeUndefined();
+    release();
+    await agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+    expect(
+      agent.session
+        .snapshotEvents()
+        .some((event) => event.type === 'user/message' && event.data.id === native.id),
+    ).toBe(true);
+  });
+
+  it('preserves explicit native execution across a maintenance wake', async () => {
+    const f = await boot();
+    const agent = await f.inbox.resolve('native-test');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    const maintenance = agent.runMaintenance(() => gate);
+    const native = createUserMessage({
+      content: [{ type: 'text', text: 'after maintenance' }],
+      source: { kind: 'user' },
+    });
+    agent.inbox.append('next-turn', native);
+    expect(
+      (await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: native.id })).error,
+    ).toBeUndefined();
+    release();
+    await maintenance;
+    await agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+    expect(
+      agent.session
+        .snapshotEvents()
+        .some((event) => event.type === 'user/message' && event.data.id === native.id),
+    ).toBe(true);
+  });
+
+  it('executes native-only and mixed-producer inboxes in the selected order', async () => {
+    const f = await boot();
+    const agent = await f.inbox.resolve('native-test');
+    const native = createUserMessage({
+      content: [{ type: 'text', text: 'native-only' }],
+      source: { kind: 'user' },
+    });
+    agent.inbox.append('next-turn', native);
+    expect(
+      (await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: native.id })).error,
+    ).toBeUndefined();
+    await agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+    const a = await f.send('a', { wakeup: false });
+    const middle = createUserMessage({
+      content: [{ type: 'text', text: 'native-middle' }],
+      source: { kind: 'user' },
+    });
+    agent.inbox.append('next-turn', middle);
+    const b = await f.send('b', { wakeup: false });
+    const last = agent.inbox.nextTurn.at(-1)!;
+    expect(
+      (await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: last.id })).error,
+    ).toBeUndefined();
+    await agent.whenIdle();
+    await f.completed(a.id);
+    await f.completed(b.id);
+    const messages = agent.session
+      .snapshotEvents()
+      .filter((event) => event.type === 'user/message');
+    expect(messages.map((event) => event.data.content[0].text)).toEqual([
+      'native-only',
+      'b',
+      'a',
+      'native-middle',
+    ]);
+  });
+
+  it('clears pending tasks without canceling active work', async () => {
+    const f = await boot();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    f.ctx.on('agent/request', async (_detail, next) => {
+      await gate;
+      return next();
+    });
+    const active = await f.send('active');
+    const queued = await f.send('queued', { wakeup: false });
+    const cleared = await f.rpc('dsh/inbox/clear', { contextId: 'native-test' });
+    expect(cleared.error).toBeUndefined();
+    expect(cleared.result.nextTurn).toEqual([]);
+    expect((await f.rpc('GetTask', { id: active.id })).result.status.state).toBe(
+      'TASK_STATE_WORKING',
+    );
+    release();
+    await f.completed(active.id);
+    await expect
+      .poll(async () => (await f.rpc('GetTask', { id: queued.id })).result.status.state)
+      .toBe('TASK_STATE_CANCELED');
+  });
+
+  it('rejects malformed inbox edits and subscriptions without durability', async () => {
+    const f = await boot();
+    await f.send('queued', { wakeup: false });
+    const snapshot = (await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result;
+    const item = snapshot.nextTurn[0];
+    for (const message of [
+      { ...item.message, messageId: 'changed' },
+      { ...item.message, parts: [] },
+      { ...item.message, parts: [{ text: null }] },
+      { ...item.message, role: 'ROLE_AGENT' },
+    ]) {
+      const edited = await f.rpc('dsh/inbox/update', {
+        contextId: 'native-test',
+        id: item.id,
+        message,
+      });
+      expect(edited.error.code).toBe(-32602);
+    }
+    const subscription = await f.rpc('dsh/inbox/subscribe', { contextId: 'native-test' });
+    expect(subscription.error).toBeDefined();
+    expect((await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result).toEqual(snapshot);
+  });
+
+  it('notifies two inbox subscribers only after checkpoint and includes native consumption', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-inbox-events-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const f = await boot({ root });
+    const task = await f.send('queued', { wakeup: false });
+    const agent = await f.inbox.resolve('native-test');
+    const subscribe = async () => {
+      const controller = new AbortController();
+      const response = await fetch(`http://127.0.0.1:${f.server.port}/a2a/`, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'A2A-Extensions': INBOX_EXTENSION,
+          'A2A-Version': '1.0',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 7,
+          method: 'dsh/inbox/subscribe',
+          params: { contextId: 'native-test' },
+        }),
+      });
+      expect(response.headers.get('content-type')).toContain('text/event-stream');
+      expect(response.headers.get('a2a-extensions')).toBe(INBOX_EXTENSION);
+      const events: Array<{ contextId: string; version: number }> = [];
+      const reading = (async () => {
+        let buffer = '';
+        for await (const chunk of response.body!) {
+          buffer += Buffer.from(chunk).toString();
+          let boundary = buffer.indexOf('\n\n');
+          while (boundary >= 0) {
+            const frame = JSON.parse(buffer.slice(0, boundary).replace(/^data: /, ''));
+            expect(frame.error).toBeUndefined();
+            events.push(frame.result);
+            buffer = buffer.slice(boundary + 2);
+            boundary = buffer.indexOf('\n\n');
+          }
+        }
+      })().catch((error) => {
+        if (!controller.signal.aborted) throw error;
+      });
+      cleanups.push(async () => {
+        controller.abort();
+        await reading;
+      });
+      await expect.poll(() => events.length).toBeGreaterThan(0);
+      return events;
+    };
+    const a = await subscribe();
+    const b = await subscribe();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let checkpointEntered = false;
+    let blocking = true;
+    f.ctx.on('session/flush', async () => {
+      if (!blocking) return;
+      checkpointEntered = true;
+      await gate;
+    });
+    const before = [a.length, b.length];
+    const queued = agent.inbox.nextTurn[0];
+    agent.inbox.replace(queued.id, { ...queued, content: [{ type: 'text', text: 'native edit' }] });
+    const editedVersion = agent.session.seq - 1;
+    await expect.poll(() => checkpointEntered).toBe(true);
+    expect([a.length, b.length]).toEqual(before);
+    blocking = false;
+    release();
+    await expect.poll(() => a.at(-1)?.version).toBeGreaterThanOrEqual(editedVersion);
+    await expect.poll(() => b.at(-1)?.version).toBeGreaterThanOrEqual(editedVersion);
+    const execution = await f.rpc('dsh/inbox/execute', { contextId: 'native-test' });
+    expect(execution.error).toBeUndefined();
+    await f.completed(task.id);
+    const consumed = agent.session
+      .snapshotEvents()
+      .filter((event) => event.type === 'agent/inbox/spliced')
+      .at(-1)!;
+    await expect.poll(() => a.at(-1)?.version).toBeGreaterThanOrEqual(consumed.seq);
+    await expect.poll(() => b.at(-1)?.version).toBeGreaterThanOrEqual(consumed.seq);
+    expect((await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result.nextTurn).toEqual(
+      [],
+    );
+  });
+
+  it('manages the native inbox through negotiated extension methods', async () => {
+    const f = await boot();
+    await f.send('parked-a', { wakeup: false });
+    await f.send('parked-b', { wakeup: false });
+    const get = await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    expect(get.error).toBeUndefined();
+    expect(get.result.nextTurn.map((item: any) => item.message.messageId)).toEqual([
+      'parked-a',
+      'parked-b',
+    ]);
+    const denied = await f.rpc('dsh/inbox/get', { contextId: 'native-test' }, false);
+    expect(denied.error).toBeDefined();
+    const [a, b] = get.result.nextTurn;
+    let editHeaders: unknown;
+    f.ctx.on('a2a/before-followup', (detail) => {
+      editHeaders = detail.requestHeaders;
+    });
+    const updated = await f.rpc('dsh/inbox/update', {
+      contextId: 'native-test',
+      id: a.id,
+      message: { ...a.message, parts: [{ text: 'edited input' }] },
+    });
+    expect(updated.error).toBeUndefined();
+    expect(editHeaders).toMatchObject({ 'a2a-version': '1.0', 'a2a-extensions': INBOX_EXTENSION });
+    expect(updated.result.nextTurn[0].message.parts).toEqual([{ text: 'edited input' }]);
+    const moved = await f.rpc('dsh/inbox/move', { contextId: 'native-test', id: b.id, index: 0 });
+    expect(moved.result.nextTurn.map((item: any) => item.id)).toEqual([b.id, a.id]);
+    const stale = await f.rpc('dsh/inbox/move', { contextId: 'native-test', id: b.id, index: 9 });
+    expect(stale.error).toBeDefined();
+    const removed = await f.rpc('dsh/inbox/remove', { contextId: 'native-test', id: b.id });
+    expect(removed.result.nextTurn.map((item: any) => item.id)).toEqual([a.id]);
+    await expect
+      .poll(async () => (await f.rpc('GetTask', { id: b.message.taskId })).result.status.state)
+      .toBe('TASK_STATE_CANCELED');
+    const executed = await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: a.id });
+    expect(executed.error).toBeUndefined();
+    await f.completed(a.message.taskId);
+    expect(
+      f.adapter.requests[0].messages.some((message: any) =>
+        message.content?.some((block: any) => block.text === 'edited input'),
+      ),
+    ).toBe(true);
+    await f.send('parked-c', { wakeup: false });
+    const cleared = await f.rpc('dsh/inbox/clear', { contextId: 'native-test' });
+    expect(cleared.result.nextTurn).toEqual([]);
+  });
+
   it('executes real DSH turns over REST and gRPC with shared task state', async () => {
     const sdk = await import(pathToFileURL(require.resolve('@a2a-js/sdk')).href);
     const { A2AService } = await import(
@@ -731,6 +1386,61 @@ it('persists completion when a legacy streaming send disconnects', async () => {
     release();
   }
 });
+
+it.each([false, true])(
+  'distinguishes Langfuse resource-limit 422 from malformed queries (%s)',
+  async (resourceLimit) => {
+    let reads = 0;
+    const server = createServer((request, response) => {
+      const url = new URL(request.url!, 'http://localhost');
+      if (url.pathname.includes('/v2/')) {
+        response.writeHead(404).end();
+        return;
+      }
+      reads++;
+      if (reads === 1 || !resourceLimit) {
+        response.writeHead(422, { 'content-type': 'application/json' }).end(
+          JSON.stringify({
+            message: resourceLimit
+              ? 'Your query could not be completed. Please narrow your request by adding more specific filters (e.g., a shorter date range).'
+              : 'Invalid query: unknown observation type',
+          }),
+        );
+        return;
+      }
+      response.setHeader('content-type', 'application/json');
+      response.end(
+        JSON.stringify({
+          data: [{ id: 'obs', traceId: 'trace', name: 'run-specific-root', input: 'marker' }],
+          meta: { totalPages: 1 },
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const realTimeout = globalThis.setTimeout;
+    const timer = vi
+      .spyOn(globalThis, 'setTimeout')
+      .mockImplementation((handler, ms, ...args) =>
+        realTimeout(handler, ms === 15_000 ? 0 : ms, ...args),
+      );
+    try {
+      const result = await runVerification({
+        baseUrl: `http://127.0.0.1:${server.address().port}`,
+        publicKey: 'fixture',
+        secretKey: 'fixture',
+        fromStartTime: new Date(Date.now() - 60_000).toISOString(),
+        codeword: 'marker',
+        observationName: 'run-specific-root',
+        evaluate: () => [],
+      });
+      expect(result.ok).toBe(resourceLimit);
+      expect(reads).toBe(resourceLimit ? 3 : 1);
+    } finally {
+      timer.mockRestore();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  },
+);
 
 it('rediscovers late inbox traces and filters admissions through the Langfuse read-back API', async () => {
   const queries: URLSearchParams[] = [];
@@ -1343,6 +2053,7 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')(
     const runId = process.env.GITHUB_RUN_ID ?? Date.now().toString();
     const attempt = process.env.GITHUB_RUN_ATTEMPT ?? '1';
     const contextId = `ci-inbox-${runId}-${attempt}-${randomUUID()}`;
+    const traceName = `dsh-inbox:${contextId}`;
     const fromStartTime = new Date(Date.now() - 60_000).toISOString();
     const replies = [
       '发布前检查待办：\n1. 构建项目\n2. 运行测试\n3. 检查发布说明',
@@ -1357,7 +2068,7 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')(
         publicKey,
         secretKey,
         baseUrl,
-        traceName: 'dsh-inbox',
+        traceName,
         captureContent: true,
         environment: 'ci',
         release: integrationRevision(),
@@ -1412,9 +2123,9 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')(
           fromStartTime,
           toStartTime,
           codeword,
-          observationName: 'inbox:admitted',
+          observationName: traceName,
           evaluate(observations) {
-            const root = observations.find((observation) => observation.name === 'dsh-inbox');
+            const root = observations.find((observation) => observation.name === traceName);
             const problems = [];
             if (!root?.endTime || root.metadata?.taskId !== tasks[index].id)
               problems.push('missing ended task-attributed root');
@@ -1489,11 +2200,11 @@ it.skipIf(process.env.DSH_INBOX_LANGFUSE_LIVE !== 'true')(
       fromStartTime,
       toStartTime,
       codeword: canceled.id,
-      observationName: 'inbox:canceled',
+      observationName: traceName,
       evaluate(observations) {
         const root = observations.find(
           (observation) =>
-            observation.name === 'dsh-inbox' && observation.metadata?.taskId === canceled.id,
+            observation.name === traceName && observation.metadata?.taskId === canceled.id,
         );
         const phases = observations
           .filter((observation) => observation.parentObservationId === root?.id)
@@ -1589,7 +2300,12 @@ describe('native ownership', () => {
     const agent = await f.inbox.resolve('native-test');
     const b = await f.send('queued', { wakeup: false });
     const nativeId = agent.inbox.nextTurn[0].id;
-    await f.inbox.promote('native-test', nativeId, a.id);
+    const steered = await f.rpc('dsh/inbox/steer', {
+      contextId: 'native-test',
+      id: nativeId,
+      taskId: a.id,
+    });
+    expect(steered.error).toBeUndefined();
     expect(agent.inbox.nextStep[0].id).toBe(nativeId);
     release();
     await agent.whenIdle();
@@ -2319,6 +3035,25 @@ describe('graceful retention', () => {
     };
     return { ctx, adapter, rpc, send, inbox: ctx.a2aInbox, plugin };
   }
+
+  it('drains a completed cancel-mode host without flushing detached session writers', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-cancel-host-stop-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const first = await host(root, [textResponse('done')], 'cancel');
+    const task = await first.send('complete');
+    await expect
+      .poll(async () => (await first.rpc('GetTask', { id: task.id })).result.status.state)
+      .toBe('TASK_STATE_COMPLETED');
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await first.ctx.fiber.dispose();
+      expect(
+        errors.mock.calls.filter(([message]) => String(message).includes('[dsh-a2a]')),
+      ).toEqual([]);
+    } finally {
+      errors.mockRestore();
+    }
+  });
 
   it('retains unclaimed steering and independent turns through public plugin disposal', async () => {
     const root = await mkdtemp(join(tmpdir(), 'a2a-graceful-'));
