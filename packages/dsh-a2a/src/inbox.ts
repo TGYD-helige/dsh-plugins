@@ -1,6 +1,7 @@
 /** Native DSH input ownership with standard A2A task delivery. */
 import { randomUUID } from 'node:crypto';
-import { Message, type Task, TaskState } from '@a2a-js/sdk';
+import { Message, Role, type Task, TaskState } from '@a2a-js/sdk';
+import { RequestMalformedError } from '@a2a-js/sdk/errors';
 import {
   AgentEvent,
   type AgentExecutionEvent,
@@ -17,6 +18,7 @@ import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm/types';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence';
 import type { A2aBridge, TaskEntry } from './bridge.js';
+import { InboxChanges } from './inbox-changes.js';
 import type { A2aTurnContext } from './index.js';
 import type { A2aServer } from './server.js';
 import { commitInboxInput, type ManagedTaskStore, markInboxInputPending } from './task-store.js';
@@ -82,6 +84,12 @@ declare module '@deepseek-ai/cordis' {
 
 /** Same-process queue control; wire messages and task subscriptions remain standard A2A. */
 export interface A2aInbox {
+  get(contextId: string): Promise<InboxSnapshot>;
+  update(contextId: string, id: string, message: Message): Promise<InboxSnapshot>;
+  move(contextId: string, id: string, index: number): Promise<InboxSnapshot>;
+  remove(contextId: string, id: string): Promise<InboxSnapshot>;
+  clearPending(contextId: string): Promise<InboxSnapshot>;
+  executePending(contextId: string, id?: string): Promise<InboxSnapshot>;
   resolve(contextId: string): Promise<Agent>;
   content(message: Message, contextId: string): Promise<ContentBlock[]>;
   /** Admit a same-process host follow-up under an existing task's durable identity. */
@@ -100,6 +108,13 @@ export interface A2aInbox {
   wake(contextId: string): Promise<string[]>;
   /** Standard cancellation is terminal and removes only this task's pending input. */
   cancel(taskId: string): Promise<string | undefined>;
+}
+
+export interface InboxSnapshot {
+  contextId: string;
+  version: number;
+  nextTurn: Array<{ id: string; message: unknown; editable: boolean }>;
+  nextStep: Array<{ id: string; message: unknown; editable: boolean }>;
 }
 
 interface TaskRun {
@@ -145,6 +160,7 @@ interface ContextRun {
 }
 
 export class NativeInbox implements A2aInbox {
+  readonly changes: InboxChanges;
   private readonly contexts = new Map<string, ContextRun>();
   private readonly resolving = new Map<string, Promise<ContextRun>>();
   private stopping = false;
@@ -158,7 +174,13 @@ export class NativeInbox implements A2aInbox {
     private readonly bridge: A2aBridge,
     private readonly store: ManagedTaskStore,
     private readonly retainPending = false,
+    notifications = false,
   ) {
+    this.changes = new InboxChanges(
+      ctx,
+      (contextId) => this.contexts.has(contextId),
+      notifications,
+    );
     bridge.inbox = this;
     this.persistence = ctx.get('sessionPersistence');
     if (retainPending)
@@ -240,6 +262,195 @@ export class NativeInbox implements A2aInbox {
     return (await this.context(contextId)).entry.handle.agent;
   }
 
+  async get(contextId: string): Promise<InboxSnapshot> {
+    const run = await this.context(contextId);
+    const agent = run.entry.handle.agent;
+    const entries = (messages: readonly UserMessage[]) =>
+      messages.map((message) => {
+        const task = this.owner(run, message);
+        const protocol = task
+          ? this.protocolMessage(run, task, message)
+          : Message.fromJSON({
+              messageId: message.id,
+              contextId,
+              role: 'ROLE_USER',
+              parts: message.content
+                .filter((block) => block.type === 'text')
+                .map((block) => ({ text: block.text })),
+            });
+        return {
+          id: message.id,
+          message: Message.toJSON(protocol),
+          editable: message.source.kind === 'a2a',
+        };
+      });
+    return {
+      contextId,
+      version: agent.session.seq - 1,
+      nextTurn: entries(agent.inbox.nextTurn),
+      nextStep: entries(agent.inbox.nextStep),
+    };
+  }
+
+  private async editQueue(
+    contextId: string,
+    edit: (run: ContextRun) => Promise<void> | void,
+  ): Promise<InboxSnapshot> {
+    const run = await this.context(contextId);
+    const operation = run.admissionTail.then(async () => {
+      if (this.stopping || this.bridge.isClearing(contextId))
+        throw new RequestMalformedError('Inbox is unloading or clearing.');
+      await edit(run);
+      await this.flush(run.entry.handle.agent.session);
+    });
+    run.admissionTail = operation.catch(() => {});
+    await operation;
+    return this.get(contextId);
+  }
+
+  private queued(run: ContextRun, id: string) {
+    const agent = run.entry.handle.agent;
+    const target = agent.inbox.nextTurn.some((message) => message.id === id)
+      ? 'next-turn'
+      : 'next-step';
+    const items = target === 'next-turn' ? agent.inbox.nextTurn : agent.inbox.nextStep;
+    const index = items.findIndex((message) => message.id === id);
+    const message = items[index];
+    if (!message) throw new RequestMalformedError('Input is no longer pending.');
+    return { agent, target, items, index, message } as const;
+  }
+
+  async update(contextId: string, id: string, message: Message): Promise<InboxSnapshot> {
+    return this.editQueue(contextId, async (run) => {
+      const queued = this.queued(run, id);
+      const task = this.owner(run, queued.message);
+      if (queued.message.source.kind !== 'a2a' || !task)
+        throw new RequestMalformedError('Only task-attributed A2A input can be edited.');
+      const original = this.protocolMessage(run, task, queued.message);
+      if (
+        message.messageId !== original.messageId ||
+        message.taskId !== original.taskId ||
+        message.contextId !== contextId ||
+        message.role !== Role.ROLE_USER ||
+        !message.parts.length ||
+        message.parts.some((part) => !part.content)
+      )
+        throw new RequestMalformedError(
+          'A user Message with unchanged messageId, taskId and contextId is required.',
+        );
+      const content = await this.content(message, contextId);
+      if (
+        this.stopping ||
+        this.bridge.isClearing(contextId) ||
+        this.queued(run, id).message !== queued.message
+      )
+        throw new RequestMalformedError('Input changed while editing.');
+      await this.ctx.parallel('a2a/before-followup', {
+        agent: queued.agent,
+        contextId,
+        taskId: task.task.id,
+        a2aMessage: message,
+        dshMessageId: id,
+        requestHeaders: task.headers,
+        signal: task.controller.signal,
+      });
+      if (
+        this.stopping ||
+        this.bridge.isClearing(contextId) ||
+        this.queued(run, id).message !== queued.message
+      )
+        throw new RequestMalformedError('Input changed while editing.');
+      const replacement = {
+        ...queued.message,
+        content,
+        source: {
+          ...queued.message.source,
+          message: JSON.stringify(Message.toJSON(message)),
+        },
+      };
+      if (!queued.agent.inbox.replace(queued.message.id, replacement))
+        throw new RequestMalformedError('Input has already been claimed.');
+      task.task.history = task.task.history.map((item) =>
+        item.messageId === original.messageId
+          ? markInboxInputPending(structuredClone(message))
+          : item,
+      );
+      await this.checkpoint(task.task, task.context);
+    });
+  }
+
+  async move(contextId: string, id: string, index: number): Promise<InboxSnapshot> {
+    return this.editQueue(contextId, (run) => {
+      const queued = this.queued(run, id);
+      if (!Number.isInteger(index) || index < 0 || index >= queued.items.length)
+        throw new RequestMalformedError('index must address the same pending list.');
+      if (index === queued.index) return;
+      // One native splice keeps reordering atomic to observers and crash recovery.
+      const items = [...queued.items];
+      items.splice(queued.index, 1);
+      items.splice(index, 0, queued.message);
+      queued.agent.inbox.splice(queued.target, 0, queued.items.length, items);
+    });
+  }
+
+  private async removed(run: ContextRun, messages: UserMessage[]): Promise<void> {
+    for (const task of new Set(messages.map((message) => this.owner(run, message)))) {
+      if (!task || task.settled) continue;
+      const ids = new Set(
+        messages
+          .filter(
+            (message) => message.source.kind === 'a2a' && message.source.taskId === task.task.id,
+          )
+          .map((message) =>
+            message.source.kind === 'a2a'
+              ? Message.fromJSON(JSON.parse(message.source.message)).messageId
+              : '',
+          ),
+      );
+      task.task.history = task.task.history.filter((message) => !ids.has(message.messageId));
+      if (
+        run.active !== task &&
+        !run.claimed.has(task) &&
+        !this.pending(run).some((message) => this.owner(run, message) === task)
+      )
+        await this.cancel(task.task.id);
+      else await this.checkpoint(task.task, task.context);
+    }
+  }
+
+  async remove(contextId: string, id: string): Promise<InboxSnapshot> {
+    return this.editQueue(contextId, async (run) => {
+      const { agent, message } = this.queued(run, id);
+      agent.inbox.remove(message.id);
+      await this.removed(run, [message]);
+    });
+  }
+
+  async clearPending(contextId: string): Promise<InboxSnapshot> {
+    return this.editQueue(contextId, async (run) => {
+      const messages = this.pending(run);
+      run.entry.handle.agent.inbox.clear();
+      await this.removed(run, messages);
+    });
+  }
+
+  async executePending(contextId: string, id?: string): Promise<InboxSnapshot> {
+    return this.editQueue(contextId, async (run) => {
+      if (id !== undefined) {
+        const queued = this.queued(run, id);
+        if (queued.target !== 'next-turn')
+          throw new RequestMalformedError(
+            'Execute selects next-turn input; use steer for next-step input.',
+          );
+        const items = [...queued.items];
+        items.splice(queued.index, 1);
+        items.unshift(queued.message);
+        queued.agent.inbox.splice(queued.target, 0, queued.items.length, items);
+      }
+      await this.wake(contextId);
+    });
+  }
+
   async enqueue(
     taskId: string,
     message: Message,
@@ -275,7 +486,7 @@ export class NativeInbox implements A2aInbox {
     const from = target === 'next-step' ? 'next-turn' : 'next-step';
     const items = from === 'next-turn' ? agent.inbox.nextTurn : agent.inbox.nextStep;
     const index = items.findIndex((item) => item.id === message.id);
-    if (index < 0) throw new Error('Queued input has already been claimed.');
+    if (index < 0) throw new RequestMalformedError('Queued input has already been claimed.');
     agent.session.append('agent/inbox/spliced', {
       target: from,
       start: index,
@@ -301,9 +512,11 @@ export class NativeInbox implements A2aInbox {
     const agent = run.entry.handle.agent;
     const target = run.tasks.get(taskId);
     const message = agent.inbox.nextTurn.find((item) => item.id === messageId);
-    if (message?.source.kind !== 'a2a') throw new Error('Queued input has already been claimed.');
+    if (message?.source.kind !== 'a2a')
+      throw new RequestMalformedError('Queued input has already been claimed.');
     const source = run.tasks.get(message.source.taskId);
-    if (!target || !source) throw new Error('Promotion requires live source and target tasks.');
+    if (!target || !source)
+      throw new RequestMalformedError('Promotion requires live source and target tasks.');
     const valid = () =>
       !this.stopping &&
       !this.bridge.isClearing(run.entry.sessionId) &&
@@ -318,7 +531,9 @@ export class NativeInbox implements A2aInbox {
       !run.claimed.has(source) &&
       agent.inbox.nextTurn.some((item) => item === message);
     if (!valid())
-      throw new Error('Promotion requires an unclaimed independent input and an active target.');
+      throw new RequestMalformedError(
+        'Promotion requires an unclaimed independent input and an active target.',
+      );
     const original = Message.fromJSON(JSON.parse(message.source.message));
     original.taskId = taskId;
     original.referenceTaskIds = [...new Set([...original.referenceTaskIds, source.task.id])];
@@ -337,11 +552,12 @@ export class NativeInbox implements A2aInbox {
     target.pendingRequests++;
     try {
       await this.checkpoint(target.task, target.context);
-      if (!valid()) throw new Error('Promotion raced input consumption or task settlement.');
+      if (!valid())
+        throw new RequestMalformedError('Promotion raced input consumption or task settlement.');
       target.task.history = [...target.task.history, markInboxInputPending(original)];
       target.headers.set(message.id, source.headers.get(message.id));
       if (!agent.inbox.replace(message.id, promoted))
-        throw new Error('Queued input has already been claimed.');
+        throw new RequestMalformedError('Queued input has already been claimed.');
       this.moveInput(agent, promoted, 'next-step');
       try {
         await this.flush(agent.session);
@@ -378,7 +594,7 @@ export class NativeInbox implements A2aInbox {
         this.contexts.get(run.entry.sessionId) !== run ||
         this.bridge.isClearing(run.entry.sessionId)
       )
-        throw new Error('Promotion was interrupted by context disposal.');
+        throw new RequestMalformedError('Promotion was interrupted by context disposal.');
       source.controller.abort();
       try {
         await this.checkpoint(target.task, target.context);
@@ -746,8 +962,10 @@ export class NativeInbox implements A2aInbox {
     }
   }
 
-  private flush(session: Session): Promise<void> {
-    return this.ctx.parallel('session/flush', session);
+  private async flush(session: Session): Promise<void> {
+    const sessions = this.ctx.get('sessions');
+    if (sessions) await sessions.flush(session);
+    else await this.ctx.parallel('session/flush', session);
   }
   private checkpoint(task: Task, context: ServerCallContext): Promise<void> {
     return this.store.checkpoint
@@ -1497,7 +1715,6 @@ export class NativeInbox implements A2aInbox {
 
   async wake(contextId: string): Promise<string[]> {
     const run = await this.context(contextId);
-    if (!run.paused) return [];
     const pending = this.pending(run).filter((message) => message.source.kind === 'a2a');
     run.paused = false;
     run.entry.handle.agent.session.append('agent/inbox/paused', { paused: false });
@@ -1571,6 +1788,7 @@ export class NativeInbox implements A2aInbox {
   }
 
   shutdown(): Promise<void> {
+    this.changes.close();
     if (this.shutdownPromise) return this.shutdownPromise;
     this.stopping = true;
     this.shutdownPromise = (async () => {

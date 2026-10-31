@@ -131,6 +131,7 @@ async function boot(
   const store = options.store ?? new SanitizedTaskStore(backend);
   const inbox = new NativeInbox(ctx, bridge, store);
   const server = await startA2aServer({
+    inbox,
     extensions: [{ uri: INBOX_EXTENSION, description: '', required: false, params: undefined }],
     host: '127.0.0.1',
     port: 0,
@@ -195,6 +196,185 @@ async function boot(
 }
 
 describe('official protocol bindings', () => {
+  it('clears pending tasks without canceling active work', async () => {
+    const f = await boot();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    f.ctx.on('agent/request', async (_detail, next) => {
+      await gate;
+      return next();
+    });
+    const active = await f.send('active');
+    const queued = await f.send('queued', { wakeup: false });
+    const cleared = await f.rpc('dsh/inbox/clear', { contextId: 'native-test' });
+    expect(cleared.error).toBeUndefined();
+    expect(cleared.result.nextTurn).toEqual([]);
+    expect((await f.rpc('GetTask', { id: active.id })).result.status.state).toBe(
+      'TASK_STATE_WORKING',
+    );
+    release();
+    await f.completed(active.id);
+    await expect
+      .poll(async () => (await f.rpc('GetTask', { id: queued.id })).result.status.state)
+      .toBe('TASK_STATE_CANCELED');
+  });
+
+  it('rejects malformed inbox edits and subscriptions without durability', async () => {
+    const f = await boot();
+    await f.send('queued', { wakeup: false });
+    const snapshot = (await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result;
+    const item = snapshot.nextTurn[0];
+    for (const message of [
+      { ...item.message, messageId: 'changed' },
+      { ...item.message, parts: [] },
+      { ...item.message, parts: [{ text: null }] },
+      { ...item.message, role: 'ROLE_AGENT' },
+    ]) {
+      const edited = await f.rpc('dsh/inbox/update', {
+        contextId: 'native-test',
+        id: item.id,
+        message,
+      });
+      expect(edited.error.code).toBe(-32602);
+    }
+    const subscription = await f.rpc('dsh/inbox/subscribe', { contextId: 'native-test' });
+    expect(subscription.error).toBeDefined();
+    expect((await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result).toEqual(snapshot);
+  });
+
+  it('notifies two inbox subscribers only after checkpoint and includes native consumption', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-inbox-events-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const f = await boot({ root });
+    const task = await f.send('queued', { wakeup: false });
+    const agent = await f.inbox.resolve('native-test');
+    const subscribe = async () => {
+      const controller = new AbortController();
+      const response = await fetch(`http://127.0.0.1:${f.server.port}/a2a/`, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'A2A-Extensions': INBOX_EXTENSION,
+          'A2A-Version': '1.0',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 7,
+          method: 'dsh/inbox/subscribe',
+          params: { contextId: 'native-test' },
+        }),
+      });
+      expect(response.headers.get('content-type')).toContain('text/event-stream');
+      expect(response.headers.get('a2a-extensions')).toBe(INBOX_EXTENSION);
+      const events: Array<{ contextId: string; version: number }> = [];
+      const reading = (async () => {
+        let buffer = '';
+        for await (const chunk of response.body!) {
+          buffer += Buffer.from(chunk).toString();
+          let boundary = buffer.indexOf('\n\n');
+          while (boundary >= 0) {
+            const frame = JSON.parse(buffer.slice(0, boundary).replace(/^data: /, ''));
+            expect(frame.error).toBeUndefined();
+            events.push(frame.result);
+            buffer = buffer.slice(boundary + 2);
+            boundary = buffer.indexOf('\n\n');
+          }
+        }
+      })().catch((error) => {
+        if (!controller.signal.aborted) throw error;
+      });
+      cleanups.push(async () => {
+        controller.abort();
+        await reading;
+      });
+      await expect.poll(() => events.length).toBeGreaterThan(0);
+      return events;
+    };
+    const a = await subscribe();
+    const b = await subscribe();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let checkpointEntered = false;
+    let blocking = true;
+    f.ctx.on('session/flush', async () => {
+      if (!blocking) return;
+      checkpointEntered = true;
+      await gate;
+    });
+    const before = [a.length, b.length];
+    const queued = agent.inbox.nextTurn[0];
+    agent.inbox.replace(queued.id, { ...queued, content: [{ type: 'text', text: 'native edit' }] });
+    const editedVersion = agent.session.seq - 1;
+    await expect.poll(() => checkpointEntered).toBe(true);
+    expect([a.length, b.length]).toEqual(before);
+    blocking = false;
+    release();
+    await expect.poll(() => a.at(-1)?.version).toBeGreaterThanOrEqual(editedVersion);
+    await expect.poll(() => b.at(-1)?.version).toBeGreaterThanOrEqual(editedVersion);
+    const execution = await f.rpc('dsh/inbox/execute', { contextId: 'native-test' });
+    expect(execution.error).toBeUndefined();
+    await f.completed(task.id);
+    const consumed = agent.session
+      .snapshotEvents()
+      .filter((event) => event.type === 'agent/inbox/spliced')
+      .at(-1)!;
+    await expect.poll(() => a.at(-1)?.version).toBeGreaterThanOrEqual(consumed.seq);
+    await expect.poll(() => b.at(-1)?.version).toBeGreaterThanOrEqual(consumed.seq);
+    expect((await f.rpc('dsh/inbox/get', { contextId: 'native-test' })).result.nextTurn).toEqual(
+      [],
+    );
+  });
+
+  it('manages the native inbox through negotiated extension methods', async () => {
+    const f = await boot();
+    await f.send('parked-a', { wakeup: false });
+    await f.send('parked-b', { wakeup: false });
+    const get = await f.rpc('dsh/inbox/get', { contextId: 'native-test' });
+    expect(get.error).toBeUndefined();
+    expect(get.result.nextTurn.map((item: any) => item.message.messageId)).toEqual([
+      'parked-a',
+      'parked-b',
+    ]);
+    const denied = await f.rpc('dsh/inbox/get', { contextId: 'native-test' }, false);
+    expect(denied.error).toBeDefined();
+    const [a, b] = get.result.nextTurn;
+    const updated = await f.rpc('dsh/inbox/update', {
+      contextId: 'native-test',
+      id: a.id,
+      message: { ...a.message, parts: [{ text: 'edited input' }] },
+    });
+    expect(updated.error).toBeUndefined();
+    expect(updated.result.nextTurn[0].message.parts).toEqual([{ text: 'edited input' }]);
+    const moved = await f.rpc('dsh/inbox/move', { contextId: 'native-test', id: b.id, index: 0 });
+    expect(moved.result.nextTurn.map((item: any) => item.id)).toEqual([b.id, a.id]);
+    const stale = await f.rpc('dsh/inbox/move', { contextId: 'native-test', id: b.id, index: 9 });
+    expect(stale.error).toBeDefined();
+    const removed = await f.rpc('dsh/inbox/remove', { contextId: 'native-test', id: b.id });
+    expect(removed.result.nextTurn.map((item: any) => item.id)).toEqual([a.id]);
+    await expect
+      .poll(async () => (await f.rpc('GetTask', { id: b.message.taskId })).result.status.state)
+      .toBe('TASK_STATE_CANCELED');
+    const executed = await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: a.id });
+    expect(executed.error).toBeUndefined();
+    await f.completed(a.message.taskId);
+    expect(
+      f.adapter.requests[0].messages.some((message: any) =>
+        message.content?.some((block: any) => block.text === 'edited input'),
+      ),
+    ).toBe(true);
+    await f.send('parked-c', { wakeup: false });
+    const cleared = await f.rpc('dsh/inbox/clear', { contextId: 'native-test' });
+    expect(cleared.result.nextTurn).toEqual([]);
+  });
+
   it('executes real DSH turns over REST and gRPC with shared task state', async () => {
     const sdk = await import(pathToFileURL(require.resolve('@a2a-js/sdk')).href);
     const { A2AService } = await import(
@@ -1589,7 +1769,12 @@ describe('native ownership', () => {
     const agent = await f.inbox.resolve('native-test');
     const b = await f.send('queued', { wakeup: false });
     const nativeId = agent.inbox.nextTurn[0].id;
-    await f.inbox.promote('native-test', nativeId, a.id);
+    const steered = await f.rpc('dsh/inbox/steer', {
+      contextId: 'native-test',
+      id: nativeId,
+      taskId: a.id,
+    });
+    expect(steered.error).toBeUndefined();
     expect(agent.inbox.nextStep[0].id).toBe(nativeId);
     release();
     await agent.whenIdle();

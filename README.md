@@ -48,7 +48,7 @@ dsh is in developer preview and **will** break compatibility between releases. P
 
 `dsh-a2a`'s approval bridge has an optional `@deepseek-ai/dsh-user-approval` peer floor of `>=0.1.6-alpha.2 || >=0.1.7-alpha.1 || >=0.2.0-rc.1 || >=0.2.1-rc.1` (tested at `0.2.1-rc.5`).
 
-`dsh-a2a` requires `@deepseek-ai/dsh-session >=0.2.0-rc.1`: optional subagent tool streaming uses the session lifecycle offset to distinguish newly created children from restored sessions, preventing false delegation attribution. Other dsh peer floors remain unchanged apart from the agent floor above.
+`dsh-a2a` requires `@deepseek-ai/dsh-session >=0.2.1-rc.5` for the owner-scoped `SessionStore.flush` durability barrier used by native inbox operations and checkpointed invalidations. Optional subagent streaming also consumes the session lifecycle offset to distinguish new children from restored sessions.
 
 `dsh-langfuse`'s optional image display uses `@deepseek-ai/dsh-attachment >=0.2.0-rc.1` (tested at `0.2.1-rc.5`); metadata-only tracing does not require an attachment backend.
 

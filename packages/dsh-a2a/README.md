@@ -16,9 +16,13 @@ dsh plugin --profile my-agent add @amaster.ai/dsh-a2a
 
 `inbox.enabled: true` uses the official DSH inbox (`Agent.send`) for ordinary `next-turn` input and `next-step` steering. Tested with the unmodified npm runtime `0.2.1-rc.5`; no core patch is required. The queue and its durable projection belong to DSH. The plugin only materializes messages, attaches A2A task identities, and translates execution events.
 
-Standard `SendMessage` / `SendStreamingMessage`, task queries, cancellation and subscriptions remain the wire interface. The negotiated inbox extension forwards `target` and `wakeup` to DSH. `wakeup: false` leaves an idle driver parked; it does not prevent an active driver from consuming pending input. A later real waking message releases pending input.
+Standard `SendMessage` / `SendStreamingMessage`, task queries, cancellation and task subscriptions keep their official meanings. The negotiated inbox extension forwards `target` and `wakeup` to DSH. `wakeup: false` leaves an idle driver parked; it does not prevent an active driver from consuming pending input. A later real waking message releases pending input.
 
-The same-process `a2aInbox` service exposes `resolve(contextId)`, `content(message, contextId)`, `enqueue(taskId, message, { target?, wakeup? })`, `promote(contextId, nativeMessageId, activeTaskId)`, and `cancel(taskId)`. There is no separate pause, wake-only, resume, or retained-task restart operation. Cancellation is terminal and removes that task's pending input. Other tasks' input is retained according to official DSH cancellation semantics, and may wait for the next waking message. Clearing a context discards all its pending work.
+The same-process `a2aInbox` service exposes `resolve`, `content`, `enqueue`, `promote`, `cancel`, `get`, `update`, `move`, `remove`, `clearPending`, and `executePending`, plus the existing pause/wake/resume controls. Pending-only clearing preserves active work; context clearing discards all work.
+
+For external clients, the [native inbox extension specification](../../docs/protocol/inbox-v1.md) defines `dsh/inbox/get`, `update`, `move`, `remove`, `clear`, `execute`, `steer`, and `subscribe` at the advertised JSONRPC endpoint. Activate it with the `A2A-Extensions` header set to the extension URI. Updates use standard A2A 1.0 user Messages; operations address native inbox IDs. REST/gRPC clients use the advertised JSONRPC endpoint for these extension methods. No extra queue or consumer is created.
+
+`dsh/inbox/subscribe` streams checkpointed invalidations `{contextId, version}` over SSE, including native consumption and edits. It registers before its initial checkpoint and sends only after owner-scoped `ctx.sessions.flush()` returns true. A false/rejected checkpoint sends no success notification. Re-read the live inbox on invalidation and reconnect; there is no replay or durable outbox. Slow clients disconnect instead of accumulating notifications. To publish the same invalidations to host listeners on `a2a/inbox-checkpointed` without an SSE subscriber, enable `inbox.notifications: true` (default false). Hosts retain authentication, authorization and product-specific fan-out.
 
 `a2a/before-followup` validates admission; `a2a/before-step` runs at the official pre-step boundary, after system-prompt assembly and before model execution. It cannot change the already assembled system prompt. Original request headers remain process-local. DSH persistence restores its own pending projection; the plugin does not replay splice logs or recover consumed claims. Graceful disposal cancels tasks by default; `inbox.shutdown: retain-pending` opts into the retention policy below. Durable A2A task snapshots require a filesystem, Redis or GCS TaskStore; an in-memory store is sufficient without restart requirements.
 
@@ -259,7 +263,7 @@ dsh ships **no authentication or authorization**. The server binds `127.0.0.1` b
 
 Optional Goal integration requires `@deepseek-ai/dsh-goal >=0.2.0-rc.2 || >=0.2.1-alpha.1` and the official Goal round driver (both tested at `0.2.1-rc.5`).
 
-Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment,tools}@0.2.1-rc.5` — the attachment store is an optional peer) — the session peer floor is `>=0.2.0-rc.1` because child attribution uses `firstLifecycleSeq` to reject restored sessions; check the `TODO(verify)` markers in `src/` before upgrading dsh.
+Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment,tools}@0.2.1-rc.5` — the attachment store is an optional peer) — the session peer floor is `>=0.2.1-rc.5` for the owner-scoped `SessionStore.flush` checkpoint barrier; check the `TODO(verify)` markers in `src/` before upgrading dsh.
 
 ## Standard A2A notifications
 

@@ -50,6 +50,8 @@ import {
 } from '@a2a-js/sdk/server/express';
 import express, { type RequestHandler } from 'express';
 import { AdmissionGate } from './admission.js';
+import type { NativeInbox } from './inbox.js';
+import { inboxRpcHandler } from './inbox-api.js';
 import { legacyStreamHandler } from './legacy-stream.js';
 import {
   connectedRequestHandler,
@@ -58,6 +60,7 @@ import {
 } from './stream-connection.js';
 
 export interface A2aServerOptions {
+  inbox?: NativeInbox;
   extensions?: AgentExtension[];
   host: string;
   port: number;
@@ -643,6 +646,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       rpcHandler,
     );
   }
+  if (options.inbox) app.post(base || '/', inboxRpcHandler(options.inbox, card));
   app.use(base, contextLookup, legacyStreamHandler(requestHandler), rpcHandler);
 
   const server: Server = createServer(app);
