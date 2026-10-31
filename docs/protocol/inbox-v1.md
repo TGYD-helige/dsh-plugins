@@ -34,6 +34,8 @@ uses native IDs. Updates preserve native/protocol IDs, context and task ownershi
 they cannot replace message identity or edit already claimed input. Index is
 evaluated after removing the selected item. Execute preserves other pending
 items and their order; steer reuses the existing task-ownership promotion rules.
+Explicit execution also drives native-producer input without inventing an A2A
+Task for it; its conversation events remain in the native session history.
 Clearing pending input does not cancel an active turn; use standard CancelTask
 for task cancellation. Removed independent queued tasks become canceled.
 

@@ -142,6 +142,9 @@ interface ContextRun {
   entry: TaskEntry;
   /** Pause blocks new admissions and pre-step claims without clearing retained input. */
   paused: boolean;
+  /** Explicitly selected native input survives a deferred driver wake. */
+  nativeExecutions?: Set<UserMessage['id']>;
+  nativeClaims?: Set<UserMessage['id']>;
   /** Context clear discards late commits after the clearing flag itself resets. */
   discardInput?: boolean;
   /** Full admission commits, drained before shutdown disposal. */
@@ -231,6 +234,10 @@ export class NativeInbox implements A2aInbox {
     ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
       const run = this.contexts.get(agent.session.id);
       if (!run) return;
+      if (run.nativeExecutions?.has(message.id)) {
+        run.nativeClaims ??= new Set();
+        run.nativeClaims.add(message.id);
+      }
       const task = this.owner(run, message);
       if (task && !task.settled) {
         run.claimed.add(task);
@@ -345,13 +352,13 @@ export class NativeInbox implements A2aInbox {
         this.queued(run, id).message !== queued.message
       )
         throw new RequestMalformedError('Input changed while editing.');
-      await this.ctx.parallel('a2a/before-followup', {
+      await this.ctx.serial('a2a/before-followup', {
         agent: queued.agent,
         contextId,
         taskId: task.task.id,
         a2aMessage: message,
         dshMessageId: id,
-        requestHeaders: task.headers,
+        requestHeaders: task.headers.get(id),
         signal: task.controller.signal,
       });
       if (
@@ -394,26 +401,25 @@ export class NativeInbox implements A2aInbox {
   }
 
   private async removed(run: ContextRun, messages: UserMessage[]): Promise<void> {
-    for (const task of new Set(messages.map((message) => this.owner(run, message)))) {
+    const removed = new Map<TaskRun, Set<string>>();
+    for (const message of messages) {
+      const task = this.owner(run, message);
+      if (!task || message.source.kind !== 'a2a') continue;
+      let ids = removed.get(task);
+      if (!ids) {
+        ids = new Set();
+        removed.set(task, ids);
+      }
+      ids.add(Message.fromJSON(JSON.parse(message.source.message)).messageId);
+    }
+    // One queue durability barrier precedes all terminal task publications.
+    await this.flush(run.entry.handle.agent.session);
+    const pending = new Set(this.pending(run).map((message) => this.owner(run, message)));
+    for (const [task, ids] of removed) {
       if (!task || task.settled) continue;
-      const ids = new Set(
-        messages
-          .filter(
-            (message) => message.source.kind === 'a2a' && message.source.taskId === task.task.id,
-          )
-          .map((message) =>
-            message.source.kind === 'a2a'
-              ? Message.fromJSON(JSON.parse(message.source.message)).messageId
-              : '',
-          ),
-      );
       task.task.history = task.task.history.filter((message) => !ids.has(message.messageId));
-      if (
-        run.active !== task &&
-        !run.claimed.has(task) &&
-        !this.pending(run).some((message) => this.owner(run, message) === task)
-      )
-        await this.cancel(task.task.id);
+      if (run.active !== task && !run.claimed.has(task) && !pending.has(task))
+        await this.cancelTask(run, task, false);
       else await this.checkpoint(task.task, task.context);
     }
   }
@@ -447,6 +453,12 @@ export class NativeInbox implements A2aInbox {
         items.unshift(queued.message);
         queued.agent.inbox.splice(queued.target, 0, queued.items.length, items);
       }
+      run.nativeExecutions = new Set([
+        ...(run.nativeClaims ?? []),
+        ...this.pending(run)
+          .filter((message) => !this.owner(run, message))
+          .map((message) => message.id),
+      ]);
       await this.wake(contextId);
     });
   }
@@ -1389,7 +1401,12 @@ export class NativeInbox implements A2aInbox {
       }
       if (run.rolledBack.delete(message.source.promotionId)) detail.messages.splice(index, 1);
     }
-    if (!run.active && detail.messages.some((message) => !this.owner(run, message)))
+    if (
+      !run.active &&
+      detail.messages.some(
+        (message) => !this.owner(run, message) && !run.nativeExecutions?.has(message.id),
+      )
+    )
       throw new Error('Native host input requires task-attributed a2aInbox.enqueue().');
     // Restarted steering and an ordinary queued turn may be claimed together by the core.
     // Requeue other owners before committing any user message, keeping task lifecycles separate.
@@ -1458,6 +1475,15 @@ export class NativeInbox implements A2aInbox {
   onSessionEvent(session: Session, event: SessionEvent): boolean {
     const run = this.contexts.get(session.id);
     if (!run) return false;
+    if (event.type === 'user/message') {
+      run.nativeExecutions?.delete(event.data.id);
+      run.nativeClaims?.delete(event.data.id);
+    }
+    if (event.type === 'turn/end' && run.nativeExecutions?.size) {
+      const pending = new Set(this.pending(run).map((message) => message.id));
+      for (const id of run.nativeExecutions) if (!pending.has(id)) run.nativeExecutions.delete(id);
+      run.nativeClaims?.clear();
+    }
     if (event.type === 'turn/start') {
       run.claimed.clear();
       run.turnStart = event;
@@ -1662,7 +1688,7 @@ export class NativeInbox implements A2aInbox {
     return undefined;
   }
 
-  private async cancelTask(run: ContextRun, task: TaskRun): Promise<void> {
+  private async cancelTask(run: ContextRun, task: TaskRun, flush = true): Promise<void> {
     const contextId = run.entry.sessionId;
     const taskId = task.task.id;
     task.discardInput = true;
@@ -1676,7 +1702,7 @@ export class NativeInbox implements A2aInbox {
     }
     try {
       try {
-        await this.flush(run.entry.handle.agent.session);
+        if (flush) await this.flush(run.entry.handle.agent.session);
       } finally {
         await this.checkpoint(structuredClone(task.task), task.context);
       }
@@ -1715,14 +1741,22 @@ export class NativeInbox implements A2aInbox {
 
   async wake(contextId: string): Promise<string[]> {
     const run = await this.context(contextId);
-    const pending = this.pending(run).filter((message) => message.source.kind === 'a2a');
+    const agent = run.entry.handle.agent;
+    const pending = this.pending(run);
     run.paused = false;
-    run.entry.handle.agent.session.append('agent/inbox/paused', { paused: false });
-    for (const [index, input] of pending.entries()) {
-      if (this.pending(run).some((message) => message.id === input.id))
-        run.entry.handle.agent.inbox.remove(input.id);
-      const target = input.source.kind === 'a2a' ? input.source.target : 'next-turn';
-      run.entry.handle.agent.send(input, target, index === pending.length - 1);
+    agent.session.append('agent/inbox/paused', { paused: false });
+    const target = agent.inbox.nextTurn.length ? 'next-turn' : 'next-step';
+    const items = target === 'next-turn' ? agent.inbox.nextTurn : agent.inbox.nextStep;
+    const input = items.at(-1);
+    if (input) {
+      // Agent.send is the public wake seam; reinsert only the tail, without canceling it.
+      agent.session.append('agent/inbox/spliced', {
+        target,
+        start: items.length - 1,
+        removedCount: 1,
+        inserted: [],
+      });
+      agent.send(input, target, true);
     }
     const taskIds = [
       ...new Set(

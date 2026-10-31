@@ -30,6 +30,9 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
   const nextStep: UserMessage[] = [];
   const session = {
     id: 'context',
+    get seq() {
+      return log.length;
+    },
     snapshotEvents: () => log.slice(),
     append(type: string, data: unknown) {
       const event = {
@@ -39,6 +42,11 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
         time: Date.now(),
       };
       log.push(event as SessionEvent);
+      if (event.type === 'agent/inbox/spliced') {
+        const splice = event.data as any;
+        const items = splice.target === 'next-turn' ? nextTurn : nextStep;
+        items.splice(splice.start, splice.removedCount ?? 0, ...splice.inserted);
+      }
       ctx.emit('session/event', session as never, event as never);
       return event;
     },
@@ -50,7 +58,6 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
       start: items.length,
       inserted: [message],
     } as never);
-    items.push(message);
     ctx.emit('agent/inbox/inserted', { agent, message });
   };
   let activity: Promise<void> | undefined;
@@ -74,19 +81,14 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
             inserted: [],
             outcome: 'canceled',
           } as never);
-          items.splice(0);
         }
       },
       append,
       prepend(target: string, message: UserMessage) {
-        const items = target === 'next-turn' ? nextTurn : nextStep;
         session.append('agent/inbox/spliced', { target, start: 0, inserted: [message] } as never);
-        items.unshift(message);
       },
       splice(target: string, start: number, removedCount: number, inserted: UserMessage[]) {
-        const items = target === 'next-turn' ? nextTurn : nextStep;
         session.append('agent/inbox/spliced', { target, start, removedCount, inserted } as never);
-        items.splice(start, removedCount, ...inserted);
       },
       replace(id: string, message: UserMessage) {
         const items = nextTurn.some((m) => m.id === id) ? nextTurn : nextStep;
@@ -99,14 +101,19 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
           inserted: [message],
           outcome: 'canceled',
         });
-        items[index] = message;
         return true;
       },
       remove(id: string) {
         for (const items of [nextTurn, nextStep]) {
           const index = items.findIndex((m) => m.id === id);
           if (index >= 0) {
-            items.splice(index, 1);
+            session.append('agent/inbox/spliced', {
+              target: items === nextTurn ? 'next-turn' : 'next-step',
+              start: index,
+              removedCount: 1,
+              inserted: [],
+              outcome: 'canceled',
+            } as never);
             return true;
           }
         }
@@ -132,7 +139,7 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
               ['next-step', nextStep, nextStep.length],
               ['next-turn', nextTurn, Math.min(1, nextTurn.length)],
             ] as const) {
-              const removed = items.splice(0, count);
+              const removed = items.slice(0, count);
               session.append('agent/inbox/spliced', {
                 target,
                 start: 0,
@@ -254,6 +261,22 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
 }
 
 describe('native A2A inbox', () => {
+  it('clears a batch without a durability flush per queued task', async () => {
+    const f = harness();
+    const flush = vi.fn(async () => true);
+    f.ctx.provide('sessions', { flush } as never);
+    const queued = Array.from({ length: 20 }, (_, index) =>
+      f.send(`queued-${index}`, { parked: true }),
+    );
+    await vi.waitFor(() => expect(f.agent.inbox.nextTurn).toHaveLength(20));
+    flush.mockClear();
+    const snapshot = await f.native.clearPending('context');
+    expect(snapshot.nextTurn).toEqual([]);
+    await Promise.all(queued.map((request) => request.execution));
+    expect(flush.mock.calls.length).toBeGreaterThan(0);
+    expect(flush.mock.calls.length).toBeLessThan(5);
+  });
+
   async function abortAtCheckpoint(
     action: 'cancel' | 'clear' | 'dispose' | 'shutdown',
     settleOperationFirst = false,

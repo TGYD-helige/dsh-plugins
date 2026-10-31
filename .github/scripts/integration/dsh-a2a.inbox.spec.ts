@@ -196,6 +196,153 @@ async function boot(
 }
 
 describe('official protocol bindings', () => {
+  it('keeps a claimed native input executable when another window executes again', async () => {
+    const f = await boot();
+    const agent = await f.inbox.resolve('native-test');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    let entered = false;
+    f.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+      entered = true;
+      await gate;
+      return next();
+    });
+    const native = createUserMessage({
+      content: [{ type: 'text', text: 'claimed' }],
+      source: { kind: 'user' },
+    });
+    agent.inbox.append('next-turn', native);
+    expect((await f.rpc('dsh/inbox/execute', { contextId: 'native-test' })).error).toBeUndefined();
+    await expect.poll(() => entered).toBe(true);
+    expect(agent.inbox.nextTurn).toEqual([]);
+    expect((await f.rpc('dsh/inbox/execute', { contextId: 'native-test' })).error).toBeUndefined();
+    release();
+    await agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+  });
+
+  it('preserves explicit native execution while a canceled driver drains', async () => {
+    const f = await boot();
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    let first = true;
+    f.ctx.on('agent/request', async (detail, next) => {
+      if (first) {
+        first = false;
+        entered();
+        await new Promise<void>((resolve) => {
+          if (detail.signal.aborted) resolve();
+          else detail.signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+        await gate;
+        detail.signal.throwIfAborted();
+      }
+      return next();
+    });
+    const active = await f.send('active');
+    await started;
+    expect((await f.rpc('CancelTask', { id: active.id })).error).toBeUndefined();
+    const agent = await f.inbox.resolve('native-test');
+    const native = createUserMessage({
+      content: [{ type: 'text', text: 'after cancellation' }],
+      source: { kind: 'user' },
+    });
+    agent.inbox.append('next-turn', native);
+    expect(
+      (await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: native.id })).error,
+    ).toBeUndefined();
+    release();
+    await agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+    expect(
+      agent.session
+        .snapshotEvents()
+        .some((event) => event.type === 'user/message' && event.data.id === native.id),
+    ).toBe(true);
+  });
+
+  it('preserves explicit native execution across a maintenance wake', async () => {
+    const f = await boot();
+    const agent = await f.inbox.resolve('native-test');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => {
+      release();
+    });
+    const maintenance = agent.runMaintenance(() => gate);
+    const native = createUserMessage({
+      content: [{ type: 'text', text: 'after maintenance' }],
+      source: { kind: 'user' },
+    });
+    agent.inbox.append('next-turn', native);
+    expect(
+      (await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: native.id })).error,
+    ).toBeUndefined();
+    release();
+    await maintenance;
+    await agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+    expect(
+      agent.session
+        .snapshotEvents()
+        .some((event) => event.type === 'user/message' && event.data.id === native.id),
+    ).toBe(true);
+  });
+
+  it('executes native-only and mixed-producer inboxes in the selected order', async () => {
+    const f = await boot();
+    const agent = await f.inbox.resolve('native-test');
+    const native = createUserMessage({
+      content: [{ type: 'text', text: 'native-only' }],
+      source: { kind: 'user' },
+    });
+    agent.inbox.append('next-turn', native);
+    expect(
+      (await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: native.id })).error,
+    ).toBeUndefined();
+    await agent.whenIdle();
+    expect(f.adapter.requests).toHaveLength(1);
+    const a = await f.send('a', { wakeup: false });
+    const middle = createUserMessage({
+      content: [{ type: 'text', text: 'native-middle' }],
+      source: { kind: 'user' },
+    });
+    agent.inbox.append('next-turn', middle);
+    const b = await f.send('b', { wakeup: false });
+    const last = agent.inbox.nextTurn.at(-1)!;
+    expect(
+      (await f.rpc('dsh/inbox/execute', { contextId: 'native-test', id: last.id })).error,
+    ).toBeUndefined();
+    await agent.whenIdle();
+    await f.completed(a.id);
+    await f.completed(b.id);
+    const messages = agent.session
+      .snapshotEvents()
+      .filter((event) => event.type === 'user/message');
+    expect(messages.map((event) => event.data.content[0].text)).toEqual([
+      'native-only',
+      'b',
+      'a',
+      'native-middle',
+    ]);
+  });
+
   it('clears pending tasks without canceling active work', async () => {
     const f = await boot();
     let release!: () => void;
@@ -346,12 +493,17 @@ describe('official protocol bindings', () => {
     const denied = await f.rpc('dsh/inbox/get', { contextId: 'native-test' }, false);
     expect(denied.error).toBeDefined();
     const [a, b] = get.result.nextTurn;
+    let editHeaders: unknown;
+    f.ctx.on('a2a/before-followup', (detail) => {
+      editHeaders = detail.requestHeaders;
+    });
     const updated = await f.rpc('dsh/inbox/update', {
       contextId: 'native-test',
       id: a.id,
       message: { ...a.message, parts: [{ text: 'edited input' }] },
     });
     expect(updated.error).toBeUndefined();
+    expect(editHeaders).toMatchObject({ 'a2a-version': '1.0', 'a2a-extensions': INBOX_EXTENSION });
     expect(updated.result.nextTurn[0].message.parts).toEqual([{ text: 'edited input' }]);
     const moved = await f.rpc('dsh/inbox/move', { contextId: 'native-test', id: b.id, index: 0 });
     expect(moved.result.nextTurn.map((item: any) => item.id)).toEqual([b.id, a.id]);
