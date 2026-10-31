@@ -1186,14 +1186,9 @@ export class NativeInbox implements A2aInbox {
     };
   }
 
-  private controls(
-    message: Message,
-    context: ServerCallContext,
-  ): { target: InboxTarget; wakeup: boolean } {
+  private controls(message: Message): { target: InboxTarget; wakeup: boolean } {
     const value = message.metadata?.[INBOX_EXTENSION];
     if (value === undefined) return { target: 'next-turn', wakeup: true };
-    if (!context.requestedExtensions?.includes(INBOX_EXTENSION))
-      throw new Error('Inbox controls require A2A-Extensions negotiation.');
     if (
       !value ||
       typeof value !== 'object' ||
@@ -1205,7 +1200,6 @@ export class NativeInbox implements A2aInbox {
       throw new Error('Invalid inbox target.');
     if (value.wakeup !== undefined && typeof value.wakeup !== 'boolean')
       throw new Error('Invalid inbox wakeup.');
-    context.addActivatedExtension(INBOX_EXTENSION);
     return {
       target: value.target === 'next-step' ? 'next-step' : 'next-turn',
       wakeup: value.wakeup !== false,
@@ -1218,7 +1212,7 @@ export class NativeInbox implements A2aInbox {
     context: ServerCallContext,
   ): Promise<undefined | (() => void)> {
     if (!message.messageId) throw new Error('message.messageId is required.');
-    const controls = this.controls(message, context);
+    const controls = this.controls(message);
     if (!message.taskId) {
       if (controls.target === 'next-step') throw new Error('Steering must address an active task.');
       return;
@@ -1401,7 +1395,7 @@ export class NativeInbox implements A2aInbox {
     let task: TaskRun | undefined;
     let ownsTask = false;
     try {
-      const controls = this.controls(userMessage, context);
+      const controls = this.controls(userMessage);
       const run = await this.context(contextId, context);
       task = run.tasks.get(taskId);
       if (!task) {
