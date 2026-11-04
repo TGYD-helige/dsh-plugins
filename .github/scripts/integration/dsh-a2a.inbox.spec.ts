@@ -971,11 +971,12 @@ describe('official protocol bindings', () => {
     await expect
       .poll(() =>
         received.some(
-          ({ body }) => body.task?.id === id && body.task.status.state === 'TASK_STATE_COMPLETED',
+          ({ body }) =>
+            body.statusUpdate?.taskId === id &&
+            body.statusUpdate.status.state === 'TASK_STATE_COMPLETED',
         ),
       )
       .toBe(true);
-    expect(JSON.stringify(received.at(-1)!.body.task.history)).toContain('push-completed');
     expect(received.every((event) => event.authorization === 'Bearer integration-callback')).toBe(
       true,
     );

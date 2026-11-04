@@ -331,7 +331,6 @@ export function apply(
         () => inbox?.shutdown(),
         () => server.close(),
         () => bridge.dispose(),
-        () => server.flushNotifications(),
         () => store.close?.(),
       ]) {
         try {

@@ -437,12 +437,8 @@ The existing legacy methods and `configuration.pushNotificationConfig` are
 handled by the SDK's v0.3 compatibility layer.
 
 The receiver gets HTTP POSTs with `Content-Type: application/a2a+json` and a
-standard `StreamResponse` containing a complete `{ task }` snapshot. Each scoped
-task has at most one HTTP dispatch in flight and one pending refresh; slow
-receivers see the latest snapshot rather than a backlog of token deltas. Read
-the snapshot as current state, not an event replay. Shutdown drains pending
-refreshes using the SDK's existing HTTP timeout. The configured Bearer credentials
-become `Authorization`;
+standard `StreamResponse`: `{ task }`, `{ message }`, `{ statusUpdate }` or
+`{ artifactUpdate }`. The configured Bearer credentials become `Authorization`;
 incoming application identity headers are not automatically forwarded. A webhook
 registered over v0.3 receives the SDK's v0.3 task snapshots and `application/json`,
 even if a later triggering request uses a different wire version.
@@ -459,8 +455,8 @@ The official store is in memory. Configs and their credentials are lost on
 restart, independently of the chosen durable TaskStore backend; clients must
 register again. Delete configurations that are no longer needed. The SDK uses
 its default five-second webhook request timeout and logs delivery failures
-without failing task execution. The plugin coalesces and drains notifications;
-it adds no retries or persistent delivery guarantee. Read task snapshots on initial
+without failing task execution. No plugin-level retries, shutdown drain or
+persistent delivery guarantee are added. Read task snapshots on initial
 connection/reconnection and tolerate missing or duplicate notifications.
 
 Keep the loopback default. Push registration lets callers choose outbound
