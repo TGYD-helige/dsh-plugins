@@ -49,6 +49,7 @@ import Schema from '@deepseek-ai/schemastery';
 import { LangfuseReporter, type LangfuseTraceContext, type ObservationLevel } from './client.js';
 import { isHookInvoked, isHookResult } from './hooks.js';
 import { displayBlocks } from './media.js';
+import { boundPayload, newPayloadBudget, type PayloadBudget, takePayloadText } from './payload.js';
 
 export type { LangfuseTraceContext } from './client.js';
 export { appendHookEvent, type HookInvoked, type HookResult } from './hooks.js';
@@ -106,7 +107,9 @@ export const Config = Schema.object({
     .min(1)
     .step(1)
     .default(256 * 1024)
-    .description('maximum captured request, raw-stream, and assembled-output bytes per LLM call'),
+    .description(
+      'maximum captured request, raw-stream, assembled-output, or tool input/output/status bytes',
+    ),
   redactFields: Schema.array(Schema.string())
     .default([])
     .description('case-insensitive payload fields to redact'),
@@ -267,196 +270,6 @@ function requestBodyOf(options: GenerateOptions, captureContent: boolean): Recor
   }
   const { signal: _, ...body } = options;
   return body;
-}
-
-interface PayloadBudget {
-  remaining: number;
-  truncated: boolean;
-}
-
-const newPayloadBudget = (maxBytes: number): PayloadBudget => ({
-  remaining: maxBytes,
-  truncated: false,
-});
-
-/** Take a UTF-8 prefix without ever exceeding the remaining content-byte budget. */
-function takePayloadText(value: string, budget: PayloadBudget): string {
-  const bytes = Buffer.byteLength(value);
-  if (bytes <= budget.remaining) {
-    budget.remaining -= bytes;
-    return value;
-  }
-  budget.truncated = true;
-  if (budget.remaining <= 0) return '';
-  let low = 0;
-  let high = value.length;
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2);
-    if (Buffer.byteLength(value.slice(0, middle)) <= budget.remaining) low = middle;
-    else high = middle - 1;
-  }
-  budget.remaining = 0;
-  return value.slice(0, low);
-}
-
-type BoundedPayload<T> = T | { truncated: true; preview?: string } | string | number;
-
-/** Build a preview whose complete JSON value, including its wrapper, fits the remaining cap. */
-function previewPayload<T>(serialized: string, budget: PayloadBudget): BoundedPayload<T> {
-  const remaining = budget.remaining;
-  const marker = { truncated: true as const };
-  const withPreview = { ...marker, preview: '' };
-  if (Buffer.byteLength(JSON.stringify(withPreview)) <= remaining) {
-    let low = 0;
-    let high = serialized.length;
-    while (low < high) {
-      const middle = Math.ceil((low + high) / 2);
-      const candidate = { ...marker, preview: serialized.slice(0, middle) };
-      if (Buffer.byteLength(JSON.stringify(candidate)) <= remaining) low = middle;
-      else high = middle - 1;
-    }
-    budget.remaining = 0;
-    return { ...marker, preview: serialized.slice(0, low) };
-  }
-  if (Buffer.byteLength(JSON.stringify(marker)) <= remaining) {
-    budget.remaining = 0;
-    return marker;
-  }
-  // Even the marker is too large: retain a plain string prefix, still capped
-  // after JSON quoting/escaping rather than by source-string bytes.
-  let low = 0;
-  let high = serialized.length;
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2);
-    if (Buffer.byteLength(JSON.stringify(serialized.slice(0, middle))) <= remaining) low = middle;
-    else high = middle - 1;
-  }
-  budget.remaining = 0;
-  return low > 0 ? serialized.slice(0, low) : remaining >= 2 ? '' : 0;
-}
-
-const MAX_ATOMIC_MASK_BYTES = 64 * 1024;
-
-/** Redact leaves while serializing, so an oversized payload never needs a full mask or stringify. */
-function boundMaskedPayload<T>(
-  input: T,
-  budget: PayloadBudget,
-  reporter: LangfuseReporter,
-): BoundedPayload<T> {
-  const seen = new WeakSet<object>();
-  const parts: string[] = [];
-  let remaining = budget.remaining;
-  let overflow = false;
-  const append = (text: string | undefined) => {
-    if (overflow || text === undefined) return;
-    const bytes = Buffer.byteLength(text);
-    if (bytes > remaining) {
-      // The node was already masked atomically; a serialized prefix is safe.
-      parts.push(takePayloadText(text, { remaining, truncated: true }));
-      remaining = 0;
-      overflow = true;
-      return;
-    }
-    parts.push(text);
-    remaining -= bytes;
-  };
-  const write = (value: unknown): unknown => {
-    if (overflow || value === undefined) return undefined;
-    if (value === null || typeof value !== 'object' || value instanceof Date) {
-      if (
-        typeof value === 'string' &&
-        Buffer.byteLength(value) > MAX_ATOMIC_MASK_BYTES &&
-        Buffer.byteLength(value) > remaining
-      ) {
-        overflow = true;
-        return undefined;
-      }
-      const masked = reporter.mask(value);
-      append(JSON.stringify(masked));
-      return masked;
-    }
-    if (seen.has(value)) {
-      append(JSON.stringify('[Circular]'));
-      return '[Circular]';
-    }
-    seen.add(value);
-    if (Array.isArray(value)) {
-      append('[');
-      const result: unknown[] = [];
-      for (const [index, item] of value.entries()) {
-        if (overflow) break;
-        if (index > 0) append(',');
-        if (item === undefined) {
-          append('null');
-          result.push(null);
-        } else {
-          const masked = write(item);
-          if (!overflow) result.push(masked);
-        }
-      }
-      append(']');
-      seen.delete(value);
-      return result;
-    }
-    append('{');
-    const result = Object.create(null) as Record<string, unknown>;
-    let first = true;
-    for (const key in value) {
-      if (overflow) break;
-      if (!Object.hasOwn(value, key)) continue;
-      const child = (value as Record<string, unknown>)[key];
-      if (child === undefined && !reporter.shouldRedactField(key)) continue;
-      if (!first) append(',');
-      first = false;
-      append(JSON.stringify(reporter.mask(key)));
-      append(':');
-      if (reporter.shouldRedactField(key)) {
-        append(JSON.stringify('[REDACTED]'));
-        result[key] = '[REDACTED]';
-      } else {
-        const masked = write(child);
-        if (!overflow) result[key] = masked;
-      }
-    }
-    append('}');
-    seen.delete(value);
-    return result;
-  };
-  try {
-    const masked = write(input);
-    if (!overflow) {
-      budget.remaining = remaining;
-      return masked as T;
-    }
-  } catch {
-    budget.truncated = true;
-    return previewPayload('', budget);
-  }
-  budget.truncated = true;
-  return previewPayload(parts.join(''), budget);
-}
-
-/** Bound a structured payload without changing its shape when it fits. */
-function boundPayload<T>(
-  input: T,
-  budget: PayloadBudget,
-  reporter?: LangfuseReporter,
-): BoundedPayload<T> {
-  if (reporter) return boundMaskedPayload(input, budget, reporter);
-  let serialized: string;
-  try {
-    serialized = JSON.stringify(input) ?? '';
-  } catch {
-    budget.truncated = true;
-    return previewPayload('', budget);
-  }
-  const bytes = Buffer.byteLength(serialized);
-  if (bytes <= budget.remaining) {
-    budget.remaining -= bytes;
-    return input;
-  }
-  budget.truncated = true;
-  return previewPayload(serialized, budget);
 }
 
 /** Keep only whole chunks that fit; stream accounting still processes every original chunk. */
@@ -704,8 +517,8 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   type Handle =
     | NonNullable<ObservationHandle>
     | NonNullable<ReturnType<LangfuseReporter['startGeneration']>>;
-  const pendingMedia = new Set<Promise<void>>();
-  const mediaFor = new WeakMap<Handle, Promise<void>>();
+  const pendingMedia = new Map<Promise<void>, readonly string[]>();
+  const mediaFor = new WeakMap<Handle, { pending: Promise<void>; sessions: readonly string[] }>();
   const mediaOptions = {
     enabled:
       config.captureContent &&
@@ -715,21 +528,38 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     timeoutMs: config.mediaTimeoutMs ?? 5000,
   };
 
-  function trackMedia(task: Promise<void>): Promise<void> {
+  function mediaSessions(sessionId: string | undefined): string[] {
+    const owners: string[] = [];
+    while (sessionId && !owners.includes(sessionId)) {
+      owners.push(sessionId);
+      sessionId = children.get(sessionId)?.parentSessionId;
+    }
+    return owners;
+  }
+
+  function trackMedia(task: Promise<void>, owners: readonly string[]): Promise<void> {
     const pending = task.catch((error) => {
       console.error('[dsh-langfuse] media finalization failed:', error);
     });
-    pendingMedia.add(pending);
+    pendingMedia.set(pending, owners);
     void pending.then(() => pendingMedia.delete(pending));
     return pending;
   }
 
-  function enrichInput(handle: Handle | null, input: Promise<unknown>): void {
+  function enrichInput(
+    handle: Handle | null,
+    input: Promise<unknown>,
+    sessionId: string | undefined,
+  ): void {
     if (!handle) return;
-    mediaFor.set(
-      handle,
-      trackMedia(input.then((value) => reporter.updateSpan(handle, { input: value }))),
-    );
+    const owners = mediaSessions(sessionId);
+    mediaFor.set(handle, {
+      pending: trackMedia(
+        input.then((value) => reporter.updateSpan(handle, { input: value })),
+        owners,
+      ),
+      sessions: owners,
+    });
   }
 
   function afterMedia(
@@ -738,18 +568,33 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
     endedAt = new Date(),
   ): void {
     const task = handle ? mediaFor.get(handle) : undefined;
-    if (task) trackMedia(task.then(() => close(endedAt)));
+    if (task)
+      trackMedia(
+        task.pending.then(() => close(endedAt)),
+        task.sessions,
+      );
     else close(endedAt);
   }
 
-  function setMessageInput(handle: ObservationHandle, content: readonly ContentBlock[]): void {
+  function setMessageInput(
+    handle: ObservationHandle,
+    content: readonly ContentBlock[],
+    sessionId: string,
+  ): void {
     if (content.some((block) => block.type !== 'text')) {
-      enrichInput(handle, displayBlocks(content, ctx.get('attachments'), mediaOptions));
+      enrichInput(handle, displayBlocks(content, ctx.get('attachments'), mediaOptions), sessionId);
     } else reporter.updateSpan(handle, { input: messageText({ content }) });
   }
 
-  async function drainMedia(): Promise<void> {
-    while (pendingMedia.size) await Promise.all([...pendingMedia]);
+  async function drainMedia(sessionId?: string): Promise<void> {
+    for (;;) {
+      // Session-less observations have no narrower durability checkpoint.
+      const pending = [...pendingMedia]
+        .filter(([, owners]) => !sessionId || !owners.length || owners.includes(sessionId))
+        .map(([task]) => task);
+      if (!pending.length) return;
+      await Promise.all(pending);
+    }
   }
 
   ctx.on('langfuse/context', (sessionId, context) => {
@@ -1317,7 +1162,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       // The delegated prompt (the child's first user/message) is the
       // subagent span's input; the descriptor enriches the span name.
       if (event.type === 'user/message' && !child.hasInput && config.captureContent) {
-        setMessageInput(child.span, event.data.content);
+        setMessageInput(child.span, event.data.content, sessionId);
         child.hasInput = true;
       } else if (event.type === 'subagent/descriptor') {
         // The label is the delegation's model-authored description — content.
@@ -1355,7 +1200,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
         if (pendingTurns.has(sessionId)) traceFor(sessionId);
         const state = sessions.get(sessionId);
         if (state && !state.hasInput && config.captureContent) {
-          setMessageInput(state.trace, event.data.content);
+          setMessageInput(state.trace, event.data.content, sessionId);
           state.hasInput = true;
         }
         break;
@@ -1501,6 +1346,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
           requestBudget.truncated ||= enrichmentBudget.truncated;
           return enriched;
         }),
+        options.sessionId,
       );
     }
 
@@ -1732,7 +1578,11 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
       // it — it rides this dispatch's (same one-off rule as llm/stream).
       const oneOffRoot = sessionId ? null : parent;
       // Argument summaries are argument content — they ride captureContent.
-      const args = config.captureContent ? reporter.mask(exec.arguments) : undefined;
+      const maxPayloadBytes = config.maxPayloadBytes ?? 256 * 1024;
+      const inputBudget = newPayloadBudget(maxPayloadBytes);
+      const args = config.captureContent
+        ? boundPayload(exec.arguments, inputBudget, reporter)
+        : undefined;
       const argSummary = config.captureContent ? toolCallSummary(args) : undefined;
       const span = reporter.startSpan(parent, {
         name: `tool:${exec.name}${argSummary ? ` [${argSummary}]` : ''}`,
@@ -1773,7 +1623,31 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
           else openToolSpans.delete(sessionId);
         }
         const end = (output = update.output) => {
-          reporter.endSpan(span, { ...update, output }, endedAt);
+          const outputBudget = newPayloadBudget(maxPayloadBytes);
+          const bounded =
+            output === undefined ? undefined : boundPayload(output, outputBudget, reporter);
+          const statusBudget = newPayloadBudget(maxPayloadBytes);
+          const status =
+            update.statusMessage === undefined
+              ? undefined
+              : boundPayload(update.statusMessage, statusBudget, reporter);
+          reporter.endSpan(
+            span,
+            {
+              ...update,
+              output: bounded,
+              statusMessage: typeof status === 'string' ? status : undefined,
+              metadata: {
+                ...update.metadata,
+                truncated:
+                  inputBudget.truncated ||
+                  outputBudget.truncated ||
+                  statusBudget.truncated ||
+                  undefined,
+              },
+            },
+            endedAt,
+          );
           reporter.endSpan(oneOffRoot, {}, endedAt);
         };
         if (display)
@@ -1782,6 +1656,7 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
               console.error('[dsh-langfuse] media projection failed:', error);
               end();
             }),
+            mediaSessions(sessionId),
           );
         else end();
       }
@@ -1817,8 +1692,8 @@ export function apply(ctx: Context, config: LangfusePluginConfig): Promise<void>
   });
 
   // Durability checkpoint: the store awaits every session/flush listener.
-  ctx.on('session/flush', async () => {
-    await drainMedia();
+  ctx.on('session/flush', async (session) => {
+    await drainMedia(session.id);
     await reporter.flush();
   });
 

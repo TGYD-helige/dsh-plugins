@@ -107,7 +107,7 @@ export interface A2aInbox {
   clearPending(contextId: string, page?: InboxPageOptions): Promise<InboxSnapshot>;
   executePending(contextId: string, id?: string, page?: InboxPageOptions): Promise<InboxSnapshot>;
   resolve(contextId: string): Promise<Agent>;
-  content(message: Message, contextId: string): Promise<ContentBlock[]>;
+  content(message: Message, contextId: string, signal?: AbortSignal): Promise<ContentBlock[]>;
   /** Admit a same-process host follow-up under an existing task's durable identity. */
   enqueue(
     taskId: string,
@@ -293,8 +293,8 @@ export class NativeInbox implements A2aInbox {
     }
   }
 
-  content(message: Message, contextId: string) {
-    return this.bridge.buildContent(message, contextId);
+  content(message: Message, contextId: string, signal?: AbortSignal) {
+    return this.bridge.buildContent(message, contextId, signal);
   }
   async resolve(contextId: string): Promise<Agent> {
     return (await this.context(contextId)).entry.handle.agent;
@@ -435,7 +435,7 @@ export class NativeInbox implements A2aInbox {
           throw new RequestMalformedError(
             'A user Message with unchanged messageId, taskId and contextId is required.',
           );
-        const content = await this.content(message, contextId);
+        const content = await this.content(message, contextId, task.controller.signal);
         if (
           this.stopping ||
           this.bridge.isClearing(contextId) ||
@@ -1062,7 +1062,11 @@ export class NativeInbox implements A2aInbox {
           else snapshots.set(snapshot.id, snapshot);
         }
         await this.flush(entry.handle.agent.session);
-        for (const snapshot of snapshots.values()) this.restoreTask(run, snapshot, context);
+        const committed = snapshots.size
+          ? this.committedInputs(run, new Set(snapshots.keys()))
+          : new Map<string, Message[]>();
+        for (const snapshot of snapshots.values())
+          this.restoreTask(run, snapshot, context, committed.get(snapshot.id) ?? []);
         run.retained = structuredClone({
           'next-step': [...entry.handle.agent.inbox.nextStep],
           'next-turn': [...entry.handle.agent.inbox.nextTurn],
@@ -1307,7 +1311,7 @@ export class NativeInbox implements A2aInbox {
     const headers = context.state.get(STATE_HEADERS_KEY);
     const work = run.admissionTail.then(async () => {
       abort.signal.throwIfAborted();
-      const content = await this.content(a2aMessage, run.entry.sessionId);
+      const content = await this.content(a2aMessage, run.entry.sessionId, abort.signal);
       abort.signal.throwIfAborted();
       const message = createUserMessage({
         content,
@@ -1459,15 +1463,26 @@ export class NativeInbox implements A2aInbox {
     }
   }
 
-  private restoreTask(run: ContextRun, snapshot: Task, context: ServerCallContext): TaskRun {
+  private committedInputs(run: ContextRun, taskIds: ReadonlySet<string>): Map<string, Message[]> {
+    const inputs = new Map<string, Message[]>();
     for (const event of run.entry.handle.agent.session.snapshotEvents()) {
-      if (
-        event.type === 'user/message' &&
-        event.data.source.kind === 'a2a' &&
-        event.data.source.taskId === snapshot.id
-      )
-        commitInboxInput(snapshot.history, Message.fromJSON(JSON.parse(event.data.source.message)));
+      if (event.type !== 'user/message' || event.data.source.kind !== 'a2a') continue;
+      const source = event.data.source;
+      if (!taskIds.has(source.taskId)) continue;
+      const messages = inputs.get(source.taskId) ?? [];
+      messages.push(Message.fromJSON(JSON.parse(source.message)));
+      inputs.set(source.taskId, messages);
     }
+    return inputs;
+  }
+
+  private restoreTask(
+    run: ContextRun,
+    snapshot: Task,
+    context: ServerCallContext,
+    committed = this.committedInputs(run, new Set([snapshot.id])).get(snapshot.id) ?? [],
+  ): TaskRun {
+    for (const message of committed) commitInboxInput(snapshot.history, message);
 
     if (!this.server) throw new Error('A2A task recovery requires the running server.');
     const bus = this.server.restoreTask(snapshot, context);

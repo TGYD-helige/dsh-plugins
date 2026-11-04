@@ -3,6 +3,7 @@ import { createServer, request, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
   type AgentCard,
+  Artifact,
   CancelTaskRequest,
   DeleteTaskPushNotificationConfigRequest,
   GetExtendedAgentCardRequest,
@@ -842,7 +843,7 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     },
   );
 
-  async function pushFixture() {
+  async function pushFixture(firstDelivery?: Promise<void>, executor = stubExecutor) {
     await server.close();
     const received: Array<{
       body: any;
@@ -860,6 +861,7 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
         authorization: request.headers.authorization,
         token: request.headers['x-a2a-notification-token'],
       });
+      if (received.length === 1) await firstDelivery;
       response.writeHead(status).end();
     });
     receiver.listen(0, '127.0.0.1');
@@ -871,7 +873,7 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
       port: 0,
       basePath: '/a2a',
       card: { name: 'test', description: '', version: '1' },
-      executor: stubExecutor,
+      executor,
       taskStore: store,
       pushNotifications: true,
     });
@@ -931,6 +933,121 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
         status: { message: { parts: [{ text: 'done' }, expect.anything()] } },
       });
     } finally {
+      await f.close();
+    }
+  });
+
+  it('preserves task, status and artifact webhook payloads in order behind a slow receiver', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const f = await pushFixture(gate);
+    try {
+      const context = new ServerCallContext({ tenant: '' });
+      const task = Task.fromJSON({
+        id: 'slow-push',
+        contextId: 'slow-context',
+        status: { state: 'TASK_STATE_WORKING' },
+      });
+      await f.store.save(task, context);
+      const bus = server.restoreTask(task, context);
+      const created = await json(
+        await rpc('CreateTaskPushNotificationConfig', {
+          taskId: task.id,
+          url: f.url,
+          authentication: { scheme: 'Bearer', credentials: 'slow-token' },
+        }),
+      );
+      expect(created.error).toBeUndefined();
+      bus.publish(AgentEvent.task(task));
+      await vi.waitFor(() => expect(f.received).toHaveLength(1));
+      for (const text of ['first', 'second', 'third']) {
+        bus.publish(
+          AgentEvent.statusUpdate({
+            taskId: task.id,
+            contextId: task.contextId,
+            status: {
+              state: TaskState.TASK_STATE_WORKING,
+              timestamp: undefined,
+              message: Message.fromJSON({
+                messageId: text,
+                taskId: task.id,
+                contextId: task.contextId,
+                role: 'ROLE_AGENT',
+                parts: [{ text }],
+              }),
+            },
+            metadata: undefined,
+          }),
+        );
+      }
+      bus.publish(
+        AgentEvent.artifactUpdate({
+          taskId: task.id,
+          contextId: task.contextId,
+          artifact: Artifact.fromJSON({
+            artifactId: 'artifact',
+            name: 'result',
+            parts: [{ text: 'artifact body' }],
+          }),
+          append: true,
+          lastChunk: true,
+          metadata: undefined,
+        }),
+      );
+      bus.publish(
+        AgentEvent.statusUpdate({
+          taskId: task.id,
+          contextId: task.contextId,
+          status: {
+            state: TaskState.TASK_STATE_COMPLETED,
+            message: undefined,
+            timestamp: undefined,
+          },
+          metadata: { marker: 'terminal' },
+        }),
+      );
+      bus.finished();
+      await vi.waitFor(async () => {
+        const polled = await json(await rpc('GetTask', { id: task.id }));
+        expect(polled.result.status.state).toBe('TASK_STATE_COMPLETED');
+      });
+      expect(f.received).toHaveLength(1);
+      release();
+      await vi.waitFor(() => expect(f.received).toHaveLength(6));
+      expect(f.received.map(({ body }) => Object.keys(body)[0])).toEqual([
+        'task',
+        'statusUpdate',
+        'statusUpdate',
+        'statusUpdate',
+        'artifactUpdate',
+        'statusUpdate',
+      ]);
+      expect(
+        f.received.slice(1, 4).map(({ body }) => body.statusUpdate.status.message.parts[0].text),
+      ).toEqual(['first', 'second', 'third']);
+      expect(f.received[4].body.artifactUpdate).toMatchObject({
+        taskId: task.id,
+        append: true,
+        lastChunk: true,
+        artifact: { artifactId: 'artifact', parts: [{ text: 'artifact body' }] },
+      });
+      expect(f.received[5].body.statusUpdate).toMatchObject({
+        taskId: task.id,
+        status: { state: 'TASK_STATE_COMPLETED' },
+        metadata: { marker: 'terminal' },
+      });
+      expect(f.received[0].body.task.status.state).toBe('TASK_STATE_WORKING');
+      expect(
+        f.received.every(
+          (event) =>
+            event.authorization === 'Bearer slow-token' &&
+            event.contentType === 'application/a2a+json',
+        ),
+      ).toBe(true);
+    } finally {
+      release();
       await f.close();
     }
   });
@@ -1014,6 +1131,51 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
       );
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(f.received).toHaveLength(count);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('delivers a message-only webhook without replacing it with a task snapshot', async () => {
+    const f = await pushFixture(undefined, {
+      ...stubExecutor,
+      async execute({ taskId, contextId }, bus) {
+        bus.publish(
+          AgentEvent.message(
+            Message.fromJSON({
+              messageId: 'direct-reply',
+              taskId,
+              contextId,
+              role: 'ROLE_AGENT',
+              parts: [{ text: 'direct message' }],
+            }),
+          ),
+        );
+        bus.finished();
+      },
+    });
+    try {
+      const sent = await json(
+        await rpc('SendMessage', {
+          tenant: '',
+          ...v1Message('direct-push'),
+          configuration: {
+            taskPushNotificationConfig: {
+              url: f.url,
+              authentication: { scheme: 'Bearer', credentials: 'message-token' },
+            },
+          },
+        }),
+      );
+      expect(sent.error).toBeUndefined();
+      expect(sent.result.message.messageId).toBe('direct-reply');
+      await vi.waitFor(() => expect(f.received).toHaveLength(1));
+      expect(f.received[0]).toMatchObject({
+        authorization: 'Bearer message-token',
+        contentType: 'application/a2a+json',
+        body: { message: { messageId: 'direct-reply', parts: [{ text: 'direct message' }] } },
+      });
+      expect(f.received[0].body.task).toBeUndefined();
     } finally {
       await f.close();
     }

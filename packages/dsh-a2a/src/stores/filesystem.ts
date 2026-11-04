@@ -4,7 +4,14 @@ import { mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { type ListTasksRequest, type ListTasksResponse, Task } from '@a2a-js/sdk';
 import type { ServerCallContext } from '@a2a-js/sdk/server';
-import { listShells, type ManagedTaskStore, taskScopeKey } from '../task-store.js';
+import { type ManagedTaskStore, taskScopeKey } from '../task-store.js';
+import {
+  LIST_PREFIX_BYTES,
+  loadTaskPage,
+  serializeTaskSnapshot,
+  snapshotListShell,
+  taskListShell,
+} from './listing.js';
 
 export class FilesystemTaskStore implements ManagedTaskStore {
   private readonly root: string;
@@ -25,7 +32,7 @@ export class FilesystemTaskStore implements ManagedTaskStore {
     try {
       const file = await open(temporary, 'wx', 0o600);
       try {
-        await file.writeFile(JSON.stringify(Task.toJSON(task)));
+        await file.writeFile(serializeTaskSnapshot(task, Task.toJSON(task)));
         await file.sync();
       } finally {
         await file.close();
@@ -63,17 +70,35 @@ export class FilesystemTaskStore implements ManagedTaskStore {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       files = [];
     }
-    const tasks: Task[] = [];
-    for (const file of files) {
-      if (!/^[a-f0-9]{64}\.json$/.test(file)) continue;
-      try {
-        tasks.push(
-          Task.fromJSON(JSON.parse(await readFile(join(this.directory(context), file), 'utf8'))),
-        );
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      }
+    const snapshots = files.filter((file) => /^[a-f0-9]{64}\.json$/.test(file));
+    const shells: Task[] = [];
+    for (let start = 0; start < snapshots.length; start += 16) {
+      const batch = await Promise.all(
+        snapshots.slice(start, start + 16).map(async (file) => {
+          const path = join(this.directory(context), file);
+          try {
+            const handle = await open(path, 'r');
+            let shell: Task | undefined;
+            try {
+              const prefix = Buffer.alloc(LIST_PREFIX_BYTES);
+              const { bytesRead } = await handle.read(prefix, 0, prefix.length, 0);
+              shell = snapshotListShell(prefix.toString('utf8', 0, bytesRead));
+              // Read legacy or oversized headers through the same open inode.
+              if (!shell)
+                shell = taskListShell(Task.fromJSON(JSON.parse(await handle.readFile('utf8'))));
+            } finally {
+              await handle.close();
+            }
+            return shell;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          }
+        }),
+      );
+      for (const shell of batch) if (shell) shells.push(shell);
     }
-    return listShells(tasks, params);
+    return loadTaskPage(shells, params, (ids) =>
+      Promise.all(ids.map((id) => this.load(id, context))),
+    );
   }
 }

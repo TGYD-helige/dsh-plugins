@@ -261,6 +261,57 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
 }
 
 describe('native A2A inbox', () => {
+  it('cancels file preparation and admits the next message without waiting for the backend', async () => {
+    const f = harness();
+    let supplied: AbortSignal | undefined;
+    let release!: (value: { readablePath: string }) => void;
+    const materializeFile = vi.fn(({ signal }: { signal?: AbortSignal }) => {
+      supplied = signal;
+      return new Promise<{ readablePath: string }>((resolve) => {
+        release = resolve;
+      });
+    });
+    f.ctx.provide('a2aFileMaterializer', { materializeFile });
+    const message = Message.fromJSON({
+      messageId: 'file',
+      contextId: 'context',
+      role: 'ROLE_USER',
+      parts: [{ text: 'placeholder' }],
+    });
+    message.parts = [
+      {
+        content: { $case: 'raw', value: Buffer.from('file') },
+        mediaType: 'text/plain',
+        filename: 'a.txt',
+        metadata: undefined,
+      },
+    ];
+    const context = new ServerCallContext();
+    const bus = new DefaultExecutionEventBus();
+    const executing = f.native.execute(
+      new RequestContext(
+        { tenant: '', message, configuration: undefined, metadata: undefined },
+        'file-task',
+        'context',
+        context,
+      ),
+      bus,
+    );
+    await vi.waitFor(() => expect(materializeFile).toHaveBeenCalledOnce());
+    try {
+      await f.native.cancel('file-task');
+      await executing;
+      expect(supplied?.aborted).toBe(true);
+      expect(f.agent.inbox.nextTurn).toHaveLength(0);
+      await f.send('after').execution;
+      expect(f.consumed).toHaveLength(1);
+    } finally {
+      release({ readablePath: '/remote/a.txt' });
+      await executing;
+      await f.bridge.dispose();
+    }
+  });
+
   it('bounds parallel task checkpoints and drains all bulk-clear writes before reporting failure', async () => {
     const store = new MemoryTaskStore();
     const f = harness([], store);
@@ -422,6 +473,24 @@ describe('native A2A inbox', () => {
     const { f } = await abortAtCheckpoint('dispose');
     expect(f.agent.send).toHaveBeenCalledOnce();
     expect(f.agent.inbox.nextTurn.map((message) => message.id)).toHaveLength(1);
+  });
+
+  it('scans the session log once for a batch of restored tasks and preserves queue order', async () => {
+    const store = new MemoryTaskStore();
+    const first = harness([], store, true);
+    const requests = Array.from({ length: 12 }, (_, i) =>
+      first.send(`queued-${i}`, { parked: true }),
+    );
+    await vi.waitFor(() => expect(first.agent.inbox.nextTurn).toHaveLength(12));
+    const ids = first.agent.inbox.nextTurn.map((message) => message.id);
+    await first.native.shutdown();
+    await Promise.all(requests.map((request) => request.execution));
+    const restored = harness(structuredClone(first.log), store, true);
+    const snapshots = vi.spyOn(restored.agent.session, 'snapshotEvents');
+    await restored.start();
+    await restored.native.resolve('context');
+    expect(restored.agent.inbox.nextTurn.map((message) => message.id)).toEqual(ids);
+    expect(snapshots.mock.calls.length).toBeLessThanOrEqual(3);
   });
 
   it('recovers checkpoint-committed input after retain-pending shutdown', async () => {

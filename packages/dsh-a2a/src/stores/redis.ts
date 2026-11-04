@@ -9,7 +9,19 @@
 
 import type { ListTasksRequest, ListTasksResponse, Task } from '@a2a-js/sdk';
 import type { ServerCallContext } from '@a2a-js/sdk/server';
-import { listShells, type ManagedTaskStore, taskScopeKey } from '../task-store.js';
+import { type ManagedTaskStore, taskScopeKey } from '../task-store.js';
+import {
+  LIST_PREFIX_BYTES,
+  loadTaskPage,
+  serializeTaskSnapshot,
+  snapshotListShell,
+  taskListShell,
+} from './listing.js';
+
+function parseSnapshot(raw: string): Task {
+  const { _dshTaskList: _, ...task } = JSON.parse(raw);
+  return task as Task;
+}
 
 export interface RedisTaskStoreConfig {
   url: string;
@@ -38,13 +50,18 @@ export class RedisTaskStore implements ManagedTaskStore {
 
   async save(task: Task, context: ServerCallContext): Promise<void> {
     if (!this.redis) return;
-    await this.redis.set(this.taskKey(task.id, context), JSON.stringify(task), 'EX', this.ttl);
+    await this.redis.set(
+      this.taskKey(task.id, context),
+      serializeTaskSnapshot(task),
+      'EX',
+      this.ttl,
+    );
   }
 
   async load(taskId: string, context: ServerCallContext): Promise<Task | undefined> {
     if (!this.redis) return undefined;
     const raw: string | null = await this.redis.get(this.taskKey(taskId, context));
-    return raw ? (JSON.parse(raw) as Task) : undefined;
+    return raw ? parseSnapshot(raw) : undefined;
   }
 
   async delete(taskId: string, context: ServerCallContext): Promise<void> {
@@ -53,11 +70,12 @@ export class RedisTaskStore implements ManagedTaskStore {
 
   async list(params: ListTasksRequest, context: ServerCallContext): Promise<ListTasksResponse> {
     if (!this.redis) return { tasks: [], nextPageToken: '', pageSize: 0, totalSize: 0 };
-    // Task shells are few and TTL-bound — a paged SCAN over the prefix is ample.
+    // SCAN only names; bounded prefixes supply the lightweight list summaries.
     const shells: Task[] = [];
+    const seen = new Set<string>();
     let cursor = '0';
     do {
-      const [next, keys]: [string, string[]] = await this.redis.scan(
+      const [next, scanned]: [string, string[]] = await this.redis.scan(
         cursor,
         'MATCH',
         `${this.prefix}:tasks:${taskScopeKey(context)}:*`,
@@ -65,12 +83,36 @@ export class RedisTaskStore implements ManagedTaskStore {
         100,
       );
       cursor = next;
+      // SCAN may repeat keys during rehashing, including within one batch.
+      const keys = scanned.filter((key) => {
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
       if (keys.length) {
-        const raws: Array<string | null> = await this.redis.mget(...keys);
-        for (const raw of raws) if (raw) shells.push(JSON.parse(raw) as Task);
+        const prefixes: Array<[Error | null, string]> = await this.redis
+          .pipeline(keys.map((key) => ['getrange', key, 0, LIST_PREFIX_BYTES - 1]))
+          .exec();
+        const legacy: string[] = [];
+        prefixes.forEach(([error, prefix], index) => {
+          if (error) throw error;
+          if (!prefix) return; // Expired since SCAN.
+          const shell = snapshotListShell(prefix);
+          if (shell) shells.push(shell);
+          else legacy.push(keys[index]);
+        });
+        if (legacy.length) {
+          const raws: Array<string | null> = await this.redis.mget(...legacy);
+          for (const raw of raws) if (raw) shells.push(taskListShell(parseSnapshot(raw)));
+        }
       }
     } while (cursor !== '0');
-    return listShells(shells, params);
+    return loadTaskPage(shells, params, async (ids) => {
+      const raws: Array<string | null> = await this.redis.mget(
+        ...ids.map((id) => this.taskKey(id, context)),
+      );
+      return raws.map((raw) => (raw ? parseSnapshot(raw) : undefined));
+    });
   }
 
   async close(): Promise<void> {

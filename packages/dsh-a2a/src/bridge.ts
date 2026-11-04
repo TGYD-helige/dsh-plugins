@@ -132,6 +132,7 @@ export class A2aBridge {
     Array<{ id: string; toolName: string; callId?: string }>
   >();
   private readonly approvals = new Map<string, PendingApproval>();
+  private readonly preparing = new Map<AbortController, { contextId: string; taskId?: string }>();
   private readonly codec: A2aApprovalCodec;
   private readonly delegation = new AsyncLocalStorage<Delegation>();
   private readonly children = new WeakMap<
@@ -349,20 +350,35 @@ export class A2aBridge {
         });
   }
 
-  /** A2A parts → dsh content blocks; throws only when no part is usable. */
-  async buildContent(message: Message, contextId: string): Promise<ContentBlock[]> {
-    const attachments = this.ctx.get('attachments');
-    const materializer = this.ctx.get('a2aFileMaterializer') as A2aFileMaterializer | undefined;
-    return buildMessageContent(
-      message.parts,
-      attachments,
-      uploadsDir(this.options.uploadsDir),
-      materializer ? { contextId, materializer } : undefined,
-      {
-        allowPrivate: this.options.downloadAllowPrivate,
-        allowedHosts: this.options.downloadAllowedHosts,
-      },
-    );
+  /** A2A parts → dsh content blocks; rejects unusable messages and cancellation. */
+  async buildContent(
+    message: Message,
+    contextId: string,
+    signal?: AbortSignal,
+    taskId = message.taskId,
+  ): Promise<ContentBlock[]> {
+    const abort = new AbortController();
+    this.preparing.set(abort, { contextId, taskId });
+    const readSignal = signal ? AbortSignal.any([signal, abort.signal]) : abort.signal;
+    try {
+      const attachments = this.ctx.get('attachments');
+      const materializer = this.ctx.get('a2aFileMaterializer') as A2aFileMaterializer | undefined;
+      const content = await buildMessageContent(
+        message.parts,
+        attachments,
+        uploadsDir(this.options.uploadsDir),
+        materializer ? { contextId, materializer } : undefined,
+        {
+          allowPrivate: this.options.downloadAllowPrivate,
+          allowedHosts: this.options.downloadAllowedHosts,
+        },
+        readSignal,
+      );
+      readSignal.throwIfAborted();
+      return content;
+    } finally {
+      this.preparing.delete(abort);
+    }
   }
 
   isClearing(contextId: string): boolean {
@@ -690,6 +706,8 @@ export class A2aBridge {
   ): Promise<string[]> {
     if (this.clearing.has(contextId)) throw new Error('Context is already being cleared.');
     this.clearing.add(contextId);
+    for (const [abort, pending] of this.preparing)
+      if (pending.contextId === contextId) abort.abort();
     try {
       await this.inbox?.clear(contextId);
       await Promise.allSettled([...(this.creating.get(contextId) ?? [])]);
@@ -727,8 +745,14 @@ export class A2aBridge {
 
   /** Abort the task's active turn; returns the contextId when the task is live. */
   cancel(taskId: string): string | undefined {
+    let preparingContext: string | undefined;
+    for (const [abort, pending] of this.preparing) {
+      if (pending.taskId !== taskId) continue;
+      preparingContext = pending.contextId;
+      abort.abort();
+    }
     const entry = this.tasks.get(taskId);
-    if (!entry) return undefined;
+    if (!entry) return preparingContext;
     const staleTurn = entry.turnActive;
     this.settleEntry(entry, 'Task canceled by request.');
     entry.staleTurn ||= staleTurn;
@@ -746,6 +770,7 @@ export class A2aBridge {
 
   /** Dispose every owned agent (plugin unload / server shutdown). */
   async dispose(): Promise<void> {
+    for (const abort of this.preparing.keys()) abort.abort();
     try {
       await this.inbox?.shutdown();
     } catch (error) {

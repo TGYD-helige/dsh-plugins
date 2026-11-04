@@ -179,6 +179,8 @@ export function evaluate(
   );
   if (candidates.length === 0) return undefined;
   const argsJson = JSON.stringify(args ?? null);
+  const matching = candidates.filter((rule) => argsMatch(rule, args, argsJson));
+  if (matching.length === 0) return undefined;
   const command = extractCommand(args, commandKeys);
   // A call without a shell command is one virtual whole-call segment — only
   // rules without command conditions can match it.
@@ -190,8 +192,7 @@ export function evaluate(
   const best: Partial<Record<PolicyDecisionKind, CompiledRule>> = {};
   for (const segment of segments) {
     let winner: CompiledRule | undefined;
-    for (const rule of candidates) {
-      if (!argsMatch(rule, args, argsJson)) continue;
+    for (const rule of matching) {
       if (!matchesSegment(rule, segment, dialect)) continue;
       winner = winner === undefined ? rule : prefer(winner, rule);
     }

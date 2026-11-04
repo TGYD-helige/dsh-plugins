@@ -101,7 +101,7 @@ export class DshAgentExecutor implements AgentExecutor {
         await this.bridge.waitForTurn(approval.entry);
         return;
       }
-      const content = await this.bridge.buildContent(userMessage, contextId);
+      const content = await this.bridge.buildContent(userMessage, contextId, undefined, taskId);
       const { entry, freshTask } = await this.bridge.ensureTask(taskId, contextId);
       eventBus.publish(
         freshTask
@@ -132,14 +132,22 @@ export class DshAgentExecutor implements AgentExecutor {
       fail();
       if (this.bridge.isClearing(contextId)) this.suppressTask?.(taskId);
       const message = error instanceof Error ? error.message : String(error);
+      const canceled = error instanceof Error && error.name === 'AbortError';
       if (!anchored) {
         eventBus.publish(
-          taskEvent(taskId, contextId, TaskState.TASK_STATE_FAILED, {
-            message: agentTextMessage(taskId, contextId, message),
-          }),
+          taskEvent(
+            taskId,
+            contextId,
+            canceled ? TaskState.TASK_STATE_CANCELED : TaskState.TASK_STATE_FAILED,
+            {
+              message: agentTextMessage(taskId, contextId, message),
+            },
+          ),
         );
       }
-      eventBus.publish(terminalStatusUpdate(taskId, contextId, 'failed', message));
+      eventBus.publish(
+        terminalStatusUpdate(taskId, contextId, canceled ? 'canceled' : 'failed', message),
+      );
     } finally {
       eventBus.finished();
     }

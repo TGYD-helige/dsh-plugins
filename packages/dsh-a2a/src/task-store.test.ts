@@ -1,3 +1,4 @@
+import { gzipSync } from 'node:zlib';
 import {
   type ListTasksRequest,
   type ListTasksResponse,
@@ -12,14 +13,17 @@ import { listShells, MemoryTaskStore, SanitizedTaskStore, sanitizeTask } from '.
 const mocks = vi.hoisted(() => {
   class MockRedis {
     static instances: MockRedis[] = [];
+    static database = new Map<string, string>();
     readonly calls = {
       set: [] as unknown[][],
       get: [] as string[],
       mget: 0,
+      mgetKeys: [] as string[][],
+      ranges: [] as unknown[][],
       del: [] as string[],
       quit: 0,
     };
-    private readonly data = new Map<string, string>();
+    private readonly data = MockRedis.database;
     constructor(readonly url: string) {
       MockRedis.instances.push(this);
     }
@@ -34,7 +38,25 @@ const mocks = vi.hoisted(() => {
     }
     async mget(...keys: string[]) {
       this.calls.mget += 1;
+      this.calls.mgetKeys.push(keys);
       return keys.map((key) => this.data.get(key) ?? null);
+    }
+    pipeline(commands: Array<[string, string, number, number]>) {
+      return {
+        exec: async () =>
+          commands.map(([, key, start, end]) => {
+            this.calls.ranges.push([key, start, end]);
+            const raw = this.data.get(key);
+            return [
+              null,
+              raw === undefined
+                ? ''
+                : Buffer.from(raw)
+                    .subarray(start, end + 1)
+                    .toString(),
+            ];
+          }),
+      };
     }
     async del(key: string) {
       this.calls.del.push(key);
@@ -57,14 +79,30 @@ vi.mock('ioredis', () => ({ Redis: mocks.MockRedis, default: mocks.MockRedis }))
 
 const gcs = vi.hoisted(() => {
   const files = new Map<string, Buffer>();
-  const activity = { active: 0, maxActive: 0 };
+  const activity = {
+    probes: 0,
+    active: 0,
+    maxActive: 0,
+    downloads: [] as string[],
+    error: undefined as number | undefined,
+  };
+  const metadata = new Map<string, unknown>();
   const file = (name: string) => ({
     name,
-    save: async (value: Buffer) => {
+    metadata: metadata.get(name),
+    save: async (value: Buffer, options?: { metadata?: unknown }) => {
       files.set(name, value);
+      metadata.set(name, options?.metadata);
     },
-    exists: async () => [files.has(name)],
+    exists: async () => {
+      activity.probes++;
+      return [files.has(name)];
+    },
     download: async () => {
+      if (activity.error)
+        throw Object.assign(new Error('download failed'), { code: activity.error });
+      if (!files.has(name)) throw Object.assign(new Error('not found'), { code: 404 });
+      activity.downloads.push(name);
       activity.active += 1;
       activity.maxActive = Math.max(activity.maxActive, activity.active);
       await new Promise<void>((resolve) => setImmediate(resolve));
@@ -73,6 +111,7 @@ const gcs = vi.hoisted(() => {
     },
     delete: async () => {
       files.delete(name);
+      metadata.delete(name);
     },
   });
   class Storage {
@@ -85,7 +124,7 @@ const gcs = vi.hoisted(() => {
       };
     }
   }
-  return { files, activity, Storage };
+  return { files, metadata, activity, Storage };
 });
 vi.mock('@google-cloud/storage', () => ({ Storage: gcs.Storage }));
 
@@ -511,6 +550,7 @@ describe('SanitizedTaskStore', () => {
 describe('RedisTaskStore', () => {
   beforeEach(() => {
     mocks.MockRedis.instances = [];
+    mocks.MockRedis.database.clear();
   });
 
   it('writes scoped task JSON with a TTL and reads it back', async () => {
@@ -525,7 +565,7 @@ describe('RedisTaskStore', () => {
     // SanitizedTaskStore wrapper's job.
     const key = redis.calls.set[0][0] as string;
     expect(key).toMatch(/^a2a:tasks:[a-f0-9]{64}:t1$/);
-    expect(redis.calls.set[0]).toEqual([key, JSON.stringify(value), 'EX', 60]);
+    expect(redis.calls.set[0].slice(2)).toEqual(['EX', 60]);
 
     const loaded = await store.load('t1', ctx);
     expect(loaded).toEqual(value);
@@ -538,11 +578,75 @@ describe('RedisTaskStore', () => {
     expect(redis.calls.quit).toBe(1);
   });
 
+  it('reads only bounded prefixes and the selected full snapshots after restart', async () => {
+    const first = new RedisTaskStore({ url: 'redis://example:6379' });
+    await first.init();
+    for (let i = 0; i < 30; i++) {
+      await first.save(
+        task(TaskState.TASK_STATE_COMPLETED, {
+          id: `t${i}`,
+          contextId: i < 3 ? 'wanted' : 'other',
+          status: {
+            state: TaskState.TASK_STATE_COMPLETED,
+            message: undefined,
+            timestamp: `2026-01-01T00:00:${String(i).padStart(2, '0')}Z`,
+          },
+          metadata: { payload: 'x'.repeat(100_000) },
+        }),
+        ctx,
+      );
+    }
+    const restored = new RedisTaskStore({ url: 'redis://example:6379' });
+    await restored.init();
+    const redis = mocks.MockRedis.instances[1];
+    const page = await restored.list(
+      listParams({ contextId: 'wanted', pageSize: 2, includeArtifacts: true }),
+      ctx,
+    );
+    expect(page.totalSize).toBe(3);
+    expect(page.tasks.map((item) => item.id)).toEqual(['t2', 't1']);
+    expect(page.tasks[0].artifacts).toHaveLength(1);
+    expect(page.tasks[0].metadata?.payload).toHaveLength(100_000);
+    expect(redis.calls.mgetKeys.flat()).toHaveLength(2);
+    expect(redis.calls.ranges).toHaveLength(30);
+    await first.delete('t0', ctx);
+    expect((await restored.list(listParams({ contextId: 'wanted' }), ctx)).totalSize).toBe(2);
+  });
+
+  it('omits a task that expires between summary enumeration and page hydration', async () => {
+    const store = new RedisTaskStore({ url: 'redis://example:6379' });
+    await store.init();
+    await store.save(task(TaskState.TASK_STATE_COMPLETED), ctx);
+    const redis = mocks.MockRedis.instances[0];
+    vi.spyOn(redis, 'mget').mockImplementationOnce(async (...keys) => {
+      for (const key of keys) mocks.MockRedis.database.delete(key);
+      return keys.map(() => null);
+    });
+    expect((await store.list(listParams(), ctx)).tasks).toEqual([]);
+    expect(await store.load('t1', ctx)).toBeUndefined();
+  });
+
   it('honors a custom key prefix', async () => {
     const store = new RedisTaskStore({ url: 'redis://example:6379', keyPrefix: 'x' });
     await store.init();
     await store.save(task(TaskState.TASK_STATE_WORKING), ctx);
     expect(mocks.MockRedis.instances[0].calls.set[0][0]).toMatch(/^x:tasks:[a-f0-9]{64}:t1$/);
+  });
+
+  it('does not duplicate tasks when Redis SCAN repeats a key', async () => {
+    const store = new RedisTaskStore({ url: 'redis://example:6379' });
+    await store.init();
+    await store.save(task(TaskState.TASK_STATE_COMPLETED), ctx);
+    const redis = mocks.MockRedis.instances[0];
+    const key = redis.calls.set[0][0] as string;
+    vi.spyOn(redis, 'scan')
+      .mockResolvedValueOnce(['1', [key, key]])
+      .mockResolvedValueOnce(['0', [key]]);
+    const page = await store.list(listParams({ pageSize: 1 }), ctx);
+    expect(page.totalSize).toBe(1);
+    expect(page.nextPageToken).toBe('');
+    expect(page.tasks.map((task) => task.id)).toEqual(['t1']);
+    expect(redis.calls.ranges).toHaveLength(1);
   });
 
   it('lists shells through the shared filter/sort/paginate path', async () => {
@@ -578,6 +682,65 @@ describe('RedisTaskStore', () => {
 });
 
 describe('GcsTaskStore', () => {
+  beforeEach(() => {
+    gcs.files.clear();
+    gcs.metadata.clear();
+    gcs.activity.error = undefined;
+  });
+  it('loads only the requested page of full snapshots after a restart', async () => {
+    gcs.files.clear();
+    const first = new GcsTaskStore({ bucket: 'test' });
+    await first.init();
+    for (let i = 0; i < 30; i++) {
+      await first.save(
+        task(TaskState.TASK_STATE_INPUT_REQUIRED, {
+          id: `task-${i}`,
+          contextId: i < 3 ? 'wanted' : 'other',
+          status: {
+            state: TaskState.TASK_STATE_INPUT_REQUIRED,
+            message: undefined,
+            timestamp: `2026-01-01T00:00:${String(i).padStart(2, '0')}Z`,
+          },
+        }),
+        ctx,
+      );
+    }
+    const restored = new GcsTaskStore({ bucket: 'test' });
+    await restored.init();
+    gcs.activity.downloads.length = 0;
+    const firstPage = await restored.list(
+      listParams({ contextId: 'wanted', pageSize: 2, includeArtifacts: true }),
+      ctx,
+    );
+    expect(firstPage.totalSize).toBe(3);
+    expect(firstPage.tasks.map((item) => item.id)).toEqual(['task-2', 'task-1']);
+    expect(firstPage.tasks[0].history[0].messageId).toBe('m1');
+    expect(firstPage.tasks[0].artifacts).toHaveLength(1);
+    expect(gcs.activity.downloads).toHaveLength(2);
+    const secondPage = await restored.list(
+      listParams({ contextId: 'wanted', pageSize: 2, pageToken: firstPage.nextPageToken }),
+      ctx,
+    );
+    expect(secondPage.tasks.map((item) => item.id)).toEqual(['task-0']);
+    expect(secondPage.tasks[0].artifacts).toEqual([]);
+    expect(secondPage.nextPageToken).toBe('');
+    expect(gcs.activity.downloads).toHaveLength(3);
+  });
+
+  it('skips concurrent deletion but propagates download failures', async () => {
+    const store = new GcsTaskStore({ bucket: 'test' });
+    await store.init();
+    await store.save(task(TaskState.TASK_STATE_COMPLETED), ctx);
+    gcs.activity.error = 404;
+    expect((await store.list(listParams(), ctx)).tasks).toEqual([]);
+    gcs.activity.error = 403;
+    await expect(store.list(listParams(), ctx)).rejects.toThrow('download failed');
+    gcs.activity.error = undefined;
+    const key = [...gcs.files.keys()][0];
+    gcs.metadata.set(key, { metadata: { dshTaskList: '{broken JSON' } });
+    expect((await store.list(listParams(), ctx)).tasks[0].id).toBe('t1');
+  });
+
   it('keeps stored task history in the caller scope', async () => {
     gcs.files.clear();
     const store = new GcsTaskStore({ bucket: 'test' });
@@ -587,6 +750,19 @@ describe('GcsTaskStore', () => {
     expect(await store.load('t1', other)).toBeUndefined();
     expect((await store.list(listParams(), other)).tasks).toEqual([]);
     expect((await store.load('t1', ctx))?.history[0].messageId).toBe('m1');
+  });
+
+  it('loads GCS snapshots with one request and only treats 404 as missing', async () => {
+    const store = new GcsTaskStore({ bucket: 'test' });
+    await store.init();
+    await store.save(task(TaskState.TASK_STATE_COMPLETED), ctx);
+    gcs.activity.probes = 0;
+    expect((await store.load('t1', ctx))?.id).toBe('t1');
+    expect(gcs.activity.probes).toBe(0);
+    expect(await store.load('missing', ctx)).toBeUndefined();
+    gcs.activity.error = 403;
+    await expect(store.load('t1', ctx)).rejects.toThrow('download failed');
+    gcs.activity.error = undefined;
   });
 
   it('downloads list snapshots with bounded concurrency', async () => {
@@ -601,3 +777,109 @@ describe('GcsTaskStore', () => {
     expect(gcs.activity.maxActive).toBeLessThanOrEqual(16);
   });
 });
+
+for (const backend of ['redis', 'gcs'] as const) {
+  describe(`${backend} listing compatibility`, () => {
+    beforeEach(() => {
+      mocks.MockRedis.instances = [];
+      mocks.MockRedis.database.clear();
+      gcs.files.clear();
+      gcs.metadata.clear();
+      gcs.activity.error = undefined;
+    });
+    const create = () =>
+      backend === 'redis'
+        ? new RedisTaskStore({ url: 'redis://example:6379' })
+        : new GcsTaskStore({ bucket: 'test' });
+
+    it('lists legacy snapshots alongside indexed snapshots without losing content', async () => {
+      const store = create();
+      await store.init();
+      const old = task(TaskState.TASK_STATE_COMPLETED, { id: 'old' });
+      await store.save(old, ctx);
+      if (backend === 'redis') {
+        const key = [...mocks.MockRedis.database.keys()][0];
+        mocks.MockRedis.database.set(key, JSON.stringify(old));
+      } else {
+        const key = [...gcs.files.keys()][0];
+        gcs.files.set(key, gzipSync(JSON.stringify(old)));
+        gcs.metadata.delete(key);
+      }
+      await store.save(task(TaskState.TASK_STATE_COMPLETED, { id: 'new' }), ctx);
+      const restored = create();
+      await restored.init();
+      const page = await restored.list(listParams({ includeArtifacts: true }), ctx);
+      expect(page.totalSize).toBe(2);
+      expect(page.tasks.map((item) => item.id).sort()).toEqual(['new', 'old']);
+      expect(page.tasks.find((item) => item.id === 'old')).toEqual(old);
+      expect(await restored.load('old', ctx)).toEqual(old);
+    });
+
+    it('falls back for an oversized summary and observes subsequent updates and deletion', async () => {
+      const store = create();
+      await store.init();
+      const value = task(TaskState.TASK_STATE_WORKING, { contextId: '长'.repeat(4000) });
+      await store.save(value, ctx);
+      const query = listParams({ contextId: value.contextId, includeArtifacts: true });
+      expect((await store.list(query, ctx)).tasks).toEqual([value]);
+      await store.save(
+        { ...value, status: { ...value.status!, state: TaskState.TASK_STATE_COMPLETED } },
+        ctx,
+      );
+      expect(
+        (await store.list({ ...query, status: TaskState.TASK_STATE_WORKING }, ctx)).tasks,
+      ).toEqual([]);
+      expect(
+        (await store.list({ ...query, status: TaskState.TASK_STATE_COMPLETED }, ctx)).totalSize,
+      ).toBe(1);
+      await store.delete(value.id, ctx);
+      expect((await store.list(query, ctx)).tasks).toEqual([]);
+    });
+
+    it('keeps status/time filtering and cursor error semantics', async () => {
+      const store = create();
+      await store.init();
+      await store.save(
+        task(TaskState.TASK_STATE_COMPLETED, {
+          id: 'a',
+          status: {
+            state: TaskState.TASK_STATE_COMPLETED,
+            message: undefined,
+            timestamp: '2026-01-01T00:00:00Z',
+          },
+        }),
+        ctx,
+      );
+      await store.save(
+        task(TaskState.TASK_STATE_WORKING, {
+          id: 'b',
+          status: {
+            state: TaskState.TASK_STATE_WORKING,
+            message: undefined,
+            timestamp: '2026-01-01T00:00:01Z',
+          },
+        }),
+        ctx,
+      );
+      const page = await store.list(
+        listParams({
+          statusTimestampAfter: '2026-01-01T00:00:00Z',
+          status: TaskState.TASK_STATE_WORKING,
+        }),
+        ctx,
+      );
+      expect(page.tasks.map((item) => item.id)).toEqual(['b']);
+      expect(
+        (
+          await store.list(
+            listParams({ pageToken: Buffer.from('timestamp|missing').toString('base64') }),
+            ctx,
+          )
+        ).tasks,
+      ).toEqual([]);
+      await expect(
+        store.list(listParams({ pageToken: Buffer.from('malformed').toString('base64') }), ctx),
+      ).rejects.toThrow('invalid page token');
+    });
+  });
+}
