@@ -85,6 +85,7 @@ export async function checkMetadataWire({ require, connection, captured }) {
     new SessionStore(ctx);
     await ctx.plugin(SystemPrompt);
     await ctx.plugin(ToolRuntime);
+    await ctx.plugin(await import(require.resolve('@deepseek-ai/dsh-tool-executor-native')));
     await apply(ctx, { ...connection, enabled: true, traceName: 'dsh-turn', captureContent: true });
     await ctx.plugin({ name: 'metadata-context-fixture', apply: applyMetadataBridge });
     const first = ctx.sessions.create();
@@ -109,14 +110,16 @@ export async function checkMetadataWire({ require, connection, captured }) {
       for await (const chunk of stream) chunks.push(chunk);
       return chunks;
     };
-    const execute = (session, name, callId) =>
-      ctx.tools.execute({
-        name,
-        arguments: { path: marker },
-        callId,
-        agent: { id: session.id },
-        signal: new AbortController().signal,
-      });
+    const execute = async (session, name, callId) =>
+      (
+        await ctx.tools.execute({
+          calls: [
+            { type: 'tool-call', name, id: callId, arguments: JSON.stringify({ path: marker }) },
+          ],
+          agent: { id: session.id },
+          signal: new AbortController().signal,
+        })
+      ).results[0].result;
     const output = {
       schema: { type: 'string' },
       render: (_args, value) => [{ type: 'text', text: value }],

@@ -791,7 +791,7 @@ async function scenarioMain({
 
   let hookPatch = '';
   if (hook) {
-    const version = envOr(process.env.DSH_CLI_VERSION, '0.2.1-rc.5');
+    const version = envOr(process.env.DSH_CLI_VERSION, '0.2.2-rc.1');
     run(
       dsh,
       [

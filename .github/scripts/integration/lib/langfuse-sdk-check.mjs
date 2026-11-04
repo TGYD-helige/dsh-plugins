@@ -377,6 +377,7 @@ try {
   new HookSessionStore(ctx);
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
+  await ctx.plugin(await import(require.resolve('@deepseek-ai/dsh-tool-executor-native')));
   await apply(ctx, { ...connection, enabled: true, traceName: 'dsh-turn', captureContent: true });
   await ctx.plugin({ name: 'tool-hooks-fixture', apply: applyHookBridge });
   const toolSession = ctx.sessions.create(undefined, { meta: { cwd: hookWorkDir } });
@@ -410,13 +411,18 @@ try {
     /* drain */
   }
   const hookToolResult = await ctx.tools.execute({
-    name: 'read',
-    arguments: { path: markerFile },
-    callId: 'hook-call',
+    calls: [
+      {
+        type: 'tool-call',
+        name: 'read',
+        id: 'hook-call',
+        arguments: JSON.stringify({ path: markerFile }),
+      },
+    ],
     agent: { id: toolSession.id },
     signal: new AbortController().signal,
   });
-  assert.equal(hookToolResult.isError, false);
+  assert.equal(hookToolResult.results[0].result.isError, false);
   toolSession.append('turn/end', { turn: 0, reason: { kind: 'completed' } });
   await ctx.parallel('session/flush', toolSession);
   const treeSpans = captured.slice(treeOffset);
