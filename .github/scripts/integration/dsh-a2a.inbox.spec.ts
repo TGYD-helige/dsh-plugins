@@ -17,6 +17,7 @@ import SessionStore from '@deepseek-ai/dsh-session';
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native';
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { A2aBridge } from '../../../packages/dsh-a2a/src/bridge.js';
@@ -104,6 +105,7 @@ async function boot(
     SessionProjectionRegistry,
     SystemPrompt,
     ToolRuntime,
+    NativeExecutor,
     AgentRegistry,
   ])
     await ctx.plugin(plugin);
@@ -2987,6 +2989,7 @@ describe('graceful retention', () => {
       SessionProjectionRegistry,
       SystemPrompt,
       ToolRuntime,
+      NativeExecutor,
       AgentRegistry,
     ])
       await ctx.plugin(plugin);

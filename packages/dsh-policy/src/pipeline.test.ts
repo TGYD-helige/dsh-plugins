@@ -10,8 +10,9 @@
 import { Context } from '@deepseek-ai/cordis';
 import type { ToolCallId } from '@deepseek-ai/dsh-llm';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native';
 import ToolRuntime, { defineTool, type ToolExecutionResult } from '@deepseek-ai/dsh-tools';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { apply, type PolicyPluginConfig } from './index.js';
 
 /** Commands the tool body actually ran (the gate's ground truth). */
@@ -39,19 +40,26 @@ async function setup(config?: PolicyPluginConfig): Promise<Context> {
   const ctx = new Context();
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
+  await ctx.plugin(NativeExecutor);
   registerBash(ctx);
   if (config) apply(ctx, config);
   return ctx;
 }
 
 let callSeq = 0;
-function runBash(ctx: Context, command: string): Promise<ToolExecutionResult> {
-  return ctx.tools.execute({
-    callId: `c${++callSeq}` as ToolCallId,
-    name: 'bash',
-    arguments: { command },
+async function runBash(ctx: Context, command: string): Promise<ToolExecutionResult> {
+  const batch = await ctx.tools.execute({
+    calls: [
+      {
+        type: 'tool-call',
+        id: `c${++callSeq}` as ToolCallId,
+        name: 'bash',
+        arguments: JSON.stringify({ command }),
+      },
+    ],
     signal: new AbortController().signal,
   });
+  return batch.results[0].result;
 }
 
 describe('dsh-policy against the real tools pipeline', () => {

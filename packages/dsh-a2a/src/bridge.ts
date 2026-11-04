@@ -306,15 +306,9 @@ export class A2aBridge {
       agentPreset = (await presets.resolve(this.options.preset || undefined)).id;
     }
 
-    const agentOptions = selection
-      ? { provider: selection.provider, model: selection.model }
-      : undefined;
-    // The loop's `{{model}}` prompt variable and request routing resolve from
-    // the agent's installed model selection (dsh-agent-loop's variables read
-    // agent.options; the scoped waterfalls wire provider/model into prompt
-    // assembly and the request config). Verified against
-    // @deepseek-ai/dsh-headless@0.1.6-alpha.2's run() — entry points are
-    // expected to resolve the deployment default themselves.
+    const agentOptions = selection ? { ...selection } : undefined;
+    // DSH 0.2.2 reads the initial route and effort from agent options;
+    // installModelSelection only adds scoped model-switch notices.
     const setup =
       selection || agentPreset
         ? async (agentCtx: Context) => {
@@ -323,7 +317,7 @@ export class A2aBridge {
               // be invoked as the setup commit and immediately unwired. Likewise
               // the mount result must not escape — setup's return value is
               // commit()-shaped to the factory.
-              installModelSelection(agentCtx, { current: selection, assembled: undefined });
+              installModelSelection(agentCtx);
             }
             if (agentPreset) await presets!.mount(agentCtx, agentPreset);
           }

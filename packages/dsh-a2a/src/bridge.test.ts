@@ -2317,15 +2317,9 @@ describe('A2aBridge + DshAgentExecutor', () => {
       expect(createCalls()[0][0].agentOptions).toEqual({
         provider: 'deepseek-official',
         model: 'deepseek-v4-flash',
+        reasoningEffort: 'low',
       });
-      expect(mocks.installModelSelection).toHaveBeenCalledWith(ctx, {
-        current: {
-          provider: 'deepseek-official',
-          model: 'deepseek-v4-flash',
-          reasoningEffort: 'low',
-        },
-        assembled: undefined,
-      });
+      expect(mocks.installModelSelection).toHaveBeenCalledWith(ctx);
     });
 
     it('prefers the configured provider/model over the deployment default', async () => {
@@ -2341,12 +2335,7 @@ describe('A2aBridge + DshAgentExecutor', () => {
         provider: 'my-provider',
         model: 'my-model',
       });
-      expect(mocks.installModelSelection).toHaveBeenCalledWith(
-        ctx,
-        expect.objectContaining({
-          current: expect.objectContaining({ provider: 'my-provider', model: 'my-model' }),
-        }),
-      );
+      expect(mocks.installModelSelection).toHaveBeenCalledWith(ctx);
     });
 
     it('creates the agent without a selection when neither source has one', async () => {

@@ -216,6 +216,7 @@ function harness(seed: SessionEvent[] = [], store = new MemoryTaskStore(), retai
                   messages,
                   turn,
                   step: 1,
+                  modelSelection: { provider: 'mock', model: 'mock' },
                   signal: new AbortController().signal,
                 },
                 async () => ({ kind: 'enter' as const, messages }),

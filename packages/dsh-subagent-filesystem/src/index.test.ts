@@ -8,6 +8,7 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import type SessionQuery from '@deepseek-ai/dsh-session-query';
 import type Subagents from '@deepseek-ai/dsh-subagent';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native';
 import Tools from '@deepseek-ai/dsh-tools';
 import { afterEach, expect, it, vi } from 'vitest';
 import { apply, inject } from './index.js';
@@ -27,6 +28,7 @@ async function setup(
   contexts.push(ctx);
   await ctx.plugin(SystemPrompt, { personaPrefix: 'Application rules' });
   await ctx.plugin(Tools);
+  await ctx.plugin(NativeExecutor);
   ctx.systemPrompt.section({ name: 'core', order: 0, text: 'Core instructions' });
   const target = (path: string): FsTarget => ({
     targetKey: FsTargetKey(`remote:${path}`),
@@ -106,17 +108,24 @@ async function setup(
   await plugin;
   const parent = agent('parent', '/remote/a');
   await ctx.serial('agent/created', { agent: parent, source: 'startup' });
-  const delegate = (
+  const delegate = async (
     a = parent,
     args: unknown = { description: 'Check stock', prompt: 'Explain discrepancy' },
   ) =>
-    ctx.tools.execute({
-      name: 'subagent_inventory_analyst',
-      callId: 'call-1' as never,
-      arguments: args,
-      signal: new AbortController().signal,
-      agent: a,
-    });
+    (
+      await ctx.tools.execute({
+        calls: [
+          {
+            type: 'tool-call',
+            id: 'call-1' as never,
+            name: 'subagent_inventory_analyst',
+            arguments: JSON.stringify(args),
+          },
+        ],
+        signal: new AbortController().signal,
+        agent: a,
+      })
+    ).results[0].result;
   return { ctx, fs, files, agents, records, parent, agent, delegate, start, dispose, plugin };
 }
 
@@ -311,13 +320,18 @@ it('honors the tool policy gate and passes the native depth limit and cancellati
   expect(
     (
       await h.ctx.tools.execute({
-        name: 'subagent_inventory_analyst',
-        callId: 'canceled' as never,
-        arguments: { description: 'Stock', prompt: 'Check' },
+        calls: [
+          {
+            type: 'tool-call',
+            id: 'canceled' as never,
+            name: 'subagent_inventory_analyst',
+            arguments: JSON.stringify({ description: 'Stock', prompt: 'Check' }),
+          },
+        ],
         agent: h.parent,
         signal: abort.signal,
       })
-    ).isError,
+    ).results[0].result.isError,
   ).toBe(true);
   expect(h.start).toHaveBeenCalledOnce();
 });

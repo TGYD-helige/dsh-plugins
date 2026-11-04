@@ -19,6 +19,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { LangfuseReporter, usageOf } from './client.js';
 import { appendHookEvent, apply, inject, type LangfusePluginConfig, name } from './index.js';
 
+declare module '@deepseek-ai/dsh-llm' {
+  interface LlmRequestPurposeMap {
+    compaction: true;
+  }
+}
+
 // The shared Langfuse SDK mock: the v5 SDK surface is three modules —
 // @langfuse/tracing (startObservation + setLangfuseTracerProvider),
 // @langfuse/otel (LangfuseSpanProcessor) and @opentelemetry/sdk-trace-node

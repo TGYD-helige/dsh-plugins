@@ -14,7 +14,7 @@ dsh plugin --profile my-agent add @amaster.ai/dsh-a2a
 
 ## Native inbox execution
 
-`inbox.enabled: true` uses the official DSH inbox (`Agent.send`) for ordinary `next-turn` input and `next-step` steering. Tested with the unmodified npm runtime `0.2.1-rc.5`; no core patch is required. Cold task recovery scans committed input once per batch and groups it by task, preserving input order. The queue and its durable projection belong to DSH. The plugin only materializes messages, attaches A2A task identities, and translates execution events.
+`inbox.enabled: true` uses the official DSH inbox (`Agent.send`) for ordinary `next-turn` input and `next-step` steering. Requires `@deepseek-ai/dsh-agent >=0.2.2-rc.1` for model selection through agent options. Tested with the unmodified npm runtime `0.2.2-rc.1`; no core patch is required. Cold task recovery scans committed input once per batch and groups it by task, preserving input order. The queue and its durable projection belong to DSH. The plugin only materializes messages, attaches A2A task identities, and translates execution events.
 
 Standard `SendMessage` / `SendStreamingMessage`, task queries, cancellation and task subscriptions keep their official meanings. Optional inbox metadata forwards `target` and `wakeup` to DSH. `wakeup: false` leaves an idle driver parked; it does not prevent an active driver from consuming pending input. A later real waking message releases pending input.
 
@@ -411,9 +411,9 @@ dsh ships **no authentication or authorization**. The server binds `127.0.0.1` b
 
 ## Compatibility
 
-Optional Goal integration requires `@deepseek-ai/dsh-goal >=0.2.0-rc.2 || >=0.2.1-alpha.1` and the official Goal round driver (both tested at `0.2.1-rc.5`).
+Optional Goal integration requires `@deepseek-ai/dsh-goal >=0.2.0-rc.2 || >=0.2.1-alpha.1 || >=0.2.2-rc.1` and the official Goal round driver (both tested at `0.2.2-rc.1`).
 
-Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment,tools}@0.2.1-rc.5` — the attachment store is an optional peer) — the session peer floor is `>=0.2.1-rc.5` for the owner-scoped `SessionStore.flush` checkpoint barrier; check the `TODO(verify)` markers in `src/` before upgrading dsh.
+Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#compatibility). Event payloads ride pre-release dsh APIs (`@deepseek-ai/dsh-{agent,session,llm,attachment,tools}@0.2.2-rc.1` — the attachment store is an optional peer) — the session peer floor is `>=0.2.1-rc.5 || >=0.2.2-rc.1` for the owner-scoped `SessionStore.flush` checkpoint barrier; check the `TODO(verify)` markers in `src/` before upgrading dsh.
 
 ## Standard A2A notifications
 

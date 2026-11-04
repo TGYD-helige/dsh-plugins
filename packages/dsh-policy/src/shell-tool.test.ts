@@ -17,6 +17,7 @@ import ShellExecutor, {
 import * as shellEnv from '@deepseek-ai/dsh-shell-env';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import * as bashTool from '@deepseek-ai/dsh-tool-bash';
+import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native';
 import ToolRuntime, { type ToolExecutionResult } from '@deepseek-ai/dsh-tools';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { apply, type PolicyPluginConfig } from './index.js';
@@ -55,6 +56,7 @@ async function setup(config?: PolicyPluginConfig): Promise<Context> {
   const ctx = new Context();
   await ctx.plugin(SystemPrompt);
   await ctx.plugin(ToolRuntime);
+  await ctx.plugin(NativeExecutor);
   await ctx.plugin(shellEnv, undefined);
   await ctx.plugin(StubShell, undefined);
   // The real model-facing bash tool; background is off so ctx.jobs is never
@@ -66,13 +68,19 @@ async function setup(config?: PolicyPluginConfig): Promise<Context> {
 }
 
 let callSeq = 0;
-function runBash(ctx: Context, command: string): Promise<ToolExecutionResult> {
-  return ctx.tools.execute({
-    callId: `c${++callSeq}` as ToolCallId,
-    name: 'bash',
-    arguments: { command, description: 'policy test call' },
+async function runBash(ctx: Context, command: string): Promise<ToolExecutionResult> {
+  const batch = await ctx.tools.execute({
+    calls: [
+      {
+        type: 'tool-call',
+        id: `c${++callSeq}` as ToolCallId,
+        name: 'bash',
+        arguments: JSON.stringify({ command, description: 'policy test call' }),
+      },
+    ],
     signal: new AbortController().signal,
   });
+  return batch.results[0].result;
 }
 
 const shellOf = (ctx: Context): StubShell => ctx.shell as StubShell;
