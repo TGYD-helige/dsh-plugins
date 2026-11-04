@@ -1,4 +1,4 @@
-import { Message, Role, TaskState } from '@a2a-js/sdk';
+import { Message, Role, Task, TaskState } from '@a2a-js/sdk';
 import { DefaultExecutionEventBus, RequestContext, ServerCallContext } from '@a2a-js/sdk/server';
 import { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
@@ -16,6 +16,64 @@ import { MemoryTaskStore } from './task-store.js';
 
 const contexts: Context[] = [];
 const cleanups: Array<() => Promise<void>> = [];
+
+it('discovers scoped recovery candidates without resolving or waking agents', async () => {
+  const store = new MemoryTaskStore();
+  const user = { userName: 'owner', isAuthenticated: true };
+  const call = new ServerCallContext({ tenant: 'Tenant', user });
+  for (const [id, contextId, state] of [
+    ['pending', 'Context', TaskState.TASK_STATE_SUBMITTED],
+    ['paused', 'Context', TaskState.TASK_STATE_INPUT_REQUIRED],
+    ['interrupted', 'context', TaskState.TASK_STATE_WORKING],
+    ['done', 'completed', TaskState.TASK_STATE_COMPLETED],
+    ['stopped', 'canceled', TaskState.TASK_STATE_CANCELED],
+    ['failed', 'failed', TaskState.TASK_STATE_FAILED],
+    ['rejected', 'rejected', TaskState.TASK_STATE_REJECTED],
+    ['unknown', 'unknown', TaskState.TASK_STATE_UNSPECIFIED],
+  ] as const)
+    await store.save(Task.fromJSON({ id, contextId, status: { state } }), call);
+  const f = harness([], store);
+  const resolve = vi.spyOn(f.native, 'resolve');
+  const create = vi.spyOn(f.ctx.get('agents')!, 'create');
+  expect(await f.native.recoveryCandidates(call)).toEqual(['Context', 'context', 'unknown']);
+  expect(
+    await f.native.recoveryCandidates(new ServerCallContext({ tenant: 'tenant', user })),
+  ).toEqual([]);
+  expect(await f.native.recoveryCandidates(new ServerCallContext({ tenant: 'Tenant' }))).toEqual(
+    [],
+  );
+  expect(await f.native.recoveryCandidates()).toEqual([]);
+  expect(resolve).not.toHaveBeenCalled();
+  expect(create).not.toHaveBeenCalled();
+  expect(f.agent.send).not.toHaveBeenCalled();
+  expect(f.agent.drive).not.toHaveBeenCalled();
+});
+
+it('resolves discovered retained input in its original tenant and owner scope', async () => {
+  const first = harness([], new MemoryTaskStore(), true);
+  first.send('one', { parked: true });
+  await vi.waitFor(() => expect(first.agent.inbox.nextTurn).toHaveLength(1));
+  await first.native.shutdown();
+  const anonymous = new ServerCallContext();
+  const call = new ServerCallContext({
+    tenant: 'Tenant',
+    user: { userName: 'owner', isAuthenticated: true },
+  });
+  const snapshot = await first.store.load('task-one', anonymous);
+  await first.store.save(snapshot!, call);
+  await first.store.delete('task-one', anonymous);
+  const restored = harness([], first.store, true);
+  await restored.start();
+  expect(await restored.native.recoveryCandidates(call)).toEqual(['context']);
+  const resolving = restored.native.resolve('context', call);
+  await expect(restored.native.resolve('context', anonymous)).rejects.toThrow('scope');
+  const agent = await resolving;
+  expect(agent.inbox.nextTurn).toHaveLength(1);
+  expect(restored.consumed).toEqual([]);
+  expect(restored.agent.drive).not.toHaveBeenCalled();
+  await expect(restored.native.resolve('context', anonymous)).rejects.toThrow('scope');
+  expect(await restored.native.resolve('context', call)).toBe(agent);
+});
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   await Promise.all(contexts.splice(0).map((ctx) => ctx.fiber.dispose()));

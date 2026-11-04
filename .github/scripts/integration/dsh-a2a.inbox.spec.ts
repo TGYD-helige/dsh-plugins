@@ -2450,6 +2450,8 @@ describe('native ownership', () => {
       root: join(root, 'sessions'),
       store: new SanitizedTaskStore(new FilesystemTaskStore({ root: join(root, 'tasks') })),
     });
+    expect(await restored.inbox.recoveryCandidates()).toEqual(['native-test']);
+    expect(restored.adapter.requests).toHaveLength(0);
     const agent = await restored.inbox.resolve('native-test');
     expect(agent.inbox.nextTurn.map((m) => m.id)).toEqual(admitted.ids);
     // The official runtime wakes on a real input, supplied by the host after discovery.
@@ -3671,6 +3673,8 @@ describe('graceful retention', () => {
     expect(child.status, child.stdout + child.stderr).toBe(0);
     const admitted = JSON.parse(await readFile(join(root, 'graceful-admitted.json'), 'utf8'));
     const second = await host(root);
+    expect(await second.inbox.recoveryCandidates()).toEqual(['graceful']);
+    expect(second.adapter.requests).toHaveLength(0);
     const restored = await second.inbox.resolve('graceful');
     expect([...restored.inbox.nextStep, ...restored.inbox.nextTurn].map((m) => m.id)).toEqual(
       admitted.ids,
@@ -3680,6 +3684,8 @@ describe('graceful retention', () => {
       root,
       Array.from({ length: 4 }, () => textResponse('done')),
     );
+    expect(await third.inbox.recoveryCandidates()).toEqual(['graceful']);
+    expect(third.adapter.requests).toHaveLength(0);
     const agent = await third.inbox.resolve('graceful');
     expect([...agent.inbox.nextStep, ...agent.inbox.nextTurn].map((m) => m.id)).toEqual(
       admitted.ids,
@@ -3703,6 +3709,7 @@ describe('graceful retention', () => {
       'future',
       'wake',
     ]);
+    expect(await third.inbox.recoveryCandidates()).toEqual([]);
     expect(messages.slice(1, 3).map((e) => e.data.id)).toEqual(admitted.ids);
     expect(messages.slice(1, 3).map((e) => JSON.parse(e.data.source.message).messageId)).toEqual([
       'promoted',

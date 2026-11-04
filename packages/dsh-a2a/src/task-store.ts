@@ -69,11 +69,54 @@ export function sanitizeTask(task: Task): Task {
 
 /** TaskStore with the optional lifecycle our backends add. */
 export interface ManagedTaskStore extends TaskStore {
+  /** Conservative discovery only; does not establish that input is safe to execute. */
+  recoveryCandidates?(context: ServerCallContext): Promise<string[]>;
   /** Durable admission checkpoint even when task state has not changed. */
   checkpoint?(task: Task, context: ServerCallContext): Promise<void>;
   init?(): Promise<void>;
   delete(taskId: string, context: ServerCallContext): Promise<void>;
   close?(): Promise<void>;
+}
+
+export function isTerminalTask(task: Task): boolean {
+  return [
+    TaskState.TASK_STATE_COMPLETED,
+    TaskState.TASK_STATE_CANCELED,
+    TaskState.TASK_STATE_FAILED,
+    TaskState.TASK_STATE_REJECTED,
+  ].includes(task.status?.state ?? TaskState.TASK_STATE_UNSPECIFIED);
+}
+
+export function recoveryContextIds(tasks: Task[]): string[] {
+  return [
+    ...new Set(tasks.filter((task) => !isTerminalTask(task)).map((task) => task.contextId)),
+  ].sort();
+}
+
+/** Custom stores retain a complete, if more expensive, discovery path. */
+export async function findRecoveryCandidates(
+  store: ManagedTaskStore,
+  context: ServerCallContext,
+): Promise<string[]> {
+  if (store.recoveryCandidates) return store.recoveryCandidates(context);
+  const ids = new Set<string>();
+  let pageToken = '';
+  do {
+    const page = await store.list(
+      {
+        tenant: '',
+        contextId: '',
+        pageSize: 100,
+        pageToken,
+        status: TaskState.TASK_STATE_UNSPECIFIED,
+        statusTimestampAfter: undefined,
+      },
+      context,
+    );
+    for (const id of recoveryContextIds(page.tasks)) ids.add(id);
+    pageToken = page.nextPageToken;
+  } while (pageToken);
+  return [...ids].sort();
 }
 
 function scopeOf(context: ServerCallContext | undefined): string {
@@ -110,6 +153,10 @@ export class MemoryTaskStore implements ManagedTaskStore {
 
   async list(params: ListTasksRequest, context: ServerCallContext): Promise<ListTasksResponse> {
     return listShells([...this.bucket(context).values()], params);
+  }
+
+  async recoveryCandidates(context: ServerCallContext): Promise<string[]> {
+    return recoveryContextIds([...this.bucket(context).values()]);
   }
 
   async delete(taskId: string, context: ServerCallContext): Promise<void> {
@@ -171,15 +218,7 @@ export class SanitizedTaskStore implements ManagedTaskStore {
     const terminal = this.terminalStates.get(task.id);
     if (terminal && terminal.expiresAt <= now) this.terminalStates.delete(task.id);
     else if (terminal && state !== terminal.state) return;
-    if (
-      state !== undefined &&
-      [
-        TaskState.TASK_STATE_COMPLETED,
-        TaskState.TASK_STATE_CANCELED,
-        TaskState.TASK_STATE_FAILED,
-        TaskState.TASK_STATE_REJECTED,
-      ].includes(state)
-    ) {
+    if (state !== undefined && isTerminalTask(task)) {
       // Map order matches expiry order: only the expired prefix needs scanning.
       for (const [id, guard] of this.terminalStates) {
         if (guard.expiresAt > now) break;
@@ -266,6 +305,10 @@ export class SanitizedTaskStore implements ManagedTaskStore {
 
   list(params: ListTasksRequest, context: ServerCallContext): Promise<ListTasksResponse> {
     return this.inner.list(params, context);
+  }
+
+  recoveryCandidates(context: ServerCallContext): Promise<string[]> {
+    return findRecoveryCandidates(this.inner, context);
   }
 }
 

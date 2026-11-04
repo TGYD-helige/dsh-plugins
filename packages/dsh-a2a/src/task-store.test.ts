@@ -317,6 +317,21 @@ describe('SanitizedTaskStore', () => {
     };
   });
 
+  it('discovers every custom-store page without changing task pagination', async () => {
+    const memory = new MemoryTaskStore();
+    for (let i = 0; i < 105; i++)
+      await memory.save(
+        task(TaskState.TASK_STATE_WORKING, { id: `t${i}`, contextId: `c${i}` }),
+        ctx,
+      );
+    inner.list.mockImplementation((params, call) => memory.list(params, call));
+    const store = new SanitizedTaskStore(inner);
+    expect(await store.recoveryCandidates(ctx)).toHaveLength(105);
+    expect(inner.list).toHaveBeenCalledTimes(2);
+    inner.list.mockRejectedValueOnce(new Error('storage unavailable'));
+    await expect(store.recoveryCandidates(ctx)).rejects.toThrow('storage unavailable');
+  });
+
   it('saves only on state transitions', async () => {
     const store = new SanitizedTaskStore(inner);
     await store.save(task(TaskState.TASK_STATE_SUBMITTED), ctx);
@@ -792,6 +807,64 @@ for (const backend of ['redis', 'gcs'] as const) {
         ? new RedisTaskStore({ url: 'redis://example:6379' })
         : new GcsTaskStore({ bucket: 'test' });
 
+    it('rejects discovery before backend initialization', async () => {
+      await expect(create().recoveryCandidates(ctx)).rejects.toThrow('not initialized');
+    });
+
+    it('recovers missing or malformed summaries and propagates backend failures', async () => {
+      const store = create();
+      await store.init();
+      const value = task(TaskState.TASK_STATE_WORKING);
+      await store.save(value, ctx);
+      const key =
+        backend === 'redis' ? [...mocks.MockRedis.database.keys()][0] : [...gcs.files.keys()][0];
+      if (backend === 'redis') mocks.MockRedis.database.set(key, JSON.stringify(value));
+      else gcs.metadata.delete(key);
+      expect(await store.recoveryCandidates(ctx)).toEqual(['c1']);
+      if (backend === 'redis')
+        mocks.MockRedis.database.set(key, JSON.stringify({ _dshTaskList: 'broken', ...value }));
+      else gcs.metadata.set(key, { metadata: { dshTaskList: '{broken JSON' } });
+      expect(await store.recoveryCandidates(ctx)).toEqual(['c1']);
+      if (backend === 'redis') mocks.MockRedis.database.set(key, '{broken JSON');
+      else gcs.activity.error = 403;
+      await expect(store.recoveryCandidates(ctx)).rejects.toThrow();
+    });
+
+    it('discovers scoped candidates after restart without hydrating full snapshots', async () => {
+      const user = { userName: 'owner', isAuthenticated: true };
+      const call = new ServerCallContext({ tenant: 'Tenant', user });
+      const store = create();
+      await store.init();
+      for (let i = 0; i < 105; i++)
+        await store.save(
+          task(i < 100 ? TaskState.TASK_STATE_COMPLETED : TaskState.TASK_STATE_INPUT_REQUIRED, {
+            id: `t${i}`,
+            contextId: i < 100 ? 'done' : 'pending',
+            metadata: { content: 'x'.repeat(100_000) },
+          }),
+          call,
+        );
+      const restored = create();
+      await restored.init();
+      const redis = mocks.MockRedis.instances.at(-1);
+      gcs.activity.downloads = [];
+      const wrapped = new SanitizedTaskStore(restored);
+      expect(await wrapped.recoveryCandidates(call)).toEqual(['pending']);
+      if (backend === 'redis') {
+        expect(redis!.calls.ranges).toHaveLength(105);
+        expect(redis!.calls.mget).toBe(0);
+        expect(redis!.calls.get).toHaveLength(0);
+      } else expect(gcs.activity.downloads).toEqual([]);
+      expect(
+        await restored.recoveryCandidates(new ServerCallContext({ tenant: 'tenant', user })),
+      ).toEqual([]);
+      expect(await wrapped.recoveryCandidates(new ServerCallContext({ tenant: 'Tenant' }))).toEqual(
+        [],
+      );
+      for (let i = 100; i < 105; i++) await store.delete(`t${i}`, call);
+      expect(await restored.recoveryCandidates(call)).toEqual([]);
+    });
+
     it('lists legacy snapshots alongside indexed snapshots without losing content', async () => {
       const store = create();
       await store.init();
@@ -822,6 +895,7 @@ for (const backend of ['redis', 'gcs'] as const) {
       await store.save(value, ctx);
       const query = listParams({ contextId: value.contextId, includeArtifacts: true });
       expect((await store.list(query, ctx)).tasks).toEqual([value]);
+      expect(await store.recoveryCandidates(ctx)).toEqual([value.contextId]);
       await store.save(
         { ...value, status: { ...value.status!, state: TaskState.TASK_STATE_COMPLETED } },
         ctx,

@@ -4,7 +4,7 @@ import { mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { type ListTasksRequest, type ListTasksResponse, Task } from '@a2a-js/sdk';
 import type { ServerCallContext } from '@a2a-js/sdk/server';
-import { type ManagedTaskStore, taskScopeKey } from '../task-store.js';
+import { type ManagedTaskStore, recoveryContextIds, taskScopeKey } from '../task-store.js';
 import {
   LIST_PREFIX_BYTES,
   loadTaskPage,
@@ -62,7 +62,7 @@ export class FilesystemTaskStore implements ManagedTaskStore {
   async delete(id: string, context: ServerCallContext): Promise<void> {
     await rm(this.path(id, context), { force: true });
   }
-  async list(params: ListTasksRequest, context: ServerCallContext): Promise<ListTasksResponse> {
+  private async shells(context: ServerCallContext): Promise<Task[]> {
     let files: string[];
     try {
       files = await readdir(this.directory(context));
@@ -97,7 +97,15 @@ export class FilesystemTaskStore implements ManagedTaskStore {
       );
       for (const shell of batch) if (shell) shells.push(shell);
     }
-    return loadTaskPage(shells, params, (ids) =>
+    return shells;
+  }
+
+  async recoveryCandidates(context: ServerCallContext): Promise<string[]> {
+    return recoveryContextIds(await this.shells(context));
+  }
+
+  async list(params: ListTasksRequest, context: ServerCallContext): Promise<ListTasksResponse> {
+    return loadTaskPage(await this.shells(context), params, (ids) =>
       Promise.all(ids.map((id) => this.load(id, context))),
     );
   }

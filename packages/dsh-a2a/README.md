@@ -18,7 +18,7 @@ dsh plugin --profile my-agent add @amaster.ai/dsh-a2a
 
 Standard `SendMessage` / `SendStreamingMessage`, task queries, cancellation and task subscriptions keep their official meanings. Optional inbox metadata forwards `target` and `wakeup` to DSH. `wakeup: false` leaves an idle driver parked; it does not prevent an active driver from consuming pending input. A later real waking message releases pending input.
 
-The same-process `a2aInbox` service exposes `resolve`, `content`, `enqueue`, `promote`, `cancel`, `get`, `update`, `move`, `remove`, `clearPending`, and `executePending`, plus the existing pause/wake/resume controls. Pending-only clearing preserves active work; context clearing discards all work.
+The same-process `a2aInbox` service exposes `recoveryCandidates`, `resolve`, `content`, `enqueue`, `promote`, `cancel`, `get`, `update`, `move`, `remove`, `clearPending`, and `executePending`, plus the existing pause/wake/resume controls. Pending-only clearing preserves active work; context clearing discards all work.
 
 Pause is process-local and writes no custom required session event. After restart, restored input stays parked until a waking admission or explicit execution. Retention recovery accepts snapshots under the historical extension URI as well as the current URI, writes only the current metadata key, and clears both keys after consumption. Explicit resume durably transfers input to a fresh task before waking it; retry after an interrupted cleanup reuses the existing replacement instead of replaying its input.
 
@@ -53,6 +53,41 @@ Only an unclaimed, single-message independent task in the same context can be pr
 Select `taskStore: filesystem` with `filesystem.root` pointing at a retained directory, and separately enable durable DSH session persistence. Keep queued file materialization on retained storage as well. Each task snapshot is scoped by tenant and user, written to a private temporary file and atomically renamed; no additional service is needed. Use one host writer per directory. Files have no automatic expiry; context clearing deletes task snapshots.
 
 After a crash, the host discovers sessions, calls `a2aInbox.resolve(contextId)` and supplies a real attributed waking input through the normal API. Restored unclaimed inputs keep their original task ownership. Startup scanning and scheduling remain host responsibilities. Explicit cancellation stays terminal and discards only the canceled task's input. This does not promise exactly-once external side effects, replay of consumed input, or replay of the interrupted active model call.
+
+#### Discovering recovery candidates
+
+`await a2aInbox.recoveryCandidates(call?)` returns sorted, distinct context IDs
+from nonterminal task checkpoints in the caller's SDK tenant/user scope (default:
+the anonymous default scope). It does not open session logs, create agents,
+resolve contexts or wake input. Pass the same `call` to
+`a2aInbox.resolve(contextId, call)` to restore tasks from that scope. Prepare host
+identity before resolving a context;
+the host still decides whether restored work should run. Paused, input-required
+and interrupted tasks can all be candidates, including tasks with no remaining
+unclaimed input. Completed, canceled, failed and rejected tasks are excluded;
+retained input on a terminal task still requires explicit `resume`.
+
+Context IDs identify agents globally within one plugin instance; the TaskStore
+scope is not a separate agent namespace. Resolving an already loading or loaded
+context with a different explicit tenant/user scope rejects. Existing host
+controls without a call context continue to address that loaded agent.
+
+No separate index or storage configuration is needed. Discovery uses the same
+atomic summaries as task listing: bounded snapshot prefixes under
+`filesystem.root`, Redis keys under the configured prefix, or object metadata in
+the configured GCS bucket. Each call enumerates the scope once, without sorting
+or hydrating full task pages. Old, malformed or oversized summaries fall back to
+reading their snapshots; unreadable snapshots and backend errors reject the
+call. Custom TaskStores without the optional discovery method use exhaustive
+task pagination. Task listing counts, filters and cursor semantics are unchanged.
+
+Discovery remains O(task count) in lightweight summaries; it is not a
+pending-only index. It covers surviving task snapshots, not orphaned session
+logs. Keep the host's session-scan fallback for deployments whose historical
+tasks were not durably stored or have expired. The memory backend has no restart
+durability. Redis persistence must be configured separately, and its task TTL
+(default 24 hours) still applies. Durable recovery also requires retained DSH
+session logs and materialized files; a TaskStore alone does not preserve them.
 
 ### Graceful host shutdown
 
