@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { compileRules, describeRule, evaluate, type PolicyRuleConfig } from './rule.js';
 
 const KEYS = ['command'];
@@ -19,6 +19,17 @@ describe('compileRules', () => {
 });
 
 describe('evaluate', () => {
+  it('checks whole-call arguments once while preserving per-segment deny decisions', () => {
+    const rules = compileRules([
+      { tool: 'bash', decision: 'allow', commandPrefix: 'echo' },
+      { tool: 'bash', decision: 'deny', argsPattern: { command: 'blocked' }, commandPrefix: 'rm' },
+    ]);
+    const match = vi.spyOn(rules[1].argsConds![0].res[0], 'test');
+    const command = `${Array.from({ length: 1000 }, () => 'echo ok').join(';')};rm blocked`;
+    expect(evaluate(rules, 'bash', { command }, KEYS)?.decision).toBe('deny');
+    expect(match).toHaveBeenCalledTimes(1);
+  });
+
   it('matches the tool name, with "*" as wildcard', () => {
     const rules: PolicyRuleConfig[] = [{ tool: 'bash', decision: 'deny' }];
     expect(run(rules, 'bash', bash('ls'))?.decision).toBe('deny');

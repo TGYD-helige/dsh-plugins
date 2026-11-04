@@ -37,6 +37,7 @@
 import type { TokenUsage } from '@deepseek-ai/dsh-llm';
 import type { LangfuseGeneration, LangfuseSpan } from '@langfuse/tracing';
 import type { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
+import { boundPayload, newPayloadBudget } from './payload.js';
 
 export interface LangfuseConnectionConfig {
   publicKey: string;
@@ -49,6 +50,7 @@ export interface LangfuseConnectionConfig {
   tags?: string[];
   captureContent?: boolean;
   captureMedia?: boolean;
+  maxPayloadBytes?: number;
 }
 
 export type ObservationLevel = 'DEFAULT' | 'WARNING' | 'ERROR';
@@ -510,7 +512,14 @@ export class LangfuseReporter {
   ): void {
     if (!span) return;
     try {
-      update = this.mask(update);
+      const budget = newPayloadBudget(this.config.maxPayloadBytes ?? 256 * 1024);
+      const input =
+        update.input === undefined ? undefined : boundPayload(update.input, budget, this);
+      update = this.mask({
+        ...update,
+        input,
+        ...(budget.truncated ? { metadata: { ...update.metadata, truncated: true } } : {}),
+      });
       span.update({ input: update.input, metadata: update.metadata });
       if (update.name) span.otelSpan.updateName(update.name);
       if (update.input !== undefined && this.roots.has(span)) {
@@ -539,7 +548,14 @@ export class LangfuseReporter {
   ): void {
     if (!span) return;
     try {
-      update = this.mask(update);
+      const budget = newPayloadBudget(this.config.maxPayloadBytes ?? 256 * 1024);
+      const output =
+        update.output === undefined ? undefined : boundPayload(update.output, budget, this);
+      update = this.mask({
+        ...update,
+        output,
+        ...(budget.truncated ? { metadata: { ...update.metadata, truncated: true } } : {}),
+      });
       span.update(update);
       if (update.output !== undefined && this.roots.has(span)) {
         span.setTraceIO({ output: update.output });

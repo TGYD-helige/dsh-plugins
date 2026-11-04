@@ -18,10 +18,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
-import { gunzipSync, gzipSync } from 'node:zlib';
+import { gunzip, gzip } from 'node:zlib';
 import type { ListTasksRequest, ListTasksResponse, Task } from '@a2a-js/sdk';
 import type { ServerCallContext } from '@a2a-js/sdk/server';
-import { listShells, type ManagedTaskStore, taskScopeKey } from '../task-store.js';
+import { type ManagedTaskStore, taskScopeKey } from '../task-store.js';
+import { loadTaskPage, parseListShell, taskListShell } from './listing.js';
+
+const compress = promisify(gzip);
+const decompress = promisify(gunzip);
 
 export interface GcsTaskStoreConfig {
   bucket: string;
@@ -49,9 +53,15 @@ export class GcsTaskStore implements ManagedTaskStore {
 
   async save(task: Task, context: ServerCallContext): Promise<void> {
     if (!this.bucket) return;
+    const shell = JSON.stringify(taskListShell(task));
     await this.bucket
       .file(`${this.prefix}/${taskScopeKey(context)}/${task.id}/metadata.json.gz`)
-      .save(gzipSync(JSON.stringify(task)), { contentType: 'application/gzip', resumable: false });
+      .save(await compress(JSON.stringify(task)), {
+        contentType: 'application/gzip',
+        resumable: false,
+        // GCS custom metadata is bounded; oversized identifiers use the legacy read path.
+        metadata: { metadata: Buffer.byteLength(shell) <= 4096 ? { dshTaskList: shell } : {} },
+      });
   }
 
   async load(taskId: string, context: ServerCallContext): Promise<Task | undefined> {
@@ -59,10 +69,13 @@ export class GcsTaskStore implements ManagedTaskStore {
     const file = this.bucket.file(
       `${this.prefix}/${taskScopeKey(context)}/${taskId}/metadata.json.gz`,
     );
-    const [exists] = await file.exists();
-    if (!exists) return undefined;
-    const [buf] = await file.download();
-    return JSON.parse(gunzipSync(buf).toString('utf8')) as Task;
+    try {
+      const [buf] = await file.download();
+      return JSON.parse((await decompress(buf)).toString('utf8')) as Task;
+    } catch (error) {
+      if ((error as { code?: number }).code === 404) return undefined;
+      throw error;
+    }
   }
 
   async delete(taskId: string, context: ServerCallContext): Promise<void> {
@@ -84,15 +97,35 @@ export class GcsTaskStore implements ManagedTaskStore {
     });
     const shells: Task[] = [];
     const metadata = files.filter((file: any) => file.name.endsWith('/metadata.json.gz'));
-    // Bound in-flight downloads while avoiding one network round-trip per task.
     for (let start = 0; start < metadata.length; start += 16) {
-      const buffers = await Promise.all(
-        metadata.slice(start, start + 16).map((file: any) => file.download()),
+      const batch = await Promise.all(
+        metadata.slice(start, start + 16).map(async (file: any) => {
+          const indexed = parseListShell(file.metadata?.metadata?.dshTaskList);
+          if (indexed) return indexed;
+          // Older snapshots have no summary; keep them visible without migration.
+          try {
+            const [buf] = await file.download();
+            return taskListShell(JSON.parse((await decompress(buf)).toString('utf8')) as Task);
+          } catch (error) {
+            if ((error as { code?: number }).code === 404) return;
+            throw error;
+          }
+        }),
       );
-      for (const [buf] of buffers)
-        shells.push(JSON.parse(gunzipSync(buf).toString('utf8')) as Task);
+      for (const shell of batch) if (shell) shells.push(shell);
     }
-    return listShells(shells, params);
+    return loadTaskPage(shells, params, (ids) =>
+      Promise.all(
+        ids.map(async (id) => {
+          try {
+            return await this.load(id, context);
+          } catch (error) {
+            if ((error as { code?: number }).code === 404) return;
+            throw error;
+          }
+        }),
+      ),
+    );
   }
 
   /**

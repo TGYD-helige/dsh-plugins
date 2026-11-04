@@ -53,6 +53,7 @@ import { AdmissionGate } from './admission.js';
 import type { NativeInbox } from './inbox.js';
 import { inboxRpcHandler } from './inbox-api.js';
 import { legacyStreamHandler } from './legacy-stream.js';
+import { CoalescingPushSender } from './push-notifications.js';
 import {
   connectedRequestHandler,
   subscriptionBus,
@@ -95,6 +96,8 @@ export interface A2aServer {
   /** The bound port (differs from options.port when 0). */
   port: number;
   grpcPort?: number;
+  /** Drain after stopping execution, before closing task storage. */
+  flushNotifications(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -316,7 +319,13 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     list: (params, context) => options.taskStore.list(params, context),
   };
   const pushStore = options.pushNotifications ? new InMemoryPushNotificationStore() : undefined;
-  const pushSender = pushStore ? createLegacyAwarePushNotificationSender(pushStore) : undefined;
+  const pushSender = pushStore
+    ? new CoalescingPushSender(
+        createLegacyAwarePushNotificationSender(pushStore),
+        options.taskStore,
+        pushStore,
+      )
+    : undefined;
   const restoredPushFailed = (error: unknown) =>
     console.error('[dsh-a2a] restored task push failed:', error);
   const handler = new (class extends DefaultRequestHandler {
@@ -728,7 +737,7 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
             await result.processEvent(event);
             if (pushSender) {
               try {
-                const snapshot = structuredClone(result.getCurrentTask());
+                const snapshot = result.getCurrentTask();
                 // SDK execution-event kinds match the StreamResponse oneof cases.
                 const response = {
                   payload: {
@@ -752,12 +761,16 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     },
     port: actualPort,
     grpcPort,
-    close: () =>
-      new Promise<void>((resolve) => {
+    flushNotifications: async () => {
+      await pushSender?.flush();
+    },
+    close: async () => {
+      await new Promise<void>((resolve) => {
         for (const stop of stopHeartbeats) stop();
         grpcServer?.forceShutdown();
         server.closeAllConnections?.();
         server.close(() => resolve());
-      }),
+      });
+    },
   };
 }

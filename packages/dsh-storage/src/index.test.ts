@@ -358,6 +358,143 @@ describe('dsh-storage plugin', () => {
     expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(1);
   });
 
+  it.each([
+    [20, 'flush', 1],
+    [70, 'flush', 3],
+    [20, 'archive', 1],
+    [20, 'dispose', 1],
+  ] as const)(
+    'coalesces %i results with a %s barrier into %i bounded writes',
+    async (count, barrier, writes) => {
+      apply(ctx, enabledConfig);
+      const backend = backends.instances[0];
+      const rows = new Map<string, any>();
+      backend.upsertMessage.mockImplementation(async (row: any) => {
+        rows.set(row.id, row);
+      });
+      backend.readMessages.mockImplementation(async (_sessionId: string, id: string) =>
+        rows.has(id) ? [rows.get(id)] : [],
+      );
+      const session = { id: 's1' };
+      const assistant = assistantEvent('', { inputTokens: 10, outputTokens: 5 }, 'model') as any;
+      assistant.data.message.content = Array.from({ length: count }, (_, i) => ({
+        type: 'tool-call',
+        id: `c${i}`,
+        name: 'read',
+        arguments: '{}',
+      }));
+      ctx.events.emit('session/event', session, assistant);
+      await ctx.events.parallel('session/flush', session);
+      backend.upsertEvent.mockClear();
+      backend.readMessages.mockClear();
+      for (let i = 0; i < count; i++) {
+        ctx.events.emit(
+          'session/event',
+          session,
+          ev('tool/result', {
+            message: {
+              toolCallId: `c${i}`,
+              content: [{ type: 'text', text: String(i).repeat(1024) }],
+              isError: i === 3,
+            },
+            ...(i === 3 ? { error: { name: 'ToolError', code: 'DENIED' } } : {}),
+          }),
+        );
+      }
+      if (barrier === 'archive') {
+        backend.archiveSession.mockImplementationOnce(async () => {
+          expect(rows.get('model').toolCalls.every((call: any) => call.result)).toBe(true);
+          return 'archive';
+        });
+        await (ctx.get('dshStorage') as any).archiveSession('s1');
+      } else if (barrier === 'dispose') {
+        await ctx.fiber.dispose();
+        expect(backend.close).toHaveBeenCalledOnce();
+      } else await ctx.events.parallel('session/flush', session);
+      expect(backend.upsertEvent).toHaveBeenCalledTimes(writes);
+      expect(backend.readMessages).toHaveBeenCalledTimes(writes);
+      expect(rows.get('model').toolCalls.map((call: any) => call.result.content[0].text)).toEqual(
+        Array.from({ length: count }, (_, i) => String(i).repeat(1024)),
+      );
+      expect(rows.get('model').toolCalls[3]).toMatchObject({
+        error: { code: 'DENIED' },
+        result: { isError: true },
+      });
+      expect(backend.upsertSession.mock.calls.at(-1)?.[0]).toMatchObject({
+        messageCount: 1,
+        totalTokens: 15,
+      });
+    },
+  );
+
+  it('keeps message groups ordered and continues after a failed merged write', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const rows = new Map<string, any>([
+      ['a', { id: 'a', type: 'model', toolCalls: [{ id: 'c1' }, { id: 'c2' }] }],
+      ['b', { id: 'b', type: 'model', toolCalls: [{ id: 'd1' }] }],
+    ]);
+    backend.upsertMessage.mockImplementation(async (row: any) => {
+      rows.set(row.id, row);
+    });
+    backend.readToolCallMessages.mockImplementation(async (_id: string, callId: string) =>
+      [...rows.values()].filter((row) => row.toolCalls.some((call: any) => call.id === callId)),
+    );
+    backend.readMessages.mockImplementation(async (_id: string, id: string) => [rows.get(id)]);
+    backend.upsertEvent.mockRejectedValueOnce(new Error('write failed'));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const callId of ['c1', 'c2', 'd1', 'c1'])
+        ctx.events.emit(
+          'session/event',
+          { id: 's1' },
+          ev('tool/result', {
+            message: { toolCallId: callId, content: [{ type: 'text', text: callId }] },
+          }),
+        );
+      await ctx.events.parallel('session/flush', { id: 's1' });
+      expect(backend.upsertEvent.mock.calls.map((call: any[]) => call[0].id)).toEqual([
+        'a',
+        'a',
+        'b',
+        'a',
+      ]);
+      expect(rows.get('a').toolCalls.map((call: any) => call.result.content[0].text)).toEqual([
+        'c1',
+        'c2',
+      ]);
+      expect(rows.get('b').toolCalls[0].result.content[0].text).toBe('d1');
+      expect(log).toHaveBeenCalledWith('[dsh-storage] mirror task error:', expect.any(Error));
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('seals pending result groups at an intervening title event', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    let row: any = { id: 'a', type: 'model', toolCalls: [{ id: 'c1' }, { id: 'c2' }] };
+    backend.readToolCallMessages.mockImplementation(async () => [row]);
+    backend.readMessages.mockImplementation(async () => [row]);
+    backend.upsertMessage.mockImplementation(async (update: any) => {
+      row = update;
+    });
+    const result = (callId: string) =>
+      ev('tool/result', { message: { toolCallId: callId, content: [] } });
+    ctx.events.emit('session/event', { id: 's1' }, result('c1'));
+    ctx.events.emit('session/event', { id: 's1' }, ev('session/title', { title: 'new title' }));
+    ctx.events.emit('session/event', { id: 's1' }, result('c2'));
+    await ctx.events.parallel('session/flush', { id: 's1' });
+    expect(
+      backend.upsertEvent.mock.calls.map((call: any[]) => [call[0]?.id, call[1].title]),
+    ).toEqual([
+      ['a', null],
+      [undefined, 'new title'],
+      ['a', 'new title'],
+    ]);
+    expect(row.toolCalls.every((call: any) => call.result)).toBe(true);
+  });
+
   it('uses a committed assistant tool call to read only its model row for a result', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];
@@ -461,6 +598,7 @@ describe('dsh-storage plugin', () => {
       });
 
     ctx.events.emit('session/event', { id: 's1' }, result('c1'));
+    await ctx.events.parallel('session/flush', { id: 's1' });
     ctx.events.emit('session/event', { id: 's1' }, result('c2'));
     await flush();
 
@@ -883,6 +1021,55 @@ describe('dsh-storage plugin', () => {
     });
   });
 
+  it('does not queue log-only lifecycle events while the database is unavailable', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    backends.initImpl = async () => {
+      throw new Error('database unavailable');
+    };
+    apply(ctx, enabledConfig);
+    await flush();
+    const backend = backends.instances[0];
+    for (let i = 0; i < 100; i++)
+      ctx.events.emit('session/event', { id: 's1' }, ev('step/start', { turn: 0, step: i }));
+    await flush();
+    expect(backend.init).toHaveBeenCalledTimes(1);
+    expect(backend.readSession).not.toHaveBeenCalled();
+    expect(backend.upsertEvent).not.toHaveBeenCalled();
+    await ctx.fiber.dispose();
+    log.mockRestore();
+  });
+
+  it('waits through the shared init retry delay and drains queued messages in order', async () => {
+    vi.useFakeTimers();
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let attempts = 0;
+    backends.initImpl = async () => {
+      if (++attempts === 1) throw new Error('offline');
+    };
+    try {
+      apply(ctx, enabledConfig);
+      await vi.advanceTimersByTimeAsync(0);
+      const backend = backends.instances[0];
+      ctx.events.emit('session/event', { id: 's1' }, userEvent('first', 'm1'));
+      ctx.events.emit('session/event', { id: 's1' }, userEvent('second', 'm2'));
+      await vi.advanceTimersByTimeAsync(999);
+      expect(attempts).toBe(1);
+      expect(backend.upsertEvent).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await ctx.events.parallel('session/flush', { id: 's1' });
+      expect(attempts).toBe(2);
+      expect(backend.upsertMessage.mock.calls.map((call: any[]) => call[0].id)).toEqual([
+        'm1',
+        'm2',
+      ]);
+    } finally {
+      await vi.runAllTimersAsync();
+      await ctx.fiber.dispose();
+      vi.useRealTimers();
+      log.mockRestore();
+    }
+  });
+
   it('retries a failed backend init on a later event without zero-seeding', async () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     let attempts = 0;
@@ -896,14 +1083,12 @@ describe('dsh-storage plugin', () => {
     expect(attempts).toBe(1);
 
     ctx.events.emit('session/event', { id: 's1' }, userEvent('lost while down', 'm1'));
-    await flush();
-    expect(attempts).toBe(2);
+    await vi.waitFor(() => expect(attempts).toBe(2), { timeout: 2000 });
     expect(backend.readSession).not.toHaveBeenCalled();
     expect(backend.upsertEvent).not.toHaveBeenCalled();
 
     ctx.events.emit('session/event', { id: 's1' }, userEvent('stored after recovery', 'm2'));
-    await flush();
-    expect(attempts).toBe(3);
+    await vi.waitFor(() => expect(attempts).toBe(3), { timeout: 2000 });
     expect(backend.readSession).toHaveBeenCalledOnce();
     expect(backend.upsertSession.mock.calls.at(-1)?.[0].messageCount).toBe(1);
     errorSpy.mockRestore();

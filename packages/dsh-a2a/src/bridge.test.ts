@@ -1991,6 +1991,49 @@ describe('A2aBridge + DshAgentExecutor', () => {
       return filePath;
     };
 
+    it('honors cancellation before returning already prepared content', async () => {
+      const abort = new AbortController();
+      const preparing = bridge.buildContent(userMessage('ready'), 'ctx1', abort.signal);
+      abort.abort();
+      await expect(preparing).rejects.toMatchObject({ name: 'AbortError' });
+    });
+
+    it.each(['cancel', 'clear', 'dispose'] as const)(
+      'interrupts pending file preparation on %s',
+      async (action) => {
+        let supplied: AbortSignal | undefined;
+        let release!: (value: { readablePath: string }) => void;
+        const materializeFile = vi.fn(({ signal }: { signal?: AbortSignal }) => {
+          supplied = signal;
+          return new Promise<{ readablePath: string }>((resolve) => {
+            release = resolve;
+          });
+        });
+        ctx.provide('a2aFileMaterializer', { materializeFile });
+        const message = {
+          ...userMessage(''),
+          parts: [part({ $case: 'raw', value: Buffer.from(docBytes) }, DOCX, 'doc.docx')],
+        };
+        const executor = new DshAgentExecutor(bridge);
+        const bus = new DefaultExecutionEventBus();
+        const { seen } = collect(bus);
+        const executing = executor.execute(requestContext(message, 't1', 'ctx1'), bus);
+        await vi.waitFor(() => expect(materializeFile).toHaveBeenCalledOnce());
+        try {
+          if (action === 'cancel') await executor.cancelTask('t1', bus);
+          else if (action === 'clear') await bridge.clearContext('ctx1');
+          else await bridge.dispose();
+          await executing;
+          expect(supplied?.aborted).toBe(true);
+          expect(agents.created).toHaveLength(0);
+          expect(statusUpdates(seen).at(-1)?.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
+        } finally {
+          release({ readablePath: '/remote/doc.docx' });
+          await executing;
+        }
+      },
+    );
+
     it('materializes non-image files without saving another host attachment', async () => {
       const store = fakeAttachments();
       const materializeFile = vi.fn(async () => ({ readablePath: '/sandbox/ctx1/doc.docx' }));
@@ -2008,6 +2051,7 @@ describe('A2aBridge + DshAgentExecutor', () => {
         bytes: docBytes,
         filename: 'doc.docx',
         mediaType: DOCX,
+        signal: expect.any(AbortSignal),
       });
       expect(agents.created[0].contents[0]).toEqual([
         expect.objectContaining({

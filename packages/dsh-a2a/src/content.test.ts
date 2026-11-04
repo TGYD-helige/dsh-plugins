@@ -72,6 +72,10 @@ const network = vi.hoisted(() => {
     },
   };
 });
+vi.mock('node:fs/promises', async (original) => {
+  const fs = await original<typeof import('node:fs/promises')>();
+  return { ...fs, writeFile: vi.fn(fs.writeFile) };
+});
 vi.mock('node:http', () => ({ request: network.request }));
 vi.mock('node:https', () => ({ request: network.request }));
 vi.mock('node:dns/promises', () => ({ lookup: network.lookup }));
@@ -161,6 +165,86 @@ describe('buildMessageContent', () => {
     expect(
       errorSpy.mock.calls.some((args: unknown[]) => String(args[0]).includes('[dsh-a2a]')),
     ).toBe(true);
+
+  it('bounds DNS validation by the download deadline', async () => {
+    vi.useFakeTimers();
+    let release!: (addresses: { address: string; family: number }[]) => void;
+    network.lookup.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    let done = false;
+    const preparing = buildMessageContent(
+      [urlPart('http://example.com/a', 'text/plain', 'a.txt')],
+      undefined,
+      dir,
+    ).then((blocks) => {
+      done = true;
+      return blocks;
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(done).toBe(true);
+      expect(textOf((await preparing)[0])).toContain('download timed out');
+    } finally {
+      release([{ address: '93.184.216.34', family: 4 }]);
+      await preparing;
+      vi.useRealTimers();
+    }
+    expect(network.request).not.toHaveBeenCalled();
+  });
+
+  it('cancels DNS preparation without starting a request after DNS eventually resolves', async () => {
+    let release!: (addresses: { address: string; family: number }[]) => void;
+    network.lookup.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const abort = new AbortController();
+    const preparing = buildMessageContent(
+      [urlPart('http://example.com/a', 'text/plain', 'a.txt')],
+      undefined,
+      dir,
+      undefined,
+      {},
+      abort.signal,
+    );
+    const rejected = expect(preparing).rejects.toThrow('canceled');
+    abort.abort(new Error('canceled'));
+    await rejected;
+    release([{ address: '93.184.216.34', family: 4 }]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(network.request).not.toHaveBeenCalled();
+  });
+
+  it('passes cancellation to materializers and stops waiting when they ignore it', async () => {
+    let supplied: AbortSignal | undefined;
+    let release!: (value: { readablePath: string }) => void;
+    const materializeFile = ({ signal }: { signal?: AbortSignal }) => {
+      supplied = signal;
+      return new Promise<{ readablePath: string }>((resolve) => {
+        release = resolve;
+      });
+    };
+    const abort = new AbortController();
+    const preparing = buildMessageContent(
+      [part({ $case: 'raw', value: Buffer.from('file') }, 'text/plain', 'a.txt')],
+      undefined,
+      dir,
+      { contextId: 'ctx', materializer: { materializeFile } },
+      {},
+      abort.signal,
+    );
+    const rejected = expect(preparing).rejects.toThrow('canceled');
+    abort.abort(new Error('canceled'));
+    await rejected;
+    expect(supplied?.aborted).toBe(true);
+    release({ readablePath: '/remote/a.txt' });
+  });
 
   it('throws only when no part is usable', async () => {
     await expect(buildMessageContent([], undefined, dir)).rejects.toThrow('usable part');
@@ -278,6 +362,51 @@ describe('buildMessageContent', () => {
     );
   });
 
+  it('keeps concurrent same-name uploads readable without scanning existing names', async () => {
+    await Promise.all(
+      Array.from({ length: 100 }, (_, i) =>
+        writeFile(path.join(dir, i === 0 ? 'report.txt' : `report-${i}.txt`), 'old'),
+      ),
+    );
+    vi.mocked(writeFile).mockClear();
+    const results = await Promise.all(
+      ['first', 'second'].map((text) =>
+        buildMessageContent(
+          [part({ $case: 'raw', value: Buffer.from(text) }, 'text/plain', 'report.txt')],
+          undefined,
+          dir,
+        ),
+      ),
+    );
+    const paths = results.map(([block]) => /path="([^"]+)"/.exec(textOf(block))![1]);
+    expect(new Set(paths).size).toBe(2);
+    expect(await Promise.all(paths.map((file) => readFile(file, 'utf8')))).toEqual([
+      'first',
+      'second',
+    ]);
+    expect(await readFile(path.join(dir, 'report.txt'), 'utf8')).toBe('old');
+    expect(vi.mocked(writeFile).mock.calls.length).toBeLessThanOrEqual(4);
+  });
+
+  it('preserves near-limit UTF-8 filenames on repeated uploads', async () => {
+    const filename = `${'文'.repeat(80)}.txt`;
+    const first = await buildMessageContent(
+      [part({ $case: 'raw', value: Buffer.from('old') }, 'text/plain', filename)],
+      undefined,
+      dir,
+    );
+    const second = await buildMessageContent(
+      [part({ $case: 'raw', value: Buffer.from('new') }, 'text/plain', filename)],
+      undefined,
+      dir,
+    );
+    const firstPath = /path="([^"]+)"/.exec(textOf(first[0]))![1];
+    const secondPath = /path="([^"]+)"/.exec(textOf(second[0]))![1];
+    expect(path.basename(secondPath)).toBe(filename);
+    expect(await readFile(firstPath, 'utf8')).toBe('old');
+    expect(await readFile(secondPath, 'utf8')).toBe('new');
+  });
+
   it('notes a persist failure instead of failing', async () => {
     const file = path.join(dir, 'afile');
     await writeFile(file, 'x');
@@ -355,7 +484,10 @@ describe('buildMessageContent', () => {
         expect(store.saveFile).not.toHaveBeenCalled();
         expect(store.saveImage).toHaveBeenCalledTimes(1);
         expect(await readFile(path.join(dir, 'report.txt'), 'utf8')).toBe('inline');
-        expect(await readFile(path.join(dir, 'report-1.txt'), 'utf8')).toBe('downloaded');
+        const downloadedPath = /path="([^"]+)"/.exec(textOf(blocks[1]))![1];
+        expect(await readFile(downloadedPath, 'utf8')).toBe('downloaded');
+        expect(path.basename(downloadedPath)).toBe('report.txt');
+        expect(path.dirname(downloadedPath)).not.toBe(dir);
         expect(textOf(blocks[0])).toContain(`path="${path.join(dir, 'report.txt')}"`);
         expect(textOf(blocks[0])).toContain('originalName="../report.txt"');
         expect(textOf(blocks[1])).toContain(`uri="${base}/report.txt"`);

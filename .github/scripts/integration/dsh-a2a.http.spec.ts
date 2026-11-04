@@ -914,7 +914,7 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
       await vi.waitFor(() =>
         expect(
           f.received.some(
-            (event) => event.body.statusUpdate?.status?.state === 'TASK_STATE_INPUT_REQUIRED',
+            (event) => event.body.task?.status?.state === 'TASK_STATE_INPUT_REQUIRED',
           ),
         ).toBe(true),
       );
@@ -926,8 +926,8 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
         ),
       ).toBe(true);
       expect(f.received[0].body.task).toMatchObject({ id, contextId: sent.result.task.contextId });
-      expect(f.received.at(-1)!.body.statusUpdate).toMatchObject({
-        taskId: id,
+      expect(f.received.at(-1)!.body.task).toMatchObject({
+        id,
         status: { message: { parts: [{ text: 'done' }, expect.anything()] } },
       });
     } finally {
@@ -990,7 +990,7 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
       await vi.waitFor(() =>
         expect(
           f.received.some(
-            (event) => event.body.statusUpdate?.status?.state === 'TASK_STATE_INPUT_REQUIRED',
+            (event) => event.body.task?.status?.state === 'TASK_STATE_INPUT_REQUIRED',
           ),
         ).toBe(true),
       );
@@ -1060,12 +1060,11 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
           }),
         );
       bus.finished();
-      await vi.waitFor(() => expect(f.received).toHaveLength(3));
+      await vi.waitFor(() =>
+        expect(f.received.at(-1)?.body.task?.status?.state).toBe('TASK_STATE_COMPLETED'),
+      );
       expect(f.received[0].body.task.id).toBe(task.id);
-      expect(f.received.slice(1).map((event) => event.body.statusUpdate.status.state)).toEqual([
-        'TASK_STATE_WORKING',
-        'TASK_STATE_COMPLETED',
-      ]);
+      expect(f.received.length).toBeLessThanOrEqual(2);
       expect(
         f.received.every(
           (event) =>
@@ -1105,7 +1104,8 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
         ),
       ).toBe(true);
       expect(f.received[0].body).toMatchObject({ kind: 'task', id: sent.result.id });
-      await vi.waitFor(() => expect(f.received).toHaveLength(3));
+      await server.flushNotifications();
+      const previousCount = f.received.length;
       await rpc(
         'SendMessage',
         {
@@ -1117,7 +1117,9 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
         },
         51,
       );
-      await vi.waitFor(() => expect(f.received).toHaveLength(6));
+      await server.flushNotifications();
+      expect(f.received.length).toBeGreaterThan(previousCount);
+      expect(f.received.at(-1)!.body.status.state).toBe('input-required');
       expect(
         f.received.every(
           (event) => event.body.kind === 'task' && event.contentType === 'application/json',
@@ -1155,7 +1157,8 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
       expect(sent.error).toBeUndefined();
       expect(sent.result.task.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
       await vi.waitFor(() => expect(error).toHaveBeenCalled());
-      await vi.waitFor(() => expect(f.received).toHaveLength(3));
+      await server.flushNotifications();
+      expect(f.received.at(-1)!.body.task.status.state).toBe('TASK_STATE_INPUT_REQUIRED');
       expect(
         (await json(await rpc('GetTask', { id: sent.result.task.id }, 50))).result.status.state,
       ).toBe('TASK_STATE_INPUT_REQUIRED');

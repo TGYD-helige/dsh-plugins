@@ -189,18 +189,25 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     ).then(() => {});
   }
 
-  // All sessions share one in-flight init. A failed attempt is cleared so the
-  // next event can retry once; no read or write passes a failed init barrier.
+  // All sessions share init and its retry delay; queued events wait rather than skip the barrier.
   let started: Promise<void> | undefined;
+  let retryAt = 0;
 
   function ensureStarted(): Promise<void> {
     if (!started) {
       const attempt = track(
-        Promise.all(backends.map((backend) => backend.init?.())).then(() => {}),
+        (async () => {
+          const delay = retryAt - Date.now();
+          if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+          await Promise.all(backends.map((backend) => backend.init?.()));
+        })(),
       );
       started = attempt;
       void attempt.catch(() => {
-        if (started === attempt) started = undefined;
+        if (started === attempt) {
+          retryAt = Date.now() + 1000;
+          started = undefined;
+        }
       });
     }
     return started;
@@ -219,12 +226,12 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   // stored row before any write (resume: constructor seeds are not re-emitted,
   // so history must come from the database, not from zero).
   const chains = new Map<string, Promise<void>>();
+  type ToolResultBatch = { events: any[]; index: number };
+  const toolBatches = new Map<string, ToolResultBatch>();
 
   function enqueue(sessionId: string, task: () => Promise<void>): void {
-    // Every task rechecks the init barrier: a failed earlier attempt must not
-    // become a resolved chain that lets later events zero-seed or no-op write.
+    // Backend work checks init inside mirrorEvent; cleanup needs only queue ordering.
     const next = (chains.get(sessionId) ?? Promise.resolve())
-      .then(() => ensureStarted())
       .then(task)
       .catch((error) => console.error('[dsh-storage] mirror task error:', error));
     chains.set(sessionId, next);
@@ -265,15 +272,17 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   ctx.effect(() => {
     void ensureStarted().catch((error) => console.error('[dsh-storage] database error:', error));
     return async () => {
+      toolBatches.clear();
+      await Promise.allSettled([...pending]);
       sessions.clear();
       toolCallMessages.clear();
-      await Promise.allSettled([...pending]);
       await guard(async (backend) => backend.close?.());
     };
   });
 
   ctx.provide('dshStorage', {
     archiveSession(sessionId: string): Promise<string | null> {
+      toolBatches.delete(sessionId);
       // Join the same per-session chain as event writes, then discard the old
       // in-memory rollup only after the database transaction commits.
       const archived = (chains.get(sessionId) ?? Promise.resolve())
@@ -302,9 +311,139 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     },
   } satisfies DshStorageService);
 
+  async function mirrorEvent(
+    session: any,
+    event: any,
+    snapshot: MessageRow | null,
+    batch?: ToolResultBatch,
+  ): Promise<void> {
+    await ensureStarted();
+    const sessionId: string = session?.id ?? 'unknown';
+    if (snapshot) {
+      await fanout((backend) => backend.upsertMessage(snapshot));
+      return;
+    }
+    const stored = sessions.get(sessionId) ?? (await seedAccum(sessionId));
+    sessions.set(sessionId, stored);
+    // Stage every change on a copy. The live accumulator advances only
+    // after the message + rollup transaction commits.
+    const accum: SessionAccum = { ...stored, metadata: { ...stored.metadata } };
+
+    let row: MessageRow | null = projectEvent(session, event, sessionId);
+    if (row && session.header?.createdAt !== undefined) {
+      row.metadata = { ...row.metadata, sessionCreatedAt: session.header.createdAt };
+    }
+    const storedRows =
+      event?.type === 'tool/result'
+        ? await readToolResultRows(session, sessionId, event)
+        : row
+          ? await backends[0].readMessages(sessionId, row.id)
+          : [];
+    let processedThrough = batch?.index;
+    if (event?.type === 'tool/result') {
+      row = mergeToolResult(event, storedRows);
+      while (
+        row &&
+        batch &&
+        processedThrough !== undefined &&
+        processedThrough + 1 < batch.events.length
+      ) {
+        const following = batch.events[processedThrough + 1];
+        const callId = toolResultCallId(following);
+        if (
+          !callId ||
+          !Array.isArray(row.toolCalls) ||
+          !row.toolCalls.some((call: any) => call?.id === callId)
+        )
+          break;
+        row = mergeToolResult(following, [row]);
+        processedThrough++;
+      }
+    }
+    const existing = row && storedRows.find((stored) => stored.id === row?.id);
+    if (event?.type === 'assistant/message' && row && existing && Array.isArray(row.toolCalls)) {
+      row.toolCalls = row.toolCalls.map((call: any) => {
+        const previous = Array.isArray(existing.toolCalls)
+          ? existing.toolCalls.find((stored: any) => stored?.id === call?.id)
+          : undefined;
+        return previous && 'result' in previous
+          ? {
+              ...call,
+              result: previous.result,
+              ...(previous.error ? { error: previous.error } : {}),
+            }
+          : call;
+      });
+    }
+    if (!row && event?.type === 'tool/result') {
+      console.error('[dsh-storage] no matching model tool call for result');
+    }
+    if (row && !existing && event?.type !== 'tool/result') {
+      accum.messageCount += 1;
+      accum.firstMessageAt ??= row.createdAt;
+      accum.lastMessageAt = row.createdAt;
+    }
+
+    // Every settled attempt/message is one model call; retries on the same
+    // step are additive rather than replacement snapshots.
+    const sampled = usageSampleOf(event);
+    let usageDelta = 0;
+    if (sampled) {
+      const sequence = Number(sampled.key);
+      const previous = Number(accum.usageSample?.key);
+      const duplicate =
+        Number.isSafeInteger(sequence) && Number.isSafeInteger(previous) && sequence <= previous;
+      if (!duplicate) {
+        usageDelta = sampled.sample.input + sampled.sample.output;
+        accum.usageSample = { key: sampled.key, ...sampled.sample };
+        accum.totalTokens += usageDelta;
+      }
+    }
+
+    // Latest-wins title snapshot (log-only `session/title` event; payload
+    // { title, messageSeqs, source } verified against dsh-session-title@0.1.6-alpha.2).
+    if (event?.type === 'session/title' && typeof event.data?.title === 'string') {
+      accum.title = event.data.title;
+    }
+
+    if (row || usageDelta !== 0 || event?.type === 'turn/end' || event?.type === 'session/title') {
+      // Merge our bookkeeping into the existing metadata instead of
+      // replacing the column — other fields (present or future) survive.
+      const metadata = {
+        ...accum.metadata,
+        ...(accum.usageSample ? { [LAST_USAGE_KEY]: accum.usageSample } : {}),
+      };
+      const sessionRow: SessionRow = {
+        sessionId,
+        title: accum.title ?? null,
+        messageCount: accum.messageCount,
+        totalTokens: accum.totalTokens,
+        firstMessageAt: accum.firstMessageAt ?? null,
+        lastMessageAt: accum.lastMessageAt ?? null,
+        ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+      };
+      await fanout((backend) => backend.upsertEvent(row, sessionRow));
+    }
+    // Advance only after commit so a failed merged write cannot skip later results.
+    if (batch && processedThrough !== undefined) batch.index = processedThrough;
+    sessions.set(sessionId, accum);
+    rememberToolCalls(sessionId, row);
+  }
+
   /* eslint-disable @typescript-eslint/no-explicit-any */
   ctx.on('session/event', (session: any, event: any) => {
-    const sessionId: string = session?.id ?? 'unknown';
+    if (
+      ![
+        'user/message',
+        'assistant/message',
+        'assistant/attempt',
+        'tool/result',
+        'turn/end',
+        'session/title',
+        'compaction/end',
+      ].includes(event?.type)
+    )
+      return;
     let snapshot: MessageRow | null;
     try {
       // Capture the committed surface now; queued writes must not observe later steps.
@@ -313,104 +452,35 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
       console.error('[dsh-storage] compaction snapshot error:', error);
       return;
     }
-    enqueue(sessionId, async () => {
-      if (snapshot) {
-        await fanout((backend) => backend.upsertMessage(snapshot));
+    if (event.type === 'compaction/end' && !snapshot) return;
+    const sessionId: string = session?.id ?? 'unknown';
+    if (event.type === 'tool/result') {
+      const pendingBatch = toolBatches.get(sessionId);
+      if (pendingBatch && pendingBatch.events.length < 32) {
+        pendingBatch.events.push(event);
         return;
       }
-      const stored = sessions.get(sessionId) ?? (await seedAccum(sessionId));
-      sessions.set(sessionId, stored);
-      // Stage every change on a copy. The live accumulator advances only
-      // after the message + rollup transaction commits.
-      const accum: SessionAccum = { ...stored, metadata: { ...stored.metadata } };
-
-      let row: MessageRow | null = projectEvent(session, event, sessionId);
-      if (row && session.header?.createdAt !== undefined) {
-        row.metadata = { ...row.metadata, sessionCreatedAt: session.header.createdAt };
-      }
-      const storedRows =
-        event?.type === 'tool/result'
-          ? await readToolResultRows(session, sessionId, event)
-          : row
-            ? await backends[0].readMessages(sessionId, row.id)
-            : [];
-      if (event?.type === 'tool/result') row = mergeToolResult(event, storedRows);
-      const existing = row && storedRows.find((stored) => stored.id === row?.id);
-      if (event?.type === 'assistant/message' && row && existing && Array.isArray(row.toolCalls)) {
-        row.toolCalls = row.toolCalls.map((call: any) => {
-          const previous = Array.isArray(existing.toolCalls)
-            ? existing.toolCalls.find((stored: any) => stored?.id === call?.id)
-            : undefined;
-          return previous && 'result' in previous
-            ? {
-                ...call,
-                result: previous.result,
-                ...(previous.error ? { error: previous.error } : {}),
-              }
-            : call;
-        });
-      }
-      if (!row && event?.type === 'tool/result') {
-        console.error('[dsh-storage] no matching model tool call for result');
-      }
-      if (row && !existing && event?.type !== 'tool/result') {
-        accum.messageCount += 1;
-        accum.firstMessageAt ??= row.createdAt;
-        accum.lastMessageAt = row.createdAt;
-      }
-
-      // Every settled attempt/message is one model call; retries on the same
-      // step are additive rather than replacement snapshots.
-      const sampled = usageSampleOf(event);
-      let usageDelta = 0;
-      if (sampled) {
-        const sequence = Number(sampled.key);
-        const previous = Number(accum.usageSample?.key);
-        const duplicate =
-          Number.isSafeInteger(sequence) && Number.isSafeInteger(previous) && sequence <= previous;
-        if (!duplicate) {
-          usageDelta = sampled.sample.input + sampled.sample.output;
-          accum.usageSample = { key: sampled.key, ...sampled.sample };
-          accum.totalTokens += usageDelta;
+      const batch: ToolResultBatch = { events: [event], index: 0 };
+      toolBatches.set(sessionId, batch);
+      enqueue(sessionId, async () => {
+        if (toolBatches.get(sessionId) === batch) toolBatches.delete(sessionId);
+        for (; batch.index < batch.events.length; batch.index++) {
+          try {
+            await mirrorEvent(session, batch.events[batch.index], null, batch);
+          } catch (error) {
+            console.error('[dsh-storage] mirror task error:', error);
+          }
         }
-      }
-
-      // Latest-wins title snapshot (log-only `session/title` event; payload
-      // { title, messageSeqs, source } verified against dsh-session-title@0.1.6-alpha.2).
-      if (event?.type === 'session/title' && typeof event.data?.title === 'string') {
-        accum.title = event.data.title;
-      }
-
-      if (
-        row ||
-        usageDelta !== 0 ||
-        event?.type === 'turn/end' ||
-        event?.type === 'session/title'
-      ) {
-        // Merge our bookkeeping into the existing metadata instead of
-        // replacing the column — other fields (present or future) survive.
-        const metadata = {
-          ...accum.metadata,
-          ...(accum.usageSample ? { [LAST_USAGE_KEY]: accum.usageSample } : {}),
-        };
-        const sessionRow: SessionRow = {
-          sessionId,
-          title: accum.title ?? null,
-          messageCount: accum.messageCount,
-          totalTokens: accum.totalTokens,
-          firstMessageAt: accum.firstMessageAt ?? null,
-          lastMessageAt: accum.lastMessageAt ?? null,
-          ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
-        };
-        await fanout((backend) => backend.upsertEvent(row, sessionRow));
-      }
-      sessions.set(sessionId, accum);
-      rememberToolCalls(sessionId, row);
-    });
+      });
+    } else {
+      toolBatches.delete(sessionId);
+      enqueue(sessionId, () => mirrorEvent(session, event, snapshot));
+    }
   });
 
   ctx.on('session/disposed', (session: any) => {
     const sessionId: string = session?.id ?? 'unknown';
+    toolBatches.delete(sessionId);
     // The delete must run inside the session's chain — a synchronous delete
     // here races the queued event tasks (the map may not even have the entry
     // yet at emit time, and queued tasks would keep growing the accumulator
@@ -432,6 +502,7 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
   // Durability checkpoint: wait only for this session. Shutdown still drains
   // the global pending set; an unrelated slow session must not block this one.
   ctx.on('session/flush', async (session: any) => {
+    toolBatches.delete(session?.id ?? 'unknown');
     const chain = chains.get(session?.id ?? 'unknown');
     if (chain) {
       await chain;

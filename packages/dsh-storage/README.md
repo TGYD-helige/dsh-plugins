@@ -46,6 +46,10 @@ npx prisma db push --schema node_modules/@amaster.ai/dsh-storage/prisma/schema.m
 # schema.postgresql.prisma / schema.sqlite.prisma / schema.sqlserver.prisma work the same way
 ```
 
+Only message, tool-result, assistant-attempt, turn-end, title, and successful compaction events enter the mirror queue; unrelated lifecycle records do not trigger database reads or retries. Failed initialization retries share a one-second delay across sessions. Valid queued events wait through that delay, and session flush/unload still drain their ordered work. Database operation failures continue to be logged and swallowed; local DSH persistence remains authoritative.
+
+Adjacent queued tool results for the same assistant row are merged before writing, with at most 32 events per batch and no debounce timer. Different messages and intervening mirrored events preserve queue order. Session flush, archive, disposal, and plugin unload seal and drain earlier batches. Full result rows are not kept in a new persistent cache. This reduces repeated reads/writes; the queue can still grow when incoming data outpaces the database.
+
 ## Data model
 
 - **`ai_messages`** — user and model rows, with `thoughts`, `tokens`, `tool_calls`, `agent_id`, `metadata` JSON columns and soft-delete. A `tool/result` updates the matching model row's `tool_calls` entry by call ID; it does not create a `type=tool` row.

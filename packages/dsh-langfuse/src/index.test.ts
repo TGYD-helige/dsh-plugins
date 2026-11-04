@@ -900,6 +900,94 @@ describe('dsh-langfuse plugin', () => {
       expect(exported).not.toContain(secretKey.slice(0, 70));
     });
 
+    it('bounds turn-root IO at the reporting boundary without mutating messages', async () => {
+      await setup({ ...enabledConfig, maxPayloadBytes: 1024 });
+      const session = sessionOf('s1');
+      const input = 'x'.repeat(100_000);
+      const output = 'y'.repeat(100_000);
+      ctx.emit('session/event', session, turnStart(0));
+      const message = { content: [{ type: 'text', text: input }] };
+      ctx.emit('session/event', session, ev('user/message', message));
+      ctx.emit(
+        'session/event',
+        session,
+        ev('assistant/message', { message: { content: [{ type: 'text', text: output }] } }),
+      );
+      ctx.emit('session/event', session, turnEnd(0));
+      const root = mocks.roots[0];
+      expect(
+        Buffer.byteLength(JSON.stringify(root.attributes['langfuse.trace.input'])),
+      ).toBeLessThanOrEqual(1024);
+      expect(
+        Buffer.byteLength(JSON.stringify(root.attributes['langfuse.trace.output'])),
+      ).toBeLessThanOrEqual(1024);
+      expect(metadataOf(root)).toMatchObject({ truncated: true });
+      expect(message.content[0].text).toBe(input);
+      expect(root.ended).toBe(1);
+    });
+
+    it('flushes one session without waiting for an unrelated image read', async () => {
+      let release!: (value: { data: Uint8Array }) => void;
+      ctx.provide('attachments', {
+        readImage: () =>
+          new Promise((resolve) => {
+            release = resolve;
+          }),
+      } as unknown as AttachmentStore);
+      await setup({ ...enabledConfig, captureMedia: true });
+      const other = sessionOf('other');
+      ctx.emit('session/event', other, turnStart(0));
+      ctx.emit('session/event', other, ev('user/message', { content: [image] }));
+      ctx.emit('session/event', other, turnEnd(0));
+      const flushing = ctx.parallel('session/flush', sessionOf('s1'));
+      try {
+        expect(
+          await Promise.race([
+            flushing.then(() => 'flushed'),
+            new Promise((resolve) => setTimeout(() => resolve('blocked'), 50)),
+          ]),
+        ).toBe('flushed');
+        expect(mocks.roots[0].ended).toBe(0);
+      } finally {
+        release({ data: Uint8Array.of(1, 2, 3) });
+        await ctx.parallel('session/flush', other);
+        await flushing;
+      }
+      expect(mocks.roots[0].ended).toBe(1);
+    });
+
+    it('keeps completed child media in the parent session durability checkpoint', async () => {
+      let release!: (value: { data: Uint8Array }) => void;
+      ctx.provide('attachments', {
+        readImage: () =>
+          new Promise((resolve) => {
+            release = resolve;
+          }),
+      } as unknown as AttachmentStore);
+      await setup({ ...enabledConfig, captureMedia: true });
+      const parent = sessionOf('s1');
+      ctx.emit('session/event', parent, turnStart(0));
+      ctx.emit('session/event', parent, userMessage('delegate'));
+      const child = childSessionOf('child', 's1');
+      ctx.emit('session/created', child);
+      ctx.emit('subagent/start', subagentStart('child'));
+      ctx.emit('session/event', child, ev('user/message', { content: [image] }));
+      ctx.emit('subagent/end', subagentEnd('child', 'completed'));
+      let done = false;
+      const flushing = ctx.parallel('session/flush', parent).then(() => {
+        done = true;
+      });
+      try {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(done).toBe(false);
+        expect(mocks.roots[0].spans[0].ended).toBe(0);
+      } finally {
+        release({ data: Uint8Array.of(1, 2, 3) });
+        await flushing;
+      }
+      expect(mocks.roots[0].spans[0].ended).toBe(1);
+    });
+
     it('does not delay streaming for image reads and drains their closed observations before flush', async () => {
       let release!: (value: { ref: typeof image.attachment; data: Uint8Array }) => void;
       const pending = new Promise<{ ref: typeof image.attachment; data: Uint8Array }>((resolve) => {
@@ -3453,6 +3541,25 @@ describe('dsh-langfuse plugin', () => {
   });
 
   describe('tools/execute', () => {
+    it('bounds tool telemetry without changing the original result or losing error metadata', async () => {
+      await setup({ ...enabledConfig, maxPayloadBytes: 1024, redactFields: ['secret'] });
+      const exec = execOf({ arguments: { secret: 'PRIVATE', path: 'x'.repeat(100_000) } });
+      const result = {
+        ...errResult('x'.repeat(100_000)),
+        content: [{ type: 'text' as const, text: 'x'.repeat(100_000) }],
+      };
+      expect(await dispatchTool(ctx, exec, async () => result)).toBe(result);
+      expect(result.content[0].text).toHaveLength(100_000);
+      const span = fakeObs(mocks.roots[0]).spans[0];
+      expect(Buffer.byteLength(JSON.stringify(span.body.input))).toBeLessThanOrEqual(1024);
+      const update = lastUpdate(span);
+      expect(Buffer.byteLength(JSON.stringify(update.output))).toBeLessThanOrEqual(1024);
+      expect(JSON.stringify(span)).not.toContain('PRIVATE');
+      expect(update.level).toBe('ERROR');
+      expect(String(update.statusMessage ?? '')).toHaveLength(0);
+      expect(update.metadata).toMatchObject({ truncated: true });
+    });
+
     it("spans one tool dispatch under the agent's session trace", async () => {
       await setup();
       ctx.emit('session/event', sessionOf('s1'), turnStart(0));

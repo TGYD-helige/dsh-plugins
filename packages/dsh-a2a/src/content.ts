@@ -18,7 +18,7 @@
  */
 
 import { lookup as dnsLookup } from 'node:dns/promises';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { BlockList, isIP } from 'node:net';
@@ -32,6 +32,24 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm/types';
 const MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 30_000;
 
+/** Stop waiting even when a backend cannot cancel its underlying work. */
+async function abortable<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  let onAbort!: () => void;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        onAbort = () => reject(signal.reason);
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
 /** Deployment-owned writer for files read by an agent's active tools. */
 export interface A2aFileMaterializer {
   materializeFile(input: {
@@ -39,6 +57,7 @@ export interface A2aFileMaterializer {
     bytes: Uint8Array;
     filename: string;
     mediaType: string;
+    signal?: AbortSignal;
   }): Promise<{ readablePath: string }>;
 }
 
@@ -60,9 +79,12 @@ export async function buildMessageContent(
   dir: string,
   materialization?: Materialization,
   downloads: UrlDownloadOptions = {},
+  signal?: AbortSignal,
 ): Promise<ContentBlock[]> {
   const content: ContentBlock[] = [];
+  signal?.throwIfAborted();
   for (const part of parts) {
+    signal?.throwIfAborted();
     const c = part.content;
     if (!c) continue;
     switch (c.$case) {
@@ -74,7 +96,12 @@ export async function buildMessageContent(
         break;
       case 'raw':
       case 'url':
-        content.push(await fileContent(c, part, attachments, dir, materialization, downloads));
+        content.push(
+          await abortable(
+            fileContent(c, part, attachments, dir, materialization, downloads, signal),
+            signal,
+          ),
+        );
         break;
       default:
         // A part kind this SDK version predates: keep it visible, never drop.
@@ -129,6 +156,7 @@ async function fileContent(
   dir: string,
   materialization: Materialization | undefined,
   downloads: UrlDownloadOptions,
+  signal?: AbortSignal,
 ): Promise<ContentBlock> {
   let bytes: Uint8Array;
   let mediaType = part.mediaType;
@@ -136,20 +164,23 @@ async function fileContent(
   try {
     if (c.$case === 'url') {
       uri = c.value;
-      const got = await download(uri, downloads);
+      const got = await download(uri, downloads, signal);
       bytes = got.bytes;
       mediaType ||= got.mediaType ?? '';
     } else {
       bytes = c.value;
     }
   } catch (error) {
+    signal?.throwIfAborted();
     return failNote(part, mediaType, uri, 'failed to read a file part', error);
   }
+  signal?.throwIfAborted();
   const image = attachments?.imageLimits.mediaTypes.includes(
     mediaType.toLowerCase() as ImageMediaType,
   );
   if (attachments && image) {
-    const block = await saveAttachment(attachments, bytes, mediaType, part.filename);
+    const block = await saveAttachment(attachments, bytes, mediaType, part.filename, signal);
+    signal?.throwIfAborted();
     if (block) return block;
   }
   if (materialization && !image) {
@@ -159,19 +190,23 @@ async function fileContent(
         bytes,
         filename: sanitizeUploadFileName(part.filename),
         mediaType,
+        signal,
       });
+      signal?.throwIfAborted();
       if (!readablePath) throw new Error('materializer returned no readable path');
       return documentBlock(uri, mediaType, bytes.byteLength, readablePath, part.filename);
     } catch (error) {
+      signal?.throwIfAborted();
       console.error('[dsh-a2a] failed to materialize a file part:', error);
       return note(part, mediaType, uri, 'file materialization failed');
     }
   }
   try {
     const name = sanitizeUploadFileName(part.filename);
-    const filePath = await persistUpload(dir, name, bytes);
+    const filePath = await persistUpload(dir, name, bytes, signal);
     return documentBlock(uri, mediaType, bytes.byteLength, filePath, part.filename);
   } catch (error) {
+    signal?.throwIfAborted();
     return failNote(part, mediaType, uri, 'failed to persist a file part', error);
   }
 }
@@ -182,6 +217,7 @@ async function saveAttachment(
   bytes: Uint8Array,
   mediaType: string,
   filename: string,
+  signal?: AbortSignal,
 ): Promise<ContentBlock | undefined> {
   const name = filename || undefined;
   if (attachments.imageLimits.mediaTypes.includes(mediaType.toLowerCase() as ImageMediaType)) {
@@ -193,31 +229,40 @@ async function saveAttachment(
       });
       return { type: 'image', attachment };
     } catch (error) {
+      signal?.throwIfAborted();
       console.error('[dsh-a2a] image admission failed; storing the bytes as a file:', error);
     }
   }
+  signal?.throwIfAborted();
   try {
     const attachment = await attachments.saveFile({ data: bytes, name });
     return { type: 'file', attachment };
   } catch (error) {
+    signal?.throwIfAborted();
     console.error('[dsh-a2a] failed to store an attachment:', error);
     return undefined;
   }
 }
 
 /** Save one upload under the upload dir; returns the absolute path. */
-async function persistUpload(dir: string, name: string, bytes: Uint8Array): Promise<string> {
+async function persistUpload(
+  dir: string,
+  name: string,
+  bytes: Uint8Array,
+  signal?: AbortSignal,
+): Promise<string> {
   await mkdir(dir, { recursive: true });
-  const { name: stem, ext } = path.parse(name);
-  for (let attempt = 0; ; attempt++) {
-    const candidate = path.join(dir, attempt === 0 ? name : `${stem}-${attempt}${ext}`);
-    try {
-      await writeFile(candidate, bytes, { flag: 'wx' });
-      return candidate;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    }
+  let candidate = path.join(dir, name);
+  try {
+    await writeFile(candidate, bytes, { flag: 'wx', signal });
+    return candidate;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
   }
+  // A unique directory preserves even near-limit UTF-8 filenames without probing old suffixes.
+  candidate = path.join(await mkdtemp(path.join(dir, 'upload-')), name);
+  await writeFile(candidate, bytes, { flag: 'wx', signal });
+  return candidate;
 }
 
 // Windows refuses these device stems regardless of extension.
@@ -372,101 +417,117 @@ async function safeAddresses(
 async function download(
   uri: string,
   options: UrlDownloadOptions,
+  requestedSignal?: AbortSignal,
 ): Promise<{ bytes: Uint8Array; mediaType?: string }> {
   const allowedHosts = new Set(
     (options.allowedHosts ?? []).map((host) => host.replace(/^\[|\]$/g, '').toLowerCase()),
   );
   const controller = new AbortController();
+  const signal = requestedSignal
+    ? AbortSignal.any([requestedSignal, controller.signal])
+    : controller.signal;
+  signal.throwIfAborted();
   const timeout = setTimeout(
     () => controller.abort(new Error('download timed out')),
     DOWNLOAD_TIMEOUT_MS,
   );
   timeout.unref();
   try {
-    let current = new URL(uri);
-    for (let redirect = 0; ; redirect++) {
-      if (current.protocol !== 'http:' && current.protocol !== 'https:') {
-        throw new Error(`unsupported scheme "${current.protocol}"`);
-      }
-      await safeAddresses(current.hostname, allowedHosts, options.allowPrivate === true);
-      const response = await new Promise<import('node:http').IncomingMessage>((resolve, reject) => {
-        const request = (current.protocol === 'http:' ? httpRequest : httpsRequest)(
-          current,
-          {
-            signal: controller.signal,
-            lookup: (hostname, lookupOptions, callback) => {
-              const allowed =
-                options.allowPrivate === true ||
-                allowedHosts.has(hostname.replace(/^\[|\]$/g, '').toLowerCase());
-              const resolving = allowed
-                ? dnsLookup(hostname, { all: lookupOptions.all ?? false }).then((entry) =>
-                    Array.isArray(entry) ? entry : [entry],
-                  )
-                : safeAddresses(hostname, allowedHosts, false);
-              void resolving.then(
-                (addresses) => {
-                  if (lookupOptions.all) return callback(null, addresses);
-                  const { address, family } = addresses[0];
-                  callback(null, address, family);
-                  return addresses;
+    return await abortable(
+      (async () => {
+        let current = new URL(uri);
+        for (let redirect = 0; ; redirect++) {
+          if (current.protocol !== 'http:' && current.protocol !== 'https:') {
+            throw new Error(`unsupported scheme "${current.protocol}"`);
+          }
+          await safeAddresses(current.hostname, allowedHosts, options.allowPrivate === true);
+          signal.throwIfAborted();
+          const response = await new Promise<import('node:http').IncomingMessage>(
+            (resolve, reject) => {
+              const request = (current.protocol === 'http:' ? httpRequest : httpsRequest)(
+                current,
+                {
+                  signal,
+                  lookup: (hostname, lookupOptions, callback) => {
+                    const allowed =
+                      options.allowPrivate === true ||
+                      allowedHosts.has(hostname.replace(/^\[|\]$/g, '').toLowerCase());
+                    const resolving = allowed
+                      ? dnsLookup(hostname, { all: lookupOptions.all ?? false }).then((entry) =>
+                          Array.isArray(entry) ? entry : [entry],
+                        )
+                      : safeAddresses(hostname, allowedHosts, false);
+                    void resolving.then(
+                      (addresses) => {
+                        if (lookupOptions.all) return callback(null, addresses);
+                        const { address, family } = addresses[0];
+                        callback(null, address, family);
+                        return addresses;
+                      },
+                      (error) => callback(error, '', 0),
+                    );
+                  },
                 },
-                (error) => callback(error, '', 0),
+                resolve,
               );
+              request.on('socket', (socket) => {
+                socket.once('connect', () => {
+                  if (options.allowPrivate === true) return;
+                  if (allowedHosts.has(current.hostname.replace(/^\[|\]$/g, '').toLowerCase()))
+                    return;
+                  try {
+                    assertPublicAddress(socket.remoteAddress ?? '');
+                  } catch (error) {
+                    request.destroy(error as Error);
+                  }
+                });
+              });
+              request.on('error', reject);
+              request.end();
             },
-          },
-          resolve,
-        );
-        request.on('socket', (socket) => {
-          socket.once('connect', () => {
-            if (options.allowPrivate === true) return;
-            if (allowedHosts.has(current.hostname.replace(/^\[|\]$/g, '').toLowerCase())) return;
-            try {
-              assertPublicAddress(socket.remoteAddress ?? '');
-            } catch (error) {
-              request.destroy(error as Error);
-            }
-          });
-        });
-        request.on('error', reject);
-        request.end();
-      });
-      const status = response.statusCode ?? 0;
-      const location = response.headers.location;
-      if ([301, 302, 303, 307, 308].includes(status) && location) {
-        response.resume();
-        if (redirect >= 5) throw new Error('too many download redirects');
-        current = new URL(location, current);
-        continue;
-      }
-      if (status < 200 || status >= 300) {
-        response.resume();
-        throw new Error(`HTTP ${status}`);
-      }
-      const declared = Number(response.headers['content-length']);
-      if (declared > MAX_DOWNLOAD_BYTES) {
-        response.destroy();
-        throw new Error(`exceeds the ${MAX_DOWNLOAD_BYTES}-byte download limit`);
-      }
-      const chunks: Uint8Array[] = [];
-      let total = 0;
-      try {
-        for await (const chunk of response) {
-          total += chunk.byteLength;
-          if (total > MAX_DOWNLOAD_BYTES) {
+          );
+          signal.throwIfAborted();
+          const status = response.statusCode ?? 0;
+          const location = response.headers.location;
+          if ([301, 302, 303, 307, 308].includes(status) && location) {
+            response.resume();
+            if (redirect >= 5) throw new Error('too many download redirects');
+            current = new URL(location, current);
+            continue;
+          }
+          if (status < 200 || status >= 300) {
+            response.resume();
+            throw new Error(`HTTP ${status}`);
+          }
+          const declared = Number(response.headers['content-length']);
+          if (declared > MAX_DOWNLOAD_BYTES) {
+            response.destroy();
             throw new Error(`exceeds the ${MAX_DOWNLOAD_BYTES}-byte download limit`);
           }
-          chunks.push(chunk);
+          const chunks: Uint8Array[] = [];
+          let total = 0;
+          try {
+            for await (const chunk of response) {
+              signal.throwIfAborted();
+              total += chunk.byteLength;
+              if (total > MAX_DOWNLOAD_BYTES) {
+                throw new Error(`exceeds the ${MAX_DOWNLOAD_BYTES}-byte download limit`);
+              }
+              chunks.push(chunk);
+            }
+          } catch (error) {
+            response.destroy();
+            throw error;
+          }
+          const contentType = response.headers['content-type'];
+          const mediaType = (Array.isArray(contentType) ? contentType[0] : contentType)
+            ?.split(';')[0]
+            .trim();
+          return { bytes: Buffer.concat(chunks, total), mediaType: mediaType || undefined };
         }
-      } catch (error) {
-        response.destroy();
-        throw error;
-      }
-      const contentType = response.headers['content-type'];
-      const mediaType = (Array.isArray(contentType) ? contentType[0] : contentType)
-        ?.split(';')[0]
-        .trim();
-      return { bytes: Buffer.concat(chunks, total), mediaType: mediaType || undefined };
-    }
+      })(),
+      signal,
+    );
   } finally {
     clearTimeout(timeout);
   }
