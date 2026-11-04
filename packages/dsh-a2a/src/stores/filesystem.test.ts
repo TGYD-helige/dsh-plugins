@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, open, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Task } from '@a2a-js/sdk';
@@ -8,7 +8,54 @@ import { FilesystemTaskStore } from './filesystem.js';
 
 vi.mock('node:fs/promises', async (original) => {
   const fs = await original<typeof import('node:fs/promises')>();
-  return { ...fs, readFile: vi.fn(fs.readFile) };
+  return {
+    ...fs,
+    open: vi.fn(async (...args: Parameters<typeof fs.open>) => {
+      const handle = await fs.open(...args);
+      vi.spyOn(handle, 'readFile');
+      return handle;
+    }),
+    readFile: vi.fn(fs.readFile),
+  };
+});
+
+it('discovers persisted candidates in one summary scan without hydrating task pages', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'a2a-recovery-'));
+  try {
+    const user = { userName: 'owner', isAuthenticated: true };
+    const call = new ServerCallContext({ tenant: 'Tenant', user });
+    const store = new FilesystemTaskStore({ root });
+    for (let i = 0; i < 105; i++)
+      await store.save(
+        Task.fromJSON({
+          id: `t${i}`,
+          contextId: i < 100 ? 'done' : 'pending',
+          status: { state: i < 100 ? 'TASK_STATE_COMPLETED' : 'TASK_STATE_SUBMITTED' },
+          metadata: { content: 'x'.repeat(100_000) },
+        }),
+        call,
+      );
+    const restored = new FilesystemTaskStore({ root });
+    vi.mocked(open).mockClear();
+    vi.mocked(readFile).mockClear();
+    expect(await restored.recoveryCandidates(call)).toEqual(['pending']);
+    expect(open).toHaveBeenCalledTimes(105);
+    for (const result of vi.mocked(open).mock.results)
+      expect((await result.value).readFile).not.toHaveBeenCalled();
+    expect(readFile).not.toHaveBeenCalled();
+    expect(
+      await restored.recoveryCandidates(new ServerCallContext({ tenant: 'tenant', user })),
+    ).toEqual([]);
+    expect(await restored.recoveryCandidates(new ServerCallContext({ tenant: 'Tenant' }))).toEqual(
+      [],
+    );
+    await store.delete('t104', call);
+    expect(await restored.recoveryCandidates(call)).toEqual(['pending']);
+    for (let i = 100; i < 104; i++) await store.delete(`t${i}`, call);
+    expect(await restored.recoveryCandidates(call)).toEqual([]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 it('reads only page snapshots while preserving filters and cross-instance updates', async () => {
@@ -61,6 +108,14 @@ it('lists legacy JSON snapshots and keeps new files readable by the old JSON dec
     await writeFile(file, JSON.stringify(Task.toJSON(task)));
     const restored = new FilesystemTaskStore({ root });
     expect((await restored.list({ contextId: 'old' } as never, context)).tasks).toEqual([task]);
+    expect(await restored.recoveryCandidates(context)).toEqual(['old']);
+    await writeFile(
+      file,
+      JSON.stringify({ _dshTaskList: 'broken', ...(Task.toJSON(task) as object) }),
+    );
+    expect(await restored.recoveryCandidates(context)).toEqual(['old']);
+    await writeFile(file, '{broken JSON');
+    await expect(restored.recoveryCandidates(context)).rejects.toThrow();
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -9,7 +9,7 @@
 
 import type { ListTasksRequest, ListTasksResponse, Task } from '@a2a-js/sdk';
 import type { ServerCallContext } from '@a2a-js/sdk/server';
-import { type ManagedTaskStore, taskScopeKey } from '../task-store.js';
+import { type ManagedTaskStore, recoveryContextIds, taskScopeKey } from '../task-store.js';
 import {
   LIST_PREFIX_BYTES,
   loadTaskPage,
@@ -68,8 +68,8 @@ export class RedisTaskStore implements ManagedTaskStore {
     await this.redis?.del(this.taskKey(taskId, context));
   }
 
-  async list(params: ListTasksRequest, context: ServerCallContext): Promise<ListTasksResponse> {
-    if (!this.redis) return { tasks: [], nextPageToken: '', pageSize: 0, totalSize: 0 };
+  private async shells(context: ServerCallContext): Promise<Task[]> {
+    if (!this.redis) return [];
     // SCAN only names; bounded prefixes supply the lightweight list summaries.
     const shells: Task[] = [];
     const seen = new Set<string>();
@@ -107,7 +107,17 @@ export class RedisTaskStore implements ManagedTaskStore {
         }
       }
     } while (cursor !== '0');
-    return loadTaskPage(shells, params, async (ids) => {
+    return shells;
+  }
+
+  async recoveryCandidates(context: ServerCallContext): Promise<string[]> {
+    if (!this.redis) throw new Error('[dsh-a2a] Redis TaskStore is not initialized.');
+    return recoveryContextIds(await this.shells(context));
+  }
+
+  async list(params: ListTasksRequest, context: ServerCallContext): Promise<ListTasksResponse> {
+    if (!this.redis) return { tasks: [], nextPageToken: '', pageSize: 0, totalSize: 0 };
+    return loadTaskPage(await this.shells(context), params, async (ids) => {
       const raws: Array<string | null> = await this.redis.mget(
         ...ids.map((id) => this.taskKey(id, context)),
       );

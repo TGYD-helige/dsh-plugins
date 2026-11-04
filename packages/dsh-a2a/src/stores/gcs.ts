@@ -21,7 +21,7 @@ import { promisify } from 'node:util';
 import { gunzip, gzip } from 'node:zlib';
 import type { ListTasksRequest, ListTasksResponse, Task } from '@a2a-js/sdk';
 import type { ServerCallContext } from '@a2a-js/sdk/server';
-import { type ManagedTaskStore, taskScopeKey } from '../task-store.js';
+import { type ManagedTaskStore, recoveryContextIds, taskScopeKey } from '../task-store.js';
 import { loadTaskPage, parseListShell, taskListShell } from './listing.js';
 
 const compress = promisify(gzip);
@@ -90,8 +90,8 @@ export class GcsTaskStore implements ManagedTaskStore {
     ]);
   }
 
-  async list(params: ListTasksRequest, context: ServerCallContext): Promise<ListTasksResponse> {
-    if (!this.bucket) return { tasks: [], nextPageToken: '', pageSize: 0, totalSize: 0 };
+  private async shells(context: ServerCallContext): Promise<Task[]> {
+    if (!this.bucket) return [];
     const [files] = await this.bucket.getFiles({
       prefix: `${this.prefix}/${taskScopeKey(context)}/`,
     });
@@ -114,7 +114,17 @@ export class GcsTaskStore implements ManagedTaskStore {
       );
       for (const shell of batch) if (shell) shells.push(shell);
     }
-    return loadTaskPage(shells, params, (ids) =>
+    return shells;
+  }
+
+  async recoveryCandidates(context: ServerCallContext): Promise<string[]> {
+    if (!this.bucket) throw new Error('[dsh-a2a] GCS TaskStore is not initialized.');
+    return recoveryContextIds(await this.shells(context));
+  }
+
+  async list(params: ListTasksRequest, context: ServerCallContext): Promise<ListTasksResponse> {
+    if (!this.bucket) return { tasks: [], nextPageToken: '', pageSize: 0, totalSize: 0 };
+    return loadTaskPage(await this.shells(context), params, (ids) =>
       Promise.all(
         ids.map(async (id) => {
           try {

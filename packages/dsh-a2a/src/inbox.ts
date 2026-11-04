@@ -21,7 +21,14 @@ import type { A2aBridge, TaskEntry } from './bridge.js';
 import { InboxChanges } from './inbox-changes.js';
 import type { A2aTurnContext } from './index.js';
 import type { A2aServer } from './server.js';
-import { commitInboxInput, type ManagedTaskStore, markInboxInputPending } from './task-store.js';
+import {
+  commitInboxInput,
+  findRecoveryCandidates,
+  isTerminalTask,
+  type ManagedTaskStore,
+  markInboxInputPending,
+  taskScopeKey,
+} from './task-store.js';
 import { agentTextMessage, SessionTranslator, terminalStatusUpdate } from './translator.js';
 
 export const INBOX_EXTENSION =
@@ -90,6 +97,8 @@ declare module '@deepseek-ai/cordis' {
 
 /** Same-process queue control; wire messages and task subscriptions remain standard A2A. */
 export interface A2aInbox {
+  /** Scoped, conservative candidates; discovery never resolves or wakes an agent. */
+  recoveryCandidates(context?: ServerCallContext): Promise<string[]>;
   get(contextId: string, page?: InboxPageOptions): Promise<InboxSnapshot>;
   update(
     contextId: string,
@@ -106,7 +115,7 @@ export interface A2aInbox {
   remove(contextId: string, id: string, page?: InboxPageOptions): Promise<InboxSnapshot>;
   clearPending(contextId: string, page?: InboxPageOptions): Promise<InboxSnapshot>;
   executePending(contextId: string, id?: string, page?: InboxPageOptions): Promise<InboxSnapshot>;
-  resolve(contextId: string): Promise<Agent>;
+  resolve(contextId: string, context?: ServerCallContext): Promise<Agent>;
   content(message: Message, contextId: string, signal?: AbortSignal): Promise<ContentBlock[]>;
   /** Admit a same-process host follow-up under an existing task's durable identity. */
   enqueue(
@@ -178,6 +187,7 @@ interface TaskRun {
 }
 interface ContextRun {
   entry: TaskEntry;
+  scope: string;
   /** Pause blocks new admissions and pre-step claims without clearing retained input. */
   paused: boolean;
   /** Context clear discards late commits after the clearing flag itself resets. */
@@ -296,8 +306,12 @@ export class NativeInbox implements A2aInbox {
   content(message: Message, contextId: string, signal?: AbortSignal) {
     return this.bridge.buildContent(message, contextId, signal);
   }
-  async resolve(contextId: string): Promise<Agent> {
-    return (await this.context(contextId)).entry.handle.agent;
+  async resolve(contextId: string, context?: ServerCallContext): Promise<Agent> {
+    return (await this.context(contextId, context)).entry.handle.agent;
+  }
+
+  recoveryCandidates(context = new ServerCallContext()): Promise<string[]> {
+    return findRecoveryCandidates(this.store, context);
   }
 
   async get(contextId: string, page?: InboxPageOptions): Promise<InboxSnapshot> {
@@ -744,7 +758,7 @@ export class NativeInbox implements A2aInbox {
       if (this.stopping || this.bridge.isClearing(contextId))
         throw new Error('Context is unavailable.');
       const previous = await this.store.load(taskId, context);
-      if (!previous || previous.contextId !== contextId || !this.terminal(previous))
+      if (!previous || previous.contextId !== contextId || !isTerminalTask(previous))
         throw new Error('Resume requires a terminal retained task.');
       const retained = retainedSnapshot(previous);
       if (typeof retained !== 'string') throw new Error('Task has no retained input to resume.');
@@ -888,7 +902,7 @@ export class NativeInbox implements A2aInbox {
       }
       if (message.source.promotedFrom === message.source.taskId) continue;
       const former = await this.store.load(message.source.promotedFrom!, context);
-      if (!former || this.terminal(former)) continue;
+      if (!former || isTerminalTask(former)) continue;
       former.status = {
         state: TaskState.TASK_STATE_CANCELED,
         message: undefined,
@@ -927,7 +941,7 @@ export class NativeInbox implements A2aInbox {
         if (typeof retained !== 'string') continue;
         // Terminal snapshots belong to explicit resume(); do not consume their
         // retained metadata during ordinary context recovery.
-        if (this.terminal(task)) continue;
+        if (isTerminalTask(task)) continue;
         snapshots.push(task);
         for (const input of JSON.parse(retained) as typeof inputs) {
           const { message } = input;
@@ -1030,16 +1044,23 @@ export class NativeInbox implements A2aInbox {
     }
   }
 
-  private context(contextId: string, context = new ServerCallContext()): Promise<ContextRun> {
+  private context(contextId: string, context?: ServerCallContext): Promise<ContextRun> {
     if (this.stopping) return Promise.reject(new Error('Native inbox is unloading.'));
+    const checkScope = (run: ContextRun) => {
+      if (context && run.scope !== taskScopeKey(context))
+        throw new Error('Context is already loaded in a different tenant or owner scope.');
+      return run;
+    };
     const existing = this.contexts.get(contextId);
-    if (existing) return Promise.resolve(existing);
+    if (existing) return Promise.resolve(existing).then(checkScope);
     let creating = this.resolving.get(contextId);
     if (!creating) {
       creating = (async () => {
+        const call = context ?? new ServerCallContext();
         const { entry } = await this.bridge.ensureTask(randomUUID(), contextId);
         const run: ContextRun = {
           entry,
+          scope: taskScopeKey(call),
           paused: false,
           tasks: new Map(),
           claimed: new Set(),
@@ -1050,15 +1071,15 @@ export class NativeInbox implements A2aInbox {
           rolledBack: new Set(),
           retained: { 'next-step': [], 'next-turn': [] },
         };
-        await this.recoverRetained(run, context);
-        await this.recoverPromotions(run, context);
+        await this.recoverRetained(run, call);
+        await this.recoverPromotions(run, call);
         const snapshots = new Map<string, Task>();
         for (const message of this.pending(run)) {
           if (message.source.kind !== 'a2a' || snapshots.has(message.source.taskId)) continue;
-          const snapshot = await this.store.load(message.source.taskId, context);
+          const snapshot = await this.store.load(message.source.taskId, call);
           if (!snapshot || snapshot.contextId !== contextId)
             throw new Error('Queued A2A task is not accessible.');
-          if (this.terminal(snapshot)) entry.handle.agent.inbox.remove(message.id);
+          if (isTerminalTask(snapshot)) entry.handle.agent.inbox.remove(message.id);
           else snapshots.set(snapshot.id, snapshot);
         }
         await this.flush(entry.handle.agent.session);
@@ -1066,7 +1087,7 @@ export class NativeInbox implements A2aInbox {
           ? this.committedInputs(run, new Set(snapshots.keys()))
           : new Map<string, Message[]>();
         for (const snapshot of snapshots.values())
-          this.restoreTask(run, snapshot, context, committed.get(snapshot.id) ?? []);
+          this.restoreTask(run, snapshot, call, committed.get(snapshot.id) ?? []);
         run.retained = structuredClone({
           'next-step': [...entry.handle.agent.inbox.nextStep],
           'next-turn': [...entry.handle.agent.inbox.nextTurn],
@@ -1078,7 +1099,7 @@ export class NativeInbox implements A2aInbox {
       })().finally(() => this.resolving.delete(contextId));
       this.resolving.set(contextId, creating);
     }
-    return creating;
+    return creating.then(checkScope);
   }
 
   private observe(phase: string, run: ContextRun, fields: Partial<A2aInboxEvent> = {}): void {
@@ -1225,7 +1246,7 @@ export class NativeInbox implements A2aInbox {
     if (
       !snapshot ||
       (message.contextId && snapshot.contextId !== message.contextId) ||
-      this.terminal(snapshot)
+      isTerminalTask(snapshot)
     )
       return;
     const run = await this.context(snapshot.contextId, context);
@@ -1255,7 +1276,7 @@ export class NativeInbox implements A2aInbox {
   /** Reattach a cold task before the SDK decides whether cancellation has a live executor. */
   async beforeTask(taskId: string, context: ServerCallContext): Promise<void> {
     const snapshot = await this.store.load(taskId, context);
-    if (!snapshot || this.terminal(snapshot)) return;
+    if (!snapshot || isTerminalTask(snapshot)) return;
     const run = await this.context(snapshot.contextId, context);
     const task = run.tasks.get(taskId) ?? this.restoreTask(run, snapshot, context);
     if (task.settled) {
@@ -1272,18 +1293,6 @@ export class NativeInbox implements A2aInbox {
       task.status?.state === TaskState.TASK_STATE_REJECTED
     )
       return 'failed';
-  }
-
-  private terminal(task: Task): boolean {
-    return (
-      !!task.status &&
-      [
-        TaskState.TASK_STATE_COMPLETED,
-        TaskState.TASK_STATE_CANCELED,
-        TaskState.TASK_STATE_FAILED,
-        TaskState.TASK_STATE_REJECTED,
-      ].includes(task.status.state)
-    );
   }
 
   private async admit(
