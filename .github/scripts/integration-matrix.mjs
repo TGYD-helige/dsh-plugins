@@ -28,6 +28,7 @@ const backendSeen = new Set();
 for (const d of readdirSync(scenariosDir, { withFileTypes: true })) {
   if (!d.isFile() || !d.name.endsWith('.mjs')) continue;
   const leg = d.name.slice(0, -'.mjs'.length);
+  if (process.env.INTEGRATION_SCENARIO && process.env.INTEGRATION_SCENARIO !== leg) continue;
   const pkg = leg.split('.', 1)[0];
   if (!existsSync(`packages/${pkg}/package.json`)) {
     console.log(`::warning::scenario ${d.name} has no packages/${pkg} — skipped`);
@@ -47,6 +48,8 @@ for (const d of readdirSync(scenariosDir, { withFileTypes: true })) {
     }
   }
 }
+if (process.env.INTEGRATION_SCENARIO && !base.length)
+  throw new Error('Unknown integration scenario');
 base.sort((a, b) => a.name.localeCompare(b.name));
 backends.sort((a, b) => a.package.localeCompare(b.package) || a.provider.localeCompare(b.provider));
 

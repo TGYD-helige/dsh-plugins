@@ -22,9 +22,15 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+    inputs:
+      scenario:
+        description: Optional exact scenario name (empty runs all)
+        required: false
+        default: ''
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.scenario || 'all' }}
   cancel-in-progress: true
 
 permissions:
@@ -54,6 +60,8 @@ jobs:
           allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
       - name: Select packages with an integration scenario
         id: select
+        env:
+          INTEGRATION_SCENARIO: ${{ inputs.scenario }}
         run: node .github/scripts/integration-matrix.mjs
 
   integration-approval:
@@ -118,6 +126,22 @@ jobs:
           echo "tarball: $name"
           echo "DSH_PKG_TARBALL=$RUNNER_TEMP/$(basename "$name")" >> "$GITHUB_ENV"
 
+      - name: Pack shared telemetry and A2A companions
+        if: matrix.package == 'dsh-telemetry' || (matrix.package == 'dsh-langfuse' && hashFiles('packages/dsh-telemetry/package.json') != '')
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.package }}" = dsh-langfuse ]; then
+            archive="$(cd packages/dsh-telemetry && pnpm pack --pack-destination "$RUNNER_TEMP" | tail -n1)"
+            echo "DSH_TELEMETRY_CORE_TARBALL=$RUNNER_TEMP/$(basename "$archive")" >> "$GITHUB_ENV"
+          else
+            archive="$(cd packages/dsh-a2a && pnpm pack --pack-destination "$RUNNER_TEMP" | tail -n1)"
+            echo "DSH_TELEMETRY_A2A_TARBALL=$RUNNER_TEMP/$(basename "$archive")" >> "$GITHUB_ENV"
+          fi
+
+      - name: Link unpublished telemetry to its local archive
+        if: env.DSH_TELEMETRY_CORE_TARBALL != ''
+        run: node .github/scripts/link-local-telemetry.mjs "$DSH_PKG_TARBALL" "$DSH_TELEMETRY_CORE_TARBALL"
+
       - name: Install the dsh CLI (pinned)
         run: |
           set -euo pipefail
@@ -137,7 +161,11 @@ jobs:
       - name: Stage A — bundle composes into the headless profile
         run: |
           set -euo pipefail
-          dsh plugin --profile headless add "$DSH_PKG_TARBALL"
+          companions=()
+          if [ -n "${DSH_TELEMETRY_CORE_TARBALL:-}" ]; then
+            companions+=("$DSH_TELEMETRY_CORE_TARBALL")
+          fi
+          dsh plugin --profile headless add "${companions[@]}" "$DSH_PKG_TARBALL"
           dsh --profile headless --dump-config | tee /tmp/dsh-config.yml
           package_name="$(node -p "require('./packages/${{ matrix.package }}/package.json').name")"
           grep -F "name: '$package_name'" /tmp/dsh-config.yml
@@ -157,9 +185,12 @@ jobs:
           # dsh-langfuse only: blanked on other packages' legs. Hook, tool-hooks,
           # cancel-hook and metadata legs require real Langfuse API read-back; base/subagent
           # legs retain the fake-OTLP fallback when keys are absent.
-          LANGFUSE_PUBLIC_KEY: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_PUBLIC_KEY || '' }}
-          LANGFUSE_SECRET_KEY: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_SECRET_KEY || '' }}
-          LANGFUSE_BASE_URL: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_BASE_URL || '' }}
+          LANGFUSE_PUBLIC_KEY: ${{ (matrix.package == 'dsh-langfuse' || startsWith(matrix.name, 'dsh-telemetry.langfuse')) && secrets.LANGFUSE_PUBLIC_KEY || '' }}
+          LANGFUSE_SECRET_KEY: ${{ (matrix.package == 'dsh-langfuse' || startsWith(matrix.name, 'dsh-telemetry.langfuse')) && secrets.LANGFUSE_SECRET_KEY || '' }}
+          LANGFUSE_BASE_URL: ${{ (matrix.package == 'dsh-langfuse' || startsWith(matrix.name, 'dsh-telemetry.langfuse')) && secrets.LANGFUSE_BASE_URL || '' }}
+          PHOENIX_API_KEY: ${{ startsWith(matrix.name, 'dsh-telemetry.phoenix') && secrets.PHOENIX_API_KEY || '' }}
+          PHOENIX_COLLECTOR_ENDPOINT: ${{ startsWith(matrix.name, 'dsh-telemetry.phoenix') && secrets.PHOENIX_COLLECTOR_ENDPOINT || '' }}
+          PHOENIX_PROJECT_NAME: ${{ startsWith(matrix.name, 'dsh-telemetry.phoenix') && secrets.PHOENIX_PROJECT_NAME || '' }}
         run: node ".github/scripts/integration/${{ matrix.name }}.mjs"
 
       # Runtime visibility: the full session event log (including
@@ -196,6 +227,7 @@ jobs:
           exit 1
 
   a2a-protocol:
+    if: inputs.scenario == ''
     name: E2E (dsh-a2a protocol bindings)
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -222,6 +254,7 @@ jobs:
         run: node .github/scripts/check-inbox.mjs -t 'official protocol bindings'
 
   native-inbox:
+    if: inputs.scenario == ''
     name: E2E (dsh-a2a.inbox)
     needs: integration-approval
     runs-on: ubuntu-latest
@@ -252,6 +285,7 @@ jobs:
         run: node .github/scripts/check-inbox.mjs -t '^(?!.*(native ownership|graceful retention))'
 
   native-ownership:
+    if: inputs.scenario == ''
     name: E2E (dsh-a2a native ownership)
     needs: integration-approval
     runs-on: ubuntu-latest
@@ -282,6 +316,7 @@ jobs:
         run: node .github/scripts/check-inbox.mjs -t 'native ownership.*reports Goal continuation'
 
   graceful-retention:
+    if: inputs.scenario == ''
     name: E2E (dsh-a2a graceful retention)
     needs: integration-approval
     runs-on: ubuntu-latest
