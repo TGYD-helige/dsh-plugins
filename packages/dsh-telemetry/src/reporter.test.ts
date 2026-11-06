@@ -1,8 +1,9 @@
 import { Context } from '@deepseek-ai/cordis';
 import { trace } from '@opentelemetry/api';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { adapters } from './adapters/index.js';
+import { TelemetryReporter } from './core/otel.js';
 import { apply, Config } from './index.js';
-import { TelemetryReporter } from './reporter.js';
 
 const state = vi.hoisted(() => ({
   spans: [] as Array<{
@@ -33,12 +34,15 @@ describe('shared isolated OTel pipeline', () => {
     'preserves parent ownership, clocks and status on %s',
     async (backend) => {
       const global = trace.getTracerProvider();
-      const reporter = new TelemetryReporter({
-        backend,
-        publicKey: 'pk',
-        secretKey: 'sk',
-        captureContent: true,
-      });
+      const reporter = new TelemetryReporter(
+        {
+          backend,
+          publicKey: 'pk',
+          secretKey: 'sk',
+          captureContent: true,
+        },
+        adapters[backend],
+      );
       await reporter.ready;
       const root = reporter.openTrace({
         name: 'turn',
@@ -75,13 +79,16 @@ describe('shared isolated OTel pipeline', () => {
     },
   );
   it('applies final content and credential safeguards after backend mapping', async () => {
-    const reporter = new TelemetryReporter({
-      backend: 'phoenix',
-      apiKey: 'phoenix-secret',
-      captureContent: false,
-      maxPayloadBytes: 128,
-      redactFields: ['password'],
-    });
+    const reporter = new TelemetryReporter(
+      {
+        backend: 'phoenix',
+        apiKey: 'phoenix-secret',
+        captureContent: false,
+        maxPayloadBytes: 128,
+        redactFields: ['password'],
+      },
+      adapters.phoenix,
+    );
     await reporter.ready;
     const root = reporter.openTrace({
       name: 'phoenix-secret',

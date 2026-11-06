@@ -1,14 +1,15 @@
-import { type CollectorConfig, collect } from '@amaster.ai/dsh-langfuse/instrumentation';
 import type { Context } from '@deepseek-ai/cordis';
 import Schema from '@deepseek-ai/schemastery';
-import { type ReporterConfig, TelemetryReporter } from './reporter.js';
+import { adapters } from './adapters/index.js';
+import { type CollectorConfig, collect } from './core/index.js';
+import { type ReporterConfig, TelemetryReporter } from './core/otel.js';
 
-export type { TraceContext as TelemetryTraceContext } from '@amaster.ai/dsh-langfuse/instrumentation';
+export type { TraceContext as TelemetryTraceContext } from './core/index.js';
 export {
   appendHookEvent,
   type HookInvoked,
   type HookResult,
-} from '@amaster.ai/dsh-langfuse/instrumentation';
+} from './core/index.js';
 export const name = 'dsh-telemetry';
 export const inject = [] as string[];
 export const Config = Schema.object({
@@ -52,5 +53,10 @@ export function apply(ctx: Context, config: TelemetryPluginConfig): Promise<void
     release: config.release || process.env.DSH_TELEMETRY_RELEASE,
     userId: config.userId || process.env.DSH_TELEMETRY_USER_ID,
   };
-  return collect(ctx, config, new TelemetryReporter(config), 'telemetry/context');
+  return collect(
+    ctx,
+    config,
+    new TelemetryReporter(config, adapters[config.backend]),
+    'telemetry/context',
+  );
 }

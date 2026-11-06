@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { adapt, resolveConnection } from './adapters.js';
+import { adapt, resolveConnection } from './adapters/index.js';
 
 describe('backend adapters', () => {
   it('resolves Phoenix YAML overrides, env fallback and prefixed collector URLs', () => {
@@ -120,5 +120,21 @@ it('maps explicit agent types independently of display names and preserves inlin
   ).toMatchObject({
     'llm.input_messages.0.message.contents.0.message_content.image.image.url':
       'data:image/png;base64,AA==',
+  });
+});
+
+it('keeps structural Phoenix telemetry when configured redaction replaces request collections', async () => {
+  const { PayloadPrivacy } = await import('./core/index.js');
+  const privacy = new PayloadPrivacy({ secrets: [], redactFields: ['tools', 'messages'] });
+  const data = privacy.mask({
+    kind: 'generation' as const,
+    model: 'test',
+    usage: { inputTokens: 2, outputTokens: 3 },
+    input: { tools: [{ name: 'read' }], messages: [{ role: 'user', content: 'sensitive' }] },
+  });
+  expect(adapt('phoenix', data)).toMatchObject({
+    'openinference.span.kind': 'LLM',
+    'llm.model_name': 'test',
+    'llm.token_count.total': 5,
   });
 });

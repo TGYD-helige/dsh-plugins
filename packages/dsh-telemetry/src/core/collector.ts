@@ -15,7 +15,7 @@ import type {} from '@deepseek-ai/dsh-tools';
 import { isHookInvoked, isHookResult } from './hooks.js';
 import { displayBlocks } from './media.js';
 import { boundPayload, newPayloadBudget, type PayloadBudget, takePayloadText } from './payload.js';
-import type { InstrumentationReporter, ObservationLevel, TraceContext } from './reporter.js';
+import type { InstrumentationReporter, ObservationLevel, TraceContext } from './types.js';
 
 export { appendHookEvent, type HookInvoked, type HookResult } from './hooks.js';
 

@@ -1,4 +1,10 @@
 {
   "extends": "../../tsconfig.base.json",
-  "include": ["src"]
+  "include": ["src"],
+  "compilerOptions": {
+    "paths": {
+      "@amaster.ai/dsh-telemetry/instrumentation": ["../dsh-telemetry/src/core/index.ts"],
+      "@amaster.ai/dsh-telemetry/langfuse": ["../dsh-telemetry/src/adapters/langfuse/index.ts"]
+    }
+  }
 }

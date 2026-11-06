@@ -1,9 +1,4 @@
 {
   "extends": "../../tsconfig.base.json",
-  "include": ["src"],
-  "compilerOptions": {
-    "paths": {
-      "@amaster.ai/dsh-langfuse/instrumentation": ["../dsh-langfuse/src/instrumentation.ts"]
-    }
-  }
+  "include": ["src"]
 }

@@ -1,3 +1,5 @@
+import { langfuseContextAttributes } from '@amaster.ai/dsh-telemetry/langfuse';
+
 /**
  * Langfuse reporter — thin synchronous wrapper over the Langfuse JS SDK v5's
  * OpenTelemetry-based tracing API (`@langfuse/tracing` + `@langfuse/otel`),
@@ -34,11 +36,11 @@
  * plugin fiber has been awaited.
  */
 
+import { PayloadPrivacy, usageOf } from '@amaster.ai/dsh-telemetry/instrumentation';
 import type { TokenUsage } from '@deepseek-ai/dsh-llm';
 import type { LangfuseGeneration, LangfuseSpan } from '@langfuse/tracing';
 import type { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { boundPayload, newPayloadBudget } from './payload.js';
-import { PayloadPrivacy } from './privacy.js';
 
 export interface LangfuseConnectionConfig {
   publicKey: string;
@@ -111,9 +113,7 @@ function parentContext(traceparent: string | undefined) {
  * `completion_tokens_details`), so the `output` bucket subtracts
  * `reasoningTokens` into `output_reasoning_tokens`. Only `usageDetails` is sent.
  */
-export { usageOf } from './usage.js';
-
-import { usageOf } from './usage.js';
+export { usageOf } from '@amaster.ai/dsh-telemetry/instrumentation';
 
 export class LangfuseReporter extends PayloadPrivacy {
   private tracing: typeof import('@langfuse/tracing') | null = null;
@@ -197,23 +197,8 @@ export class LangfuseReporter extends PayloadPrivacy {
    */
   private stampTraceContext(observation: Observation, context: TraceContext | undefined): void {
     if (!context) return;
-    if (context.traceName)
-      observation.otelSpan.setAttribute('langfuse.trace.name', this.mask(context.traceName));
-    if (context.sessionId)
-      observation.otelSpan.setAttribute('session.id', this.mask(context.sessionId));
-    if (context.userId) observation.otelSpan.setAttribute('user.id', this.mask(context.userId));
-    if (context.tags?.length)
-      observation.otelSpan.setAttribute('langfuse.trace.tags', this.mask(context.tags));
-    if (context.metadata) {
-      // Langfuse merges the JSON object with observation.metadata.<key>
-      // attributes, giving the latter (our runtime facts) precedence. The
-      // object form also preserves null/empty strings that SDK v5's
-      // per-key serializer omits, without inheriting a parent's runtime facts.
-      // Do not also set trace.metadata: v4 gives it precedence over even
-      // observation-specific fields, which would undo that collision policy.
-      const metadata = JSON.stringify(this.mask(context.metadata));
-      observation.otelSpan.setAttribute('langfuse.observation.metadata', metadata);
-    }
+    for (const [key, value] of Object.entries(langfuseContextAttributes(this.mask(context))))
+      observation.otelSpan.setAttribute(key, value);
     this.traceContext.set(observation, context);
   }
 

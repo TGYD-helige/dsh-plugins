@@ -10,11 +10,7 @@
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
-    "./package.json": "./package.json",
-    "./instrumentation": {
-      "types": "./lib/types/instrumentation.d.ts",
-      "default": "./lib/instrumentation.js"
-    }
+    "./package.json": "./package.json"
   },
   "files": [
     "lib",
@@ -41,7 +37,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.5"
+    "@deepseek-ai/schemastery": "^3.18.5",
+    "@amaster.ai/dsh-telemetry": "workspace:*"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

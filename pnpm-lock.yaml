@@ -159,6 +159,9 @@ importers:
 
   packages/dsh-langfuse:
     dependencies:
+      '@amaster.ai/dsh-telemetry':
+        specifier: workspace:*
+        version: link:../dsh-telemetry
       '@deepseek-ai/schemastery':
         specifier: ^3.18.5
         version: 3.18.5
@@ -388,9 +391,6 @@ importers:
 
   packages/dsh-telemetry:
     dependencies:
-      '@amaster.ai/dsh-langfuse':
-        specifier: workspace:*
-        version: link:../dsh-langfuse
       '@deepseek-ai/schemastery':
         specifier: ^3.18.5
         version: 3.19.0

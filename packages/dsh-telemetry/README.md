@@ -15,7 +15,7 @@ dsh plugin --profile my-agent add \
   @opentelemetry/exporter-trace-otlp-proto@0.221.0
 ```
 
-The bundle inserts the `telemetry` row, disabled by default. The same-release `@amaster.ai/dsh-langfuse` dependency supplies its documented SDK-independent `instrumentation` export; installing that dependency does not enable the legacy collector. dsh service/event consumers are peers, supplied by the profile. The four OTel packages are optional peers and load lazily only when enabled.
+The bundle inserts the `telemetry` row, disabled by default. The SDK-independent collector lives in `core/`. Pure backend mapping/configuration lives in `adapters/phoenix/` and `adapters/langfuse/`; the composition root selects an adapter. The legacy package reuses this collector and the extracted Langfuse context, usage, payload, privacy and media helpers while retaining its SDK reporter. The new plugin has no dependency on the legacy package or Langfuse SDK. dsh service/event consumers are peers, supplied by the profile. The four OTel packages are optional peers and load lazily only when enabled.
 
 ## Phoenix
 

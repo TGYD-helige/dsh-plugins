@@ -721,6 +721,10 @@ async function scenarioMain({
   metadata = false,
   telemetryBackend,
 }) {
+  if (telemetryBackend) {
+    const { probeTelemetry } = await import('./telemetry-live-probe.mjs');
+    await probeTelemetry(telemetryBackend);
+  }
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-langfuse-${tag}-e2e`);
   mkdirSync(workDir, { recursive: true });
   const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
@@ -784,7 +788,9 @@ async function scenarioMain({
       '--profile',
       'headless',
       'add',
-      ...(telemetryBackend ? [resolve(process.env.DSH_TELEMETRY_COLLECTOR_TARBALL)] : []),
+      ...(process.env.DSH_TELEMETRY_CORE_TARBALL
+        ? [resolve(process.env.DSH_TELEMETRY_CORE_TARBALL)]
+        : []),
       resolve(DSH_PKG_TARBALL),
     ],
     {

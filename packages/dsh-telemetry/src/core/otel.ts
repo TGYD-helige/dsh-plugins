@@ -1,3 +1,11 @@
+import type { Span, SpanContext, Tracer } from '@opentelemetry/api';
+import type { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
+import type {
+  Attributes,
+  BackendAdapter,
+  ConnectionConfig,
+  ObservationData,
+} from '../adapters/types.js';
 import {
   boundPayload,
   type InstrumentationReporter,
@@ -6,16 +14,7 @@ import {
   type SpanInput,
   type SpanUpdate,
   type TraceContext,
-} from '@amaster.ai/dsh-langfuse/instrumentation';
-import type { Span, SpanContext, Tracer } from '@opentelemetry/api';
-import type { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
-import {
-  type Attributes,
-  adapt,
-  type ConnectionConfig,
-  type ObservationData,
-  resolveConnection,
-} from './adapters.js';
+} from './index.js';
 
 export interface ReporterConfig extends ConnectionConfig {
   captureContent: boolean;
@@ -42,7 +41,10 @@ export class TelemetryReporter implements InstrumentationReporter {
   private observations = new WeakMap<object, Observation>();
   private privacy: PayloadPrivacy;
   private credentials: string[];
-  constructor(private config: ReporterConfig) {
+  constructor(
+    private config: ReporterConfig,
+    private adapter: BackendAdapter,
+  ) {
     const values = [
       config.apiKey,
       config.publicKey,
@@ -61,12 +63,22 @@ export class TelemetryReporter implements InstrumentationReporter {
   shouldRedactField(key: string) {
     return this.privacy.shouldRedactField(key);
   }
-  private failure(operation: string) {
-    console.error(`[dsh-telemetry] ${operation} failed`);
+  private failure(operation: string, error?: unknown) {
+    const errors = Array.isArray(error) ? error : [error];
+    const categories = errors.map((item) => {
+      if (!(item instanceof Error)) return 'unknown';
+      const code = (item as Error & { code?: number }).code;
+      if (typeof code === 'number') return `HTTP ${code}`;
+      const match = item.message.match(
+        /\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|Timeout|timeout|aborted)\b/,
+      );
+      return match?.[0] ?? item.name;
+    });
+    console.error(`[dsh-telemetry] ${operation} failed (${categories.join(', ')})`);
   }
   private async init() {
     try {
-      const connection = resolveConnection(this.config);
+      const connection = this.adapter.resolve(this.config, process.env);
       // Encoded authentication is a credential too, should it reappear in request metadata.
       this.privacy = new PayloadPrivacy({
         secrets: [
@@ -111,8 +123,8 @@ export class TelemetryReporter implements InstrumentationReporter {
       });
       this.api = api;
       this.tracer = this.provider.getTracer('dsh-telemetry', '0.1.0');
-    } catch {
-      this.failure('initialization');
+    } catch (error) {
+      this.failure('initialization', error);
     }
   }
   private parent(traceparent?: string): SpanContext | undefined {
@@ -255,7 +267,7 @@ export class TelemetryReporter implements InstrumentationReporter {
         bounded[key] = boundPayload(bounded[key], newPayloadBudget(cap), this);
     }
     if (!this.config.captureContent) delete bounded.statusMessage;
-    const attributes = adapt(this.config.backend, bounded);
+    const attributes = this.adapter.attributes(bounded);
     // Final safeguard AFTER adaptation, including indexed OpenInference messages and JSON fields.
     const safe: Attributes = {};
     for (const [key, value] of Object.entries(attributes)) {
@@ -306,8 +318,8 @@ export class TelemetryReporter implements InstrumentationReporter {
     await this.ready;
     try {
       await this.provider?.forceFlush();
-    } catch {
-      this.failure('flush');
+    } catch (error) {
+      this.failure('flush', error);
     }
   }
   async shutdown() {
@@ -318,8 +330,8 @@ export class TelemetryReporter implements InstrumentationReporter {
     this.api = undefined;
     try {
       await provider?.shutdown();
-    } catch {
-      this.failure('shutdown');
+    } catch (error) {
+      this.failure('shutdown', error);
     }
   }
 }

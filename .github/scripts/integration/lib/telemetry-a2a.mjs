@@ -10,12 +10,14 @@ import { runVerification } from './langfuse-shared.mjs';
 import { runPhoenixVerification } from './phoenix-shared.mjs';
 
 export async function runTelemetryA2a(backend) {
-  requireEnv(['DSH_TELEMETRY_COLLECTOR_TARBALL', 'DSH_TELEMETRY_A2A_TARBALL', 'DSH_PKG_TARBALL']);
+  requireEnv(['DSH_TELEMETRY_A2A_TARBALL', 'DSH_PKG_TARBALL']);
   requireEnv(
     backend === 'phoenix'
       ? ['PHOENIX_API_KEY', 'PHOENIX_COLLECTOR_ENDPOINT', 'PHOENIX_PROJECT_NAME']
       : ['LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY'],
   );
+  const { probeTelemetry } = await import('./telemetry-live-probe.mjs');
+  await probeTelemetry(backend);
   const tag = `telemetry-${backend}-a2a`;
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-a2a-e2e-${tag}`);
   const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
@@ -28,11 +30,9 @@ export async function runTelemetryA2a(backend) {
       '--profile',
       'web',
       'add',
-      ...[
-        process.env.DSH_TELEMETRY_COLLECTOR_TARBALL,
-        process.env.DSH_TELEMETRY_A2A_TARBALL,
-        process.env.DSH_PKG_TARBALL,
-      ].map((file) => resolve(file)),
+      ...[process.env.DSH_TELEMETRY_A2A_TARBALL, process.env.DSH_PKG_TARBALL].map((file) =>
+        resolve(file),
+      ),
       '@opentelemetry/api@1.9.1',
       '@opentelemetry/sdk-trace-node@2.10.0',
       '@opentelemetry/resources@2.10.0',

@@ -192,4 +192,4 @@ The Langfuse integration scenarios label observations with environment `ci`, rel
 
 ## Shared instrumentation export
 
-`@amaster.ai/dsh-langfuse/instrumentation` exposes the SDK-independent collector (`collect`), reporter contract, payload/privacy helpers, hook helpers and token accounting. `dsh-telemetry` uses this documented boundary with a different reporter; it never loads the legacy SDK reporter. The legacy entry point still owns its original Config/environment handling and `langfuse/context` event. Install matching release versions when consuming this boundary.
+`@amaster.ai/dsh-telemetry/instrumentation` exposes the SDK-independent collector (`collect`), reporter contract, payload/privacy helpers, hook helpers and token accounting. The legacy entry point uses that collector with its original SDK reporter. `@amaster.ai/dsh-telemetry/langfuse` provides the shared pure Langfuse context mapping; both reporters use the same mapping and usage helpers. The legacy entry point still owns its original Config/environment handling and `langfuse/context` event. Install matching release versions when consuming this boundary.

@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import protobuf from 'protobufjs';
-import { TelemetryReporter } from '../../../../packages/dsh-telemetry/lib/reporter.js';
+import { adapters } from '../../../../packages/dsh-telemetry/lib/adapters/index.js';
+import { TelemetryReporter } from '../../../../packages/dsh-telemetry/lib/core/otel.js';
 
 const root = await protobuf.load(fileURLToPath(new URL('./otlp-trace.proto', import.meta.url)));
 const Request = root.lookupType('ExportTraceServiceRequest');
@@ -33,15 +34,18 @@ const attributes = (values) =>
   );
 try {
   for (const backend of ['phoenix', 'langfuse']) {
-    const reporter = new TelemetryReporter({
-      backend,
-      endpoint: `http://127.0.0.1:${server.address().port}/prefix`,
-      apiKey: 'phoenix-private',
-      publicKey: 'pk-test',
-      secretKey: 'sk-test',
-      project: 'otlp-test',
-      captureContent: true,
-    });
+    const reporter = new TelemetryReporter(
+      {
+        backend,
+        endpoint: `http://127.0.0.1:${server.address().port}/prefix`,
+        apiKey: 'phoenix-private',
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+        project: 'otlp-test',
+        captureContent: true,
+      },
+      adapters[backend],
+    );
     try {
       await reporter.ready;
       const parent = reporter.openTrace({

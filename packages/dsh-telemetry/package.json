@@ -10,7 +10,15 @@
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./instrumentation": {
+      "types": "./lib/types/core/index.d.ts",
+      "default": "./lib/core/index.js"
+    },
+    "./langfuse": {
+      "types": "./lib/types/adapters/langfuse/index.d.ts",
+      "default": "./lib/adapters/langfuse/index.js"
+    }
   },
   "files": [
     "lib",
@@ -37,8 +45,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.5",
-    "@amaster.ai/dsh-langfuse": "workspace:*"
+    "@deepseek-ai/schemastery": "^3.18.5"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

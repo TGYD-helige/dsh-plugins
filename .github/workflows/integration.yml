@@ -118,18 +118,17 @@ jobs:
           echo "tarball: $name"
           echo "DSH_PKG_TARBALL=$RUNNER_TEMP/$(basename "$name")" >> "$GITHUB_ENV"
 
-      - name: Pack telemetry collector and A2A companions
-        if: matrix.package == 'dsh-telemetry'
+      - name: Pack shared telemetry and A2A companions
+        if: matrix.package == 'dsh-telemetry' || matrix.package == 'dsh-langfuse'
         run: |
           set -euo pipefail
-          for companion in dsh-langfuse dsh-a2a; do
-            archive="$(cd "packages/$companion" && pnpm pack --pack-destination "$RUNNER_TEMP" | tail -n1)"
-            if [ "$companion" = dsh-langfuse ]; then
-              echo "DSH_TELEMETRY_COLLECTOR_TARBALL=$RUNNER_TEMP/$(basename "$archive")" >> "$GITHUB_ENV"
-            else
-              echo "DSH_TELEMETRY_A2A_TARBALL=$RUNNER_TEMP/$(basename "$archive")" >> "$GITHUB_ENV"
-            fi
-          done
+          if [ "${{ matrix.package }}" = dsh-langfuse ]; then
+            archive="$(cd packages/dsh-telemetry && pnpm pack --pack-destination "$RUNNER_TEMP" | tail -n1)"
+            echo "DSH_TELEMETRY_CORE_TARBALL=$RUNNER_TEMP/$(basename "$archive")" >> "$GITHUB_ENV"
+          else
+            archive="$(cd packages/dsh-a2a && pnpm pack --pack-destination "$RUNNER_TEMP" | tail -n1)"
+            echo "DSH_TELEMETRY_A2A_TARBALL=$RUNNER_TEMP/$(basename "$archive")" >> "$GITHUB_ENV"
+          fi
 
       - name: Install the dsh CLI (pinned)
         run: |
@@ -151,8 +150,8 @@ jobs:
         run: |
           set -euo pipefail
           companions=()
-          if [ -n "${DSH_TELEMETRY_COLLECTOR_TARBALL:-}" ]; then
-            companions+=("$DSH_TELEMETRY_COLLECTOR_TARBALL")
+          if [ -n "${DSH_TELEMETRY_CORE_TARBALL:-}" ]; then
+            companions+=("$DSH_TELEMETRY_CORE_TARBALL")
           fi
           dsh plugin --profile headless add "${companions[@]}" "$DSH_PKG_TARBALL"
           dsh --profile headless --dump-config | tee /tmp/dsh-config.yml

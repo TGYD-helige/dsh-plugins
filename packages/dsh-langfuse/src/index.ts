@@ -31,10 +31,10 @@
  * @module dsh-langfuse
  */
 
+import { type CollectorConfig, collect } from '@amaster.ai/dsh-telemetry/instrumentation';
 import type { Context } from '@deepseek-ai/cordis';
 import Schema from '@deepseek-ai/schemastery';
 import { LangfuseReporter } from './client.js';
-import { type CollectorConfig, collect } from './collector.js';
 
 export type { LangfuseTraceContext } from './client.js';
 export { appendHookEvent, type HookInvoked, type HookResult } from './hooks.js';
