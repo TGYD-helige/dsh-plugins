@@ -188,14 +188,24 @@ export class LangfuseReporter extends PayloadPrivacy {
         spanProcessors: [processor],
         idGenerator: this.ids,
       });
-      // Isolated provider, not provider.register(): the process-global OTEL
-      // provider stays untouched. Set `tracing` last — observation methods
-      // gate on it, and it must never be visible before the provider is wired.
-      tracing.setLangfuseTracerProvider(this.provider);
+      // Publish readiness only after the isolated pipeline is wired.
       this.api = api;
       this.tracing = tracing;
     } catch (error) {
       console.error('[dsh-langfuse] client init failed:', error);
+    }
+  }
+
+  /** SDK creation is synchronous; restore its shared provider before any other caller runs. */
+  private withProvider<T>(create: () => T): T {
+    const tracing = this.tracing!;
+    const api = this.api!;
+    const previous = tracing.getLangfuseTracerProvider();
+    tracing.setLangfuseTracerProvider(this.provider);
+    try {
+      return api.context.with(api.ROOT_CONTEXT, create);
+    } finally {
+      tracing.setLangfuseTracerProvider(previous);
     }
   }
 
@@ -228,7 +238,7 @@ export class LangfuseReporter extends PayloadPrivacy {
       const externalParent = parentContext(input.context?.traceparent);
       input = this.mask(input);
       const root = ids.withTraceId(externalParent === NO_PARENT ? input.traceId : undefined, () =>
-        api.context.with(api.ROOT_CONTEXT, () =>
+        this.withProvider(() =>
           tracing.startObservation(
             input.name,
             { metadata: input.metadata },
@@ -288,7 +298,7 @@ export class LangfuseReporter extends PayloadPrivacy {
     if (!parent || !api) return null;
     try {
       input = this.mask(input);
-      const generation = api.context.with(api.ROOT_CONTEXT, () =>
+      const generation = this.withProvider(() =>
         parent.startObservation(
           input.name,
           {
@@ -364,7 +374,7 @@ export class LangfuseReporter extends PayloadPrivacy {
         input: input.input,
         metadata: input.metadata,
       };
-      const span = api.context.with(api.ROOT_CONTEXT, () =>
+      const span = this.withProvider(() =>
         input.startTime && this.tracing
           ? this.tracing.startObservation(input.name, attributes, {
               parentSpanContext: parent.otelSpan.spanContext(),
@@ -479,10 +489,6 @@ export class LangfuseReporter extends PayloadPrivacy {
       await provider.shutdown();
     } catch (error) {
       console.error('[dsh-langfuse] shutdown failed:', error);
-    } finally {
-      // Release the module-global isolated-provider slot so a reloaded fiber
-      // starts clean — even when the shutdown flush failed.
-      tracing.setLangfuseTracerProvider(null);
     }
   }
 }

@@ -686,6 +686,49 @@ try {
     'disposing a pending idle turn must not create a root',
   );
   await checkMetadataWire({ require, connection, captured });
+  const tracing = await import(require.resolve('@langfuse/tracing'));
+  const previousProvider = tracing.getLangfuseTracerProvider();
+  const secondCapture = [];
+  const secondServer = await startFakeIngestion(secondCapture);
+  const first = new LangfuseReporter(connection);
+  const second = new LangfuseReporter({
+    ...connection,
+    baseUrl: `http://127.0.0.1:${secondServer.address().port}`,
+  });
+  try {
+    await Promise.all([first.ready, second.ready]);
+    const offset = captured.length;
+    for (const [owner, digit] of [
+      [first, '5'],
+      [second, '6'],
+    ]) {
+      const root = owner.openTrace({ name: `owner-${digit}`, traceId: digit.repeat(32) });
+      assert.equal(root.traceId, digit.repeat(32), 'each reporter must retain its requested ID');
+      const generation = owner.startGeneration(root, { name: `generation-${digit}` });
+      owner.endGeneration(generation, { output: 'answer' });
+      const child = owner.startSpan(root, { name: `child-${digit}`, startTime: new Date() });
+      owner.endSpan(child, { output: 'done' });
+      owner.endSpan(root, { output: 'done' });
+      assert.equal(tracing.getLangfuseTracerProvider(), previousProvider);
+    }
+    await Promise.all([first.flush(), second.flush()]);
+    assert.deepEqual(
+      captured
+        .slice(offset)
+        .map((span) => span.name)
+        .sort(),
+      ['child-5', 'generation-5', 'owner-5'],
+    );
+    assert.deepEqual(secondCapture.map((span) => span.name).sort(), [
+      'child-6',
+      'generation-6',
+      'owner-6',
+    ]);
+  } finally {
+    await Promise.all([first.shutdown(), second.shutdown()]);
+    await new Promise((resolve) => secondServer.close(resolve));
+  }
+  assert.equal(tracing.getLangfuseTracerProvider(), previousProvider);
   console.log('real Langfuse SDK / OTLP checks passed');
 } finally {
   if (hookWorkDir) rmSync(hookWorkDir, { recursive: true, force: true });

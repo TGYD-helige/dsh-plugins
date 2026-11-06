@@ -137,6 +137,7 @@ vi.mock('@langfuse/tracing', () => ({
     mocks.roots.push(root);
     return root;
   },
+  getLangfuseTracerProvider: () => mocks.isolatedProviders.at(-1) ?? null,
   setLangfuseTracerProvider: (provider: unknown) => {
     mocks.isolatedProviders.push(provider);
   },
@@ -385,7 +386,7 @@ describe('dsh-langfuse plugin', () => {
     });
     // The processor is wired into an isolated provider (never the global one).
     expect(mocks.providers[0].config.spanProcessors).toEqual([mocks.processors[0]]);
-    expect(mocks.isolatedProviders).toEqual([mocks.providers[0]]);
+    expect(mocks.isolatedProviders).toEqual([]);
   });
 
   it('keeps admission, execution and terminal outcomes in one trace per native task', async () => {
@@ -3878,11 +3879,11 @@ describe('dsh-langfuse plugin', () => {
       expect(mocks.providers[0].forceFlush).toHaveBeenCalledTimes(1);
     });
 
-    it('shuts the exporter down and releases the isolated provider when the fiber unloads', async () => {
+    it('shuts the exporter down without replacing the host provider when the fiber unloads', async () => {
       await setup();
       await ctx.fiber.dispose();
       expect(mocks.providers[0].shutdown).toHaveBeenCalledTimes(1);
-      expect(mocks.isolatedProviders.at(-1)).toBeNull();
+      expect(mocks.isolatedProviders).toEqual([]);
     });
 
     it('ends every still-open observation at fiber unload (un-ended spans never export)', async () => {
@@ -4016,7 +4017,7 @@ describe('LangfuseReporter', () => {
     await reporter.ready;
     expect(mocks.processors[0].config).toMatchObject(config);
     expect(mocks.providers[0].config.spanProcessors).toEqual([mocks.processors[0]]);
-    expect(mocks.isolatedProviders).toEqual([mocks.providers[0]]);
+    expect(mocks.isolatedProviders).toEqual([]);
   });
 
   it('creates trace roots, generations and spans through the observation API', async () => {
@@ -4154,16 +4155,19 @@ describe('LangfuseReporter', () => {
     };
     mocks.state.failCreate = true;
     expect(reporter.openTrace({ name: 't' })).toBeNull();
+    expect(mocks.isolatedProviders.at(-1)).toBeNull();
     expect(errorSpy).toHaveBeenCalledWith(
       '[dsh-langfuse] trace creation failed:',
       expect.any(Error),
     );
     expect(reporter.startGeneration(root, { name: 'g' })).toBeNull();
+    expect(mocks.isolatedProviders.at(-1)).toBeNull();
     expect(errorSpy).toHaveBeenCalledWith(
       '[dsh-langfuse] generation creation failed:',
       expect.any(Error),
     );
     expect(reporter.startSpan(root, { name: 's' })).toBeNull();
+    expect(mocks.isolatedProviders.at(-1)).toBeNull();
     expect(errorSpy).toHaveBeenCalledWith(
       '[dsh-langfuse] span creation failed:',
       expect.any(Error),
