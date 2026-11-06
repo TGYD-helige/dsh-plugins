@@ -127,7 +127,7 @@ jobs:
           echo "DSH_PKG_TARBALL=$RUNNER_TEMP/$(basename "$name")" >> "$GITHUB_ENV"
 
       - name: Pack shared telemetry and A2A companions
-        if: matrix.package == 'dsh-telemetry' || matrix.package == 'dsh-langfuse'
+        if: matrix.package == 'dsh-telemetry' || (matrix.package == 'dsh-langfuse' && hashFiles('packages/dsh-telemetry/package.json') != '')
         run: |
           set -euo pipefail
           if [ "${{ matrix.package }}" = dsh-langfuse ]; then

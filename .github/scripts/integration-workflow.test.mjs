@@ -314,3 +314,22 @@ test('Phoenix 21 read-back decodes flattened metadata fields', async () => {
   });
   assert.deepEqual(span.metadata, { dialect: 'codex', point: 'UserPromptSubmit', durationMs: 12 });
 });
+
+test('unpublished telemetry dependencies use local companion archives without requiring the new package on main', () => {
+  const pack = workflow.match(
+    / {6}- name: Pack shared telemetry and A2A companions\n[\s\S]*?(?=\n {6}- name:)/,
+  )?.[0];
+  assert.ok(pack, 'missing local companion packaging');
+  assert.ok(
+    pack.includes("hashFiles('packages/dsh-telemetry/package.json') != ''"),
+    'main must work before the telemetry package exists',
+  );
+  assert.match(pack, /pnpm pack --pack-destination/);
+  const install = workflow.match(
+    / {6}- name: Stage A — bundle composes into the headless profile\n[\s\S]*?(?=\n {6}#)/,
+  )?.[0];
+  assert.ok(
+    install?.includes('dsh plugin --profile headless add "${companions[@]}" "$DSH_PKG_TARBALL"'),
+    'install local archives together rather than resolving unpublished workspace dependencies from npm',
+  );
+});
