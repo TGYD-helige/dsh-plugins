@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 let input = '';
 for await (const chunk of process.stdin) input += chunk;
 const payload = JSON.parse(input);
-const marker = payload.prompt?.match(/\bci-marker-hook-[\w-]+\.txt\b/)?.[0];
+const marker = payload.prompt?.match(/\bci-marker-[\w-]+\.txt\b/)?.[0];
 if (payload.hook_event_name !== 'UserPromptSubmit' || !marker) {
   throw new Error('unexpected hook payload');
 }

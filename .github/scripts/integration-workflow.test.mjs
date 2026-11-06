@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { stopA2a } from './integration/lib/a2a-shared.mjs';
 import * as integration from './integration/lib/ci-shared.mjs';
 
@@ -267,6 +268,33 @@ test('manual integration can select one exact scenario and rejects unknown names
       encoding: 'utf8',
     });
     assert.notEqual(bad.status, 0);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('real hook fixture accepts marker names for both telemetry backends', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'telemetry-hook-marker-'));
+  try {
+    for (const tag of ['hook', 'telemetry-phoenix-hook', 'telemetry-langfuse-hook']) {
+      const marker = `ci-marker-${tag}-1-1`;
+      writeFileSync(join(directory, `${marker}.txt`), `${marker}-content\n`);
+      const result = spawnSync(
+        process.execPath,
+        [fileURLToPath(new URL('./integration/lib/hook-script.mjs', import.meta.url))],
+        {
+          cwd: directory,
+          input: JSON.stringify({
+            hook_event_name: 'UserPromptSubmit',
+            prompt: `read ${marker}.txt`,
+          }),
+          encoding: 'utf8',
+        },
+      );
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout, 'ci-hook-context-verification');
+      assert.equal(result.stderr, 'hook-script-result: marker-verified');
+    }
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
