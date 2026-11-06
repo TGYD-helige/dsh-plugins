@@ -32,38 +32,32 @@ export function takePayloadText(value: string, budget: PayloadBudget): string {
 
 type BoundedPayload<T> = T | { truncated: true; preview?: string } | string | number;
 
+/** Clip JSON-escaped bytes once, then discard an incomplete escape or surrogate at the cut. */
+function jsonStringPrefix(text: string, maxBytes: number): string {
+  let prefix = takePayloadText(JSON.stringify(text).slice(1, -1), newPayloadBudget(maxBytes));
+  const last = prefix.charCodeAt(prefix.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) prefix = prefix.slice(0, -1);
+  const slash = prefix.lastIndexOf('\\');
+  if (slash >= 0) {
+    let start = slash;
+    while (start > 0 && prefix[start - 1] === '\\') start--;
+    if ((slash - start) % 2 === 0 && /^(?:u[0-9a-f]{0,3})?$/i.test(prefix.slice(slash + 1)))
+      prefix = prefix.slice(0, slash);
+  }
+  return JSON.parse(`"${prefix}"`);
+}
+
 /** Build a preview whose complete JSON value, including its wrapper, fits the remaining cap. */
 function previewPayload<T>(serialized: string, budget: PayloadBudget): BoundedPayload<T> {
   const remaining = budget.remaining;
   const marker = { truncated: true as const };
   const withPreview = { ...marker, preview: '' };
-  if (Buffer.byteLength(JSON.stringify(withPreview)) <= remaining) {
-    let low = 0;
-    let high = serialized.length;
-    while (low < high) {
-      const middle = Math.ceil((low + high) / 2);
-      const candidate = { ...marker, preview: serialized.slice(0, middle) };
-      if (Buffer.byteLength(JSON.stringify(candidate)) <= remaining) low = middle;
-      else high = middle - 1;
-    }
-    budget.remaining = 0;
-    return { ...marker, preview: serialized.slice(0, low) };
-  }
-  if (Buffer.byteLength(JSON.stringify(marker)) <= remaining) {
-    budget.remaining = 0;
-    return marker;
-  }
-  // Even the marker is too large: retain a plain string prefix, still capped
-  // after JSON quoting/escaping rather than by source-string bytes.
-  let low = 0;
-  let high = serialized.length;
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2);
-    if (Buffer.byteLength(JSON.stringify(serialized.slice(0, middle))) <= remaining) low = middle;
-    else high = middle - 1;
-  }
+  const overhead = Buffer.byteLength(JSON.stringify(withPreview));
   budget.remaining = 0;
-  return low > 0 ? serialized.slice(0, low) : remaining >= 2 ? '' : 0;
+  if (overhead <= remaining)
+    return { ...marker, preview: jsonStringPrefix(serialized, remaining - overhead) };
+  if (Buffer.byteLength(JSON.stringify(marker)) <= remaining) return marker;
+  return remaining >= 2 ? jsonStringPrefix(serialized, remaining - 2) : 0;
 }
 
 const MAX_ATOMIC_MASK_BYTES = 64 * 1024;
