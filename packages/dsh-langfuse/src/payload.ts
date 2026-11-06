@@ -1,4 +1,4 @@
-import type { LangfuseReporter } from './client.js';
+import type { InstrumentationReporter } from './reporter.js';
 
 export interface PayloadBudget {
   remaining: number;
@@ -72,7 +72,7 @@ const MAX_ATOMIC_MASK_BYTES = 64 * 1024;
 function boundMaskedPayload<T>(
   input: T,
   budget: PayloadBudget,
-  reporter: LangfuseReporter,
+  reporter: Pick<InstrumentationReporter, 'mask' | 'shouldRedactField'>,
 ): BoundedPayload<T> {
   const seen = new WeakSet<object>();
   const parts: string[] = [];
@@ -171,7 +171,7 @@ function boundMaskedPayload<T>(
 export function boundPayload<T>(
   input: T,
   budget: PayloadBudget,
-  reporter?: LangfuseReporter,
+  reporter?: Pick<InstrumentationReporter, 'mask' | 'shouldRedactField'>,
 ): BoundedPayload<T> {
   if (reporter) return boundMaskedPayload(input, budget, reporter);
   let serialized: string;

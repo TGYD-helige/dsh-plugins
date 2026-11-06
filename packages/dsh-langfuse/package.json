@@ -10,7 +10,11 @@
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./instrumentation": {
+      "types": "./lib/types/instrumentation.d.ts",
+      "default": "./lib/instrumentation.js"
+    }
   },
   "files": [
     "lib",

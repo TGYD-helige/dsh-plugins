@@ -13,7 +13,8 @@
     "test": "node --test .github/scripts/integration-workflow.test.mjs && pnpm -r run test",
     "test:sdk": "pnpm --filter @amaster.ai/dsh-langfuse build && node .github/scripts/integration/lib/langfuse-sdk-check.mjs",
     "lint": "biome check .",
-    "lint:fix": "biome check --write ."
+    "lint:fix": "biome check --write .",
+    "test:otlp": "pnpm --filter @amaster.ai/dsh-telemetry... build && node .github/scripts/integration/lib/telemetry-otlp-check.mjs"
   },
   "devDependencies": {
     "typescript": "^5.6.3",
@@ -40,7 +41,8 @@
     "@deepseek-ai/dsh-working-directory": "0.2.2-rc.1",
     "@deepseek-ai/dsh-goal": "0.2.2-rc.1",
     "@deepseek-ai/dsh-goal-round-driver": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-tool-executor-native": "0.2.2-rc.1"
+    "@deepseek-ai/dsh-tool-executor-native": "0.2.2-rc.1",
+    "protobufjs": "7.6.6"
   },
   "engines": {
     "node": "^20.19 || ^22.12 || >=24.0"

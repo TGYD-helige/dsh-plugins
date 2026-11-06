@@ -1,0 +1,30 @@
+// Wire-compatible subset of OpenTelemetry's collector/trace/v1/trace_service.proto
+// and trace/v1/trace.proto. Omitted fields are intentionally ignored by the receiver.
+syntax = "proto3";
+message ExportTraceServiceRequest { repeated ResourceSpans resource_spans = 1; }
+message ResourceSpans { Resource resource = 1; repeated ScopeSpans scope_spans = 2; }
+message Resource { repeated KeyValue attributes = 1; }
+message ScopeSpans { repeated Span spans = 2; }
+message Span {
+  bytes trace_id = 1;
+  bytes span_id = 2;
+  bytes parent_span_id = 4;
+  string name = 5;
+  fixed64 start_time_unix_nano = 7;
+  fixed64 end_time_unix_nano = 8;
+  repeated KeyValue attributes = 9;
+  Status status = 15;
+}
+message Status { string message = 2; int32 code = 3; }
+message KeyValue { string key = 1; AnyValue value = 2; }
+message AnyValue {
+  string string_value = 1;
+  bool bool_value = 2;
+  int64 int_value = 3;
+  double double_value = 4;
+  ArrayValue array_value = 5;
+  KeyValueList kvlist_value = 6;
+  bytes bytes_value = 7;
+}
+message ArrayValue { repeated AnyValue values = 1; }
+message KeyValueList { repeated KeyValue values = 1; }

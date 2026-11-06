@@ -1,0 +1,96 @@
+{
+  "name": "@amaster.ai/dsh-telemetry",
+  "version": "0.1.0",
+  "description": "Unified OpenTelemetry tracing for DeepSeek Harness with Langfuse and Phoenix adapters",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "preview.png"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TGYD-helige/dsh-plugins.git",
+    "directory": "packages/dsh-telemetry"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5",
+    "@amaster.ai/dsh-langfuse": "workspace:*"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-attachment": ">=0.2.0-rc.1 || >=0.2.1-rc.1 || >=0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm": ">=0.1.5-rc.1 || >=0.1.6-alpha.1 || >=0.1.7-alpha.1 || >=0.2.0-rc.1 || >=0.2.1-rc.1 || >=0.2.2-rc.1",
+    "@deepseek-ai/dsh-session": ">=0.1.5-rc.1 || >=0.1.6-alpha.1 || >=0.1.7-alpha.1 || >=0.2.0-rc.1 || >=0.2.1-rc.1 || >=0.2.2-rc.1",
+    "@deepseek-ai/dsh-subagent": ">=0.1.5-rc.1 || >=0.1.6-alpha.1 || >=0.1.7-alpha.1 || >=0.2.0-rc.1 || >=0.2.1-rc.1 || >=0.2.2-rc.1",
+    "@deepseek-ai/dsh-tools": ">=0.1.5-rc.1 || >=0.1.6-alpha.1 || >=0.1.7-alpha.1 || >=0.2.0-rc.1 || >=0.2.1-rc.1 || >=0.2.2-rc.1",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-trace-node": "^2.10.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "^0.221.0",
+    "@opentelemetry/resources": "^2.10.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentelemetry/api": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-attachment": {
+      "optional": true
+    },
+    "@opentelemetry/sdk-trace-node": {
+      "optional": true
+    },
+    "@opentelemetry/exporter-trace-otlp-proto": {
+      "optional": true
+    },
+    "@opentelemetry/resources": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-agent": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-attachment": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-hook-protocol": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-ptc-runtime": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session-projection": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-subagent": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-util-time": "0.2.2-rc.1",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/exporter-trace-otlp-proto": "0.221.0",
+    "@opentelemetry/sdk-trace-node": "^2.10.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.11",
+    "@deepseek-ai/dsh-tool-executor-native": "0.2.2-rc.1",
+    "@opentelemetry/resources": "2.10.0"
+  },
+  "engines": {
+    "node": "^20.19 || ^22.12 || >=24.0"
+  }
+}

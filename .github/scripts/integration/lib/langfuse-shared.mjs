@@ -41,6 +41,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { integrationModel, integrationRevision, netEnv, requireEnv, run } from './ci-shared.mjs';
+import { runPhoenixVerification } from './phoenix-shared.mjs';
 
 // ---------------------------------------------------------------------------
 // Real-Langfuse verification (efficient v2 Observations API, with v1 fallback
@@ -718,6 +719,7 @@ async function scenarioMain({
   toolHooks = false,
   cancelHook = false,
   metadata = false,
+  telemetryBackend,
 }) {
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-langfuse-${tag}-e2e`);
   mkdirSync(workDir, { recursive: true });
@@ -729,7 +731,11 @@ async function scenarioMain({
 
   const publicKey = envOr(process.env.LANGFUSE_PUBLIC_KEY, '');
   const secretKey = envOr(process.env.LANGFUSE_SECRET_KEY, '');
-  if ((hook || toolHooks || cancelHook || metadata) && (!publicKey || !secretKey)) {
+  if (
+    (hook || toolHooks || cancelHook || metadata || telemetryBackend === 'langfuse') &&
+    telemetryBackend !== 'phoenix' &&
+    (!publicKey || !secretKey)
+  ) {
     throw new Error('hook/metadata E2E requires LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY');
   }
   // A half-configured pair is a misconfiguration — never silently fake it.
@@ -738,7 +744,9 @@ async function scenarioMain({
       '::warning::only one of LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY is set — running in fake mode',
     );
   }
-  const realMode = Boolean(publicKey && secretKey);
+  if (telemetryBackend === 'phoenix')
+    requireEnv(['PHOENIX_API_KEY', 'PHOENIX_COLLECTOR_ENDPOINT', 'PHOENIX_PROJECT_NAME']);
+  const realMode = telemetryBackend === 'phoenix' || Boolean(publicKey && secretKey);
   const baseUrl = envOr(process.env.LANGFUSE_BASE_URL, DEFAULT_BASE_URL);
   console.log(`mode: ${realMode ? `real Langfuse (${baseUrl})` : 'fake OTLP endpoint'}`);
 
@@ -769,10 +777,6 @@ async function scenarioMain({
   // sets autoInstallPeers: false, so runtime peers are added explicitly —
   // including the OTEL api/exporter packages @langfuse/otel itself peers on.
   // The dsh-* peers ship with the profile itself.
-  run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], {
-    cwd: workDir,
-    env: dshHomeEnv,
-  });
   run(
     dsh,
     [
@@ -780,11 +784,29 @@ async function scenarioMain({
       '--profile',
       'headless',
       'add',
-      '@langfuse/tracing@5.10.1',
-      '@langfuse/otel@5.10.1',
+      ...(telemetryBackend ? [resolve(process.env.DSH_TELEMETRY_COLLECTOR_TARBALL)] : []),
+      resolve(DSH_PKG_TARBALL),
+    ],
+    {
+      cwd: workDir,
+      env: dshHomeEnv,
+    },
+  );
+  run(
+    dsh,
+    [
+      'plugin',
+      '--profile',
+      'headless',
+      'add',
+      ...(telemetryBackend
+        ? ['@opentelemetry/resources@2.10.0']
+        : ['@langfuse/tracing@5.10.1', '@langfuse/otel@5.10.1']),
       '@opentelemetry/sdk-trace-node@2.10.0',
       '@opentelemetry/api@1.9.1',
-      '@opentelemetry/exporter-trace-otlp-http@0.221.0',
+      telemetryBackend
+        ? '@opentelemetry/exporter-trace-otlp-proto@0.221.0'
+        : '@opentelemetry/exporter-trace-otlp-http@0.221.0',
     ],
     { cwd: workDir, env: dshHomeEnv },
   );
@@ -856,10 +878,10 @@ async function scenarioMain({
   writeFileSync(
     patchPath,
     `# dsh-langfuse integration scenario (${tag}): enable the plugin against ${realMode ? 'the real Langfuse' : 'the fake endpoint'}.
-- id: langfuse
+- id: ${telemetryBackend ? 'telemetry' : 'langfuse'}
   config:
     enabled: true
-    publicKey: ${pluginConnection.publicKey}
+${telemetryBackend ? `    backend: ${telemetryBackend}\n` : ''}    publicKey: ${pluginConnection.publicKey}
     secretKey: ${pluginConnection.secretKey}
     baseUrl: ${pluginConnection.baseUrl}
     environment: ci
@@ -939,7 +961,9 @@ ${hookPatch}
     await runQuery(prompt(markerFile));
     let problems;
     if (realMode) {
-      const result = await runVerification({
+      const result = await (telemetryBackend === 'phoenix'
+        ? runPhoenixVerification
+        : runVerification)({
         baseUrl,
         publicKey,
         secretKey,

@@ -11,6 +11,7 @@ Composable, config-driven plugins for [DeepSeek Harness (dsh)](https://github.co
 | [`@amaster.ai/dsh-a2a`](packages/dsh-a2a) | Serves dsh agents over the [A2A protocol](https://github.com/a2aproject) **1.0** (JSON-RPC + SSE, opt-in HTTP+JSON/REST and gRPC, with v0.3 compatibility): all eleven standard operations, tool approvals, opt-in native inbox execution; pluggable task-state stores (memory/filesystem/Redis/GCS + workspace archive) | `ctx.agents`, `session/event`, `approval/request`, own protocol listeners |
 | [`@amaster.ai/dsh-storage`](packages/dsh-storage) | Mirrors the session event stream into MySQL/PostgreSQL/SQLite/SQL Server (`ai_messages` / `ai_chat_histories`) | `session/event` tap (local persistence stays authoritative) |
 | [`@amaster.ai/dsh-langfuse`](packages/dsh-langfuse) | Langfuse observability: one generation per LLM call (plus a nested `llm-request` span with the verbatim loop-built request), one span per tool call or hook run, one trace per turn; subagent child sessions nested under the parent's tree | `llm/stream`, `tools/pre-execute` → `tools/result`, `session/event` (including `hook/*`), `session/created` + `subagent/start`/`subagent/end` |
+| [`@amaster.ai/dsh-telemetry`](packages/dsh-telemetry) | Unified OTel tracing for Langfuse or Phoenix, including request context, hooks, subagents and A2A tasks | Shared `llm/stream`, tool, session, hook, subagent and A2A collector → backend adapter → shared OTLP/HTTP protobuf |
 | [`@amaster.ai/dsh-policy`](packages/dsh-policy) | Declarative tool-call policy: config-driven `allow`/`deny`/`ask` rules (tool name, args pattern, per-segment shell command prefix/regex, priority) — Gemini CLI-style policy files as plain plugin config | `tools/pre-execute` waterfall (`ask` rides dsh's approval seam) |
 | [`@amaster.ai/dsh-subagent-filesystem`](packages/dsh-subagent-filesystem) | Discovers Markdown specialist roles through the caller's filesystem and delegates through native in-process subagents | `ctx.fs`, scoped `ctx.tools` / `ctx.systemPrompt`, `agent/created`, `ctx.subagents` |
 
@@ -27,6 +28,7 @@ Composable, config-driven plugins for [DeepSeek Harness (dsh)](https://github.co
   </tr>
   <tr>
     <td width="50%" valign="top"><strong>dsh-subagent-filesystem</strong><br><a href="packages/dsh-subagent-filesystem"><img src="packages/dsh-subagent-filesystem/preview.png" alt="dsh-subagent-filesystem preview" width="360"></a></td>
+    <td width="50%" valign="top"><strong>dsh-telemetry</strong><br><a href="packages/dsh-telemetry"><img src="packages/dsh-telemetry/preview.png" alt="dsh-telemetry preview" width="360"></a></td>
   </tr>
 </table>
 
@@ -53,6 +55,8 @@ dsh is in developer preview and **will** break compatibility between releases. P
 `dsh-langfuse`'s optional image display uses `@deepseek-ai/dsh-attachment >=0.2.0-rc.1 || >=0.2.2-rc.1` (tested at `0.2.2-rc.1`); metadata-only tracing does not require an attachment backend.
 
 `dsh-subagent-filesystem` requires `@deepseek-ai/dsh-subagent >=0.2.1-rc.2 || >=0.2.2-rc.1` (tested at `0.2.2-rc.1`) and the native in-process `spawn` provider. It supports foreground reports and continuable background children; Markdown definitions cannot override models, tools, or permissions.
+
+`dsh-telemetry` tests the same dsh `0.2.2-rc.1` collector with OTel API `1.9.1`, SDK/resources `2.10.0`, and OTLP/HTTP protobuf exporter `0.221.0`. It needs no Langfuse SDK. See its README for backend server/version limits, project configuration and migration; enable one collector per profile.
 
 ## Install
 
@@ -161,6 +165,7 @@ packages/
 ├── dsh-a2a/        # A2A protocol server plugin
 ├── dsh-storage/    # session storage mirror plugin (+ prisma schema)
 ├── dsh-langfuse/   # Langfuse observability plugin
+├── dsh-telemetry/  # Unified Langfuse/Phoenix tracing
 └── dsh-policy/     # declarative tool-call policy plugin
 ```
 

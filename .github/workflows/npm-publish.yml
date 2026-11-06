@@ -269,6 +269,7 @@ jobs:
           pnpm build
           pnpm test
           pnpm test:sdk
+          pnpm test:otlp
           pnpm lint
 
       - name: Publish to npm

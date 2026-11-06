@@ -189,3 +189,7 @@ Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#comp
 MIT
 
 The Langfuse integration scenarios label observations with environment `ci`, release `GITHUB_SHA`, and tags for scenario, run ID, and workflow run attempt. Select environment `ci` in Langfuse to find new E2E traces. Read-back uses a bounded time window for each model run and queries a discovered trace directly while ingestion settles.
+
+## Shared instrumentation export
+
+`@amaster.ai/dsh-langfuse/instrumentation` exposes the SDK-independent collector (`collect`), reporter contract, payload/privacy helpers, hook helpers and token accounting. `dsh-telemetry` uses this documented boundary with a different reporter; it never loads the legacy SDK reporter. The legacy entry point still owns its original Config/environment handling and `langfuse/context` event. Install matching release versions when consuming this boundary.

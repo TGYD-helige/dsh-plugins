@@ -118,6 +118,19 @@ jobs:
           echo "tarball: $name"
           echo "DSH_PKG_TARBALL=$RUNNER_TEMP/$(basename "$name")" >> "$GITHUB_ENV"
 
+      - name: Pack telemetry collector and A2A companions
+        if: matrix.package == 'dsh-telemetry'
+        run: |
+          set -euo pipefail
+          for companion in dsh-langfuse dsh-a2a; do
+            archive="$(cd "packages/$companion" && pnpm pack --pack-destination "$RUNNER_TEMP" | tail -n1)"
+            if [ "$companion" = dsh-langfuse ]; then
+              echo "DSH_TELEMETRY_COLLECTOR_TARBALL=$RUNNER_TEMP/$(basename "$archive")" >> "$GITHUB_ENV"
+            else
+              echo "DSH_TELEMETRY_A2A_TARBALL=$RUNNER_TEMP/$(basename "$archive")" >> "$GITHUB_ENV"
+            fi
+          done
+
       - name: Install the dsh CLI (pinned)
         run: |
           set -euo pipefail
@@ -137,7 +150,11 @@ jobs:
       - name: Stage A — bundle composes into the headless profile
         run: |
           set -euo pipefail
-          dsh plugin --profile headless add "$DSH_PKG_TARBALL"
+          companions=()
+          if [ -n "${DSH_TELEMETRY_COLLECTOR_TARBALL:-}" ]; then
+            companions+=("$DSH_TELEMETRY_COLLECTOR_TARBALL")
+          fi
+          dsh plugin --profile headless add "${companions[@]}" "$DSH_PKG_TARBALL"
           dsh --profile headless --dump-config | tee /tmp/dsh-config.yml
           package_name="$(node -p "require('./packages/${{ matrix.package }}/package.json').name")"
           grep -F "name: '$package_name'" /tmp/dsh-config.yml
@@ -157,9 +174,12 @@ jobs:
           # dsh-langfuse only: blanked on other packages' legs. Hook, tool-hooks,
           # cancel-hook and metadata legs require real Langfuse API read-back; base/subagent
           # legs retain the fake-OTLP fallback when keys are absent.
-          LANGFUSE_PUBLIC_KEY: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_PUBLIC_KEY || '' }}
-          LANGFUSE_SECRET_KEY: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_SECRET_KEY || '' }}
-          LANGFUSE_BASE_URL: ${{ matrix.package == 'dsh-langfuse' && secrets.LANGFUSE_BASE_URL || '' }}
+          LANGFUSE_PUBLIC_KEY: ${{ (matrix.package == 'dsh-langfuse' || startsWith(matrix.name, 'dsh-telemetry.langfuse')) && secrets.LANGFUSE_PUBLIC_KEY || '' }}
+          LANGFUSE_SECRET_KEY: ${{ (matrix.package == 'dsh-langfuse' || startsWith(matrix.name, 'dsh-telemetry.langfuse')) && secrets.LANGFUSE_SECRET_KEY || '' }}
+          LANGFUSE_BASE_URL: ${{ (matrix.package == 'dsh-langfuse' || startsWith(matrix.name, 'dsh-telemetry.langfuse')) && secrets.LANGFUSE_BASE_URL || '' }}
+          PHOENIX_API_KEY: ${{ startsWith(matrix.name, 'dsh-telemetry.phoenix') && secrets.PHOENIX_API_KEY || '' }}
+          PHOENIX_COLLECTOR_ENDPOINT: ${{ startsWith(matrix.name, 'dsh-telemetry.phoenix') && secrets.PHOENIX_COLLECTOR_ENDPOINT || '' }}
+          PHOENIX_PROJECT_NAME: ${{ startsWith(matrix.name, 'dsh-telemetry.phoenix') && secrets.PHOENIX_PROJECT_NAME || '' }}
         run: node ".github/scripts/integration/${{ matrix.name }}.mjs"
 
       # Runtime visibility: the full session event log (including

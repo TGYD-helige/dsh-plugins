@@ -202,3 +202,13 @@ test('A2A protocol regressions run without the secret-backed approval gate', () 
   assert.match(job, /node \.github\/scripts\/integration\/dsh-a2a\.mjs/);
   assert.match(job, /check-inbox\.mjs -t 'official protocol bindings'/);
 });
+
+test('telemetry Phoenix secrets are step-scoped to Phoenix legs', () => {
+  for (const key of ['PHOENIX_API_KEY', 'PHOENIX_COLLECTOR_ENDPOINT', 'PHOENIX_PROJECT_NAME']) {
+    assert.ok(
+      workflow.includes(
+        `${key}: \u0024{{ startsWith(matrix.name, 'dsh-telemetry.phoenix') && secrets.${key} || '' }}`,
+      ),
+    );
+  }
+});
