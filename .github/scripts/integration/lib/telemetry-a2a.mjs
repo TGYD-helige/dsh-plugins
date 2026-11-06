@@ -56,7 +56,7 @@ export async function runTelemetryA2a(backend) {
     async function runTask(prompt) {
       const client = a2aClient(boot.a2a, { signal: AbortSignal.timeout(240_000) });
       const { res, body } = await client.rpc('SendMessage', {
-        message: client.userMessage(prompt, { contextId }),
+        message: client.userMessage(prompt, { contextId, messageId: randomUUID() }),
         configuration: { returnImmediately: true },
       });
       assert(res.ok && !body.error, 'SendMessage must succeed');
