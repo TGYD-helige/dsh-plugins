@@ -204,16 +204,6 @@ test('A2A protocol regressions run without the secret-backed approval gate', () 
   assert.match(job, /check-inbox\.mjs -t 'official protocol bindings'/);
 });
 
-test('telemetry Phoenix secrets are step-scoped to Phoenix legs', () => {
-  for (const key of ['PHOENIX_API_KEY', 'PHOENIX_COLLECTOR_ENDPOINT', 'PHOENIX_PROJECT_NAME']) {
-    assert.ok(
-      workflow.includes(
-        `${key}: \u0024{{ startsWith(matrix.name, 'dsh-telemetry.phoenix') && secrets.${key} || '' }}`,
-      ),
-    );
-  }
-});
-
 test('Phoenix API validation distinguishes agent and chain types and requires indexed messages', async () => {
   const { phoenixObservation, evaluatePhoenixSemantics } = await import(
     './integration/lib/phoenix-shared.mjs'
@@ -332,6 +322,21 @@ test('unpublished telemetry dependencies use local companion archives without re
     install?.includes('dsh plugin --profile headless add "${companions[@]}" "$DSH_PKG_TARBALL"'),
     'install local archives together rather than resolving unpublished workspace dependencies from npm',
   );
+});
+
+test('new backend secrets are scoped to the exact telemetry backend', () => {
+  for (const key of ['PHOENIX_API_KEY', 'PHOENIX_COLLECTOR_ENDPOINT', 'PHOENIX_PROJECT_NAME'])
+    assert.ok(
+      workflow.includes(
+        `${key}: \${{ startsWith(matrix.name, 'dsh-telemetry.phoenix') && secrets.${key} || '' }}`,
+      ),
+    );
+  for (const key of ['LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY', 'LANGFUSE_BASE_URL'])
+    assert.ok(
+      workflow.includes(
+        `(matrix.package == 'dsh-langfuse' || startsWith(matrix.name, 'dsh-telemetry.langfuse')) && secrets.${key} || ''`,
+      ),
+    );
 });
 
 test('a packed plugin resolves its unpublished dependency offline through a local file reference', () => {
