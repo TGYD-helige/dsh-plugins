@@ -202,3 +202,48 @@ it('strips adapted content and redacts adapted JSON at the final boundary', asyn
     token: '[REDACTED]',
   });
 });
+
+it.each(['phoenix', 'langfuse'] as const)(
+  'preserves reasoning through the collector and %s adapter',
+  async (backend) => {
+    const ctx = new Context();
+    await apply(
+      ctx,
+      Config({ enabled: true, backend, publicKey: 'pk-test', secretKey: 'sk-test' }),
+    );
+    const chunks = [
+      { type: 'reasoning-delta', index: 0, text: 'Check ' },
+      { type: 'reasoning-delta', index: 0, text: 'the file.' },
+      { type: 'text-delta', index: 1, text: 'answer' },
+      { type: 'usage', usage: { inputTokens: 3, outputTokens: 4, reasoningTokens: 2 } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ];
+    try {
+      const received = [];
+      for await (const chunk of ctx.waterfall(
+        'llm/stream',
+        { provider: 'test', model: 'test', messages: [] } as never,
+        async function* () {
+          yield* chunks as never[];
+        },
+      ))
+        received.push(chunk);
+      expect(received).toEqual(chunks);
+    } finally {
+      await ctx.fiber.dispose();
+    }
+    const outputKey = backend === 'phoenix' ? 'output.value' : 'langfuse.observation.output';
+    const request = state.spans.find((span) => span.name === 'llm-request')!;
+    const generation = state.spans.find((span) => span.name.startsWith('llm-call'))!;
+    expect(JSON.parse(String(request.attributes[outputKey]))).toEqual(chunks);
+    expect(JSON.parse(String(generation.attributes[outputKey]))).toEqual({
+      role: 'assistant',
+      content: 'answer',
+      thinking: [{ type: 'thinking', content: 'Check the file.' }],
+    });
+    if (backend === 'phoenix')
+      expect(
+        generation.attributes['llm.output_messages.0.message.contents.0.message_content.text'],
+      ).toBe('Check the file.');
+  },
+);

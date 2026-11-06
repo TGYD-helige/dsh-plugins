@@ -432,3 +432,97 @@ test('a packed plugin resolves its unpublished dependency offline through a loca
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('reasoning validation follows the source stream instead of requiring the model to think', async () => {
+  const { evaluateReasoning } = await import('./integration/lib/langfuse-shared.mjs');
+  const generation = { id: 'g', type: 'GENERATION', output: 'answer' };
+  const request = {
+    type: 'SPAN',
+    name: 'llm-request',
+    parentObservationId: 'g',
+    output: [{ type: 'text-delta', text: 'answer' }],
+  };
+  assert.deepEqual(evaluateReasoning([generation, request], []), []);
+  assert.deepEqual(
+    evaluateReasoning(
+      [
+        {
+          ...generation,
+          metadata: { purpose: 'session-title' },
+          output: { thinking: [{ type: 'thinking', content: 'title reasoning' }] },
+        },
+        { ...request, output: [{ type: 'reasoning-delta', text: 'title reasoning' }] },
+      ],
+      [],
+    ),
+    [],
+  );
+  assert.ok(evaluateReasoning([generation, request], ['source reasoning']).length > 0);
+  request.output = [
+    { type: 'reasoning-delta', text: 'source ' },
+    { type: 'reasoning-delta', text: 'reasoning' },
+  ];
+  assert.ok(
+    evaluateReasoning([generation, request], ['source reasoning']).length > 0,
+    'display loss must fail',
+  );
+  generation.output = { thinking: [{ type: 'thinking', content: 'source reasoning' }] };
+  assert.deepEqual(evaluateReasoning([generation, request], ['source reasoning']), []);
+  assert.ok(
+    evaluateReasoning([generation, request], ['different reasoning']).length > 0,
+    'changed content must fail',
+  );
+  assert.ok(
+    evaluateReasoning([generation, request], []).length > 0,
+    'unexpected content must fail',
+  );
+});
+
+test('reasoning evidence reads current durable model streams and fails on missing evidence', async () => {
+  const { readReasoningSource } = await import('./integration/lib/langfuse-shared.mjs');
+  const { zstdCompressSync } = await import('node:zlib');
+  const directory = mkdtempSync(join(tmpdir(), 'reasoning-source-'));
+  const sessions = join(directory, 'sessions', 'workspace', 'session');
+  mkdirSync(sessions, { recursive: true });
+  const write = (rows) =>
+    writeFileSync(
+      join(sessions, 'session.v4.jsonl.zstd'),
+      Buffer.concat(rows.map((row) => zstdCompressSync(Buffer.from(`${JSON.stringify(row)}\n`)))),
+    );
+  const settled = (time, texts) => ({
+    type: 'assistant/message',
+    time,
+    data: {
+      stream: [
+        { type: 'reasoning-chunks', time0: time, index: 0, dt: texts.slice(1).map(() => 0), texts },
+      ],
+    },
+  });
+  try {
+    write([
+      settled(1000, ['old']),
+      settled(3000, ['source ', 'reasoning']),
+      { ...settled(3500, ['failed attempt reasoning']), type: 'assistant/attempt' },
+    ]);
+    assert.deepEqual(readReasoningSource(directory, new Date(2000).toISOString()), [
+      'source reasoning',
+      'failed attempt reasoning',
+    ]);
+    write([
+      {
+        type: 'assistant/message',
+        time: 3000,
+        data: {
+          stream: [{ type: 'text-chunks', time0: 3000, index: 0, dt: [], texts: ['answer'] }],
+        },
+      },
+    ]);
+    assert.deepEqual(readReasoningSource(directory, new Date(2000).toISOString()), []);
+    assert.throws(
+      () => readReasoningSource(directory, new Date(4000).toISOString()),
+      /settled model stream/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

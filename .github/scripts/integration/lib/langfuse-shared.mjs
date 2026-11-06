@@ -36,10 +36,12 @@
  */
 
 import { spawn } from 'node:child_process';
-import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { zstdDecompressSync } from 'node:zlib';
+import { expandAssistantStream } from '@deepseek-ai/dsh-llm/assistant-stream';
 import { integrationModel, integrationRevision, netEnv, requireEnv, run } from './ci-shared.mjs';
 import { runPhoenixVerification } from './phoenix-shared.mjs';
 
@@ -140,30 +142,72 @@ export function evaluateTrace(observations, codeword) {
   return problems;
 }
 
-// Reasoning content lands as reasoning-delta chunks in llm-request spans' raw
-// stream outputs. The scenario runs thinking at max effort, so SOME span in
-// the trace must carry one (purpose calls don't reason — check them all).
-export function evaluateReasoning(observations) {
-  const has = observations.some(
-    (o) =>
-      o.type === 'SPAN' &&
-      o.name === 'llm-request' &&
-      Array.isArray(o.output) &&
-      o.output.some((c) => c?.type === 'reasoning-delta'),
-  );
-  const displayed = observations.some(
-    (o) =>
-      o.type === 'GENERATION' &&
-      Array.isArray(o.output?.thinking) &&
-      o.output.thinking.some((part) => part?.type === 'thinking' && part.content?.length > 0),
-  );
+// The provider may return no reasoning even at max effort; compare against the durable stream.
+export function readReasoningSource(dshHome, fromStartTime) {
+  const sessions = join(dshHome, 'sessions');
+  const expected = [];
+  let settled = 0;
+  for (const file of readdirSync(sessions, { recursive: true })) {
+    if (!/session(?:\.v\d+)?\.jsonl\.zstd$/.test(file)) continue;
+    // dsh appends zstd frames; Node's synchronous decoder consumes only one frame at a time.
+    let compressed = readFileSync(join(sessions, file));
+    const frames = [];
+    while (compressed.length) {
+      const { buffer, engine } = zstdDecompressSync(compressed, { info: true });
+      assert(engine.bytesWritten > 0, 'invalid session compression frame');
+      frames.push(buffer);
+      compressed = compressed.subarray(engine.bytesWritten);
+    }
+    const rows = Buffer.concat(frames).toString('utf8');
+    for (const line of rows.trim().split('\n')) {
+      const event = JSON.parse(line);
+      if (
+        !['assistant/message', 'assistant/attempt'].includes(event.type) ||
+        event.time < Date.parse(fromStartTime)
+      )
+        continue;
+      const chunks = expandAssistantStream(event.data.stream);
+      settled++;
+      const reasoning = chunks
+        .filter(({ chunk }) => chunk.type === 'reasoning-delta')
+        .map(({ chunk }) => chunk.text)
+        .join('');
+      if (reasoning) expected.push(reasoning);
+    }
+  }
+  assert(settled > 0, 'no settled model stream for reasoning verification');
+  return expected;
+}
+
+export function evaluateReasoning(observations, expected) {
+  const generations = observations.filter((o) => o.type === 'GENERATION' && !o.metadata?.purpose);
+  const ids = new Set(generations.map((o) => o.id));
+  const raw = observations
+    .filter((o) => o.name === 'llm-request' && ids.has(o.parentObservationId))
+    .map((o) =>
+      Array.isArray(o.output)
+        ? o.output
+            .filter((c) => c.type === 'reasoning-delta')
+            .map((c) => c.text)
+            .join('')
+        : '',
+    )
+    .filter(Boolean);
+  const displayed = generations
+    .map((o) =>
+      Array.isArray(o.output?.thinking)
+        ? o.output.thinking
+            .filter((part) => part.type === 'thinking')
+            .map((part) => part.content)
+            .join('')
+        : '',
+    )
+    .filter(Boolean);
+  const matches = (values) =>
+    JSON.stringify([...values].sort()) === JSON.stringify([...expected].sort());
   return [
-    ...(!has
-      ? [
-          'no llm-request span output has a reasoning-delta chunk (thinking should be enabled at max)',
-        ]
-      : []),
-    ...(!displayed ? ['no generation output displays reasoning'] : []),
+    ...(!matches(raw) ? ['raw reasoning differs from the source stream'] : []),
+    ...(!matches(displayed) ? ['displayed reasoning differs from the source stream'] : []),
   ];
 }
 
@@ -720,6 +764,7 @@ async function scenarioMain({
   cancelHook = false,
   metadata = false,
   telemetryBackend,
+  reasoning = false,
 }) {
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-langfuse-${tag}-e2e`);
   mkdirSync(workDir, { recursive: true });
@@ -887,8 +932,8 @@ async function scenarioMain({
   // Enable the plugin through the profile's user patch layer (an id-targeted
   // row replaces the bundle row's whole config). The agent-default-model row
   // pins the integration model; the llm-deepseek row turns thinking ON at max
-  // effort — reasoning content must land in Langfuse (reasoning-delta chunks
-  // in the raw stream). Caveat: reasoning enabled makes this gateway
+  // effort. Any reasoning the provider returns must survive collection.
+  // Caveat: reasoning enabled makes this gateway
   // stochastically garble or hang on tool calls (observed in CI) — the retry
   // loop absorbs it.
   const patchPath = join(dshHome, 'profiles', 'headless', 'cordis.patch.yml');
@@ -976,6 +1021,12 @@ ${hookPatch}
     captured.length = 0;
     const runStartedAt = new Date(Date.now() - 1000).toISOString();
     await runQuery(prompt(markerFile));
+    const source = reasoning ? readReasoningSource(dshHome, runStartedAt) : undefined;
+    if (source) console.log(`Source reasoning: ${source.length} model stream(s)`);
+    const evaluateRun = (observations, marker) => [
+      ...evaluate(observations, marker),
+      ...(source ? evaluateReasoning(observations, source) : []),
+    ];
     let problems;
     if (realMode) {
       const result = await (telemetryBackend === 'phoenix'
@@ -987,7 +1038,7 @@ ${hookPatch}
         fromStartTime: runStartedAt,
         toStartTime: new Date().toISOString(),
         codeword,
-        evaluate,
+        evaluate: evaluateRun,
       });
       if (result.ok) {
         state = result.state;
@@ -995,7 +1046,7 @@ ${hookPatch}
       }
       console.log(`::warning::${name} attempt ${attempt} did not verify: ${result.state}`);
     } else {
-      problems = evaluate(capturedToObservations(captured), codeword);
+      problems = evaluateRun(capturedToObservations(captured), codeword);
       if (problems.length === 0) {
         state = 'captured shape matches';
         break;
