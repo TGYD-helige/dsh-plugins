@@ -721,10 +721,6 @@ async function scenarioMain({
   metadata = false,
   telemetryBackend,
 }) {
-  if (telemetryBackend) {
-    const { probeTelemetry } = await import('./telemetry-live-probe.mjs');
-    await probeTelemetry(telemetryBackend);
-  }
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-langfuse-${tag}-e2e`);
   mkdirSync(workDir, { recursive: true });
   const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
@@ -752,6 +748,19 @@ async function scenarioMain({
     requireEnv(['PHOENIX_API_KEY', 'PHOENIX_COLLECTOR_ENDPOINT', 'PHOENIX_PROJECT_NAME']);
   const realMode = telemetryBackend === 'phoenix' || Boolean(publicKey && secretKey);
   const baseUrl = envOr(process.env.LANGFUSE_BASE_URL, DEFAULT_BASE_URL);
+  if (telemetryBackend === 'langfuse') {
+    try {
+      const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/public/health`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      const { version } = await response.json();
+      console.log(
+        `Langfuse server version: ${typeof version === 'string' && /^[a-zA-Z0-9.+_-]{1,60}$/.test(version) ? version : 'not reported'}`,
+      );
+    } catch {
+      console.log('Langfuse server version: not reported');
+    }
+  }
   console.log(`mode: ${realMode ? `real Langfuse (${baseUrl})` : 'fake OTLP endpoint'}`);
 
   // Fake mode only: the capture sink the assertions read from.

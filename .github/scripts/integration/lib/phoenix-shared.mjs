@@ -41,6 +41,7 @@ export async function runPhoenixVerification({ fromStartTime, codeword, evaluate
   const project = encodeURIComponent(process.env.PHOENIX_PROJECT_NAME);
   const deadline = Date.now() + 5 * 60_000;
   let state = 'no matching Phoenix trace';
+  let versionReported = false;
   while (Date.now() < deadline) {
     const observations = [];
     let cursor;
@@ -58,6 +59,13 @@ export async function runPhoenixVerification({ fromStartTime, codeword, evaluate
       // A new project may not be visible until the first batch has ingested.
       if (response.status === 404) break;
       if (!response.ok) throw new Error(`Phoenix read-back HTTP ${response.status}`);
+      if (!versionReported) {
+        const version = response.headers.get('x-phoenix-server-version');
+        console.log(
+          `Phoenix server version: ${version && /^[a-zA-Z0-9.+_-]{1,60}$/.test(version) ? version : 'not reported'}`,
+        );
+        versionReported = true;
+      }
       const body = await response.json();
       observations.push(...body.data.map(phoenixObservation));
       cursor = body.next_cursor;
@@ -98,7 +106,10 @@ export function evaluatePhoenixSemantics(observations) {
   const problems = [];
   for (const span of observations) {
     const expectedKind =
-      span.name === 'dsh-turn' || span.name === 'a2a-task' || span.name?.startsWith('subagent')
+      span.name === 'dsh-turn' ||
+      span.name === 'agent:turn' ||
+      span.name === 'a2a-task' ||
+      span.name?.startsWith('subagent')
         ? 'AGENT'
         : span.name?.startsWith('hook:') || span.name === 'llm-request'
           ? 'CHAIN'
@@ -111,6 +122,8 @@ export function evaluatePhoenixSemantics(observations) {
       problems.push(`${span.name} must have OpenInference kind ${expectedKind}`);
     if (span.type !== 'GENERATION') continue;
     const attributes = span.attributes;
+    if (span.input?.provider && attributes['llm.system'] !== span.input.provider)
+      problems.push('missing LLM system/provider');
     const messages = [
       ...(span.input?.system ? [{ role: 'system', content: span.input.system }] : []),
       ...(Array.isArray(span.input?.messages) ? span.input.messages : []),

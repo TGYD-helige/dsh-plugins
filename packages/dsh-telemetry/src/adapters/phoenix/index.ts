@@ -45,6 +45,7 @@ function map(data: ObservationData): Attributes {
   set('metadata', { ...data.metadata, environment: data.environment, release: data.release });
   if (data.tags?.length) attributes['tag.tags'] = data.tags;
   set('llm.model_name', data.model);
+  set('llm.system', data.provider);
   set('llm.invocation_parameters', data.modelParameters);
   if (data.kind === 'tool') {
     set('tool.name', data.name);
@@ -97,15 +98,21 @@ function mapMessage(attributes: Attributes, prefix: string, value: unknown) {
   if (Array.isArray(message.thinking))
     message.thinking.forEach((block: { content?: string }, i: number) => {
       if (block.content) {
-        attributes[`${prefix}.message.contents.${i}.message_content.type`] = 'text';
+        attributes[`${prefix}.message.contents.${i}.message_content.type`] = 'reasoning';
         attributes[`${prefix}.message.contents.${i}.message_content.text`] = block.content;
       }
     });
-  if (typeof message.reasoning_content === 'string')
+  if (typeof message.reasoning_content === 'string') {
+    attributes[`${prefix}.message.contents.0.message_content.type`] = 'reasoning';
     attributes[`${prefix}.message.contents.0.message_content.text`] = message.reasoning_content;
+  }
   if (Array.isArray(message.content)) {
     const text: string[] = [];
     message.content.forEach((block: Record<string, unknown>, i: number) => {
+      if (block.type === 'reasoning' && typeof block.text === 'string') {
+        attributes[`${prefix}.message.contents.${i}.message_content.type`] = 'reasoning';
+        attributes[`${prefix}.message.contents.${i}.message_content.text`] = block.text;
+      }
       if (block.type === 'text' && typeof block.text === 'string') text.push(block.text);
       if (block.type === 'image_url') {
         const image = block.image_url as { url?: string } | undefined;

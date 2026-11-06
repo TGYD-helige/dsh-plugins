@@ -150,3 +150,16 @@ it.each([
     ).endpoint,
   ).toBe(expected);
 });
+
+it('emits the provider and typed reasoning parts required by OpenInference', () => {
+  expect(
+    adapt('phoenix', {
+      kind: 'generation',
+      provider: 'deepseek',
+      output: { role: 'assistant', thinking: [{ type: 'thinking', content: 'reason' }] },
+    }),
+  ).toMatchObject({
+    'llm.system': 'deepseek',
+    'llm.output_messages.0.message.contents.0.message_content.type': 'reasoning',
+  });
+});

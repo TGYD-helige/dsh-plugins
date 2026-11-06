@@ -687,6 +687,7 @@ export function collect(
       }
       const trace = reporter.startSpan(task.trace, {
         name: 'agent:turn',
+        asType: 'agent',
         metadata: { turn, taskId: task.taskId },
         startTime: pending?.startTime,
       });
@@ -1220,6 +1221,7 @@ export function collect(
     const generation = reporter.startGeneration(parent, {
       name: generationName,
       model: options.model,
+      provider: options.provider,
       input,
       modelParameters,
       metadata: { purpose: options.purpose },

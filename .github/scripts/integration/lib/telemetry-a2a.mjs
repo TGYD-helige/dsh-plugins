@@ -16,8 +16,6 @@ export async function runTelemetryA2a(backend) {
       ? ['PHOENIX_API_KEY', 'PHOENIX_COLLECTOR_ENDPOINT', 'PHOENIX_PROJECT_NAME']
       : ['LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY'],
   );
-  const { probeTelemetry } = await import('./telemetry-live-probe.mjs');
-  await probeTelemetry(backend);
   const tag = `telemetry-${backend}-a2a`;
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-a2a-e2e-${tag}`);
   const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
@@ -81,7 +79,7 @@ export async function runTelemetryA2a(backend) {
     const evaluate = (observations) => {
       const task = observations.find((o) => o.name === 'a2a-task');
       const turn = observations.find(
-        (o) => o.name === 'dsh-turn' && o.parentObservationId === task?.id,
+        (o) => o.name === 'agent:turn' && o.parentObservationId === task?.id,
       );
       const generation = observations.find(
         (o) => o.type === 'GENERATION' && o.parentObservationId === turn?.id,

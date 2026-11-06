@@ -239,3 +239,35 @@ test('Phoenix API validation distinguishes agent and chain types and requires in
   });
   assert.ok(evaluatePhoenixSemantics([llm]).some((problem) => problem.includes('message.role')));
 });
+
+test('manual integration can select one exact scenario and rejects unknown names', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'selected-scenario-'));
+  try {
+    const output = join(directory, 'output');
+    const result = spawnSync(process.execPath, ['.github/scripts/integration-matrix.mjs'], {
+      env: {
+        ...process.env,
+        INTEGRATION_SCENARIO: 'dsh-telemetry.phoenix-a2a',
+        GITHUB_OUTPUT: output,
+      },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const matrix = JSON.parse(
+      readFileSync(output, 'utf8')
+        .split('\n')
+        .find((line) => line.startsWith('matrix='))
+        .slice(7),
+    );
+    assert.deepEqual(matrix.include, [
+      { package: 'dsh-telemetry', name: 'dsh-telemetry.phoenix-a2a' },
+    ]);
+    const bad = spawnSync(process.execPath, ['.github/scripts/integration-matrix.mjs'], {
+      env: { ...process.env, INTEGRATION_SCENARIO: 'unknown', GITHUB_OUTPUT: output },
+      encoding: 'utf8',
+    });
+    assert.notEqual(bad.status, 0);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

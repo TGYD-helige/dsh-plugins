@@ -57,6 +57,8 @@ export class TelemetryReporter implements InstrumentationReporter {
     const errors = Array.isArray(error) ? error : [error];
     const categories = errors.map((item) => {
       if (!(item instanceof Error)) return 'unknown';
+      if (process.env.CI)
+        console.error('[DEBUG-telemetry-export]', this.mask(item.message).slice(0, 200));
       const code = (item as Error & { code?: number }).code;
       if (typeof code === 'number') return `HTTP ${code}`;
       const match = item.message.match(

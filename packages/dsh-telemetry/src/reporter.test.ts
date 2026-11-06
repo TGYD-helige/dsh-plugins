@@ -6,6 +6,7 @@ import { TelemetryReporter } from './core/otel.js';
 import { apply, Config } from './index.js';
 
 const state = vi.hoisted(() => ({
+  fail: false,
   spans: [] as Array<{
     name: string;
     attributes: Record<string, unknown>;
@@ -18,9 +19,13 @@ const state = vi.hoisted(() => ({
 }));
 vi.mock('@opentelemetry/exporter-trace-otlp-proto', () => ({
   OTLPTraceExporter: class {
-    export(spans: typeof state.spans, callback: (result: { code: number }) => void) {
+    export(spans: typeof state.spans, callback: (result: { code: number; error?: Error }) => void) {
       state.spans.push(...spans);
-      callback({ code: 0 });
+      callback(
+        state.fail
+          ? { code: 1, error: Object.assign(new Error('private-export-response'), { code: 401 }) }
+          : { code: 0 },
+      );
     }
     async shutdown() {}
     async forceFlush() {}
@@ -28,6 +33,8 @@ vi.mock('@opentelemetry/exporter-trace-otlp-proto', () => ({
 }));
 afterEach(() => {
   state.spans.length = 0;
+  state.fail = false;
+  vi.restoreAllMocks();
 });
 describe('shared isolated OTel pipeline', () => {
   it.each(['phoenix', 'langfuse'] as const)(
@@ -153,4 +160,45 @@ it('collects concurrent sessions without changing stream chunks and drains on fi
   const other = state.spans.find((s) => s.attributes['session.id'] === 'two')!;
   expect(other.spanContext().traceId).not.toBe(llm.spanContext().traceId);
   expect(other.endTime).toBeDefined();
+});
+
+it('swallows exporter failures and logs only a safe failure category', async () => {
+  const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const reporter = new TelemetryReporter(
+    { backend: 'phoenix', captureContent: false },
+    adapters.phoenix,
+  );
+  await reporter.ready;
+  reporter.endSpan(reporter.openTrace({ name: 'failure' }));
+  state.fail = true;
+  await expect(reporter.flush()).resolves.toBeUndefined();
+  expect(diagnostic).toHaveBeenCalledWith('[dsh-telemetry] flush failed (HTTP 401)');
+  expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('private-export-response');
+  await expect(reporter.shutdown()).resolves.toBeUndefined();
+});
+
+it('strips adapted content and redacts adapted JSON at the final boundary', async () => {
+  const reporter = new TelemetryReporter(
+    {
+      backend: 'phoenix',
+      apiKey: 'phoenix-secret',
+      captureContent: false,
+      redactFields: ['password'],
+    },
+    {
+      ...adapters.phoenix,
+      attributes: () => ({
+        'input.value': 'PROMPT-BYPASS',
+        metadata: '{"password":"private","token":"phoenix-secret"}',
+      }),
+    },
+  );
+  await reporter.ready;
+  reporter.endSpan(reporter.openTrace({ name: 'safe' }));
+  await reporter.shutdown();
+  expect(state.spans[0].attributes['input.value']).toBeUndefined();
+  expect(JSON.parse(String(state.spans[0].attributes.metadata))).toEqual({
+    password: '[REDACTED]',
+    token: '[REDACTED]',
+  });
 });

@@ -13,6 +13,7 @@ export interface SpanInput {
   asType?: 'tool' | 'agent';
   startTime?: Date;
   model?: string;
+  provider?: string;
   modelParameters?: Record<string, string | number>;
 }
 export interface SpanUpdate {

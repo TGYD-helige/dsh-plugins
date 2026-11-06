@@ -17,6 +17,7 @@ export interface ObservationData extends SpanUpdate {
   userId?: string;
   tags?: string[];
   model?: string;
+  provider?: string;
   modelParameters?: Record<string, string | number>;
   environment?: string;
   release?: string;
