@@ -60,7 +60,7 @@ export class TelemetryReporter implements InstrumentationReporter {
       const code = (item as Error & { code?: number }).code;
       if (typeof code === 'number') return `HTTP ${code}`;
       const match = item.message.match(
-        /\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|Timeout|timeout|aborted)\b/,
+        /\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|Timeout|timeout|timed out|aborted)\b/,
       );
       return match?.[0] ?? item.name;
     });
@@ -87,7 +87,6 @@ export class TelemetryReporter implements InstrumentationReporter {
       const transport = new exporter.OTLPTraceExporter({
         url: connection.endpoint,
         headers: connection.headers,
-        timeoutMillis: 5000,
       });
       this.provider = new sdk.NodeTracerProvider({
         resource: resources.resourceFromAttributes({
@@ -104,7 +103,6 @@ export class TelemetryReporter implements InstrumentationReporter {
         spanProcessors: [
           new sdk.BatchSpanProcessor(transport, {
             scheduledDelayMillis: 1000,
-            exportTimeoutMillis: 6000,
           }),
         ],
       });

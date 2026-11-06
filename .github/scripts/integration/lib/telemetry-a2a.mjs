@@ -74,8 +74,7 @@ export async function runTelemetryA2a(backend) {
       await delay(1000);
     }
     assert(completed, 'A2A task did not complete');
-    await stopA2a(proc);
-    proc = undefined;
+    // Read back task spans before the CLI's bounded SIGTERM shutdown.
     const evaluate = (observations) => {
       const task = observations.find((o) => o.name === 'a2a-task');
       const turn = observations.find(
@@ -105,6 +104,8 @@ export async function runTelemetryA2a(backend) {
       evaluate,
     });
     assert(result.ok, result.state);
+    await stopA2a(proc);
+    proc = undefined;
     console.log(`SCENARIO_OK (${backend} real A2A task API read-back)`);
   } finally {
     if (proc) await stopA2a(proc);

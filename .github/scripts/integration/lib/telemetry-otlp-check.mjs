@@ -1,6 +1,7 @@
 /** Real shared protobuf exporter → loopback receiver, no backend/LLM credentials. */
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import protobuf from 'protobufjs';
 import { adapters } from '../../../../packages/dsh-telemetry/lib/adapters/index.js';
@@ -9,6 +10,7 @@ import { TelemetryReporter } from '../../../../packages/dsh-telemetry/lib/core/o
 const root = await protobuf.load(fileURLToPath(new URL('./otlp-trace.proto', import.meta.url)));
 const Request = root.lookupType('ExportTraceServiceRequest');
 const captured = [];
+let responsesSent = 0;
 const server = createServer(async (req, res) => {
   try {
     assert.equal(req.headers['content-type'], 'application/x-protobuf');
@@ -16,6 +18,8 @@ const server = createServer(async (req, res) => {
     for await (const chunk of req) chunks.push(chunk);
     const payload = Request.toObject(Request.decode(Buffer.concat(chunks)), { longs: String });
     captured.push({ path: req.url, auth: req.headers.authorization, payload });
+    if (req.url.startsWith('/slow/')) await delay(6000);
+    responsesSent++;
     res.writeHead(200, { 'content-type': 'application/x-protobuf' }).end();
   } catch {
     res.writeHead(400).end();
@@ -38,6 +42,7 @@ try {
     ['langfuse', ''],
     ['phoenix', '/prefix'],
     ['langfuse', '/prefix'],
+    ['phoenix', '/slow'],
   ]) {
     const reporter = new TelemetryReporter(
       {
@@ -75,6 +80,11 @@ try {
         new Date('2026-01-01T00:00:01Z'),
       );
       await reporter.flush();
+      assert.equal(
+        responsesSent,
+        captured.length,
+        'flush must wait for a collector taking longer than five seconds',
+      );
       const batch = captured.at(-1);
       assert.equal(
         batch.path,
