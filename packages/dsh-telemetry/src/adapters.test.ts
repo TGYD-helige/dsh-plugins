@@ -15,7 +15,7 @@ describe('backend adapters', () => {
     ).toEqual({
       endpoint: 'https://example.com/s/team/v1/traces',
       headers: { Authorization: 'Bearer secret' },
-      project: 'yaml-project',
+      resourceAttributes: { 'openinference.project.name': 'yaml-project' },
       secrets: ['secret'],
     });
   });
@@ -92,7 +92,7 @@ it('uses the GitHub-configured PHOENIX_PROJECT_NAME and keeps a complete traces 
       },
     ),
   ).toMatchObject({
-    project: 'ci-project',
+    resourceAttributes: { 'openinference.project.name': 'ci-project' },
     endpoint: 'https://example.com/s/team/v1/traces',
     headers: {},
   });

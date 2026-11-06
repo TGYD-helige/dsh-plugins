@@ -10,7 +10,10 @@ function resolve(
   return {
     endpoint: traceEndpoint(base, '/v1/traces'),
     headers: key ? { Authorization: `Bearer ${key}` } : {},
-    project: config.project || env.PHOENIX_PROJECT || env.PHOENIX_PROJECT_NAME || 'default',
+    resourceAttributes: {
+      'openinference.project.name':
+        config.project || env.PHOENIX_PROJECT || env.PHOENIX_PROJECT_NAME || 'default',
+    },
     secrets: [key].filter(Boolean),
   };
 }
@@ -134,4 +137,15 @@ function mapMessage(attributes: Attributes, prefix: string, value: unknown) {
   });
 }
 
-export const phoenix: BackendAdapter = { resolve, attributes: map };
+export const phoenix: BackendAdapter = {
+  resolve,
+  attributes: map,
+  contentPrefixes: [
+    'input.',
+    'output.',
+    'llm.input_messages.',
+    'llm.output_messages.',
+    'llm.tools.',
+    'tool.parameters',
+  ],
+};

@@ -40,21 +40,11 @@ export class TelemetryReporter implements InstrumentationReporter {
   private tracer?: Tracer;
   private observations = new WeakMap<object, Observation>();
   private privacy: PayloadPrivacy;
-  private credentials: string[];
   constructor(
     private config: ReporterConfig,
     private adapter: BackendAdapter,
   ) {
-    const values = [
-      config.apiKey,
-      config.publicKey,
-      config.secretKey,
-      process.env.PHOENIX_API_KEY,
-      process.env.LANGFUSE_PUBLIC_KEY,
-      process.env.LANGFUSE_SECRET_KEY,
-    ].filter((s): s is string => !!s);
-    this.credentials = values;
-    this.privacy = new PayloadPrivacy({ secrets: values, redactFields: config.redactFields });
+    this.privacy = new PayloadPrivacy({ secrets: [], redactFields: config.redactFields });
     this.ready = this.init();
   }
   mask<T>(data: T): T {
@@ -82,7 +72,6 @@ export class TelemetryReporter implements InstrumentationReporter {
       // Encoded authentication is a credential too, should it reappear in request metadata.
       this.privacy = new PayloadPrivacy({
         secrets: [
-          ...this.credentials,
           ...connection.secrets,
           ...Object.values(connection.headers),
           ...Object.values(connection.headers).map((v) => v.replace(/^(Basic|Bearer) /, '')),
@@ -103,9 +92,7 @@ export class TelemetryReporter implements InstrumentationReporter {
       this.provider = new sdk.NodeTracerProvider({
         resource: resources.resourceFromAttributes({
           'service.name': 'dsh-telemetry',
-          ...(connection.project
-            ? { 'openinference.project.name': this.mask(connection.project) }
-            : {}),
+          ...this.mask(connection.resourceAttributes),
           ...(this.config.environment
             ? { 'deployment.environment.name': this.mask(this.config.environment) }
             : {}),
@@ -273,10 +260,7 @@ export class TelemetryReporter implements InstrumentationReporter {
     for (const [key, value] of Object.entries(attributes)) {
       if (
         !this.config.captureContent &&
-        (/^(input\.|output\.|llm\.(input_messages|output_messages|tools)\.|tool\.parameters)/.test(
-          key,
-        ) ||
-          /^langfuse\.(observation|trace)\.(input|output|status_message)/.test(key))
+        this.adapter.contentPrefixes.some((prefix) => key.startsWith(prefix))
       )
         continue;
       const item = boundPayload(value, newPayloadBudget(cap), this);

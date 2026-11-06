@@ -25,6 +25,9 @@ export function phoenixObservation(span) {
     usageDetails: { total: attr('llm.token_count.total') ?? 0 },
     metadata: parse(attr('metadata')),
     sessionId: attr('session.id'),
+    spanKind: kind,
+    attributes,
+    statusCode: span.status_code,
     startTime: span.start_time,
     endTime: span.end_time,
   };
@@ -67,7 +70,7 @@ export async function runPhoenixVerification({ fromStartTime, codeword, evaluate
     );
     for (const traceId of traces) {
       const trace = observations.filter((o) => o.traceId === traceId);
-      const problems = evaluate(trace, codeword);
+      const problems = [...evaluate(trace, codeword), ...evaluatePhoenixSemantics(trace)];
       for (const span of trace) {
         if (
           !span.startTime ||
@@ -88,4 +91,64 @@ export async function runPhoenixVerification({ fromStartTime, codeword, evaluate
     await delay(Math.min(10_000, Math.max(0, deadline - Date.now())));
   }
   return { ok: false, state };
+}
+
+/** Preserve backend semantics that the cross-backend display normalization cannot express. */
+export function evaluatePhoenixSemantics(observations) {
+  const problems = [];
+  for (const span of observations) {
+    const expectedKind =
+      span.name === 'dsh-turn' || span.name === 'a2a-task' || span.name?.startsWith('subagent')
+        ? 'AGENT'
+        : span.name?.startsWith('hook:') || span.name === 'llm-request'
+          ? 'CHAIN'
+          : span.type === 'GENERATION'
+            ? 'LLM'
+            : span.type === 'TOOL'
+              ? 'TOOL'
+              : undefined;
+    if (expectedKind && span.spanKind !== expectedKind)
+      problems.push(`${span.name} must have OpenInference kind ${expectedKind}`);
+    if (span.type !== 'GENERATION') continue;
+    const attributes = span.attributes;
+    const messages = [
+      ...(span.input?.system ? [{ role: 'system', content: span.input.system }] : []),
+      ...(Array.isArray(span.input?.messages) ? span.input.messages : []),
+    ];
+    for (const [i, message] of messages.entries()) {
+      const prefix = `llm.input_messages.${i}.message`;
+      if (attributes[`${prefix}.role`] !== message.role) problems.push(`missing ${prefix}.role`);
+      if (message.toolCallId && attributes[`${prefix}.tool_call_id`] !== message.toolCallId)
+        problems.push('tool result linkage missing');
+      const calls = Array.isArray(message.content)
+        ? message.content.filter((block) => block.type === 'tool-call')
+        : [];
+      for (const [j, call] of calls.entries()) {
+        const prefixCall = `${prefix}.tool_calls.${j}.tool_call`;
+        if (
+          attributes[`${prefixCall}.id`] !== call.id ||
+          attributes[`${prefixCall}.function.name`] !== call.name ||
+          attributes[`${prefixCall}.function.arguments`] !== call.arguments
+        )
+          problems.push('input tool call mapping missing');
+      }
+    }
+    const output = span.output;
+    const calls = output?.tool_calls ?? [];
+    for (const [i, call] of calls.entries()) {
+      if (attributes[`llm.output_messages.0.message.tool_calls.${i}.tool_call.id`] !== call.id)
+        problems.push('output tool call ID missing');
+    }
+    const text = typeof output === 'string' ? output : output?.content;
+    if (typeof text === 'string' && attributes['llm.output_messages.0.message.content'] !== text)
+      problems.push('assistant message content missing');
+    const input = Number(attributes['llm.token_count.prompt']);
+    const completion = Number(attributes['llm.token_count.completion']);
+    const total = Number(attributes['llm.token_count.total']);
+    if (Number.isFinite(total) && input + completion !== total)
+      problems.push('Phoenix inclusive token totals disagree');
+    const reasoning = Number(attributes['llm.token_count.completion_details.reasoning'] ?? 0);
+    if (reasoning > completion) problems.push('reasoning exceeds completion tokens');
+  }
+  return problems;
 }

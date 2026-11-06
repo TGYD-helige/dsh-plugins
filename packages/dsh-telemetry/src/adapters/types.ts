@@ -27,6 +27,12 @@ export interface BackendAdapter {
   resolve(
     config: ConnectionConfig,
     env: NodeJS.ProcessEnv,
-  ): { endpoint: string; headers: Record<string, string>; project: string; secrets: string[] };
+  ): {
+    endpoint: string;
+    headers: Record<string, string>;
+    resourceAttributes: Attributes;
+    secrets: string[];
+  };
+  readonly contentPrefixes: readonly string[];
   attributes(data: ObservationData): Attributes;
 }

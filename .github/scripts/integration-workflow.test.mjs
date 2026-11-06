@@ -212,3 +212,30 @@ test('telemetry Phoenix secrets are step-scoped to Phoenix legs', () => {
     );
   }
 });
+
+test('Phoenix API validation distinguishes agent and chain types and requires indexed messages', async () => {
+  const { phoenixObservation, evaluatePhoenixSemantics } = await import(
+    './integration/lib/phoenix-shared.mjs'
+  );
+  const root = phoenixObservation({
+    name: 'dsh-turn',
+    span_kind: 'CHAIN',
+    context: { trace_id: 't', span_id: 's' },
+    attributes: {},
+  });
+  assert.ok(evaluatePhoenixSemantics([root]).some((problem) => problem.includes('AGENT')));
+  const llm = phoenixObservation({
+    name: 'llm-call',
+    span_kind: 'LLM',
+    context: { trace_id: 't', span_id: 'l' },
+    attributes: {
+      'input.value': JSON.stringify({
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+      }),
+      'llm.token_count.prompt': 2,
+      'llm.token_count.completion': 3,
+      'llm.token_count.total': 5,
+    },
+  });
+  assert.ok(evaluatePhoenixSemantics([llm]).some((problem) => problem.includes('message.role')));
+});

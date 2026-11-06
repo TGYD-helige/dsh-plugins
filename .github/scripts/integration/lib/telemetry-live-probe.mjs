@@ -8,6 +8,12 @@ export async function probeTelemetry(backend) {
   const adapter = adapters[backend];
   const config = { backend, captureContent: false };
   const connection = adapter.resolve(config, process.env);
+  const known = new Set(['api', 'public', 'otel', 'v1', 'v2', 'traces']);
+  const route = new URL(connection.endpoint).pathname
+    .split('/')
+    .map((segment) => (known.has(segment) ? segment : segment ? '*' : ''))
+    .join('/');
+  console.log(`OTLP probe ${backend}: normalized route ${route}`);
   const responses = [];
   const pending = new Set();
   const server = createServer((req, res) => {
@@ -23,6 +29,9 @@ export async function probeTelemetry(backend) {
           signal: AbortSignal.timeout(20_000),
         });
         responses.push(response.status);
+        console.log(
+          `OTLP probe ${backend}: content-type ${response.headers.get('content-type')}, allow ${(response.headers.get('allow') ?? '').replace(/[^A-Z, ]/g, '')}, redirected ${response.redirected}`,
+        );
         console.log(
           `OTLP probe ${backend}: HTTP ${response.status}, ${Date.now() - started}ms, ${req.headers['content-type']}`,
         );

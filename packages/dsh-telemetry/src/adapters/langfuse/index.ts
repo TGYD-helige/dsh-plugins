@@ -14,7 +14,7 @@ function resolve(config: ConnectionConfig, env: NodeJS.ProcessEnv) {
     headers: {
       Authorization: `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString('base64')}`,
     },
-    project: '',
+    resourceAttributes: {},
     secrets: [publicKey, secretKey],
   };
 }
@@ -52,7 +52,17 @@ function map(data: ObservationData): Attributes {
   return attributes;
 }
 
-export const langfuse: BackendAdapter = { resolve, attributes: map };
+export const langfuse: BackendAdapter = {
+  resolve,
+  attributes: map,
+  contentPrefixes: [
+    'langfuse.observation.input',
+    'langfuse.observation.output',
+    'langfuse.observation.status_message',
+    'langfuse.trace.input',
+    'langfuse.trace.output',
+  ],
+};
 
 /** Extracted from the legacy reporter; context is masked by each caller before mapping. */
 export function langfuseContextAttributes(
