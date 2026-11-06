@@ -23,7 +23,14 @@ export function phoenixObservation(span) {
     output: parse(attr('output.value')),
     model: attr('llm.model_name'),
     usageDetails: { total: attr('llm.token_count.total') ?? 0 },
-    metadata: parse(attr('metadata')),
+    // Phoenix decodes metadata JSON at ingestion, then flattens its fields in REST responses.
+    metadata:
+      parse(attr('metadata')) ??
+      Object.fromEntries(
+        Object.entries(attributes)
+          .filter(([key]) => key.startsWith('metadata.'))
+          .map(([key, value]) => [key.slice('metadata.'.length), value]),
+      ),
     sessionId: attr('session.id'),
     spanKind: kind,
     attributes,

@@ -299,3 +299,18 @@ test('real hook fixture accepts marker names for both telemetry backends', () =>
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('Phoenix 21 read-back decodes flattened metadata fields', async () => {
+  const { phoenixObservation } = await import('./integration/lib/phoenix-shared.mjs');
+  const span = phoenixObservation({
+    name: 'hook:UserPromptSubmit',
+    span_kind: 'CHAIN',
+    context: { trace_id: 't', span_id: 's' },
+    attributes: {
+      'metadata.dialect': 'codex',
+      'metadata.point': 'UserPromptSubmit',
+      'metadata.durationMs': 12,
+    },
+  });
+  assert.deepEqual(span.metadata, { dialect: 'codex', point: 'UserPromptSubmit', durationMs: 12 });
+});
