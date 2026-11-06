@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { gunzipSync } from 'node:zlib';
 import protobuf from 'protobufjs';
 import { adapters } from '../../../../packages/dsh-telemetry/lib/adapters/index.js';
 import { TelemetryReporter } from '../../../../packages/dsh-telemetry/lib/core/otel.js';
@@ -16,8 +17,17 @@ const server = createServer(async (req, res) => {
     assert.equal(req.headers['content-type'], 'application/x-protobuf');
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
-    const payload = Request.toObject(Request.decode(Buffer.concat(chunks)), { longs: String });
-    captured.push({ path: req.url, auth: req.headers.authorization, payload });
+    const wire = Buffer.concat(chunks);
+    const compression = req.headers['content-encoding'];
+    const decoded = compression === 'gzip' ? gunzipSync(wire) : wire;
+    const payload = Request.toObject(Request.decode(decoded), { longs: String });
+    captured.push({
+      path: req.url,
+      auth: req.headers.authorization,
+      payload,
+      compression,
+      bytes: wire.length,
+    });
     if (req.url.startsWith('/slow/')) await delay(6000);
     responsesSent++;
     res.writeHead(200, { 'content-type': 'application/x-protobuf' }).end();
@@ -43,7 +53,10 @@ try {
     ['phoenix', '/prefix'],
     ['langfuse', '/prefix'],
     ['phoenix', '/slow'],
+    ['phoenix', '/compressed'],
   ]) {
+    const previousCompression = process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION;
+    if (prefix === '/compressed') process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION = 'gzip';
     const reporter = new TelemetryReporter(
       {
         backend,
@@ -67,7 +80,17 @@ try {
       const child = reporter.startGeneration(parent, {
         name: 'llm',
         model: 'test',
-        input: { messages: [{ role: 'user', content: 'hello phoenix-private sk-test' }] },
+        input: {
+          messages: [
+            {
+              role: 'user',
+              content:
+                prefix === '/compressed'
+                  ? 'large prompt '.repeat(10_000)
+                  : 'hello phoenix-private sk-test',
+            },
+          ],
+        },
       });
       reporter.endGeneration(child, {
         output: 'world',
@@ -86,6 +109,11 @@ try {
         'flush must wait for a collector taking longer than five seconds',
       );
       const batch = captured.at(-1);
+      if (prefix === '/compressed') {
+        assert.equal(batch.compression, 'gzip');
+        assert.ok(batch.bytes < 4096, 'large repetitive prompts should compress before transport');
+        assert.ok(JSON.stringify(batch.payload).includes('large prompt '));
+      }
       assert.equal(
         batch.path,
         backend === 'phoenix' ? `${prefix}/v1/traces` : `${prefix}/api/public/otel/v1/traces`,
@@ -126,6 +154,9 @@ try {
       assert.equal(attributes(turn.attributes)['langfuse.trace.output'], undefined);
     } finally {
       await reporter.shutdown();
+      if (previousCompression === undefined)
+        delete process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION;
+      else process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION = previousCompression;
     }
   }
   console.log(

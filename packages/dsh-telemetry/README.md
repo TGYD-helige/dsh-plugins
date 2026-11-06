@@ -105,6 +105,8 @@ Media difference from the legacy SDK: this plugin sends bounded inline image dat
 
 Other settings: `traceName` (`dsh-turn`), `userId` (fallback `DSH_TELEMETRY_USER_ID`), `tags` (`[]`), and `release` (fallback `DSH_TELEMETRY_RELEASE`).
 
+The shared exporter honors standard OTel transport variables, including `OTEL_EXPORTER_OTLP_TRACES_COMPRESSION=gzip` for large prompts over slower links and `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` (milliseconds). Phoenix CI uses gzip; application profiles retain the SDK defaults unless configured.
+
 ## Migration and compatibility
 
 Existing `@amaster.ai/dsh-langfuse` installation, `langfuse` row, Config, environment variables, `langfuse/context`, hook helpers and public exports remain available. Migration is manual: disable the legacy row, enable `telemetry`, select a backend, and emit `telemetry/context`. Existing history is untouched. Metrics/logs/evaluation/prompt management and simultaneous multi-backend export are outside this package.

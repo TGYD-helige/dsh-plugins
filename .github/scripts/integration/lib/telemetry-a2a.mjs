@@ -16,6 +16,7 @@ export async function runTelemetryA2a(backend) {
       ? ['PHOENIX_API_KEY', 'PHOENIX_COLLECTOR_ENDPOINT', 'PHOENIX_PROJECT_NAME']
       : ['LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY'],
   );
+  if (backend === 'phoenix') process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION ??= 'gzip';
   const tag = `telemetry-${backend}-a2a`;
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-a2a-e2e-${tag}`);
   const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');

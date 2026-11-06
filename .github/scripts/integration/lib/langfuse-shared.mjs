@@ -744,8 +744,10 @@ async function scenarioMain({
       '::warning::only one of LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY is set — running in fake mode',
     );
   }
-  if (telemetryBackend === 'phoenix')
+  if (telemetryBackend === 'phoenix') {
     requireEnv(['PHOENIX_API_KEY', 'PHOENIX_COLLECTOR_ENDPOINT', 'PHOENIX_PROJECT_NAME']);
+    process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION ??= 'gzip';
+  }
   const realMode = telemetryBackend === 'phoenix' || Boolean(publicKey && secretKey);
   const baseUrl = envOr(process.env.LANGFUSE_BASE_URL, DEFAULT_BASE_URL);
   if (telemetryBackend === 'langfuse') {
