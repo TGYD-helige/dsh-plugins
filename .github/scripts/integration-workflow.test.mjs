@@ -480,15 +480,11 @@ test('reasoning validation follows the source stream instead of requiring the mo
 
 test('reasoning evidence reads current durable model streams and fails on missing evidence', async () => {
   const { readReasoningSource } = await import('./integration/lib/langfuse-shared.mjs');
-  const { zstdCompressSync } = await import('node:zlib');
   const directory = mkdtempSync(join(tmpdir(), 'reasoning-source-'));
   const sessions = join(directory, 'sessions', 'workspace', 'session');
   mkdirSync(sessions, { recursive: true });
   const write = (rows) =>
-    writeFileSync(
-      join(sessions, 'session.v4.jsonl.zstd'),
-      Buffer.concat(rows.map((row) => zstdCompressSync(Buffer.from(`${JSON.stringify(row)}\n`)))),
-    );
+    writeFileSync(join(sessions, 'session.v4.jsonl'), rows.map(JSON.stringify).join('\n'));
   const settled = (time, texts) => ({
     type: 'assistant/message',
     time,

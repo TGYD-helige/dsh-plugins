@@ -40,7 +40,6 @@ import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { zstdDecompressSync } from 'node:zlib';
 import { expandAssistantStream } from '@deepseek-ai/dsh-llm/assistant-stream';
 import { integrationModel, integrationRevision, netEnv, requireEnv, run } from './ci-shared.mjs';
 import { runPhoenixVerification } from './phoenix-shared.mjs';
@@ -148,17 +147,8 @@ export function readReasoningSource(dshHome, fromStartTime) {
   const expected = [];
   let settled = 0;
   for (const file of readdirSync(sessions, { recursive: true })) {
-    if (!/session(?:\.v\d+)?\.jsonl\.zstd$/.test(file)) continue;
-    // dsh appends zstd frames; Node's synchronous decoder consumes only one frame at a time.
-    let compressed = readFileSync(join(sessions, file));
-    const frames = [];
-    while (compressed.length) {
-      const { buffer, engine } = zstdDecompressSync(compressed, { info: true });
-      assert(engine.bytesWritten > 0, 'invalid session compression frame');
-      frames.push(buffer);
-      compressed = compressed.subarray(engine.bytesWritten);
-    }
-    const rows = Buffer.concat(frames).toString('utf8');
+    if (!/session(?:\.v\d+)?\.jsonl$/.test(file)) continue;
+    const rows = readFileSync(join(sessions, file), 'utf8');
     for (const line of rows.trim().split('\n')) {
       const event = JSON.parse(line);
       if (
@@ -950,7 +940,16 @@ ${telemetryBackend ? `    backend: ${telemetryBackend}\n` : ''}    publicKey: ${
     release: ${JSON.stringify(integrationRevision())}
     tags: ${JSON.stringify(['ci', `scenario:${tag}`, `run:${runId}`, `attempt:${runAttempt}`])}
 ${metadata ? '    redactFields: ["password"]\n' : ''}
-
+${
+  reasoning
+    ? `
+- id: session-persistence-jsonl
+  config:
+    root: ${JSON.stringify(join(dshHome, 'sessions'))}
+    compression: none
+`
+    : ''
+}
 - id: agent-default-model
   config:
     provider: deepseek-official
