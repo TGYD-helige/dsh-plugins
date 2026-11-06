@@ -33,11 +33,16 @@ const attributes = (values) =>
     ]),
   );
 try {
-  for (const backend of ['phoenix', 'langfuse']) {
+  for (const [backend, prefix] of [
+    ['phoenix', ''],
+    ['langfuse', ''],
+    ['phoenix', '/prefix'],
+    ['langfuse', '/prefix'],
+  ]) {
     const reporter = new TelemetryReporter(
       {
         backend,
-        endpoint: `http://127.0.0.1:${server.address().port}/prefix`,
+        endpoint: `http://127.0.0.1:${server.address().port}${prefix}`,
         apiKey: 'phoenix-private',
         publicKey: 'pk-test',
         secretKey: 'sk-test',
@@ -73,7 +78,7 @@ try {
       const batch = captured.at(-1);
       assert.equal(
         batch.path,
-        backend === 'phoenix' ? '/prefix/v1/traces' : '/prefix/api/public/otel/v1/traces',
+        backend === 'phoenix' ? `${prefix}/v1/traces` : `${prefix}/api/public/otel/v1/traces`,
       );
       assert.equal(
         batch.auth,

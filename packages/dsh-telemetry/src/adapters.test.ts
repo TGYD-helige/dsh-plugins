@@ -138,3 +138,15 @@ it('keeps structural Phoenix telemetry when configured redaction replaces reques
     'llm.token_count.total': 5,
   });
 });
+
+it.each([
+  ['phoenix', 'https://example.com/v1/traces'],
+  ['langfuse', 'https://example.com/api/public/otel/v1/traces'],
+] as const)('normalizes a %s root origin without a double slash', (backend, expected) => {
+  expect(
+    resolveConnection(
+      { backend, endpoint: 'https://example.com/', publicKey: 'pk', secretKey: 'sk' },
+      {},
+    ).endpoint,
+  ).toBe(expected);
+});

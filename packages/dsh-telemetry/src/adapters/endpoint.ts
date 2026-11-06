@@ -8,7 +8,7 @@ export function traceEndpoint(base: string, suffix: string) {
     url.hash
   )
     throw new Error('Invalid telemetry collector endpoint');
-  url.pathname = url.pathname.replace(/\/$/, '');
-  if (!url.pathname.endsWith('/v1/traces')) url.pathname += suffix;
+  const path = url.pathname.replace(/\/+$/, '');
+  url.pathname = path.endsWith('/v1/traces') ? path : `${path}${suffix}`;
   return url.toString();
 }

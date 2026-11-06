@@ -1,7 +1,0 @@
-# Telemetry preview
-
-Generated with the built-in imagegen tool. Final asset: `packages/dsh-telemetry/preview.png`, 1672 × 941. Reference: accepted `packages/dsh-langfuse/preview.png`; final edit reference was the generated seated bassist. User direction: a recognizable sister, distinct colors/clothing, standing electric bassist, and the original abstract right-hand observability composition.
-
-Final edit prompt:
-
-EDIT ONLY pose and bass placement in attached banner. User specifically wants STANDING bassist, not sitting. Remove stool completely. Same lovable sister beaver FACE and periwinkle fur, wavy bob, peach cardigan, indigo trousers, periwinkle sneakers. She now STANDS full height in relaxed confident live-performance stance, feet naturally apart, one knee slightly bent. FOUR-STRING electric bass hangs from a visible dark SHOULDER STRAP, teal bass BODY at WAIST/HIP, long maple neck diagonally UP to right. Left hand fretting neck, right hand plucking strings by pickups; anatomically natural playing pose. Correct four strings/four tuning pegs, no extra fingers. Keep all other art direction, title 'dsh-telemetry', tagline 'Unified tracing for dsh', navy underwater matte background, white whale circular core and abstract trace hierarchy/waveform/node network EXACTLY as supplied composition. Keep character from obscuring left text and right graphics. 1672 x 941 PNG, polished soft matte plush 3D and diffuse cloth. No stool, no sitting, no flute.
