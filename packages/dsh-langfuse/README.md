@@ -189,3 +189,7 @@ Pinned dsh/cordis versions live in the [root compat matrix](../../README.md#comp
 MIT
 
 The Langfuse integration scenarios label observations with environment `ci`, release `GITHUB_SHA`, and tags for scenario, run ID, and workflow run attempt. Select environment `ci` in Langfuse to find new E2E traces. Read-back uses a bounded time window for each model run and queries a discovered trace directly while ingestion settles.
+
+## Phoenix and native OTLP tracing
+
+For Phoenix or SDK-independent Langfuse tracing, use [`@amaster.ai/dsh-telemetry`](../dsh-telemetry). Existing Langfuse profiles remain supported. Enable only one collector per profile; keep this plugin when Langfuse managed-media uploads are required.

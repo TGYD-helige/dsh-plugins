@@ -3,6 +3,11 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
+const build = spawnSync('pnpm', ['--filter', '@amaster.ai/dsh-telemetry', 'build'], {
+  cwd: root,
+  stdio: 'inherit',
+});
+if (build.status !== 0) process.exit(build.status ?? 1);
 const result = spawnSync(
   process.execPath,
   [

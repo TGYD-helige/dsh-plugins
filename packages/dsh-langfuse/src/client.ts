@@ -1,3 +1,5 @@
+import { langfuseContextAttributes } from '@amaster.ai/dsh-telemetry/langfuse';
+
 /**
  * Langfuse reporter — thin synchronous wrapper over the Langfuse JS SDK v5's
  * OpenTelemetry-based tracing API (`@langfuse/tracing` + `@langfuse/otel`),
@@ -34,6 +36,7 @@
  * plugin fiber has been awaited.
  */
 
+import { PayloadPrivacy, usageOf } from '@amaster.ai/dsh-telemetry/instrumentation';
 import type { TokenUsage } from '@deepseek-ai/dsh-llm';
 import type { LangfuseGeneration, LangfuseSpan } from '@langfuse/tracing';
 import type { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
@@ -110,30 +113,9 @@ function parentContext(traceparent: string | undefined) {
  * `completion_tokens_details`), so the `output` bucket subtracts
  * `reasoningTokens` into `output_reasoning_tokens`. Only `usageDetails` is sent.
  */
-export function usageOf(usage: TokenUsage): Record<string, number> {
-  // The dsh type marks the two primary fields required, but a non-conformant
-  // adapter emitting a partial usage chunk would otherwise turn every bucket
-  // NaN (serialized as null by the SDK — silently corrupting billed usage).
-  const input =
-    (usage.inputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0);
-  const output = usage.outputTokens ?? 0;
-  const total = input + output;
-  // Clamp reasoning at the provider's output count: reasoning is a subset of
-  // output, and only a broken adapter would report more — clamping keeps the
-  // buckets summing to total even then.
-  const reasoning = Math.min(usage.reasoningTokens ?? 0, output);
-  const usageDetails: Record<string, number> = {
-    input: usage.inputTokens ?? 0,
-    output: output - reasoning,
-    total,
-  };
-  if (usage.cacheReadTokens) usageDetails.cache_read_input_tokens = usage.cacheReadTokens;
-  if (usage.cacheWriteTokens) usageDetails.cache_creation_input_tokens = usage.cacheWriteTokens;
-  if (reasoning) usageDetails.output_reasoning_tokens = reasoning;
-  return usageDetails;
-}
+export { usageOf } from '@amaster.ai/dsh-telemetry/instrumentation';
 
-export class LangfuseReporter {
+export class LangfuseReporter extends PayloadPrivacy {
   private tracing: typeof import('@langfuse/tracing') | null = null;
   private api: typeof import('@opentelemetry/api') | null = null;
   private provider: NodeTracerProvider | null = null;
@@ -155,99 +137,8 @@ export class LangfuseReporter {
   readonly ready: Promise<void>;
 
   constructor(private config: LangfuseConnectionConfig) {
+    super({ secrets: [config.publicKey, config.secretKey], redactFields: config.redactFields });
     this.ready = this.init();
-  }
-
-  /** Whether a payload property should be replaced without inspecting its value. */
-  shouldRedactField(key: string): boolean {
-    return !!this.config.redactFields?.some((field) => field.toLowerCase() === key.toLowerCase());
-  }
-
-  /** Clone telemetry only; never mutate harness-owned messages or tool results. */
-  mask<T>(data: T): T {
-    const secrets = [this.config.publicKey, this.config.secretKey].filter(Boolean);
-    const fields = new Set(this.config.redactFields?.map((key) => key.toLowerCase()));
-    const seen = new WeakSet<object>();
-    const redactText = (text: string): string => {
-      const markedRanges: Array<[number, number]> = Array.from(
-        text.matchAll(/\[REDACTED\]/g),
-        (match) => [match.index, match.index + match[0].length],
-      );
-      const ranges: Array<[number, number]> = [];
-      let markerIndex = 0;
-      const addRange = (start: number, stop: number) => {
-        // Existing markers are atomic: a second mask must never expand them.
-        // Walk the sorted marker list once instead of rescanning it per match.
-        while (markerIndex < markedRanges.length && markedRanges[markerIndex][1] <= start)
-          markerIndex += 1;
-        if (
-          markerIndex < markedRanges.length &&
-          start < markedRanges[markerIndex][1] &&
-          stop > markedRanges[markerIndex][0]
-        )
-          return;
-        ranges.push([start, stop]);
-      };
-      for (const match of text.matchAll(/(?:pk|sk)-lf-[\w-]+/g))
-        addRange(match.index, match.index + match[0].length);
-      for (const secret of secrets) {
-        // Each independent scan starts at the first marker. Do not reset for
-        // every match, or a large marker list becomes quadratic again.
-        markerIndex = 0;
-        for (
-          let index = text.indexOf(secret);
-          index !== -1;
-          index = text.indexOf(secret, index + 1)
-        ) {
-          addRange(index, index + secret.length);
-        }
-      }
-      let output = '';
-      let end = 0;
-      // Match the original text once, merging overlap before changing any bytes.
-      for (const [start, stop] of ranges.sort((a, b) => a[0] - b[0])) {
-        if (start >= end) output += `${text.slice(end, start)}[REDACTED]`;
-        end = Math.max(end, stop);
-      }
-      return output + text.slice(end);
-    };
-    const redact = (value: unknown): unknown => {
-      if (typeof value === 'string') {
-        // Tool-call arguments and SDK attributes may themselves be JSON text.
-        if (fields.size && /^\s*[[{]/.test(value)) {
-          let parsed: unknown;
-          try {
-            parsed = JSON.parse(value);
-          } catch {
-            /* not JSON */
-          }
-          if (parsed !== undefined) {
-            const masked = JSON.stringify(redact(parsed));
-            if (masked !== JSON.stringify(parsed)) return masked;
-          }
-        }
-        return redactText(value);
-      }
-      if (!value || typeof value !== 'object' || value instanceof Date) return value;
-      if (seen.has(value)) return '[Circular]';
-      seen.add(value);
-      const result = Array.isArray(value)
-        ? value.map(redact)
-        : Object.fromEntries(
-            Object.entries(value).map(([key, child]) => [
-              redact(key),
-              fields.has(key.toLowerCase()) ? '[REDACTED]' : redact(child),
-            ]),
-          );
-      seen.delete(value);
-      return result;
-    };
-    try {
-      return redact(data) as T;
-    } catch (error) {
-      console.error('[dsh-langfuse] redaction failed:', error);
-      return '[REDACTED]' as T;
-    }
   }
 
   /** Dynamically import the SDK and wire the isolated export pipeline. */
@@ -306,23 +197,8 @@ export class LangfuseReporter {
    */
   private stampTraceContext(observation: Observation, context: TraceContext | undefined): void {
     if (!context) return;
-    if (context.traceName)
-      observation.otelSpan.setAttribute('langfuse.trace.name', this.mask(context.traceName));
-    if (context.sessionId)
-      observation.otelSpan.setAttribute('session.id', this.mask(context.sessionId));
-    if (context.userId) observation.otelSpan.setAttribute('user.id', this.mask(context.userId));
-    if (context.tags?.length)
-      observation.otelSpan.setAttribute('langfuse.trace.tags', this.mask(context.tags));
-    if (context.metadata) {
-      // Langfuse merges the JSON object with observation.metadata.<key>
-      // attributes, giving the latter (our runtime facts) precedence. The
-      // object form also preserves null/empty strings that SDK v5's
-      // per-key serializer omits, without inheriting a parent's runtime facts.
-      // Do not also set trace.metadata: v4 gives it precedence over even
-      // observation-specific fields, which would undo that collision policy.
-      const metadata = JSON.stringify(this.mask(context.metadata));
-      observation.otelSpan.setAttribute('langfuse.observation.metadata', metadata);
-    }
+    for (const [key, value] of Object.entries(langfuseContextAttributes(this.mask(context))))
+      observation.otelSpan.setAttribute(key, value);
     this.traceContext.set(observation, context);
   }
 

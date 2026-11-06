@@ -133,7 +133,7 @@ try {
   assert.ok(captured.every((span) => attribute(span, keys.ENVIRONMENT) === 'redacted'));
   const observations = capturedToObservations(captured);
   assert.deepEqual(evaluateTrace(observations, 'sdk-marker'), []);
-  assert.deepEqual(evaluateReasoning(observations), []);
+  assert.deepEqual(evaluateReasoning(observations, ['check']), []);
   const fromStartTime = new Date(Date.now() - 60_000).toISOString();
   const toStartTime = new Date().toISOString();
   const queries = [];

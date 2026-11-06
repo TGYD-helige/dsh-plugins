@@ -204,6 +204,107 @@ test('A2A protocol regressions run without the secret-backed approval gate', () 
   assert.match(job, /check-inbox\.mjs -t 'official protocol bindings'/);
 });
 
+test('Phoenix API validation distinguishes agent and chain types and requires indexed messages', async () => {
+  const { phoenixObservation, evaluatePhoenixSemantics } = await import(
+    './integration/lib/phoenix-shared.mjs'
+  );
+  const root = phoenixObservation({
+    name: 'dsh-turn',
+    span_kind: 'CHAIN',
+    context: { trace_id: 't', span_id: 's' },
+    attributes: {},
+  });
+  assert.ok(evaluatePhoenixSemantics([root]).some((problem) => problem.includes('AGENT')));
+  const llm = phoenixObservation({
+    name: 'llm-call',
+    span_kind: 'LLM',
+    context: { trace_id: 't', span_id: 'l' },
+    attributes: {
+      'input.value': JSON.stringify({
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+      }),
+      'llm.token_count.prompt': 2,
+      'llm.token_count.completion': 3,
+      'llm.token_count.total': 5,
+    },
+  });
+  assert.ok(evaluatePhoenixSemantics([llm]).some((problem) => problem.includes('message.role')));
+});
+
+test('manual integration can select one exact scenario and rejects unknown names', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'selected-scenario-'));
+  try {
+    const output = join(directory, 'output');
+    const result = spawnSync(process.execPath, ['.github/scripts/integration-matrix.mjs'], {
+      env: {
+        ...process.env,
+        INTEGRATION_SCENARIO: 'dsh-telemetry.phoenix-a2a',
+        GITHUB_OUTPUT: output,
+      },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const matrix = JSON.parse(
+      readFileSync(output, 'utf8')
+        .split('\n')
+        .find((line) => line.startsWith('matrix='))
+        .slice(7),
+    );
+    assert.deepEqual(matrix.include, [
+      { package: 'dsh-telemetry', name: 'dsh-telemetry.phoenix-a2a' },
+    ]);
+    const bad = spawnSync(process.execPath, ['.github/scripts/integration-matrix.mjs'], {
+      env: { ...process.env, INTEGRATION_SCENARIO: 'unknown', GITHUB_OUTPUT: output },
+      encoding: 'utf8',
+    });
+    assert.notEqual(bad.status, 0);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('real hook fixture accepts marker names for both telemetry backends', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'telemetry-hook-marker-'));
+  try {
+    for (const tag of ['hook', 'telemetry-phoenix-hook', 'telemetry-langfuse-hook']) {
+      const marker = `ci-marker-${tag}-1-1`;
+      writeFileSync(join(directory, `${marker}.txt`), `${marker}-content\n`);
+      const result = spawnSync(
+        process.execPath,
+        [fileURLToPath(new URL('./integration/lib/hook-script.mjs', import.meta.url))],
+        {
+          cwd: directory,
+          input: JSON.stringify({
+            hook_event_name: 'UserPromptSubmit',
+            prompt: `read ${marker}.txt`,
+          }),
+          encoding: 'utf8',
+        },
+      );
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout, 'ci-hook-context-verification');
+      assert.equal(result.stderr, 'hook-script-result: marker-verified');
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Phoenix 21 read-back decodes flattened metadata fields', async () => {
+  const { phoenixObservation } = await import('./integration/lib/phoenix-shared.mjs');
+  const span = phoenixObservation({
+    name: 'hook:UserPromptSubmit',
+    span_kind: 'CHAIN',
+    context: { trace_id: 't', span_id: 's' },
+    attributes: {
+      'metadata.dialect': 'codex',
+      'metadata.point': 'UserPromptSubmit',
+      'metadata.durationMs': 12,
+    },
+  });
+  assert.deepEqual(span.metadata, { dialect: 'codex', point: 'UserPromptSubmit', durationMs: 12 });
+});
+
 test('unpublished telemetry dependencies use local companion archives without requiring the new package on main', () => {
   const pack = workflow.match(
     / {6}- name: Pack shared telemetry and A2A companions\n[\s\S]*?(?=\n {6}- name:)/,
@@ -326,6 +427,96 @@ test('a packed plugin resolves its unpublished dependency offline through a loca
       readFileSync(archives.core),
       unchanged,
       'archives without this dependency remain unchanged',
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('reasoning validation follows the source stream instead of requiring the model to think', async () => {
+  const { evaluateReasoning } = await import('./integration/lib/langfuse-shared.mjs');
+  const generation = { id: 'g', type: 'GENERATION', output: 'answer' };
+  const request = {
+    type: 'SPAN',
+    name: 'llm-request',
+    parentObservationId: 'g',
+    output: [{ type: 'text-delta', text: 'answer' }],
+  };
+  assert.deepEqual(evaluateReasoning([generation, request], []), []);
+  assert.deepEqual(
+    evaluateReasoning(
+      [
+        {
+          ...generation,
+          metadata: { purpose: 'session-title' },
+          output: { thinking: [{ type: 'thinking', content: 'title reasoning' }] },
+        },
+        { ...request, output: [{ type: 'reasoning-delta', text: 'title reasoning' }] },
+      ],
+      [],
+    ),
+    [],
+  );
+  assert.ok(evaluateReasoning([generation, request], ['source reasoning']).length > 0);
+  request.output = [
+    { type: 'reasoning-delta', text: 'source ' },
+    { type: 'reasoning-delta', text: 'reasoning' },
+  ];
+  assert.ok(
+    evaluateReasoning([generation, request], ['source reasoning']).length > 0,
+    'display loss must fail',
+  );
+  generation.output = { thinking: [{ type: 'thinking', content: 'source reasoning' }] };
+  assert.deepEqual(evaluateReasoning([generation, request], ['source reasoning']), []);
+  assert.ok(
+    evaluateReasoning([generation, request], ['different reasoning']).length > 0,
+    'changed content must fail',
+  );
+  assert.ok(
+    evaluateReasoning([generation, request], []).length > 0,
+    'unexpected content must fail',
+  );
+});
+
+test('reasoning evidence reads current durable model streams and fails on missing evidence', async () => {
+  const { readReasoningSource } = await import('./integration/lib/langfuse-shared.mjs');
+  const directory = mkdtempSync(join(tmpdir(), 'reasoning-source-'));
+  const sessions = join(directory, 'sessions', 'workspace', 'session');
+  mkdirSync(sessions, { recursive: true });
+  const write = (rows) =>
+    writeFileSync(join(sessions, 'session.v4.jsonl'), rows.map(JSON.stringify).join('\n'));
+  const settled = (time, texts) => ({
+    type: 'assistant/message',
+    time,
+    data: {
+      stream: [
+        { type: 'reasoning-chunks', time0: time, index: 0, dt: texts.slice(1).map(() => 0), texts },
+      ],
+    },
+  });
+  try {
+    write([
+      settled(1000, ['old']),
+      settled(3000, ['source ', 'reasoning']),
+      { ...settled(3500, ['failed attempt reasoning']), type: 'assistant/attempt' },
+    ]);
+    assert.deepEqual(readReasoningSource(directory, new Date(2000).toISOString()), [
+      'source reasoning',
+      'failed attempt reasoning',
+    ]);
+    write([
+      {
+        type: 'assistant/message',
+        time: 3000,
+        data: {
+          stream: [{ type: 'text-chunks', time0: 3000, index: 0, dt: [], texts: ['answer'] }],
+        },
+      },
+    ]);
+    assert.deepEqual(readReasoningSource(directory, new Date(2000).toISOString()), []);
+    assert.throws(
+      () => readReasoningSource(directory, new Date(4000).toISOString()),
+      /settled model stream/,
     );
   } finally {
     rmSync(directory, { recursive: true, force: true });

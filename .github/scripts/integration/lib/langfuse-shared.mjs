@@ -36,11 +36,13 @@
  */
 
 import { spawn } from 'node:child_process';
-import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { expandAssistantStream } from '@deepseek-ai/dsh-llm/assistant-stream';
 import { integrationModel, integrationRevision, netEnv, requireEnv, run } from './ci-shared.mjs';
+import { runPhoenixVerification } from './phoenix-shared.mjs';
 
 // ---------------------------------------------------------------------------
 // Real-Langfuse verification (efficient v2 Observations API, with v1 fallback
@@ -139,30 +141,63 @@ export function evaluateTrace(observations, codeword) {
   return problems;
 }
 
-// Reasoning content lands as reasoning-delta chunks in llm-request spans' raw
-// stream outputs. The scenario runs thinking at max effort, so SOME span in
-// the trace must carry one (purpose calls don't reason — check them all).
-export function evaluateReasoning(observations) {
-  const has = observations.some(
-    (o) =>
-      o.type === 'SPAN' &&
-      o.name === 'llm-request' &&
-      Array.isArray(o.output) &&
-      o.output.some((c) => c?.type === 'reasoning-delta'),
-  );
-  const displayed = observations.some(
-    (o) =>
-      o.type === 'GENERATION' &&
-      Array.isArray(o.output?.thinking) &&
-      o.output.thinking.some((part) => part?.type === 'thinking' && part.content?.length > 0),
-  );
+// The provider may return no reasoning even at max effort; compare against the durable stream.
+export function readReasoningSource(dshHome, fromStartTime) {
+  const sessions = join(dshHome, 'sessions');
+  const expected = [];
+  let settled = 0;
+  for (const file of readdirSync(sessions, { recursive: true })) {
+    if (!/session(?:\.v\d+)?\.jsonl$/.test(file)) continue;
+    const rows = readFileSync(join(sessions, file), 'utf8');
+    for (const line of rows.trim().split('\n')) {
+      const event = JSON.parse(line);
+      if (
+        !['assistant/message', 'assistant/attempt'].includes(event.type) ||
+        event.time < Date.parse(fromStartTime)
+      )
+        continue;
+      const chunks = expandAssistantStream(event.data.stream);
+      settled++;
+      const reasoning = chunks
+        .filter(({ chunk }) => chunk.type === 'reasoning-delta')
+        .map(({ chunk }) => chunk.text)
+        .join('');
+      if (reasoning) expected.push(reasoning);
+    }
+  }
+  assert(settled > 0, 'no settled model stream for reasoning verification');
+  return expected;
+}
+
+export function evaluateReasoning(observations, expected) {
+  const generations = observations.filter((o) => o.type === 'GENERATION' && !o.metadata?.purpose);
+  const ids = new Set(generations.map((o) => o.id));
+  const raw = observations
+    .filter((o) => o.name === 'llm-request' && ids.has(o.parentObservationId))
+    .map((o) =>
+      Array.isArray(o.output)
+        ? o.output
+            .filter((c) => c.type === 'reasoning-delta')
+            .map((c) => c.text)
+            .join('')
+        : '',
+    )
+    .filter(Boolean);
+  const displayed = generations
+    .map((o) =>
+      Array.isArray(o.output?.thinking)
+        ? o.output.thinking
+            .filter((part) => part.type === 'thinking')
+            .map((part) => part.content)
+            .join('')
+        : '',
+    )
+    .filter(Boolean);
+  const matches = (values) =>
+    JSON.stringify([...values].sort()) === JSON.stringify([...expected].sort());
   return [
-    ...(!has
-      ? [
-          'no llm-request span output has a reasoning-delta chunk (thinking should be enabled at max)',
-        ]
-      : []),
-    ...(!displayed ? ['no generation output displays reasoning'] : []),
+    ...(!matches(raw) ? ['raw reasoning differs from the source stream'] : []),
+    ...(!matches(displayed) ? ['displayed reasoning differs from the source stream'] : []),
   ];
 }
 
@@ -718,6 +753,8 @@ async function scenarioMain({
   toolHooks = false,
   cancelHook = false,
   metadata = false,
+  telemetryBackend,
+  reasoning = false,
 }) {
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-langfuse-${tag}-e2e`);
   mkdirSync(workDir, { recursive: true });
@@ -729,7 +766,11 @@ async function scenarioMain({
 
   const publicKey = envOr(process.env.LANGFUSE_PUBLIC_KEY, '');
   const secretKey = envOr(process.env.LANGFUSE_SECRET_KEY, '');
-  if ((hook || toolHooks || cancelHook || metadata) && (!publicKey || !secretKey)) {
+  if (
+    (hook || toolHooks || cancelHook || metadata || telemetryBackend === 'langfuse') &&
+    telemetryBackend !== 'phoenix' &&
+    (!publicKey || !secretKey)
+  ) {
     throw new Error('hook/metadata E2E requires LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY');
   }
   // A half-configured pair is a misconfiguration — never silently fake it.
@@ -738,8 +779,25 @@ async function scenarioMain({
       '::warning::only one of LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY is set — running in fake mode',
     );
   }
-  const realMode = Boolean(publicKey && secretKey);
+  if (telemetryBackend === 'phoenix') {
+    requireEnv(['PHOENIX_API_KEY', 'PHOENIX_COLLECTOR_ENDPOINT', 'PHOENIX_PROJECT_NAME']);
+    process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION ??= 'gzip';
+  }
+  const realMode = telemetryBackend === 'phoenix' || Boolean(publicKey && secretKey);
   const baseUrl = envOr(process.env.LANGFUSE_BASE_URL, DEFAULT_BASE_URL);
+  if (telemetryBackend === 'langfuse') {
+    try {
+      const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/public/health`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      const { version } = await response.json();
+      console.log(
+        `Langfuse server version: ${typeof version === 'string' && /^[a-zA-Z0-9.+_-]{1,60}$/.test(version) ? version : 'not reported'}`,
+      );
+    } catch {
+      console.log('Langfuse server version: not reported');
+    }
+  }
   console.log(`mode: ${realMode ? `real Langfuse (${baseUrl})` : 'fake OTLP endpoint'}`);
 
   // Fake mode only: the capture sink the assertions read from.
@@ -769,10 +827,6 @@ async function scenarioMain({
   // sets autoInstallPeers: false, so runtime peers are added explicitly —
   // including the OTEL api/exporter packages @langfuse/otel itself peers on.
   // The dsh-* peers ship with the profile itself.
-  run(dsh, ['plugin', '--profile', 'headless', 'add', resolve(DSH_PKG_TARBALL)], {
-    cwd: workDir,
-    env: dshHomeEnv,
-  });
   run(
     dsh,
     [
@@ -780,11 +834,31 @@ async function scenarioMain({
       '--profile',
       'headless',
       'add',
-      '@langfuse/tracing@5.10.1',
-      '@langfuse/otel@5.10.1',
+      ...(process.env.DSH_TELEMETRY_CORE_TARBALL
+        ? [resolve(process.env.DSH_TELEMETRY_CORE_TARBALL)]
+        : []),
+      resolve(DSH_PKG_TARBALL),
+    ],
+    {
+      cwd: workDir,
+      env: dshHomeEnv,
+    },
+  );
+  run(
+    dsh,
+    [
+      'plugin',
+      '--profile',
+      'headless',
+      'add',
+      ...(telemetryBackend
+        ? ['@opentelemetry/resources@2.10.0']
+        : ['@langfuse/tracing@5.10.1', '@langfuse/otel@5.10.1']),
       '@opentelemetry/sdk-trace-node@2.10.0',
       '@opentelemetry/api@1.9.1',
-      '@opentelemetry/exporter-trace-otlp-http@0.221.0',
+      telemetryBackend
+        ? '@opentelemetry/exporter-trace-otlp-proto@0.221.0'
+        : '@opentelemetry/exporter-trace-otlp-http@0.221.0',
     ],
     { cwd: workDir, env: dshHomeEnv },
   );
@@ -848,25 +922,34 @@ async function scenarioMain({
   // Enable the plugin through the profile's user patch layer (an id-targeted
   // row replaces the bundle row's whole config). The agent-default-model row
   // pins the integration model; the llm-deepseek row turns thinking ON at max
-  // effort — reasoning content must land in Langfuse (reasoning-delta chunks
-  // in the raw stream). Caveat: reasoning enabled makes this gateway
+  // effort. Any reasoning the provider returns must survive collection.
+  // Caveat: reasoning enabled makes this gateway
   // stochastically garble or hang on tool calls (observed in CI) — the retry
   // loop absorbs it.
   const patchPath = join(dshHome, 'profiles', 'headless', 'cordis.patch.yml');
   writeFileSync(
     patchPath,
     `# dsh-langfuse integration scenario (${tag}): enable the plugin against ${realMode ? 'the real Langfuse' : 'the fake endpoint'}.
-- id: langfuse
+- id: ${telemetryBackend ? 'telemetry' : 'langfuse'}
   config:
     enabled: true
-    publicKey: ${pluginConnection.publicKey}
+${telemetryBackend ? `    backend: ${telemetryBackend}\n` : ''}    publicKey: ${pluginConnection.publicKey}
     secretKey: ${pluginConnection.secretKey}
     baseUrl: ${pluginConnection.baseUrl}
     environment: ci
     release: ${JSON.stringify(integrationRevision())}
     tags: ${JSON.stringify(['ci', `scenario:${tag}`, `run:${runId}`, `attempt:${runAttempt}`])}
 ${metadata ? '    redactFields: ["password"]\n' : ''}
-
+${
+  reasoning
+    ? `
+- id: session-persistence-jsonl
+  config:
+    root: ${JSON.stringify(join(dshHome, 'sessions'))}
+    compression: none
+`
+    : ''
+}
 - id: agent-default-model
   config:
     provider: deepseek-official
@@ -937,16 +1020,24 @@ ${hookPatch}
     captured.length = 0;
     const runStartedAt = new Date(Date.now() - 1000).toISOString();
     await runQuery(prompt(markerFile));
+    const source = reasoning ? readReasoningSource(dshHome, runStartedAt) : undefined;
+    if (source) console.log(`Source reasoning: ${source.length} model stream(s)`);
+    const evaluateRun = (observations, marker) => [
+      ...evaluate(observations, marker),
+      ...(source ? evaluateReasoning(observations, source) : []),
+    ];
     let problems;
     if (realMode) {
-      const result = await runVerification({
+      const result = await (telemetryBackend === 'phoenix'
+        ? runPhoenixVerification
+        : runVerification)({
         baseUrl,
         publicKey,
         secretKey,
         fromStartTime: runStartedAt,
         toStartTime: new Date().toISOString(),
         codeword,
-        evaluate,
+        evaluate: evaluateRun,
       });
       if (result.ok) {
         state = result.state;
@@ -954,7 +1045,7 @@ ${hookPatch}
       }
       console.log(`::warning::${name} attempt ${attempt} did not verify: ${result.state}`);
     } else {
-      problems = evaluate(capturedToObservations(captured), codeword);
+      problems = evaluateRun(capturedToObservations(captured), codeword);
       if (problems.length === 0) {
         state = 'captured shape matches';
         break;
