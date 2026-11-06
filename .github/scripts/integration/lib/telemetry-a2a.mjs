@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { a2aClient, assert, bootA2a, stopA2a, THINKING_OFF } from './a2a-shared.mjs';
 import { integrationRevision, requireEnv, run } from './ci-shared.mjs';
-import { runVerification } from './langfuse-shared.mjs';
+import { runVerification, verifyLangfuseSession } from './langfuse-shared.mjs';
 import { runPhoenixVerification, verifyPhoenixSessionIO } from './phoenix-shared.mjs';
 
 export async function runTelemetryA2a(backend) {
@@ -79,7 +79,9 @@ export async function runTelemetryA2a(backend) {
       }
       assert(false, 'A2A task did not complete');
     }
-    const firstPrompt = `请用工具读取 ${marker}.txt 并复述内容`;
+    const taskPrompt = (file) =>
+      `请用 read 工具读取绝对路径 ${JSON.stringify(join(workDir, `${file}.txt`))}，原样返回内容后结束，不要搜索其他文件。`;
+    const firstPrompt = taskPrompt(marker);
     await runTask(firstPrompt);
     // Read back task spans before the CLI's bounded SIGTERM shutdown.
     const evaluate = (observations, codeword) => {
@@ -104,10 +106,13 @@ export async function runTelemetryA2a(backend) {
       ];
     };
     const verify = backend === 'phoenix' ? runPhoenixVerification : runVerification;
-    const result = await verify({
+    const connection = {
       baseUrl: process.env.LANGFUSE_BASE_URL || 'https://cloud.langfuse.com',
       publicKey: process.env.LANGFUSE_PUBLIC_KEY,
       secretKey: process.env.LANGFUSE_SECRET_KEY,
+    };
+    const result = await verify({
+      ...connection,
       fromStartTime: startedAt,
       toStartTime: new Date().toISOString(),
       codeword: marker,
@@ -120,11 +125,9 @@ export async function runTelemetryA2a(backend) {
     }
     const secondMarker = `${marker}-follow-up`;
     writeFileSync(join(workDir, `${secondMarker}.txt`), secondMarker);
-    await runTask(`请用工具读取 ${secondMarker}.txt 并复述内容`);
+    await runTask(taskPrompt(secondMarker));
     const second = await verify({
-      baseUrl: process.env.LANGFUSE_BASE_URL || 'https://cloud.langfuse.com',
-      publicKey: process.env.LANGFUSE_PUBLIC_KEY,
-      secretKey: process.env.LANGFUSE_SECRET_KEY,
+      ...connection,
       fromStartTime: startedAt,
       toStartTime: new Date().toISOString(),
       codeword: secondMarker,
@@ -133,12 +136,20 @@ export async function runTelemetryA2a(backend) {
     assert(second.ok, second.state);
     const lastRoot = second.trace.find((span) => span.name === 'a2a-task');
     assert(lastRoot.traceId !== firstRoot.traceId, 'separate tasks must keep separate trace IDs');
-    assert(
-      lastRoot.sessionId === contextId && firstRoot.sessionId === contextId,
-      'tasks must retain their session',
-    );
     if (backend === 'phoenix') {
+      assert(
+        lastRoot.sessionId === contextId && firstRoot.sessionId === contextId,
+        'tasks must retain their session',
+      );
       await verifyPhoenixSessionIO(contextId, firstPrompt, lastRoot.output);
+    } else {
+      await verifyLangfuseSession({
+        ...connection,
+        sessionId: contextId,
+        traceIds: [firstRoot.traceId, lastRoot.traceId],
+        release: integrationRevision(),
+        tags,
+      });
     }
     await stopA2a(proc);
     proc = undefined;

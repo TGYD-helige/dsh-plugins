@@ -546,6 +546,36 @@ test('subagent verification requires a successful completed read of the fixture'
   }
 });
 
+test('Langfuse session verification checks both task traces and CI identity through the session API', async (t) => {
+  const { verifyLangfuseSession } = await import('./integration/lib/langfuse-shared.mjs');
+  const trace = {
+    id: 'first',
+    sessionId: 'session',
+    environment: 'ci',
+    release: 'head',
+    tags: ['ci', 'run:1'],
+  };
+  let body = { id: 'session', traces: [trace, { ...trace, id: 'second' }] };
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    assert.equal(String(url), 'https://langfuse.invalid/api/public/sessions/session');
+    return new Response(JSON.stringify(body), { status: 200 });
+  });
+  const options = {
+    baseUrl: 'https://langfuse.invalid',
+    publicKey: 'pk-fixture',
+    secretKey: 'sk-fixture',
+    sessionId: 'session',
+    traceIds: ['first', 'second'],
+    release: 'head',
+    tags: ['ci', 'run:1'],
+  };
+  await verifyLangfuseSession(options);
+  body = { ...body, traces: [trace] };
+  await assert.rejects(verifyLangfuseSession(options), /missing task trace/);
+  body = { ...body, traces: [trace, { ...trace, id: 'second', tags: [] }] };
+  await assert.rejects(verifyLangfuseSession(options));
+});
+
 test('reasoning evidence reads current durable model streams and fails on missing evidence', async () => {
   const { readReasoningSource } = await import('./integration/lib/langfuse-shared.mjs');
   const directory = mkdtempSync(join(tmpdir(), 'reasoning-source-'));

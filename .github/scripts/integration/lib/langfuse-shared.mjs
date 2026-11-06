@@ -35,6 +35,7 @@
  *   exit   : non-zero on any failure
  */
 
+import strictAssert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -745,6 +746,42 @@ export async function startFakeIngestion(captured) {
   server.unref();
   await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
   return server;
+}
+
+export async function verifyLangfuseSession({
+  baseUrl,
+  publicKey,
+  secretKey,
+  sessionId,
+  traceIds,
+  release,
+  tags,
+}) {
+  const response = await fetch(
+    `${baseUrl.replace(/\/$/, '')}/api/public/sessions/${encodeURIComponent(sessionId)}`,
+    {
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString('base64')}`,
+      },
+      signal: AbortSignal.timeout(15_000),
+    },
+  );
+  strictAssert.ok(response.ok, `Langfuse session read-back HTTP ${response.status}`);
+  let session;
+  try {
+    session = JSON.parse(await response.text());
+  } catch {
+    throw new Error('Langfuse session read-back returned invalid JSON');
+  }
+  strictAssert.equal(session.id, sessionId);
+  for (const id of traceIds) {
+    const trace = session.traces?.find((trace) => trace.id === id);
+    strictAssert.ok(trace, 'missing task trace in Langfuse session');
+    strictAssert.equal(trace.sessionId, sessionId);
+    strictAssert.equal(trace.environment, 'ci');
+    strictAssert.equal(trace.release, release);
+    strictAssert.deepEqual(new Set(trace.tags), new Set(tags));
+  }
 }
 
 /**
