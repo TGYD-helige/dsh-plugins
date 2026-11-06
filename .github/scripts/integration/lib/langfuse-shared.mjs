@@ -406,9 +406,12 @@ export function evaluateSubagentTrace(observations, codeword) {
 
   const childGeneration = generations.find((o) => subSpan && o.parentObservationId === subSpan.id);
   need(childGeneration, 'no generation nested under the "subagent" span');
+  const childIds = new Set(
+    spans.filter((o) => o.name === 'subagent' || o.name?.startsWith('subagent:')).map((o) => o.id),
+  );
   // A fixture read needs two model calls; allow two retries, but catch search loops in CI.
   need(
-    generations.filter((o) => subSpan && o.parentObservationId === subSpan.id).length <= 4,
+    generations.filter((o) => childIds.has(o.parentObservationId)).length <= 4,
     'fixture subagent exceeded four LLM calls',
   );
   if (childGeneration) {

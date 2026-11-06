@@ -516,6 +516,22 @@ test('subagent verification requires a successful completed read of the fixture'
     ).includes('fixture subagent exceeded four LLM calls'),
     'a one-file read must not pass after an extended search loop',
   );
+  assert.ok(
+    evaluateSubagentTrace(
+      [
+        ...tree,
+        { ...tree[1], id: 'second-delegate' },
+        { ...tree[2], id: 'second-child', parentObservationId: 'second-delegate' },
+        ...Array.from({ length: 4 }, (_, i) => ({
+          ...tree[3],
+          id: `second-${i}`,
+          parentObservationId: 'second-child',
+        })),
+      ],
+      marker,
+    ).includes('fixture subagent exceeded four LLM calls'),
+    'repeated delegations must share the fixture call budget',
+  );
   for (const update of [
     { level: 'ERROR', output: `cannot read /work/${marker}.txt` },
     { statusCode: 'ERROR', output: `cannot read /work/${marker}.txt` },
