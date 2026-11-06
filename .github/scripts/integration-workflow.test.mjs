@@ -478,6 +478,58 @@ test('reasoning validation follows the source stream instead of requiring the mo
   );
 });
 
+test('subagent verification requires a successful completed read of the fixture', async () => {
+  const { evaluateSubagentTrace } = await import('./integration/lib/langfuse-shared.mjs');
+  const marker = 'ci-subagent-read';
+  const tree = [
+    { id: 'root', type: 'SPAN', name: 'dsh-turn', endTime: 1 },
+    {
+      id: 'delegate',
+      type: 'TOOL',
+      name: 'tool:subagent',
+      parentObservationId: 'root',
+      endTime: 1,
+    },
+    { id: 'child', type: 'SPAN', name: 'subagent', parentObservationId: 'delegate', endTime: 1 },
+    {
+      id: 'llm',
+      type: 'GENERATION',
+      parentObservationId: 'child',
+      model: integration.integrationModel(),
+      endTime: 1,
+    },
+    {
+      id: 'read',
+      type: 'TOOL',
+      name: 'tool:read',
+      parentObservationId: 'child',
+      endTime: 1,
+      input: { file_path: `/work/${marker}.txt` },
+      output: `${marker}-content`,
+    },
+  ];
+  assert.deepEqual(evaluateSubagentTrace(tree, marker), []);
+  assert.ok(
+    evaluateSubagentTrace(
+      [...tree, ...Array.from({ length: 4 }, (_, i) => ({ ...tree[3], id: `extra-${i}` }))],
+      marker,
+    ).includes('fixture subagent exceeded four LLM calls'),
+    'a one-file read must not pass after an extended search loop',
+  );
+  for (const update of [
+    { level: 'ERROR', output: `cannot read /work/${marker}.txt` },
+    { statusCode: 'ERROR', output: `cannot read /work/${marker}.txt` },
+    { endTime: null },
+    { output: undefined },
+    { name: 'tool:bash' },
+  ]) {
+    assert.ok(
+      evaluateSubagentTrace([...tree.slice(0, -1), { ...tree.at(-1), ...update }], marker).length,
+      'failed, unfinished or unrelated tools must not satisfy the read scenario',
+    );
+  }
+});
+
 test('reasoning evidence reads current durable model streams and fails on missing evidence', async () => {
   const { readReasoningSource } = await import('./integration/lib/langfuse-shared.mjs');
   const directory = mkdtempSync(join(tmpdir(), 'reasoning-source-'));

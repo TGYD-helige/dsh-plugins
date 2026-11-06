@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { a2aClient, assert, bootA2a, stopA2a, THINKING_OFF } from './a2a-shared.mjs';
-import { requireEnv, run } from './ci-shared.mjs';
+import { integrationRevision, requireEnv, run } from './ci-shared.mjs';
 import { runVerification } from './langfuse-shared.mjs';
 import { runPhoenixVerification, verifyPhoenixSessionIO } from './phoenix-shared.mjs';
 
@@ -18,6 +18,12 @@ export async function runTelemetryA2a(backend) {
   );
   if (backend === 'phoenix') process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION ??= 'gzip';
   const tag = `telemetry-${backend}-a2a`;
+  const tags = [
+    'ci',
+    `scenario:${tag}`,
+    `run:${process.env.GITHUB_RUN_ID || 'local'}`,
+    `attempt:${process.env.GITHUB_RUN_ATTEMPT || '1'}`,
+  ];
   const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), `dsh-a2a-e2e-${tag}`);
   const dshHome = process.env.DSH_HOME ?? join(workDir, 'dsh-home');
   mkdirSync(workDir, { recursive: true });
@@ -49,7 +55,7 @@ export async function runTelemetryA2a(backend) {
       tag,
       inbox: true,
       reuse: true,
-      extraPatch: `${THINKING_OFF}\n- id: telemetry\n  config:\n    enabled: true\n    backend: ${backend}\n\n- id: session-title-llm\n  disabled: true\n`,
+      extraPatch: `${THINKING_OFF}\n- id: telemetry\n  config:\n    enabled: true\n    backend: ${backend}\n    environment: ci\n    release: ${JSON.stringify(integrationRevision())}\n    tags: ${JSON.stringify(tags)}\n\n- id: session-title-llm\n  disabled: true\n`,
     });
     proc = boot.proc;
     const contextId = randomUUID();
@@ -108,20 +114,30 @@ export async function runTelemetryA2a(backend) {
       evaluate,
     });
     assert(result.ok, result.state);
+    const firstRoot = result.trace.find((span) => span.name === 'a2a-task');
     if (backend === 'phoenix') {
-      const firstRoot = result.trace.find((span) => span.name === 'a2a-task');
       await verifyPhoenixSessionIO(contextId, firstPrompt, firstRoot.output);
-      const secondMarker = `${marker}-follow-up`;
-      writeFileSync(join(workDir, `${secondMarker}.txt`), secondMarker);
-      await runTask(`请用工具读取 ${secondMarker}.txt 并复述内容`);
-      const second = await runPhoenixVerification({
-        fromStartTime: startedAt,
-        codeword: secondMarker,
-        evaluate,
-      });
-      assert(second.ok, second.state);
-      const lastRoot = second.trace.find((span) => span.name === 'a2a-task');
-      assert(lastRoot.traceId !== firstRoot.traceId, 'separate tasks must keep separate trace IDs');
+    }
+    const secondMarker = `${marker}-follow-up`;
+    writeFileSync(join(workDir, `${secondMarker}.txt`), secondMarker);
+    await runTask(`请用工具读取 ${secondMarker}.txt 并复述内容`);
+    const second = await verify({
+      baseUrl: process.env.LANGFUSE_BASE_URL || 'https://cloud.langfuse.com',
+      publicKey: process.env.LANGFUSE_PUBLIC_KEY,
+      secretKey: process.env.LANGFUSE_SECRET_KEY,
+      fromStartTime: startedAt,
+      toStartTime: new Date().toISOString(),
+      codeword: secondMarker,
+      evaluate,
+    });
+    assert(second.ok, second.state);
+    const lastRoot = second.trace.find((span) => span.name === 'a2a-task');
+    assert(lastRoot.traceId !== firstRoot.traceId, 'separate tasks must keep separate trace IDs');
+    assert(
+      lastRoot.sessionId === contextId && firstRoot.sessionId === contextId,
+      'tasks must retain their session',
+    );
+    if (backend === 'phoenix') {
       await verifyPhoenixSessionIO(contextId, firstPrompt, lastRoot.output);
     }
     await stopA2a(proc);

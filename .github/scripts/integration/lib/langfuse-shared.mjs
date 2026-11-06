@@ -406,6 +406,11 @@ export function evaluateSubagentTrace(observations, codeword) {
 
   const childGeneration = generations.find((o) => subSpan && o.parentObservationId === subSpan.id);
   need(childGeneration, 'no generation nested under the "subagent" span');
+  // A fixture read needs two model calls; allow two retries, but catch search loops in CI.
+  need(
+    generations.filter((o) => subSpan && o.parentObservationId === subSpan.id).length <= 4,
+    'fixture subagent exceeded four LLM calls',
+  );
   if (childGeneration) {
     need(
       childGeneration.model === EXPECTED_MODEL,
@@ -418,10 +423,14 @@ export function evaluateSubagentTrace(observations, codeword) {
     (o) =>
       subSpan &&
       o.parentObservationId === subSpan.id &&
-      o.name?.startsWith('tool:') &&
-      JSON.stringify(o.input ?? '').includes(codeword),
+      o.name?.startsWith('tool:read') &&
+      o.level !== 'ERROR' &&
+      o.statusCode !== 'ERROR' &&
+      o.endTime != null &&
+      JSON.stringify(o.input ?? '').includes(codeword) &&
+      JSON.stringify(o.output ?? '').includes(codeword),
   );
-  need(childTool, 'no codeword-bearing tool span under the "subagent" span');
+  need(childTool, 'no successful completed fixture read under the "subagent" span');
   if (childTool) need(childTool.type === 'TOOL', 'child tool observation must have type TOOL');
   return problems;
 }
@@ -469,6 +478,7 @@ function spanToObservation(span) {
     input: otlpJsonAttr(span, 'langfuse.observation.input'),
     output: otlpJsonAttr(span, 'langfuse.observation.output'),
     model: otlpAttr(span, 'langfuse.observation.model.name') ?? undefined,
+    level: otlpAttr(span, 'langfuse.observation.level') ?? 'DEFAULT',
     usageDetails: otlpJsonAttr(span, 'langfuse.observation.usage_details'),
     sessionId: otlpAttr(span, 'session.id') ?? undefined,
     metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
@@ -676,7 +686,11 @@ export async function runVerification({
         }
         const problems = evaluate(observations, codeword);
         if (problems.length === 0) {
-          return { ok: true, state: `trace ${traceId} matches the expected dsh-langfuse shape` };
+          return {
+            ok: true,
+            state: `trace ${traceId} matches the expected dsh-langfuse shape`,
+            trace: observations,
+          };
         }
         lastState = `trace ${traceId} incomplete: ${problems.join('; ')}`;
         console.log(`  not complete yet: ${problems.join('; ')}`);
@@ -742,6 +756,10 @@ export async function runScenario(opts) {
     console.error(`::error::${error.message}`);
     process.exit(1);
   }
+}
+
+export function subagentPrompt(markerFile, workDir) {
+  return `请调用 subagent 工具，委派一个子代理用 read 工具读取绝对路径 ${JSON.stringify(join(workDir, markerFile))} 并原样返回文件内容，然后立即结束。委派时须完整保留该路径，不要猜测或改写路径；不要搜索其他文件。你自己不要读取。`;
 }
 
 async function scenarioMain({
@@ -1019,7 +1037,7 @@ ${hookPatch}
     console.log(`\n(${name} attempt ${attempt}/${maxAttempts})`);
     captured.length = 0;
     const runStartedAt = new Date(Date.now() - 1000).toISOString();
-    await runQuery(prompt(markerFile));
+    await runQuery(prompt(markerFile, workDir));
     const source = reasoning ? readReasoningSource(dshHome, runStartedAt) : undefined;
     if (source) console.log(`Source reasoning: ${source.length} model stream(s)`);
     const evaluateRun = (observations, marker) => [
