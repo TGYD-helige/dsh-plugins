@@ -138,6 +138,10 @@ jobs:
             echo "DSH_TELEMETRY_A2A_TARBALL=$RUNNER_TEMP/$(basename "$archive")" >> "$GITHUB_ENV"
           fi
 
+      - name: Link unpublished telemetry to its local archive
+        if: env.DSH_TELEMETRY_CORE_TARBALL != ''
+        run: node .github/scripts/link-local-telemetry.mjs "$DSH_PKG_TARBALL" "$DSH_TELEMETRY_CORE_TARBALL"
+
       - name: Install the dsh CLI (pinned)
         run: |
           set -euo pipefail

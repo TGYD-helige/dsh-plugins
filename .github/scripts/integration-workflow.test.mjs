@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { stopA2a } from './integration/lib/a2a-shared.mjs';
 import * as integration from './integration/lib/ci-shared.mjs';
 
@@ -235,4 +236,91 @@ test('new backend secrets are scoped to the exact telemetry backend', () => {
         `(matrix.package == 'dsh-langfuse' || startsWith(matrix.name, 'dsh-telemetry.langfuse')) && secrets.${key} || ''`,
       ),
     );
+});
+
+test('a packed plugin resolves its unpublished dependency offline through a local file reference', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'local-telemetry-dependency-'));
+  try {
+    const archives = {};
+    for (const [label, manifest] of [
+      ['core', { name: '@amaster.ai/dsh-telemetry', version: '0.1.0' }],
+      [
+        'plugin',
+        {
+          name: '@amaster.ai/dsh-langfuse',
+          version: '0.1.0',
+          dependencies: { '@amaster.ai/dsh-telemetry': '0.1.0' },
+        },
+      ],
+    ]) {
+      const source = join(directory, label);
+      mkdirSync(join(source, 'package'), { recursive: true });
+      writeFileSync(join(source, 'package/package.json'), JSON.stringify(manifest));
+      writeFileSync(join(source, 'package/index.js'), 'export const preserved = true;');
+      const archive = join(directory, `${label}.tgz`);
+      execFileSync('tar', ['-czf', archive, '-C', source, 'package']);
+      archives[label] = archive;
+    }
+    const install = (name) => {
+      const consumer = join(directory, name);
+      mkdirSync(consumer);
+      writeFileSync(join(consumer, 'package.json'), '{"private":true}');
+      return spawnSync(
+        'pnpm',
+        ['add', '--offline', '--ignore-scripts', archives.core, archives.plugin],
+        { cwd: consumer, encoding: 'utf8' },
+      );
+    };
+    const before = install('before');
+    assert.notEqual(
+      before.status,
+      0,
+      'semver dependency must reproduce the registry-resolution failure',
+    );
+    assert.match(before.stdout + before.stderr, /ERR_PNPM_NO_OFFLINE_META/);
+    const linked = spawnSync(
+      process.execPath,
+      [
+        fileURLToPath(new URL('./link-local-telemetry.mjs', import.meta.url)),
+        archives.plugin,
+        archives.core,
+      ],
+      { encoding: 'utf8' },
+    );
+    assert.equal(linked.status, 0, linked.stderr);
+    const manifest = JSON.parse(
+      execFileSync('tar', ['-xOzf', archives.plugin, 'package/package.json'], { encoding: 'utf8' }),
+    );
+    assert.equal(manifest.dependencies['@amaster.ai/dsh-telemetry'], `file:${archives.core}`);
+    assert.equal(
+      execFileSync('tar', ['-xOzf', archives.plugin, 'package/index.js'], { encoding: 'utf8' }),
+      'export const preserved = true;',
+    );
+    assert.equal(
+      JSON.parse(readFileSync(join(directory, 'plugin/package/package.json'), 'utf8')).dependencies[
+        '@amaster.ai/dsh-telemetry'
+      ],
+      '0.1.0',
+    );
+    const after = install('after');
+    assert.equal(after.status, 0, after.stdout + after.stderr);
+    const unchanged = readFileSync(archives.core);
+    const noDependency = spawnSync(
+      process.execPath,
+      [
+        fileURLToPath(new URL('./link-local-telemetry.mjs', import.meta.url)),
+        archives.core,
+        archives.core,
+      ],
+      { encoding: 'utf8' },
+    );
+    assert.equal(noDependency.status, 0, noDependency.stderr);
+    assert.deepEqual(
+      readFileSync(archives.core),
+      unchanged,
+      'archives without this dependency remain unchanged',
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
