@@ -190,6 +190,6 @@ MIT
 
 The Langfuse integration scenarios label observations with environment `ci`, release `GITHUB_SHA`, and tags for scenario, run ID, and workflow run attempt. Select environment `ci` in Langfuse to find new E2E traces. Read-back uses a bounded time window for each model run and queries a discovered trace directly while ingestion settles.
 
-## Shared instrumentation export
+## Phoenix and native OTLP tracing
 
-`@amaster.ai/dsh-telemetry/instrumentation` exposes the SDK-independent collector (`collect`), reporter contract, payload/privacy helpers, hook helpers and token accounting. The legacy entry point uses that collector with its original SDK reporter. `@amaster.ai/dsh-telemetry/langfuse` provides the shared pure Langfuse context mapping; both reporters use the same mapping and usage helpers. The legacy entry point still owns its original Config/environment handling and `langfuse/context` event. Install matching release versions when consuming this boundary.
+For Phoenix or SDK-independent Langfuse tracing, use [`@amaster.ai/dsh-telemetry`](../dsh-telemetry). Existing Langfuse profiles remain supported. Enable only one collector per profile; keep this plugin when Langfuse managed-media uploads are required.
