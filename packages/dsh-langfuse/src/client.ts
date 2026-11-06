@@ -200,7 +200,9 @@ export class LangfuseReporter extends PayloadPrivacy {
   private withProvider<T>(create: () => T): T {
     const tracing = this.tracing!;
     const api = this.api!;
-    const previous = tracing.getLangfuseTracerProvider();
+    const current = tracing.getLangfuseTracerProvider();
+    // The SDK getter resolves its null fallback; restore that fallback across host reloads.
+    const previous = current === api.trace.getTracerProvider() ? null : current;
     tracing.setLangfuseTracerProvider(this.provider);
     try {
       return api.context.with(api.ROOT_CONTEXT, create);

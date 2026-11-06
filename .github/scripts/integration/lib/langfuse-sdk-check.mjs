@@ -729,6 +729,20 @@ try {
     await new Promise((resolve) => secondServer.close(resolve));
   }
   assert.equal(tracing.getLangfuseTracerProvider(), previousProvider);
+  const { NodeTracerProvider } = await import(require.resolve('@opentelemetry/sdk-trace-node'));
+  const replacement = new NodeTracerProvider();
+  try {
+    api.trace.disable();
+    assert.equal(api.trace.setGlobalTracerProvider(replacement), true);
+    assert.equal(
+      tracing.getLangfuseTracerProvider(),
+      api.trace.getTracerProvider(),
+      'reporters must preserve the SDK fallback when the host provider reloads',
+    );
+  } finally {
+    api.trace.disable();
+    await replacement.shutdown();
+  }
   console.log('real Langfuse SDK / OTLP checks passed');
 } finally {
   if (hookWorkDir) rmSync(hookWorkDir, { recursive: true, force: true });
