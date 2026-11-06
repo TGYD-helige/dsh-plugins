@@ -143,7 +143,8 @@ vi.mock('@langfuse/tracing', () => ({
   LangfuseOtelSpanAttributes: { IS_APP_ROOT: 'langfuse.internal.is_app_root' },
 }));
 vi.mock('@langfuse/otel', () => ({ LangfuseSpanProcessor: mocks.MockSpanProcessor }));
-vi.mock('@opentelemetry/sdk-trace-node', () => ({
+vi.mock('@opentelemetry/sdk-trace-node', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@opentelemetry/sdk-trace-node')>()),
   NodeTracerProvider: mocks.MockNodeTracerProvider,
 }));
 

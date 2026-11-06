@@ -8,6 +8,7 @@ import type {
 } from '../adapters/types.js';
 import {
   boundPayload,
+  createTraceIdGenerator,
   type InstrumentationReporter,
   newPayloadBudget,
   PayloadPrivacy,
@@ -38,6 +39,7 @@ export class TelemetryReporter implements InstrumentationReporter {
   private api?: typeof import('@opentelemetry/api');
   private provider?: NodeTracerProvider;
   private tracer?: Tracer;
+  private ids?: ReturnType<typeof createTraceIdGenerator>;
   private observations = new WeakMap<object, Observation>();
   private privacy: PayloadPrivacy;
   constructor(
@@ -88,7 +90,9 @@ export class TelemetryReporter implements InstrumentationReporter {
         url: connection.endpoint,
         headers: connection.headers,
       });
+      this.ids = createTraceIdGenerator(new sdk.RandomIdGenerator());
       this.provider = new sdk.NodeTracerProvider({
+        idGenerator: this.ids,
         resource: resources.resourceFromAttributes({
           'service.name': 'dsh-telemetry',
           ...this.mask(connection.resourceAttributes),
@@ -126,13 +130,23 @@ export class TelemetryReporter implements InstrumentationReporter {
       isRemote: true,
     };
   }
-  private start(data: ObservationData, parent?: SpanContext, startTime?: Date): object | null {
-    if (!this.api || !this.tracer) return null;
+  private start(
+    data: ObservationData,
+    parent?: SpanContext,
+    startTime?: Date,
+    traceId?: string,
+  ): object | null {
+    const api = this.api;
+    const tracer = this.tracer;
+    const ids = this.ids;
+    if (!api || !tracer || !ids) return null;
     try {
       const context = parent
-        ? this.api.trace.setSpanContext(this.api.ROOT_CONTEXT, parent)
-        : this.api.ROOT_CONTEXT;
-      const span = this.tracer.startSpan(this.mask(data.name ?? 'span'), { startTime }, context);
+        ? api.trace.setSpanContext(api.ROOT_CONTEXT, parent)
+        : api.ROOT_CONTEXT;
+      const span = ids.withTraceId(traceId, () =>
+        tracer.startSpan(this.mask(data.name ?? 'span'), { startTime }, context),
+      );
       const handle = {};
       this.observations.set(handle, { span, data: this.mask(data) });
       return handle;
@@ -150,11 +164,6 @@ export class TelemetryReporter implements InstrumentationReporter {
     traceId?: string;
   }): object | null {
     const external = this.parent(input.context?.traceparent);
-    const parent =
-      external ??
-      (input.traceId
-        ? { traceId: input.traceId, spanId: '0000000000000001', traceFlags: 1 }
-        : undefined);
     const handle = this.start(
       {
         kind: 'root',
@@ -168,8 +177,9 @@ export class TelemetryReporter implements InstrumentationReporter {
         environment: this.config.environment,
         release: this.config.release,
       },
-      parent,
+      external,
       input.startTime,
+      external ? undefined : input.traceId,
     );
     if (handle) this.observations.get(handle)!.contextMetadata = this.mask(input.context?.metadata);
     return handle;

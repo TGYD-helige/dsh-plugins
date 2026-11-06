@@ -522,3 +522,61 @@ test('reasoning evidence reads current durable model streams and fails on missin
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('Phoenix rejects an A2A root that points to a missing parent', async () => {
+  const { evaluatePhoenixSemantics } = await import('./integration/lib/phoenix-shared.mjs');
+  const root = {
+    id: 'task-root',
+    name: 'a2a-task',
+    spanKind: 'AGENT',
+    type: 'SPAN',
+    startTime: '2026-01-01T00:00:00Z',
+    endTime: '2026-01-01T00:00:01Z',
+    parentObservationId: '0000000000000001',
+  };
+  assert.deepEqual(evaluatePhoenixSemantics([root]), ['missing parent of a2a-task']);
+  assert.deepEqual(evaluatePhoenixSemantics([{ ...root, parentObservationId: null }]), []);
+});
+
+test('Phoenix session verification requires the first input and last output', async (t) => {
+  const { verifyPhoenixSessionIO } = await import('./integration/lib/phoenix-shared.mjs');
+  const oldEndpoint = process.env.PHOENIX_COLLECTOR_ENDPOINT;
+  const oldKey = process.env.PHOENIX_API_KEY;
+  process.env.PHOENIX_COLLECTOR_ENDPOINT = 'http://phoenix.test/v1/traces';
+  process.env.PHOENIX_API_KEY = 'unit-test-key';
+  let firstInput = null;
+  let lastOutput = { value: 'task completed' };
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.equal(options.headers.Authorization, 'Bearer unit-test-key');
+    if (String(url).endsWith('/v1/sessions/task-session'))
+      return Response.json({
+        data: { id: 'UHJvamVjdFNlc3Npb246MQ==', session_id: 'task-session' },
+      });
+    assert.equal(String(url), 'http://phoenix.test/graphql');
+    assert.match(JSON.parse(options.body).query, /firstInput/);
+    return Response.json({ data: { node: { firstInput, lastOutput } } });
+  });
+  try {
+    await assert.rejects(
+      () => verifyPhoenixSessionIO('task-session', 'read ci-marker.txt', 'task completed'),
+      /session first input/,
+    );
+    firstInput = { value: 'read ci-marker.txt' };
+    await verifyPhoenixSessionIO('task-session', 'read ci-marker.txt', 'task completed');
+    lastOutput = { value: 'previous task response' };
+    await assert.rejects(
+      () => verifyPhoenixSessionIO('task-session', 'read ci-marker.txt', 'task completed'),
+      /session last output/,
+    );
+    lastOutput = null;
+    await assert.rejects(
+      () => verifyPhoenixSessionIO('task-session', 'read ci-marker.txt', 'task completed'),
+      /session last output/,
+    );
+  } finally {
+    if (oldEndpoint === undefined) delete process.env.PHOENIX_COLLECTOR_ENDPOINT;
+    else process.env.PHOENIX_COLLECTOR_ENDPOINT = oldEndpoint;
+    if (oldKey === undefined) delete process.env.PHOENIX_API_KEY;
+    else process.env.PHOENIX_API_KEY = oldKey;
+  }
+});

@@ -36,7 +36,11 @@ import { langfuseContextAttributes } from '@amaster.ai/dsh-telemetry/langfuse';
  * plugin fiber has been awaited.
  */
 
-import { PayloadPrivacy, usageOf } from '@amaster.ai/dsh-telemetry/instrumentation';
+import {
+  createTraceIdGenerator,
+  PayloadPrivacy,
+  usageOf,
+} from '@amaster.ai/dsh-telemetry/instrumentation';
 import type { TokenUsage } from '@deepseek-ai/dsh-llm';
 import type { LangfuseGeneration, LangfuseSpan } from '@langfuse/tracing';
 import type { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
@@ -119,6 +123,7 @@ export class LangfuseReporter extends PayloadPrivacy {
   private tracing: typeof import('@langfuse/tracing') | null = null;
   private api: typeof import('@opentelemetry/api') | null = null;
   private provider: NodeTracerProvider | null = null;
+  private ids: ReturnType<typeof createTraceIdGenerator> | null = null;
   /**
    * Observation → its trace's correlating attributes; children inherit their
    * parent's. Stamped on every observation (`session.id`,
@@ -178,7 +183,11 @@ export class LangfuseReporter extends PayloadPrivacy {
           return this.mask(data);
         },
       });
-      this.provider = new sdkNode.NodeTracerProvider({ spanProcessors: [processor] });
+      this.ids = createTraceIdGenerator(new sdkNode.RandomIdGenerator());
+      this.provider = new sdkNode.NodeTracerProvider({
+        spanProcessors: [processor],
+        idGenerator: this.ids,
+      });
       // Isolated provider, not provider.register(): the process-global OTEL
       // provider stays untouched. Set `tracing` last — observation methods
       // gate on it, and it must never be visible before the provider is wired.
@@ -213,19 +222,18 @@ export class LangfuseReporter extends PayloadPrivacy {
   }): LangfuseSpan | null {
     const tracing = this.tracing;
     const api = this.api;
-    if (!tracing || !api) return null;
+    const ids = this.ids;
+    if (!tracing || !api || !ids) return null;
     try {
       const externalParent = parentContext(input.context?.traceparent);
-      const parent =
-        externalParent === NO_PARENT && input.traceId
-          ? { traceId: input.traceId, spanId: '0000000000000001', traceFlags: 1 }
-          : externalParent;
       input = this.mask(input);
-      const root = api.context.with(api.ROOT_CONTEXT, () =>
-        tracing.startObservation(
-          input.name,
-          { metadata: input.metadata },
-          { parentSpanContext: parent, startTime: input.startTime },
+      const root = ids.withTraceId(externalParent === NO_PARENT ? input.traceId : undefined, () =>
+        api.context.with(api.ROOT_CONTEXT, () =>
+          tracing.startObservation(
+            input.name,
+            { metadata: input.metadata },
+            { parentSpanContext: externalParent, startTime: input.startTime },
+          ),
         ),
       );
       this.stampTraceContext(root, {

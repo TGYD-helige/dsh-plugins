@@ -62,7 +62,11 @@ try {
     metadata: { password: 'ambient-private' },
   };
   const root = propagateAttributes(ambient, () =>
-    reporter.openTrace({ name: 'dsh-turn', sessionId: 'sdk-session' }),
+    reporter.openTrace({
+      name: 'dsh-turn',
+      sessionId: 'sdk-session',
+      traceId: '33333333333333333333333333333333',
+    }),
   );
   assert.ok(root, 'SDK initialization must create a real observation');
   reporter.updateSpan(root, { input: { prompt: 'sdk-marker', password: 'private-value' } });
@@ -94,6 +98,7 @@ try {
   reporter.endSpan(root, { output: 'sdk-answer' });
   const external = reporter.openTrace({
     name: 'sdk-external',
+    traceId: '44444444444444444444444444444444',
     context: {
       traceparent: '00-1234567890abcdef1234567890abcdef-1234567890abcdef-01',
     },
@@ -104,6 +109,8 @@ try {
   assert.equal(captured.length, 5, 'all ended SDK observations must reach OTLP ingestion');
   const own = captured.find((span) => span.name === 'dsh-turn');
   const joined = captured.find((span) => span.name === 'sdk-external');
+  assert.equal(own.traceId, '33333333333333333333333333333333');
+  assert.ok(!own.parentSpanId, 'a task trace must not invent a parent');
   assert.equal(attribute(own, keys.IS_APP_ROOT), true);
   assert.deepEqual(JSON.parse(attribute(own, keys.TRACE_INPUT)), {
     prompt: 'sdk-marker',

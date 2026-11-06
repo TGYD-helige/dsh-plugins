@@ -53,6 +53,7 @@ describe('shared isolated OTel pipeline', () => {
       await reporter.ready;
       const root = reporter.openTrace({
         name: 'turn',
+        traceId: 'abcdefabcdefabcdefabcdefabcdefab',
         sessionId: 's',
         startTime: new Date('2026-01-01T00:00:00Z'),
         context: {
@@ -245,5 +246,45 @@ it.each(['phoenix', 'langfuse'] as const)(
       expect(
         generation.attributes['llm.output_messages.0.message.contents.0.message_content.text'],
       ).toBe('Check the file.');
+  },
+);
+
+it.each(['phoenix', 'langfuse'] as const)(
+  'exports a parentless task with its requested trace ID on %s',
+  async (backend) => {
+    const reporter = new TelemetryReporter(
+      { backend, publicKey: 'pk-test', secretKey: 'sk-test', captureContent: true },
+      adapters[backend],
+    );
+    await reporter.ready;
+    const task = reporter.openTrace({
+      name: 'a2a-task',
+      sessionId: 'task-session',
+      traceId: 'abcdefabcdefabcdefabcdefabcdefab',
+    });
+    const turn = reporter.startSpan(task, { name: 'agent:turn', asType: 'agent' });
+    reporter.endSpan(turn);
+    reporter.endSpan(task, { input: 'first user input', output: 'last assistant output' });
+    reporter.endSpan(reporter.openTrace({ name: 'ordinary-turn', sessionId: 'other-session' }));
+    await reporter.shutdown();
+    const root = state.spans.find((span) => span.name === 'a2a-task')!;
+    const child = state.spans.find((span) => span.name === 'agent:turn')!;
+    expect(root.spanContext().traceId).toBe('abcdefabcdefabcdefabcdefabcdefab');
+    expect(root.parentSpanContext).toBeUndefined();
+    expect(child.parentSpanContext?.spanId).toBe(root.spanContext().spanId);
+    expect(child.spanContext().traceId).toBe(root.spanContext().traceId);
+    expect(
+      state.spans.find((span) => span.name === 'ordinary-turn')!.spanContext().traceId,
+    ).not.toBe(root.spanContext().traceId);
+    const sessionRoot = state.spans.find(
+      (span) => !span.parentSpanContext && span.attributes['session.id'] === 'task-session',
+    );
+    const prefix = backend === 'phoenix' ? '' : 'langfuse.observation.';
+    expect(sessionRoot?.attributes[backend === 'phoenix' ? 'input.value' : `${prefix}input`]).toBe(
+      'first user input',
+    );
+    expect(
+      sessionRoot?.attributes[backend === 'phoenix' ? 'output.value' : `${prefix}output`],
+    ).toBe('last assistant output');
   },
 );

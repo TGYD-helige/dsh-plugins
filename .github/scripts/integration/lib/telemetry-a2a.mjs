@@ -7,7 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { a2aClient, assert, bootA2a, stopA2a, THINKING_OFF } from './a2a-shared.mjs';
 import { requireEnv, run } from './ci-shared.mjs';
 import { runVerification } from './langfuse-shared.mjs';
-import { runPhoenixVerification } from './phoenix-shared.mjs';
+import { runPhoenixVerification, verifyPhoenixSessionIO } from './phoenix-shared.mjs';
 
 export async function runTelemetryA2a(backend) {
   requireEnv(['DSH_TELEMETRY_A2A_TARBALL', 'DSH_PKG_TARBALL']);
@@ -52,31 +52,31 @@ export async function runTelemetryA2a(backend) {
       extraPatch: `${THINKING_OFF}\n- id: telemetry\n  config:\n    enabled: true\n    backend: ${backend}\n\n- id: session-title-llm\n  disabled: true\n`,
     });
     proc = boot.proc;
-    const client = a2aClient(boot.a2a, { signal: AbortSignal.timeout(240_000) });
     const contextId = randomUUID();
-    const { res, body } = await client.rpc('SendMessage', {
-      message: client.userMessage(`请用工具读取 ${marker}.txt 并复述内容`, { contextId }),
-      configuration: { returnImmediately: true },
-    });
-    assert(res.ok && !body.error, 'SendMessage must succeed');
-    const taskId = body.result.task.id;
-    let completed = false;
-    for (let i = 0; i < 120; i++) {
-      const result = await client.rpc('GetTask', { id: taskId });
-      const state = result.body.result?.status?.state;
-      assert(
-        !['TASK_STATE_FAILED', 'TASK_STATE_REJECTED', 'TASK_STATE_CANCELED'].includes(state),
-        'task must not fail',
-      );
-      if (state === 'TASK_STATE_COMPLETED') {
-        completed = true;
-        break;
+    async function runTask(prompt) {
+      const client = a2aClient(boot.a2a, { signal: AbortSignal.timeout(240_000) });
+      const { res, body } = await client.rpc('SendMessage', {
+        message: client.userMessage(prompt, { contextId }),
+        configuration: { returnImmediately: true },
+      });
+      assert(res.ok && !body.error, 'SendMessage must succeed');
+      const taskId = body.result.task.id;
+      for (let i = 0; i < 120; i++) {
+        const result = await client.rpc('GetTask', { id: taskId });
+        const state = result.body.result?.status?.state;
+        assert(
+          !['TASK_STATE_FAILED', 'TASK_STATE_REJECTED', 'TASK_STATE_CANCELED'].includes(state),
+          'task must not fail',
+        );
+        if (state === 'TASK_STATE_COMPLETED') return;
+        await delay(1000);
       }
-      await delay(1000);
+      assert(false, 'A2A task did not complete');
     }
-    assert(completed, 'A2A task did not complete');
+    const firstPrompt = `请用工具读取 ${marker}.txt 并复述内容`;
+    await runTask(firstPrompt);
     // Read back task spans before the CLI's bounded SIGTERM shutdown.
-    const evaluate = (observations) => {
+    const evaluate = (observations, codeword) => {
       const task = observations.find((o) => o.name === 'a2a-task');
       const turn = observations.find(
         (o) => o.name === 'agent:turn' && o.parentObservationId === task?.id,
@@ -85,10 +85,13 @@ export async function runTelemetryA2a(backend) {
         (o) => o.type === 'GENERATION' && o.parentObservationId === turn?.id,
       );
       const tool = observations.find(
-        (o) => o.type === 'TOOL' && JSON.stringify(o.input).includes(marker),
+        (o) => o.type === 'TOOL' && JSON.stringify(o.input).includes(codeword),
       );
       return [
         ...(!task?.endTime ? ['missing completed A2A task root'] : []),
+        ...(task?.parentObservationId ? ['A2A task root must not have a parent'] : []),
+        ...(!JSON.stringify(task?.input ?? '').includes(codeword) ? ['missing task input'] : []),
+        ...(!task?.output ? ['missing task output'] : []),
         ...(!turn?.endTime ? ['missing task-owned turn'] : []),
         ...(!generation?.usageDetails?.total ? ['missing task generation usage'] : []),
         ...(!tool?.endTime ? ['missing task tool'] : []),
@@ -105,6 +108,22 @@ export async function runTelemetryA2a(backend) {
       evaluate,
     });
     assert(result.ok, result.state);
+    if (backend === 'phoenix') {
+      const firstRoot = result.trace.find((span) => span.name === 'a2a-task');
+      await verifyPhoenixSessionIO(contextId, firstPrompt, firstRoot.output);
+      const secondMarker = `${marker}-follow-up`;
+      writeFileSync(join(workDir, `${secondMarker}.txt`), secondMarker);
+      await runTask(`请用工具读取 ${secondMarker}.txt 并复述内容`);
+      const second = await runPhoenixVerification({
+        fromStartTime: startedAt,
+        codeword: secondMarker,
+        evaluate,
+      });
+      assert(second.ok, second.state);
+      const lastRoot = second.trace.find((span) => span.name === 'a2a-task');
+      assert(lastRoot.traceId !== firstRoot.traceId, 'separate tasks must keep separate trace IDs');
+      await verifyPhoenixSessionIO(contextId, firstPrompt, lastRoot.output);
+    }
     await stopA2a(proc);
     proc = undefined;
     console.log(`SCENARIO_OK (${backend} real A2A task API read-back)`);
