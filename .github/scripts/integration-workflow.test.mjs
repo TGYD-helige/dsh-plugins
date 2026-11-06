@@ -363,7 +363,14 @@ test('a packed plugin resolves its unpublished dependency offline through a loca
       writeFileSync(join(consumer, 'package.json'), '{"private":true}');
       return spawnSync(
         'pnpm',
-        ['add', '--offline', '--ignore-scripts', archives.core, archives.plugin],
+        [
+          'add',
+          '--offline',
+          '--ignore-scripts',
+          '--registry=https://local-telemetry.invalid/',
+          archives.core,
+          archives.plugin,
+        ],
         { cwd: consumer, encoding: 'utf8' },
       );
     };
