@@ -30,7 +30,7 @@ Every change follows the ladder — stop at the first rung that holds:
 3. Stdlib does it?            → use it
 4. Native platform feature?   → use it
 5. Installed dependency?      → use it — no new deps for one-call problems
-6. One line?                  → one line
+6. One clear expression?      → use it
 7. Only then: the minimum that works
 ```
 
@@ -43,6 +43,13 @@ The ladder runs *after* understanding the problem, never instead of it. Never la
 Use for process work: `to-spec`/`to-tickets` before non-trivial implementations, `tdd` for behavior changes, `diagnosing-bugs` (no fix without reproduced root cause), `code-review`, `research`, `resolving-merge-conflicts` as named.
 
 ---
+
+## Code Design
+
+- Keep the normal path easy to follow. Name values after the event, state, or protocol field they represent. Split a dense expression when readers must reconstruct the order of decisions.
+- Pass helpers the fields or service they use. Keep Cordis context access and backend I/O at plugin boundaries so mapping and policy decisions can run on plain inputs.
+- Keep backend-specific behavior in its adapter. Share logic across plugins when callers need the same behavior and can evolve together. Similar-looking code alone is a poor reason to couple separately installable packages.
+- In loops and stream handlers, count file, database, and network calls per turn. Reuse a read within the operation when its value stays valid. Batch independent writes only when ordering, failure handling, and the awaited flush guarantee are preserved.
 
 ## Conventions
 
@@ -63,7 +70,7 @@ Use for process work: `to-spec`/`to-tickets` before non-trivial implementations,
 - Reproduce bugs on the reported transport, backend, and configuration when possible. Use a minimal, sanitized fixture for payload-specific failures. Check other callers and backends for the same defect, including paths that read existing records.
 - On read or parse failure, preserve stored data and fail closed at policy gates.
 - When telemetry fields change, inspect the serialized export, test promised redaction with dummy credentials, and document what leaves the process.
-- On per-event and per-chunk hooks, account for repeated work as payloads grow. Preserve streaming and cancellation.
+- On stream hooks, check for repeated parsing or copying of the accumulated payload as each chunk arrives. Preserve streaming and cancellation.
 - Report which revision and checks you verified, outstanding failures, and integrations still untested. Rerun affected checks after fixes.
 
 ---
