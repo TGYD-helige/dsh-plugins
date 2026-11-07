@@ -4,6 +4,19 @@
  * runner.
  */
 import { spawnSync } from 'node:child_process';
+import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+/** Opt-in observation of existing calls; the private fixture is outside package inventory. */
+export function modelPerformancePatch(dshHome, profile = 'headless') {
+  if (!process.env.DSH_MODEL_PERFORMANCE_OUTPUT) return '';
+  const directory = join(dshHome, 'profiles', profile, 'ci-performance-fixture');
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, 'package.json'), JSON.stringify({ private: true }));
+  const module = join(directory, 'model-performance-bridge.mjs');
+  copyFileSync(new URL('./model-performance-bridge.mjs', import.meta.url), module);
+  return `\n- insert:\n    - id: ci-model-performance\n      name: ${JSON.stringify(module)}\n`;
+}
 
 export function requireEnv(names) {
   for (const name of names) {

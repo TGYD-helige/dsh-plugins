@@ -175,8 +175,10 @@ jobs:
       # with inbox editing, steering and checkpointed multi-client invalidation.
       # Secrets are scoped to this step only.
       - name: Stage B — run scenario
+        id: scenario
         if: env.DSH_SECRETS_AVAILABLE == 'true'
         env:
+          DSH_MODEL_PERFORMANCE_OUTPUT: ${{ runner.temp }}/model-performance.jsonl
           DSH_INTEGRATION_BASE_URL: ${{ secrets.DSH_INTEGRATION_BASE_URL }}
           DSH_INTEGRATION_API_KEY: ${{ secrets.DSH_INTEGRATION_API_KEY }}
           # Optional model override for the scenarios; unset/empty falls back
@@ -192,6 +194,14 @@ jobs:
           PHOENIX_COLLECTOR_ENDPOINT: ${{ startsWith(matrix.name, 'dsh-telemetry.phoenix') && secrets.PHOENIX_COLLECTOR_ENDPOINT || '' }}
           PHOENIX_PROJECT_NAME: ${{ startsWith(matrix.name, 'dsh-telemetry.phoenix') && secrets.PHOENIX_PROJECT_NAME || '' }}
         run: node ".github/scripts/integration/${{ matrix.name }}.mjs"
+
+      - name: Summarize existing real-model calls
+        if: always() && env.DSH_SECRETS_AVAILABLE == 'true'
+        env:
+          DSH_MODEL_PERFORMANCE_OUTPUT: ${{ runner.temp }}/model-performance.jsonl
+          DSH_MODEL_PERFORMANCE_SCENARIO: ${{ matrix.name }}
+          DSH_MODEL_PERFORMANCE_OUTCOME: ${{ steps.scenario.outcome }}
+        run: node .github/scripts/model-performance.mjs
 
       # Runtime visibility: the full session event log (including
       # request/header — what the model actually saw) lives in the profile's
@@ -217,6 +227,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
           path: |
+            model-performance.json
             ${{ runner.temp }}/dsh-storage-e2e/dsh.db
             ${{ runner.temp }}/dsh-home/sessions
 

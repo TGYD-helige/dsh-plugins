@@ -6,10 +6,310 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { Context } from '@deepseek-ai/cordis';
 import { stopA2a } from './integration/lib/a2a-shared.mjs';
 import * as integration from './integration/lib/ci-shared.mjs';
 
 const workflow = readFileSync(new URL('../workflows/integration.yml', import.meta.url), 'utf8');
+
+async function modelPerformanceFixture(t) {
+  const { apply } = await import('./integration/lib/model-performance-bridge.mjs');
+  const directory = mkdtempSync(join(tmpdir(), 'model-performance-'));
+  const output = join(directory, 'calls.jsonl');
+  const previous = process.env.DSH_MODEL_PERFORMANCE_OUTPUT;
+  process.env.DSH_MODEL_PERFORMANCE_OUTPUT = output;
+  const ctx = new Context();
+  t.after(async () => {
+    await ctx.fiber.dispose();
+    if (previous === undefined) delete process.env.DSH_MODEL_PERFORMANCE_OUTPUT;
+    else process.env.DSH_MODEL_PERFORMANCE_OUTPUT = previous;
+    rmSync(directory, { recursive: true, force: true });
+  });
+  apply(ctx);
+  return {
+    ctx,
+    output,
+    directory,
+    records: () => readFileSync(output, 'utf8').trim().split('\n').map(JSON.parse),
+  };
+}
+
+test('real-model observer measures existing streams without exporting content or credentials', async (t) => {
+  const { ctx, output } = await modelPerformanceFixture(t);
+  let now = 100;
+  t.mock.method(performance, 'now', () => now);
+  const secret = 'sk-model-fixture-private';
+  const chunks = [
+    { type: 'block-start', index: 0, blockType: 'text' },
+    { type: 'text-delta', index: 0, text: '' },
+    { type: 'reasoning-delta', index: 1, text: secret },
+    { type: 'tool-call-delta', index: 2, id: 'call', name: 'read', argumentsDelta: secret },
+    { type: 'text-delta', index: 0, text: secret },
+    {
+      type: 'usage',
+      usage: {
+        inputTokens: 10,
+        cacheReadTokens: 5,
+        cacheWriteTokens: 2,
+        outputTokens: 40,
+        reasoningTokens: 15,
+      },
+    },
+    { type: 'finish', reason: { kind: 'stop' }, replayState: { credential: secret } },
+  ];
+  const received = [];
+  for await (const chunk of ctx.waterfall(
+    'llm/stream',
+    {
+      provider: 'fixture',
+      model: 'fixture-model',
+      messages: [{ text: secret }],
+      headers: { authorization: secret },
+    },
+    async function* () {
+      for (const [index, chunk] of chunks.entries()) {
+        now = [110, 120, 150, 170, 200, 300, 350][index];
+        yield chunk;
+      }
+    },
+  ))
+    received.push(chunk);
+  assert.deepEqual(received, chunks);
+  const wire = readFileSync(output, 'utf8');
+  assert.ok(!wire.includes(secret));
+  const metric = JSON.parse(wire.trim());
+  assert.equal(metric.durationMs, 250);
+  assert.equal(metric.firstTokenMs, 50);
+  assert.equal(metric.outputTokensPerSecond, 200);
+  assert.equal(metric.totalInputTokens, 17);
+  assert.equal(metric.outputTokens, 40);
+  assert.equal(metric.reasoningTokens, 15);
+  assert.equal(metric.outcome, 'stop');
+  assert.equal(metric.chunks, 7);
+});
+
+test('model performance preserves synchronous errors, stream errors, cancellation and early close', async (t) => {
+  const { ctx, records } = await modelPerformanceFixture(t);
+  const error = new Error('private-fixture-failure');
+  assert.throws(
+    () =>
+      ctx.waterfall('llm/stream', {}, () => {
+        throw error;
+      }),
+    (received) => received === error,
+  );
+  await assert.rejects(
+    async () => {
+      for await (const _ of ctx.waterfall('llm/stream', {}, async function* () {
+        yield { type: 'text-delta', index: 0, text: 'private' };
+        throw error;
+      })) {
+      }
+    },
+    (received) => received === error,
+  );
+  for await (const _ of ctx.waterfall('llm/stream', {}, async function* () {
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  })) {
+  }
+  let closed = false;
+  for await (const _ of ctx.waterfall('llm/stream', {}, async function* () {
+    try {
+      yield { type: 'text-delta', index: 0, text: 'private' };
+    } finally {
+      closed = true;
+    }
+  }))
+    break;
+  assert.equal(closed, true);
+  const abort = new AbortController();
+  await assert.rejects(
+    async () => {
+      for await (const _ of ctx.waterfall(
+        'llm/stream',
+        { signal: abort.signal },
+        async function* () {
+          yield { type: 'text-delta', index: 0, text: 'private' };
+          abort.abort(error);
+          throw error;
+        },
+      )) {
+      }
+    },
+    (received) => received === error,
+  );
+  const rows = records();
+  assert.deepEqual(
+    rows.map((row) => row.outcome),
+    ['error', 'error', 'stop', 'consumer-closed', 'aborted'],
+  );
+  assert.equal(rows[2].firstTokenMs, null);
+  assert.equal(rows[2].outputTokensPerSecond, null);
+  assert.equal(rows[2].totalInputTokens, null);
+  assert.ok(!JSON.stringify(rows).includes(error.message));
+});
+
+test('model performance isolates concurrent calls and recognizes tool-name tokens', async (t) => {
+  const { ctx, records } = await modelPerformanceFixture(t);
+  let release;
+  const pending = new Promise((resolve) => {
+    release = resolve;
+  });
+  const first = (async () => {
+    for await (const _ of ctx.waterfall('llm/stream', { model: 'first' }, async function* () {
+      yield { type: 'text-delta', index: 0, text: 'private' };
+      await pending;
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    })) {
+    }
+  })();
+  t.after(release);
+  for await (const _ of ctx.waterfall('llm/stream', { model: 'second' }, async function* () {
+    yield { type: 'tool-call-delta', index: 0, id: 'call', name: 'read', argumentsDelta: '' };
+    yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } };
+    yield { type: 'finish', reason: { kind: 'tool-calls' } };
+  })) {
+  }
+  release();
+  await first;
+  const rows = records();
+  assert.deepEqual(
+    rows.map((row) => [row.call, row.model]),
+    [
+      [2, 'second'],
+      [1, 'first'],
+    ],
+  );
+  assert.equal(typeof rows[0].firstTokenMs, 'number');
+  assert.equal(rows[0].totalInputTokens, 0);
+  assert.equal(rows[1].totalInputTokens, null);
+});
+
+test('model performance write failures cannot break the source stream', async (t) => {
+  const { ctx, directory } = await modelPerformanceFixture(t);
+  rmSync(directory, { recursive: true, force: true });
+  const errors = t.mock.method(console, 'error', () => {});
+  const chunk = { type: 'text-delta', index: 0, text: 'private-fixture' };
+  const received = [];
+  for await (const value of ctx.waterfall('llm/stream', {}, async function* () {
+    yield chunk;
+  }))
+    received.push(value);
+  assert.equal(received[0], chunk);
+  assert.deepEqual(errors.mock.calls[0].arguments, ['[ci-model-performance] metrics write failed']);
+});
+
+test('model performance summaries keep missing data null and separate auxiliary calls', async (t) => {
+  const { summarizeModelPerformance } = await import('./model-performance.mjs');
+  const { output, directory } = await modelPerformanceFixture(t);
+  const rows = [
+    {
+      provider: 'fixture',
+      model: 'requested',
+      purpose: 'main',
+      outcome: 'stop',
+      durationMs: 300,
+      firstTokenMs: 50,
+      decodeMs: 250,
+      outputTokens: 50,
+      totalInputTokens: 20,
+      reasoningTokens: 10,
+    },
+    {
+      provider: 'fixture',
+      model: 'requested',
+      purpose: 'main',
+      outcome: 'error',
+      durationMs: 100,
+      firstTokenMs: null,
+      decodeMs: null,
+      outputTokens: null,
+      totalInputTokens: null,
+      reasoningTokens: null,
+    },
+    {
+      provider: 'fixture',
+      model: 'requested',
+      purpose: 'session-title',
+      outcome: 'stop',
+      durationMs: 30,
+      firstTokenMs: 10,
+      decodeMs: 20,
+      outputTokens: 0,
+      totalInputTokens: 0,
+    },
+  ];
+  const summary = summarizeModelPerformance(rows);
+  assert.equal(summary.samples, 3);
+  assert.equal(summary.groups.length, 2);
+  assert.equal(summary.groups[0].durationP50Ms, 100);
+  assert.equal(summary.groups[0].durationP95Ms, 300);
+  assert.equal(summary.groups[0].firstTokenP50Ms, 50);
+  assert.equal(summary.groups[0].outputTokensPerSecond, 200);
+  assert.equal(summary.groups[0].totalInputTokens, 20);
+  assert.equal(summary.groups[1].outputTokens, 0);
+  assert.equal(summary.groups[1].reasoningTokens, null);
+  assert.deepEqual(summarizeModelPerformance([]), { samples: 0, calls: [], groups: [] });
+  writeFileSync(output, rows.map(JSON.stringify).join('\n'));
+  const script = fileURLToPath(new URL('./model-performance.mjs', import.meta.url));
+  const result = spawnSync(process.execPath, [script], {
+    cwd: directory,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GITHUB_STEP_SUMMARY: join(directory, 'summary'),
+      INTEGRATION_CHECKOUT_REF: 'tested-head',
+      DSH_MODEL_PERFORMANCE_SCENARIO: 'fixture',
+      DSH_MODEL_PERFORMANCE_OUTCOME: 'success',
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(readFileSync(join(directory, 'model-performance.json'), 'utf8'));
+  assert.equal(report.revision, 'tested-head');
+  assert.equal(report.scenario, 'fixture');
+  assert.equal(report.samples, 3);
+  assert.match(readFileSync(join(directory, 'summary'), 'utf8'), /Real-model performance/);
+});
+
+test('model observer is opt-in on every real scenario profile and is absent from backend legs', async (t) => {
+  const { directory } = await modelPerformanceFixture(t);
+  const patch = integration.modelPerformancePatch(directory, 'web');
+  assert.match(patch, /id: ci-model-performance/);
+  assert.deepEqual(
+    JSON.parse(
+      readFileSync(join(directory, 'profiles/web/ci-performance-fixture/package.json'), 'utf8'),
+    ),
+    { private: true },
+  );
+  delete process.env.DSH_MODEL_PERFORMANCE_OUTPUT;
+  assert.equal(integration.modelPerformancePatch(directory), '');
+  for (const file of [
+    'lib/a2a-shared.mjs',
+    'lib/langfuse-shared.mjs',
+    'lib/policy-shared.mjs',
+    'dsh-storage.mjs',
+    'dsh-subagent-filesystem.mjs',
+  ]) {
+    assert.match(
+      readFileSync(new URL(`./integration/${file}`, import.meta.url), 'utf8'),
+      /\$\{modelPerformancePatch\(dshHome/,
+    );
+  }
+  const scenario = workflow.match(/^ {2}scenario:\n[\s\S]*?(?=^ {2}[\w-]+:)/m)?.[0];
+  const backend = workflow.match(/^ {2}scenario-backends:\n[\s\S]*$/m)?.[0];
+  assert.match(
+    scenario,
+    /DSH_MODEL_PERFORMANCE_OUTPUT: \$\{\{ runner.temp \}\}\/model-performance.jsonl/,
+  );
+  assert.match(scenario, /run: node \.github\/scripts\/model-performance.mjs/);
+  assert.match(scenario, /\n {12}model-performance.json\n/);
+  assert.doesNotMatch(backend, /DSH_MODEL_PERFORMANCE|model-performance/);
+  const performanceWorkflow = readFileSync(
+    new URL('../workflows/performance.yml', import.meta.url),
+    'utf8',
+  );
+  assert.doesNotMatch(performanceWorkflow, /soak|sustained|DSH_PERFORMANCE_SOAK/);
+});
 
 test('native inbox model E2E is discovered as a packed-plugin gateway scenario', () => {
   const directory = mkdtempSync(join(tmpdir(), 'inbox-model-matrix-'));

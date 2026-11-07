@@ -5,6 +5,7 @@ lib/
 *.tgz
 *.log
 /performance-*.json
+/model-performance.json
 .DS_Store
 .idea/
 

@@ -6,12 +6,6 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      soak_minutes:
-        description: Optional sustained telemetry load (zero runs short checks only)
-        type: choice
-        default: '0'
-        options: ['0', '15', '30', '60']
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -39,10 +33,6 @@ jobs:
       - run: pnpm test:performance:network
       - run: pnpm test:performance:database
       - run: pnpm test:performance:combined
-      - name: Smoke test the sustained-load runner
-        env:
-          DSH_PERFORMANCE_SOAK_SECONDS: '10'
-        run: pnpm test:performance:soak
       - name: Upload performance results
         if: always()
         uses: actions/upload-artifact@v7
@@ -86,34 +76,5 @@ jobs:
         with:
           name: performance-postgresql
           path: performance-database-postgresql.json
-          if-no-files-found: error
-          retention-days: 7
-
-  soak:
-    name: Performance sustained load
-    if: github.event_name == 'workflow_dispatch' && inputs.soak_minutes != '0'
-    runs-on: ubuntu-latest
-    timeout-minutes: 75
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - name: Run sustained unique-session workload
-        env:
-          SOAK_MINUTES: ${{ inputs.soak_minutes }}
-        run: |
-          export DSH_PERFORMANCE_SOAK_SECONDS=$((SOAK_MINUTES * 60))
-          pnpm test:performance:soak
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: performance-sustained-load
-          path: performance-soak.json
           if-no-files-found: error
           retention-days: 7

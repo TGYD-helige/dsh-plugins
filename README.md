@@ -226,25 +226,30 @@ DSH_PERFORMANCE_DB_URL=postgresql://postgres:performance-only@127.0.0.1:5432/dsh
 pnpm test:performance:database
 ```
 
-For a sustained unique-session workload, manually dispatch **Performance** with
-`soak_minutes` set to `15`, `30` or `60`. This runs Phoenix content capture and
-records heap/RSS, active resource types, CPU and flush/stream timings periodically
-in `performance-soak.json`; it verifies every expected span reaches the receiver.
-The default dispatch value `0` runs short checks only. Normal PRs exercise the
-same runner for ten seconds without adding a long-duration job.
-
-```sh
-pnpm test:performance:soak  # 30 minutes by default
-DSH_PERFORMANCE_SOAK_SECONDS=10 pnpm test:performance:soak  # local smoke test
-```
-
-Both reports are retained for seven days. Capacity and work limits fail the check;
+Performance reports are retained for seven days. Capacity and work limits fail the check;
 hardware-dependent timing/memory figures are observations without fixed thresholds.
 The agents and responses are synthetic, even in the real transport/database tests.
 Reports do not establish production capacity or leak freedom. Query plans are
 recorded rather than required to choose a particular index on a small fixture;
 MySQL/SQL Server performance, real image decoding and production-network behavior
 are not covered by these benchmarks.
+
+Real-model performance is collected by the existing [Integration workflow](.github/workflows/integration.yml).
+A CI-only `llm/stream` observer reuses the scenarios' existing calls, including
+retries, tool rounds and subagents. Each scenario's E2E artifact includes
+`model-performance.json`, with a summary in the job summary. The report groups by
+requested model/provider and purpose, retaining each attempt's outcome, stream
+duration, first-token latency, input/cache/output/reasoning token counts and
+observed output rate. No extra model requests are made.
+
+Times are measured at the dsh stream boundary, include consumer pacing and exclude
+profile startup and tool execution between calls. First-token detection includes
+non-empty text/reasoning and meaningful tool-call deltas. Output rate uses the
+provider's output-token count (reasoning is already included) divided by elapsed
+time from the first token to stream closure. Missing usage or token timestamps
+remain null; an early-cancelled scenario may have no observed calls. The observer
+records neither prompts, replies, arguments, headers, URLs nor credentials.
+These measurements are observations, without fixed gateway-latency thresholds.
 
 ## Current limitations
 
