@@ -195,7 +195,7 @@ async function benchmark(provider) {
           ready();
           await release;
         },
-        { timeout: 10_000 },
+        { timeout: 30_000 },
       );
       let writing;
       try {
@@ -222,6 +222,31 @@ async function benchmark(provider) {
         const independentAt = performance.now();
         assert.equal((await backend.readToolCallMessages(target, 'call-10'))[0]?.id, 'm10');
         const independentReadMs = performance.now() - independentAt;
+        writing = Promise.all([
+          writing,
+          ...Array.from({ length: 31 }, () =>
+            backend.upsertMessage({ ...row, content: 'updated' }),
+          ),
+        ]);
+        void writing.catch(() => {});
+        const poolDeadline = Date.now() + 5000;
+        let blockedConnections = 0;
+        while (Date.now() < poolDeadline) {
+          const rows = await client.$queryRawUnsafe(
+            "SELECT count(*)::int AS n FROM pg_stat_activity WHERE application_name='dsh_performance_backend' AND wait_event_type='Lock'",
+          );
+          blockedConnections = rows[0].n;
+          if (blockedConnections === 10) break;
+          await delay(10);
+        }
+        // The pinned pg pool defaults to ten: remaining writes must queue in the client.
+        assert.equal(
+          blockedConnections,
+          10,
+          '32 backend writes must saturate the actual backend pool',
+        );
+        pool.backendQueuedWrites = 32;
+        pool.backendBlockedConnections = blockedConnections;
         unlock();
         await Promise.all([writing, transaction]);
         lock = { waitAndReleaseMs: performance.now() - lockAt, independentReadMs };

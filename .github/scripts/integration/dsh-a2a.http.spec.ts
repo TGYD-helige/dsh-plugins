@@ -336,6 +336,137 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
     30_000,
   );
 
+  it.skipIf(process.env.DSH_PERFORMANCE_NETWORK !== 'true').each(['sse', 'grpc'])(
+    'performance: cancels running executors over %s',
+    async (transport) => {
+      await server.close();
+      const running = new Map<string, { contextId: string; release(): void }>();
+      server = await startA2aServer({
+        host: '127.0.0.1',
+        port: 0,
+        basePath: '/a2a',
+        grpc: { enabled: true, port: 0 },
+        card: { name: 'active-cancellation', description: '', version: '0.0.1' },
+        taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+        executor: {
+          async execute(request, bus) {
+            const waiting = new Promise<void>((release) => {
+              running.set(request.taskId, { contextId: request.contextId, release });
+            });
+            bus.publish(
+              AgentEvent.task(
+                Task.fromJSON({
+                  id: request.taskId,
+                  contextId: request.contextId,
+                  status: { state: 'TASK_STATE_WORKING' },
+                }),
+              ),
+            );
+            try {
+              await waiting;
+            } finally {
+              running.delete(request.taskId);
+              bus.finished();
+            }
+          },
+          async cancelTask(id, bus) {
+            const work = running.get(id);
+            if (!work) throw new Error('executor is not running');
+            bus.publish(
+              AgentEvent.statusUpdate({
+                taskId: id,
+                contextId: work.contextId,
+                status: {
+                  state: TaskState.TASK_STATE_CANCELED,
+                  message: undefined,
+                  timestamp: undefined,
+                },
+                metadata: undefined,
+              }),
+            );
+            work.release();
+          },
+        },
+      });
+      base = `http://127.0.0.1:${server.port}`;
+      const Client = makeGenericClientConstructor(A2AService, 'A2AService');
+      const client = new Client(`127.0.0.1:${server.grpcPort}`, credentials.createInsecure());
+      const metadata = new Metadata();
+      metadata.set('a2a-version', '1.0');
+      try {
+        const latencies = await Promise.all(
+          Array.from({ length: 32 }, async () => {
+            if (transport === 'grpc') {
+              const stream = client.sendStreamingMessage(
+                SendMessageRequest.fromJSON(v1Message('active')),
+                metadata,
+                { deadline: Date.now() + 10_000 },
+              );
+              const events: any[] = [];
+              stream.on('data', (event: unknown) => events.push(event));
+              const ended = new Promise<void>((resolve, reject) =>
+                stream.on('end', resolve).on('error', reject),
+              );
+              const first = await new Promise<any>((resolve, reject) =>
+                stream.once('data', resolve).once('error', reject),
+              );
+              expect(running.has(first.payload.value.id)).toBe(true);
+              const started = performance.now();
+              const task = await new Promise<any>((resolve, reject) =>
+                client.cancelTask(
+                  CancelTaskRequest.fromJSON({ id: first.payload.value.id }),
+                  metadata,
+                  { deadline: Date.now() + 10_000 },
+                  (error: Error | null, value: unknown) => (error ? reject(error) : resolve(value)),
+                ),
+              );
+              expect(task.status.state).toBe(TaskState.TASK_STATE_CANCELED);
+              await ended;
+              expect(events.at(-1).payload.value.status.state).toBe(TaskState.TASK_STATE_CANCELED);
+              return performance.now() - started;
+            }
+            const response = await rpc('SendStreamingMessage', v1Message('active'));
+            const reader = response.body!.getReader();
+            try {
+              let initial = '';
+              while (!initial.includes('\n\n')) {
+                const chunk = await reader.read();
+                expect(chunk.done).toBe(false);
+                initial += new TextDecoder().decode(chunk.value);
+              }
+              const id = JSON.parse(initial.split('\n\n')[0].slice(6)).result.task.id;
+              expect(running.has(id)).toBe(true);
+              const started = performance.now();
+              const result = await json(await rpc('CancelTask', { id }));
+              expect(result.result.status.state).toBe('TASK_STATE_CANCELED');
+              let wire = '';
+              for (;;) {
+                const chunk = await reader.read();
+                if (chunk.done) break;
+                wire += new TextDecoder().decode(chunk.value);
+              }
+              expect(wire).toContain('TASK_STATE_CANCELED');
+              return performance.now() - started;
+            } finally {
+              await reader.cancel();
+            }
+          }),
+        );
+        expect(running.size).toBe(0);
+        networkMetrics.push({
+          transport: `${transport}-active-cancel`,
+          concurrency: 32,
+          latenciesMs: latencies,
+        });
+        networkReport();
+      } finally {
+        for (const work of running.values()) work.release();
+        client.close();
+      }
+    },
+    30_000,
+  );
+
   it('shares task state between the official REST and JSON-RPC bindings', async () => {
     await server.close();
     server = await startA2aServer({

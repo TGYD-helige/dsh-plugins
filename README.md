@@ -198,9 +198,9 @@ against a loopback OTLP receiver in separate processes.
 | Slow exporters | 1,000 LLM calls while exports stall; pinned OTel queue/batch limits, failure/timeout handling and unload completion |
 | Large payloads | Up to 10,000 entries, 64-level JSON and split credentials; bounded traversal/bytes and preserved redaction on both adapters |
 | Policy scale | 10/1,000 candidate rules and 1,000 shell substitutions; one argument serialization and one args check per candidate, preserving deny decisions |
-| Protocol load | 64 requests each over HTTP, SSE and gRPC at concurrency 1/16/64; first-frame/request percentiles, throughput and event-loop delay; 32 concurrent subscription cancellations |
+| Protocol load | 64 requests each over HTTP, SSE and gRPC at concurrency 1/16/64; first-frame/request percentiles, throughput and event-loop delay; 32 concurrent subscription cancellations plus running-executor cancellation over SSE/gRPC |
 | Attachments/media | 24 MiB real chunked download, 64 MiB cap refusal and cancellation without leftover files; 128 images sharing a 4 MiB read budget, including ignored-read cancellation |
-| Real databases | 1,000/5,000 rows, oldest tool-call lookup, query plans, 32 concurrent reads and archive verification on SQLite/PostgreSQL; PostgreSQL additionally saturates a two-connection pool and verifies a row-lock wait does not block unrelated reads |
+| Real databases | 1,000/5,000 rows, oldest tool-call lookup, query plans, 32 concurrent reads and archive verification on SQLite/PostgreSQL; PostgreSQL additionally saturates a two-connection fixture pool and the actual backend pool with 32 locked writes, and verifies a single row-lock wait leaves other reads available |
 | Combined plugins | A2A alone versus A2A + Storage + Telemetry + Policy over real HTTP/SQLite/OTLP, with eight warmup tasks and 64 measured tasks at concurrency eight; verifies policy rejection, all 144 message rows and 72 exported generations |
 
 `performance-results.json` records unit-test outcomes and durations.
