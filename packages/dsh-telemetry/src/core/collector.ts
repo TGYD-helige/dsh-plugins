@@ -1068,7 +1068,7 @@ export function collect(
     if (event.type === 'turn/end' || event.type === 'turn/start') toolCalls.delete(sessionId);
     if (event.type === 'turn/end') closeHooks(sessionId, true);
     const child = children.get(sessionId);
-    if (child) {
+    if (child && !event.type.startsWith('compaction/')) {
       if (event.type === 'turn/start') child.turn = event.data.turn;
       if (event.type === 'turn/end') {
         rememberTurn(sessionId, event.data.turn, child.span, child.turnTrace ?? null);

@@ -391,12 +391,32 @@ it.each([true, false])(
   },
 );
 
-it.each([true, false])(
-  'records compaction lifecycle without double-counting llmStreamCall=%s',
-  async (llmStreamCall) => {
+it.each([
+  [true, false],
+  [false, false],
+  [true, true],
+  [false, true],
+])(
+  'records compaction lifecycle without double-counting llmStreamCall=%s child=%s',
+  async (llmStreamCall, child) => {
     const ctx = new Context();
     await apply(ctx, Config({ enabled: true, backend: 'phoenix', captureContent: true }));
-    const session = { id: 'summary-session', header: { id: 'summary-session' } } as never;
+    const session = {
+      id: 'summary-session',
+      header: {
+        id: 'summary-session',
+        ...(child ? { parentSession: 'parent', origin: 'subagent', delegationDepth: 1 } : {}),
+      },
+    } as never;
+    if (child) {
+      ctx.emit('session/created', session);
+      ctx.emit('subagent/start', {
+        runId: 'run-summary',
+        provider: 'spawn',
+        id: 'summary-session',
+        local: true,
+      } as never);
+    }
     let seq = 0;
     const event = (type: string, data: unknown) =>
       ctx.emit('session/event', session, { type, seq: ++seq, time: Date.now(), data } as never);
