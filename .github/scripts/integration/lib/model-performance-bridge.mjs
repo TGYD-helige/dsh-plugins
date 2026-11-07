@@ -80,6 +80,7 @@ export function apply(ctx) {
         outcome = options.signal?.aborted ? 'aborted' : 'error';
         throw error;
       } finally {
+        if (!finished && options.signal?.aborted) outcome = 'aborted';
         record();
       }
     })();

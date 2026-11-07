@@ -156,6 +156,41 @@ test('model performance preserves synchronous errors, stream errors, cancellatio
   assert.ok(!JSON.stringify(rows).includes(error.message));
 });
 
+test('model performance records consumer-side cancellation and closes the source', async (t) => {
+  const { ctx, records } = await modelPerformanceFixture(t);
+  const error = new Error('consumer-cancelled');
+  for (const finished of [false, true]) {
+    const abort = new AbortController();
+    let closed = false;
+    await assert.rejects(
+      async () => {
+        for await (const _ of ctx.waterfall(
+          'llm/stream',
+          { signal: abort.signal },
+          async function* () {
+            try {
+              abort.abort(error);
+              yield finished
+                ? { type: 'finish', reason: { kind: 'stop' } }
+                : { type: 'text-delta', index: 0, text: 'private' };
+            } finally {
+              closed = true;
+            }
+          },
+        )) {
+          abort.signal.throwIfAborted();
+        }
+      },
+      (received) => received === error,
+    );
+    assert.equal(closed, true);
+  }
+  assert.deepEqual(
+    records().map((row) => row.outcome),
+    ['aborted', 'stop'],
+  );
+});
+
 test('model performance isolates concurrent calls and recognizes tool-name tokens', async (t) => {
   const { ctx, records } = await modelPerformanceFixture(t);
   let release;
