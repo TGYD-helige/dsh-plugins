@@ -46,9 +46,11 @@ function map(data: ObservationData): Attributes {
   if (data.tags?.length) attributes['tag.tags'] = data.tags;
   set('llm.model_name', data.model);
   set('llm.system', data.provider);
+  set('llm.provider', data.provider);
   set('llm.invocation_parameters', data.modelParameters);
   if (data.kind === 'tool') {
-    set('tool.name', data.name);
+    set('tool.name', data.metadata?.toolName ?? data.name);
+    set('tool.id', data.metadata?.callId);
     set('tool.parameters', data.input);
   }
   if (data.usage) {

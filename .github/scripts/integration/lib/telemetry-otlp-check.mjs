@@ -86,6 +86,7 @@ try {
       const child = reporter.startGeneration(parent, {
         name: 'llm',
         model: 'test',
+        startTime: new Date('2026-01-01T00:00:00Z'),
         input: {
           messages: [
             {
@@ -100,6 +101,7 @@ try {
       });
       reporter.endGeneration(child, {
         output: 'world',
+        completionStartTime: new Date('2026-01-01T00:00:00.250Z'),
         usage: { inputTokens: 2, outputTokens: 3 },
         level: 'ERROR',
       });
@@ -140,6 +142,9 @@ try {
       assert.equal(spans.length, 2);
       const llm = spans.find((s) => s.name === 'llm');
       const turn = spans.find((s) => s.name === 'turn');
+      assert.equal(llm.events.length, 1);
+      assert.equal(llm.events[0].name, 'first_token');
+      assert.equal(llm.events[0].timeUnixNano, '1767225600250000000');
       assert.equal(
         Buffer.from(turn.traceId).toString('hex'),
         taskRoot ? '33333333333333333333333333333333' : '11111111111111111111111111111111',

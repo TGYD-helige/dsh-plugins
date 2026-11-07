@@ -289,6 +289,8 @@ export class TelemetryReporter implements InstrumentationReporter {
     try {
       observation.span.updateName(this.mask(observation.data.name ?? 'span'));
       observation.span.setAttributes(this.attributes(observation.data));
+      if (observation.data.kind === 'generation' && observation.data.completionStartTime)
+        observation.span.addEvent('first_token', observation.data.completionStartTime);
       observation.span.setStatus({
         code: observation.data.level === 'ERROR' ? 2 : observation.data.level === 'WARNING' ? 0 : 1,
         message: this.config.captureContent ? this.mask(observation.data.statusMessage) : undefined,

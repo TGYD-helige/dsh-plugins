@@ -35,6 +35,7 @@ export function phoenixObservation(span) {
     sessionId: attr('session.id'),
     spanKind: kind,
     attributes,
+    events: span.events ?? [],
     statusCode: span.status_code,
     startTime: span.start_time,
     endTime: span.end_time,
@@ -150,7 +151,31 @@ export function evaluatePhoenixSemantics(observations) {
               : undefined;
     if (expectedKind && span.spanKind !== expectedKind)
       problems.push(`${span.name} must have OpenInference kind ${expectedKind}`);
+    if (span.type === 'TOOL') {
+      if (span.attributes['tool.name'] !== span.metadata?.toolName || !span.metadata?.toolName)
+        problems.push('missing clean tool name');
+      if (span.attributes['tool.id'] !== span.metadata?.callId || !span.metadata?.callId)
+        problems.push('missing tool call ID');
+    }
     if (span.type !== 'GENERATION') continue;
+    if (
+      span.metadata?.source !== 'compaction/summary' &&
+      span.output &&
+      (typeof span.output === 'string' ||
+        span.output.content ||
+        span.output.thinking?.length ||
+        span.output.tool_calls?.length)
+    ) {
+      const firstTokens = (span.events ?? []).filter((event) => event.name === 'first_token');
+      const at = Date.parse(firstTokens[0]?.timestamp);
+      if (
+        firstTokens.length !== 1 ||
+        !Number.isFinite(at) ||
+        at < Date.parse(span.startTime) ||
+        at > Date.parse(span.endTime)
+      )
+        problems.push('missing or invalid first token event');
+    }
     const attributes = span.attributes;
     if (span.input?.provider && attributes['llm.system'] !== span.input.provider)
       problems.push('missing LLM system/provider');

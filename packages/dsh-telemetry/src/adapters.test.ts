@@ -163,3 +163,13 @@ it('emits the provider and typed reasoning parts required by OpenInference', () 
     'llm.output_messages.0.message.contents.0.message_content.type': 'reasoning',
   });
 });
+
+it('keeps clean tool identity separate from the readable tree label', () => {
+  expect(
+    adapt('phoenix', {
+      kind: 'tool',
+      name: 'tool:read [/tmp/a]',
+      metadata: { toolName: 'read', callId: 'call-1' },
+    }),
+  ).toMatchObject({ 'tool.name': 'read', 'tool.id': 'call-1' });
+});

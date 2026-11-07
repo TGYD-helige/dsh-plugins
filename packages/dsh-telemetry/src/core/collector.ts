@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Context, Events } from '@deepseek-ai/cordis';
+import type {} from '@deepseek-ai/dsh-compaction';
 import type {
   ContentBlock,
   FinishReason,
@@ -416,8 +417,18 @@ export function collect(
     (result: Parameters<Events['tools/result']>[1]) => void
   >();
   const openHooks = new Map<string, Map<string, HookObservation>>();
-  const openOperations = new Set<() => void>();
-  const operationSessions = new Map<() => void, string | undefined>();
+  const compactions = new Map<
+    string,
+    {
+      id: string;
+      span: ObservationHandle;
+      startTime: Date;
+      finish: (update?: Parameters<InstrumentationReporter['endSpan']>[1], at?: Date) => void;
+    }
+  >();
+  type LifecycleEnd = 'session_disposed' | 'plugin_unloaded';
+  const openOperations = new Set<(reason?: LifecycleEnd) => void>();
+  const operationSessions = new Map<(reason?: LifecycleEnd) => void, string | undefined>();
   const traceContexts = new Map<string, TraceContext>();
   type Handle =
     | NonNullable<ObservationHandle>
@@ -1081,6 +1092,107 @@ export function collect(
       return;
     }
     switch (event.type) {
+      case 'compaction/start': {
+        compactions.get(sessionId)?.finish();
+        const standalone =
+          event.data.turn === null && !sessions.has(sessionId) && !children.has(sessionId);
+        const parent = parentFor(sessionId);
+        const root = standalone ? sessions.get(sessionId) : undefined;
+        const startTime = new Date(event.time);
+        const span = reporter.startSpan(parent, {
+          name: 'compaction',
+          startTime,
+          metadata: {
+            compactionId: event.data.compactionId,
+            sourceCommandId: event.data.sourceCommandId,
+          },
+        });
+        const close = (terminatedBy: LifecycleEnd = 'plugin_unloaded') =>
+          finish({ level: 'WARNING', metadata: { terminatedBy } });
+        const finish = (
+          update: Parameters<InstrumentationReporter['endSpan']>[1] = {
+            level: 'WARNING',
+            metadata: { terminatedBy: 'superseded' },
+          },
+          at = new Date(),
+        ) => {
+          compactions.delete(sessionId);
+          openOperations.delete(close);
+          operationSessions.delete(close);
+          reporter.endSpan(span, update, at);
+          if (root && sessions.get(sessionId) === root) {
+            sessions.delete(sessionId);
+            endTurn(root, update, at);
+          }
+        };
+        compactions.set(sessionId, { id: event.data.compactionId, span, startTime, finish });
+        openOperations.add(close);
+        operationSessions.set(close, sessionId);
+        break;
+      }
+      case 'compaction/summary': {
+        const entry = compactions.get(sessionId);
+        if (!entry || entry.id !== event.data.compactionId) break;
+        const output = config.captureContent
+          ? boundPayload(
+              event.data.summary,
+              newPayloadBudget(config.maxPayloadBytes ?? 256 * 1024),
+              reporter,
+            )
+          : undefined;
+        reporter.updateSpan(entry.span, {
+          output,
+          metadata: {
+            model: event.data.model,
+            provider: event.data.provider,
+            shadowedRange: event.data.shadowedRange,
+            shadowedTokenCount: event.data.shadowedTokenCount,
+          },
+        });
+        // The producer identifies calls already captured by llm/stream; count only external calls here.
+        if (!event.data.llmStreamCall) {
+          const generation = reporter.startGeneration(entry.span, {
+            name: 'llm-call [compaction]',
+            model: event.data.model,
+            provider: event.data.provider,
+            startTime: entry.startTime,
+            metadata: { purpose: 'compaction', source: 'compaction/summary' },
+          });
+          reporter.endGeneration(
+            generation,
+            {
+              output:
+                config.captureContent && event.data.rawOutput
+                  ? boundPayload(
+                      event.data.rawOutput,
+                      newPayloadBudget(config.maxPayloadBytes ?? 256 * 1024),
+                      reporter,
+                    )
+                  : output,
+              usage: event.data.usage,
+            },
+            new Date(event.time),
+          );
+        }
+        break;
+      }
+      case 'compaction/end': {
+        const entry = compactions.get(sessionId);
+        if (entry?.id === event.data.compactionId) {
+          if (event.data.error) noteError(sessionId);
+          entry.finish(
+            {
+              level: event.data.error ? 'ERROR' : 'DEFAULT',
+              statusMessage: event.data.error
+                ? contentMessage(config, event.data.error)
+                : undefined,
+              metadata: { endReason: event.data.error ? 'error' : 'completed' },
+            },
+            new Date(event.time),
+          );
+        }
+        break;
+      }
       case 'turn/start': {
         // A leftover entry is either a between-turns one-off trace or a turn
         // whose `turn/end` was never seen (crash-orphaned): end and replace
@@ -1088,7 +1200,12 @@ export function collect(
         // keep what it already recorded.
         closeHooks(sessionId, true);
         const stale = sessions.get(sessionId);
-        if (stale) endTurn(stale);
+        if (stale)
+          endTurn(stale, {
+            output: stale.lastAssistantText,
+            level: 'WARNING',
+            metadata: { terminatedBy: 'superseded' },
+          });
         inboxInputs.delete(sessionId);
         sessions.delete(sessionId);
         pendingTurns.set(sessionId, {
@@ -1161,7 +1278,7 @@ export function collect(
   ctx.on('session/disposed', (session) => {
     const sessionId: string = session.id;
     for (const close of [...openOperations]) {
-      if (operationSessions.get(close) === sessionId) close();
+      if (operationSessions.get(close) === sessionId) close('session_disposed');
     }
     const child = children.get(sessionId);
     if (child && !child.started) {
@@ -1190,7 +1307,12 @@ export function collect(
     // End an abandoned root (crash-orphaned turn or between-turns one-off
     // trace) — v5 spans only export on end, so dropping it open would lose
     // everything it recorded.
-    if (state) endTurn(state);
+    if (state)
+      endTurn(state, {
+        output: state.lastAssistantText,
+        level: 'WARNING',
+        metadata: { terminatedBy: 'session_disposed' },
+      });
     suspendTasks(sessionId);
     // Children: keep the entry — background/continuable subagents dispose
     // their session BEFORE subagent/end fires, and the span's close must ride
@@ -1205,7 +1327,10 @@ export function collect(
   // must not be async — it returns an async-generator tee instead.
   // ------------------------------------------------------------------
   ctx.on('llm/stream', (options, next) => {
-    const parent = parentFor(options.sessionId);
+    const parent =
+      (options.purpose === 'compaction' && options.sessionId
+        ? compactions.get(options.sessionId)?.span
+        : undefined) ?? parentFor(options.sessionId);
     // A session-less call's trace root has no session lifecycle to close it
     // (it is never cached in `sessions`), so it rides this call's: un-ended
     // spans never export in v5 — end it when the call settles.
@@ -1224,7 +1349,11 @@ export function collect(
       provider: options.provider,
       input,
       modelParameters,
-      metadata: { purpose: options.purpose },
+      metadata: {
+        purpose: options.purpose,
+        requestedModel: options.model,
+        requestedProvider: options.provider,
+      },
     });
     if (
       generation &&
@@ -1278,6 +1407,7 @@ export function collect(
     }> = [];
     let usage: TokenUsage | undefined;
     let finish: FinishReason | undefined;
+    let providerResponse: unknown;
     let completionStartTime: Date | undefined;
     let thrownMessage: string | undefined;
     const outputBody = () =>
@@ -1292,7 +1422,7 @@ export function collect(
           : text || undefined
         : undefined;
     let closed = false;
-    const closeCall = () => {
+    const closeCall = (terminatedBy?: LifecycleEnd) => {
       if (closed) return;
       closed = true;
       const endedAt = new Date();
@@ -1362,8 +1492,10 @@ export function collect(
               statusMessage,
               metadata: {
                 finishReason: finish?.kind,
+                providerResponse,
                 errorCode: failure?.failure?.code,
                 incomplete: finish ? undefined : true,
+                terminatedBy,
                 toolCallCount: toolCallCount > 0 ? toolCallCount : undefined,
                 truncated:
                   requestBudget.truncated ||
@@ -1452,6 +1584,13 @@ export function collect(
               break;
             case 'finish':
               finish = chunk.reason;
+              // Adapter-owned response facts stay opaque; never guess a served model from a route.
+              if (config.captureContent && chunk.replayState)
+                providerResponse = boundPayload(
+                  chunk.replayState.response,
+                  newPayloadBudget(maxPayloadBytes),
+                  reporter,
+                );
               break;
           }
           yield chunk;
@@ -1505,8 +1644,15 @@ export function collect(
         toolCalls.set(sessionId, calls);
       }
       let closed = false;
-      const closeTool = () =>
-        finishTool({ level: 'WARNING', statusMessage: 'plugin unloaded during tool call' });
+      const closeTool = (terminatedBy: LifecycleEnd = 'plugin_unloaded') =>
+        finishTool({
+          level: 'WARNING',
+          statusMessage:
+            terminatedBy === 'session_disposed'
+              ? 'session disposed during tool call'
+              : 'plugin unloaded during tool call',
+          metadata: { terminatedBy },
+        });
       function finishTool(
         update: NonNullable<Parameters<InstrumentationReporter['endSpan']>[1]>,
         display?: Promise<unknown>,
@@ -1608,16 +1754,30 @@ export function collect(
   ctx.effect(() => {
     return async () => {
       const endedAt = new Date();
-      for (const close of openOperations) close();
+      for (const close of openOperations) close('plugin_unloaded');
       for (const sessionId of openHooks.keys()) closeHooks(sessionId);
       await drainMedia();
       // End every tracked observation still open before shutting the exporter
       // down — v5 spans only export on end, so unloading mid-turn (profile
       // reload) would otherwise silently drop them.
-      for (const state of sessions.values()) endTurn(state, {}, endedAt);
+      for (const state of sessions.values())
+        endTurn(
+          state,
+          {
+            output: state.lastAssistantText,
+            level: 'WARNING',
+            metadata: { terminatedBy: 'plugin_unloaded' },
+          },
+          endedAt,
+        );
       suspendTasks();
       await drainMedia();
-      for (const child of children.values()) reporter.endSpan(child.span, {}, endedAt);
+      for (const child of children.values())
+        reporter.endSpan(
+          child.span,
+          { level: 'WARNING', metadata: { terminatedBy: 'plugin_unloaded' } },
+          endedAt,
+        );
       sessions.clear();
       pendingTurns.clear();
       nativeInboxes.clear();
