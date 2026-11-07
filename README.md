@@ -186,16 +186,6 @@ The hard limits are queue size, database calls, capture work and payload bytes;
 test durations are retained in `performance-results.json` as a 7-day CI artifact.
 These checks do not establish production latency, throughput or heap usage.
 
-Every published plugin must retain unit tests and a discoverable integration
-scenario. Full Integration runs finish with **Integration gate**: all required
-jobs must succeed, including live-model and database legs. Failure, cancellation,
-an unexpected skip or an empty matrix fails the gate. Targeted manual scenario
-runs do not satisfy it. The gate publishes **Integration required** on the tested
-PR head SHA, since `pull_request_target` checks themselves belong to the base SHA.
-For main protection, require **Lint**, **Typecheck, Build & Test**,
-**Performance budgets** and **Integration required** from GitHub Actions.
-Enable newly introduced requirements after their workflows are available on main.
-
 ## Current limitations
 
 - All plugins are disabled by default; enable and configure each explicitly in the profile.
