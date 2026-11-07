@@ -1,7 +1,37 @@
 import { Context } from '@deepseek-ai/cordis';
 import type { Session } from '@deepseek-ai/dsh-session';
-import { expect, it, vi } from 'vitest';
+import { expect, it, onTestFinished, vi } from 'vitest';
 import { InboxChanges } from './inbox-changes.js';
+
+it.each([10, 1000])('shares checkpoints across %i subscribers and releases them', async (count) => {
+  const ctx = new Context();
+  onTestFinished(() => ctx.fiber.dispose());
+  const flush = vi.fn(async () => true);
+  ctx.provide('sessions', { flush } as never);
+  const changes = new InboxChanges(ctx, () => true);
+  const seen = vi.fn();
+  const closed = vi.fn();
+  const sessions = Array.from(
+    { length: 8 },
+    (_, index) => ({ id: `c${index}`, seq: 1 }) as Session,
+  );
+  for (const session of sessions) {
+    for (let i = 0; i < count; i++) changes.watch(session, () => seen(session.id), closed);
+  }
+  await Promise.all(
+    sessions.flatMap((session) => Array.from({ length: 100 }, () => changes.checkpoint(session))),
+  );
+  expect(flush).toHaveBeenCalledTimes(8);
+  expect(seen).toHaveBeenCalledTimes(count * 8);
+  for (const session of sessions) ctx.emit('session/disposed', session);
+  expect(closed).toHaveBeenCalledTimes(count * 8);
+  await Promise.all(
+    sessions.map((session) => expect(changes.checkpoint(session)).rejects.toThrow()),
+  );
+  changes.close();
+  expect(closed).toHaveBeenCalledTimes(count * 8);
+  expect(flush).toHaveBeenCalledTimes(8);
+});
 
 it.each([0, 1, 2, 3, 4])(
   'publishes changes arriving while a checkpoint job completes (%s microtasks)',

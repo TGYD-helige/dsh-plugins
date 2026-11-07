@@ -32,6 +32,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: performance-results
-          path: performance-results.json
+          path: |
+            performance-results.json
+            performance-metrics.json
           if-no-files-found: error
           retention-days: 7

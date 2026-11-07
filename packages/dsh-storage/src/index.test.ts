@@ -967,6 +967,52 @@ describe('dsh-storage plugin', () => {
     expect(flushedWhileBWasBlocked).toBe(true);
   });
 
+  it('drains a blocked burst in order without blocking other sessions', async () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    onTestFinished(async () => {
+      release();
+      await ctx.fiber.dispose();
+    });
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const written: string[] = [];
+    backend.upsertMessage.mockImplementation(async (row: any) => {
+      if (row.sessionId === 'slow') await blocked;
+      written.push(`${row.sessionId}:${row.id}`);
+    });
+    const slow = { id: 'slow' };
+    for (let index = 0; index < 512; index++)
+      ctx.events.emit('session/event', slow, userEvent('burst', `m${index}`));
+    const fast = Array.from({ length: 16 }, (_, index) => ({ id: `fast-${index}` }));
+    for (const session of fast) ctx.events.emit('session/event', session, userEvent('ready'));
+    let drained = false;
+    const pending = ctx.events.parallel('session/flush', slow).then(() => {
+      drained = true;
+    });
+    await Promise.all(fast.map((session) => ctx.events.parallel('session/flush', session)));
+    expect(drained).toBe(false);
+    expect(written).toHaveLength(16);
+    expect(backend.readSession).toHaveBeenCalledTimes(17);
+    release();
+    await pending;
+    expect(written.filter((id) => id.startsWith('slow:'))).toEqual(
+      Array.from({ length: 512 }, (_, index) => `slow:m${index}`),
+    );
+    expect(backend.upsertMessage).toHaveBeenCalledTimes(528);
+    expect(backend.readMessages).toHaveBeenCalledTimes(528);
+    expect(backend.readMessages.mock.calls.every((args: unknown[]) => args.length === 2)).toBe(
+      true,
+    );
+    expect(backend.readToolCallMessages).not.toHaveBeenCalled();
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0]).toMatchObject({
+      sessionId: 'slow',
+      messageCount: 512,
+    });
+  });
+
   it('seeds the rollup from the stored session row on resume', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];

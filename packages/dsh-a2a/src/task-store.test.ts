@@ -7,7 +7,7 @@ import {
   TaskState,
 } from '@a2a-js/sdk';
 import { ServerCallContext } from '@a2a-js/sdk/server';
-import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, type Mock, onTestFinished, vi } from 'vitest';
 import { listShells, MemoryTaskStore, SanitizedTaskStore, sanitizeTask } from './task-store.js';
 
 const mocks = vi.hoisted(() => {
@@ -806,6 +806,42 @@ for (const backend of ['redis', 'gcs'] as const) {
       backend === 'redis'
         ? new RedisTaskStore({ url: 'redis://example:6379' })
         : new GcsTaskStore({ bucket: 'test' });
+
+    it.each([100, 1000])('bounds list and recovery I/O for %i large snapshots', async (count) => {
+      const store = create();
+      if (store instanceof RedisTaskStore) onTestFinished(() => store.close());
+      await store.init();
+      for (let index = 0; index < count; index++)
+        await store.save(
+          task(index % 2 === 0 ? TaskState.TASK_STATE_WORKING : TaskState.TASK_STATE_COMPLETED, {
+            id: `large-${index}`,
+            contextId: `c${index % 10}`,
+            metadata: { payload: 'x'.repeat(32_768) },
+          }),
+          ctx,
+        );
+      const restored = create();
+      if (restored instanceof RedisTaskStore) onTestFinished(() => restored.close());
+      await restored.init();
+      gcs.activity.downloads.length = 0;
+      gcs.activity.maxActive = 0;
+      const page = await restored.list(listParams({ pageSize: 7 }), ctx);
+      expect(page.totalSize).toBe(count);
+      expect(page.tasks).toHaveLength(7);
+      expect(new Set(page.tasks.map((item) => item.id)).size).toBe(7);
+      expect(page.tasks.every((item) => item.metadata?.payload === 'x'.repeat(32_768))).toBe(true);
+      expect(await restored.recoveryCandidates(ctx)).toEqual(['c0', 'c2', 'c4', 'c6', 'c8']);
+      if (backend === 'redis') {
+        const calls = mocks.MockRedis.instances[1].calls;
+        expect(calls.mgetKeys.flat()).toHaveLength(7);
+        expect(calls.ranges).toHaveLength(count * 2);
+        expect(calls.ranges.every(([, start, end]) => start === 0 && end === 8191)).toBe(true);
+        expect(calls.get).toHaveLength(0);
+      } else {
+        expect(gcs.activity.downloads).toHaveLength(7);
+        expect(gcs.activity.maxActive).toBeLessThanOrEqual(16);
+      }
+    });
 
     it('rejects discovery before backend initialization', async () => {
       await expect(create().recoveryCandidates(ctx)).rejects.toThrow('not initialized');

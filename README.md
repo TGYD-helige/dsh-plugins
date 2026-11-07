@@ -179,12 +179,34 @@ pnpm test         # vitest (packages with a test script)
 pnpm test:performance  # deterministic budgets + JSON results; no credentials
 ```
 
-The [Performance workflow](.github/workflows/performance.yml) runs the **Performance budgets** check. Its focused test modules cover
-slow-consumer backlog at 100 and 10,000 frames, storage batching at up to 1,024
-tool results, and eight concurrent telemetry streams at 256 and 16,384 chunks.
-The hard limits are queue size, database calls, capture work and payload bytes;
-test durations are retained in `performance-results.json` as a 7-day CI artifact.
-These checks do not establish production latency, throughput or heap usage.
+The [Performance workflow](.github/workflows/performance.yml) runs the **Performance
+budgets** check without model or backend credentials. It reuses focused unit-test
+modules with mocked backends, then benchmarks the real telemetry plugin/exporter
+against a loopback OTLP receiver in separate processes.
+
+| Area | Workload and checks |
+| --- | --- |
+| Slow consumers | 100/10,000 frames in byte/object streams; bounded backlog and listener cleanup |
+| Task discovery | 100/1,000 large Redis/GCS snapshots; bounded prefix reads, page-only hydration, recovery without full downloads, GCS concurrency |
+| Subscriptions | 10/1,000 subscribers per context across eight contexts; shared checkpoints and disposal cleanup |
+| Storage | Up to 1,024 tool results; bounded batching and cache lookups; a 512-message blocked burst alongside 16 other sessions; paginated SQL lookup/archive |
+| Telemetry streams | Eight concurrent 256/16,384-chunk streams; bounded serialization/masking and unchanged delivery |
+| Lifecycle | 32 plugin lifecycles with 32 sessions each; no leftover fake-clock timers or late event handling |
+| Slow exporters | 1,000 LLM calls while exports stall; pinned OTel queue/batch limits, failure/timeout handling and unload completion |
+| Large payloads | Up to 10,000 entries, 64-level JSON and split credentials; bounded traversal/bytes and preserved redaction on both adapters |
+
+`performance-results.json` records unit-test outcomes and durations.
+`performance-metrics.json` compares disabled telemetry with content capture off/on
+for both Phoenix and Langfuse. Each mode runs in a fresh Node process: 16 warmup
+turns, then five samples of 64 turns with 128 chunks each. The report includes
+startup, streaming, flush and shutdown time, CPU usage, turns/second, sampled heap,
+post-GC retained heap growth, process peak RSS and ratios against disabled mode.
+The receiver runs outside the measured worker, so its CPU is excluded.
+
+Both reports are retained for seven days. Capacity and work limits fail the check;
+hardware-dependent timing/memory figures are observations without fixed thresholds.
+The synthetic workload and mocked backend tests do not establish production
+latency, throughput, database performance or a long-duration memory-leak guarantee.
 
 ## Current limitations
 

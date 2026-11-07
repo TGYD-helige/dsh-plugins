@@ -15,7 +15,7 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "test:otlp": "pnpm --filter @amaster.ai/dsh-telemetry... build && node .github/scripts/integration/lib/telemetry-otlp-check.mjs",
-    "test:performance": "vitest run packages/dsh-a2a/src/stream-connection.test.ts packages/dsh-storage/src/index.test.ts packages/dsh-telemetry/src/reporter.test.ts packages/dsh-telemetry/src/core/payload.test.ts --reporter=default --reporter=json --outputFile=performance-results.json"
+    "test:performance": "pnpm --filter @amaster.ai/dsh-telemetry build && vitest run packages/dsh-a2a/src/stream-connection.test.ts packages/dsh-storage/src/index.test.ts packages/dsh-telemetry/src/reporter.test.ts packages/dsh-telemetry/src/core/payload.test.ts packages/dsh-a2a/src/task-store.test.ts packages/dsh-a2a/src/inbox-changes.test.ts packages/dsh-storage/src/backends/database.test.ts packages/dsh-langfuse/src/index.test.ts --reporter=default --reporter=json --outputFile=performance-results.json && node .github/scripts/integration/lib/performance-overhead.mjs"
   },
   "devDependencies": {
     "typescript": "^5.6.3",

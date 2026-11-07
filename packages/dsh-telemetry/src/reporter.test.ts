@@ -7,6 +7,9 @@ import { apply, Config } from './index.js';
 
 const state = vi.hoisted(() => ({
   fail: false,
+  hold: false,
+  pending: [] as Array<(result: { code: number; error?: Error }) => void>,
+  batches: [] as number[],
   spans: [] as Array<{
     name: string;
     attributes: Record<string, unknown>;
@@ -22,6 +25,11 @@ vi.mock('@opentelemetry/exporter-trace-otlp-proto', () => ({
   OTLPTraceExporter: class {
     export(spans: typeof state.spans, callback: (result: { code: number; error?: Error }) => void) {
       state.spans.push(...spans);
+      state.batches.push(spans.length);
+      if (state.hold) {
+        state.pending.push(callback);
+        return;
+      }
       callback(
         state.fail
           ? { code: 1, error: Object.assign(new Error('private-export-response'), { code: 401 }) }
@@ -35,7 +43,11 @@ vi.mock('@opentelemetry/exporter-trace-otlp-proto', () => ({
 afterEach(() => {
   state.spans.length = 0;
   state.fail = false;
+  state.hold = false;
+  state.pending.splice(0).forEach((callback) => callback({ code: 0 }));
+  state.batches.length = 0;
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 describe('shared isolated OTel pipeline', () => {
   it.each(['phoenix', 'langfuse'] as const)(
@@ -219,6 +231,186 @@ it.each([256, 16_384])(
         truncated: true,
       });
       expect(Buffer.byteLength(String(span.attributes['output.value']))).toBeLessThanOrEqual(1024);
+    }
+  },
+);
+
+it.each(['phoenix', 'langfuse'] as const)(
+  'redacts fragmented credentials in large requests and streams on %s',
+  async (backend) => {
+    const ctx = new Context();
+    onTestFinished(() => ctx.fiber.dispose());
+    const secret = 'perf-credential-value';
+    await apply(
+      ctx,
+      Config({
+        enabled: true,
+        backend,
+        apiKey: secret,
+        publicKey: 'pk-fixture',
+        secretKey: secret,
+        maxPayloadBytes: 1024,
+        redactFields: ['password'],
+      }),
+    );
+    const pieces = ['perf-', 'credential-', 'value'];
+    const input = {
+      provider: 'test',
+      model: 'test',
+      messages: Array.from({ length: 1000 }, () => ({
+        role: 'user',
+        content: [
+          { type: 'text', text: JSON.stringify({ password: 'private-field', token: secret }) },
+        ],
+      })),
+      tools: Array.from({ length: 100 }, (_, index) => ({
+        name: `tool-${index}`,
+        description: secret,
+        parameters: { type: 'object' },
+      })),
+    };
+    let received = 0;
+    for await (const _ of ctx.waterfall('llm/stream', input as never, async function* () {
+      for (let repeat = 0; repeat < 32; repeat++)
+        for (const text of pieces) yield { type: 'text-delta', index: 0, text } as never;
+      yield { type: 'finish', reason: { kind: 'stop' } } as never;
+    }))
+      received++;
+    expect(received).toBe(97);
+    await ctx.fiber.dispose();
+    const wire = JSON.stringify(state.spans.map((span) => span.attributes));
+    expect(wire).not.toContain(secret);
+    expect(wire).not.toContain('private-field');
+    expect(wire).toContain('[REDACTED]');
+    const generation = state.spans.find(
+      (span) =>
+        span.attributes['openinference.span.kind'] === 'LLM' ||
+        span.attributes['langfuse.observation.type'] === 'generation',
+    );
+    expect(generation).toBeDefined();
+    for (const span of state.spans)
+      for (const key of [
+        'input.value',
+        'output.value',
+        'langfuse.observation.input',
+        'langfuse.observation.output',
+      ]) {
+        const value = span.attributes[key];
+        if (value !== undefined) expect(Buffer.byteLength(String(value))).toBeLessThanOrEqual(1024);
+      }
+    expect(input.messages[0].content[0].text).toContain(secret);
+  },
+);
+
+it('releases timers and event listeners across repeated plugin lifecycles', async () => {
+  vi.useFakeTimers();
+  for (let cycle = 0; cycle < 32; cycle++) {
+    const ctx = new Context();
+    await apply(ctx, Config({ enabled: true, backend: 'phoenix' }));
+    try {
+      for (let index = 0; index < 32; index++) {
+        const session = { id: `session-${index}`, header: { id: `session-${index}` } } as never;
+        ctx.emit('telemetry/context', `session-${index}`, { metadata: { cycle } });
+        ctx.emit('session/event', session, {
+          type: 'turn/start',
+          seq: 1,
+          time: Date.now(),
+          data: { turn: 0 },
+        } as never);
+        ctx.emit('session/event', session, {
+          type: 'user/message',
+          seq: 2,
+          time: Date.now(),
+          data: { role: 'user', content: [{ type: 'text', text: 'lifecycle' }] },
+        } as never);
+        ctx.emit('session/disposed', session);
+      }
+    } finally {
+      await ctx.fiber.dispose();
+    }
+    expect(vi.getTimerCount()).toBe(0);
+    const before = state.spans.length;
+    ctx.emit(
+      'session/event',
+      { id: 'late' } as never,
+      {
+        type: 'turn/start',
+        seq: 1,
+        time: Date.now(),
+        data: { turn: 0 },
+      } as never,
+    );
+    ctx.emit(
+      'session/event',
+      { id: 'late' } as never,
+      {
+        type: 'user/message',
+        seq: 2,
+        time: Date.now(),
+        data: { role: 'user', content: [{ type: 'text', text: 'late' }] },
+      } as never,
+    );
+    await ctx.parallel('session/flush', { id: 'late' } as never);
+    expect(state.spans).toHaveLength(before);
+  }
+  expect(state.spans).toHaveLength(1024);
+  expect(new Set(state.spans.map((span) => span.spanContext().spanId)).size).toBe(1024);
+});
+
+it.each(['release', 'failure', 'timeout'])(
+  'bounds exporter backlog and keeps streaming during %s',
+  async (outcome) => {
+    vi.useFakeTimers();
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const ctx = new Context();
+    await apply(ctx, Config({ enabled: true, backend: 'phoenix', captureContent: false }));
+    state.hold = true;
+    try {
+      let received = 0;
+      for (let call = 0; call < 1000; call++) {
+        for await (const chunk of ctx.waterfall(
+          'llm/stream',
+          { provider: 'test', model: 'test', messages: [] } as never,
+          async function* () {
+            yield { type: 'text-delta', index: 0, text: 'answer' } as never;
+            yield { type: 'finish', reason: { kind: 'stop' } } as never;
+          },
+        )) {
+          expect(chunk).toBeDefined();
+          received++;
+        }
+      }
+      expect(received).toBe(2000);
+      expect(state.pending).toHaveLength(1);
+      expect(state.batches).toEqual([512]);
+      let disposed = false;
+      const disposal = ctx.fiber.dispose().then(() => {
+        disposed = true;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(disposed).toBe(false);
+      // Pinned OTel defaults: one 512-span export plus at most 2,048 queued spans.
+      expect(state.spans).toHaveLength(2560);
+      expect(state.batches.every((size) => size <= 512)).toBe(true);
+      state.hold = false;
+      if (outcome === 'timeout') await vi.advanceTimersByTimeAsync(30_001);
+      else
+        state.pending
+          .splice(0)
+          .forEach((callback) =>
+            callback(
+              outcome === 'release' ? { code: 0 } : { code: 1, error: new Error('ETIMEDOUT') },
+            ),
+          );
+      await disposal;
+      expect(disposed).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+      if (outcome !== 'release')
+        expect(errors).toHaveBeenCalledWith(expect.stringMatching(/^\[dsh-telemetry\]/));
+    } finally {
+      state.hold = false;
+      state.pending.splice(0).forEach((callback) => callback({ code: 0 }));
+      await ctx.fiber.dispose();
     }
   },
 );
