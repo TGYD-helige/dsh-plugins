@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -10,6 +18,63 @@ import { stopA2a } from './integration/lib/a2a-shared.mjs';
 import * as integration from './integration/lib/ci-shared.mjs';
 
 const workflow = readFileSync(new URL('../workflows/integration.yml', import.meta.url), 'utf8');
+
+test('every published plugin has unit tests and a discoverable integration scenario', () => {
+  const packages = new URL('../../packages/', import.meta.url);
+  const scenarios = new URL('./integration/', import.meta.url);
+  for (const name of readdirSync(packages)) {
+    const manifestPath = new URL(`${name}/package.json`, packages);
+    if (!existsSync(manifestPath)) continue;
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    if (manifest.private) continue;
+    assert.equal(manifest.scripts?.test, 'vitest run', `${name} must run its unit tests`);
+    assert.ok(
+      readdirSync(scenarios).some(
+        (file) => file.endsWith('.mjs') && (file === `${name}.mjs` || file.startsWith(`${name}.`)),
+      ),
+      `${name} needs a discoverable integration scenario`,
+    );
+  }
+});
+
+test('the Integration gate covers every job and rejects failed, cancelled or skipped work', () => {
+  const gate = workflow.match(/^ {2}gate:\n[\s\S]*$/m)?.[0];
+  assert.ok(gate, 'Integration needs a fixed summary gate');
+  assert.match(gate, /if:.*always\(\).*inputs\.scenario == ''/);
+  const required = [...workflow.slice(workflow.indexOf('\njobs:\n')).matchAll(/^ {2}([\w-]+):\n/gm)]
+    .map((match) => match[1])
+    .filter((name) => name !== 'gate');
+  const dependencies = gate
+    .match(/needs: \[([^\]]+)\]/)[1]
+    .split(',')
+    .map((id) => id.trim());
+  assert.deepEqual(dependencies.sort(), required.sort());
+  const script = gate.match(/run: \|\n((?: {10}.*\n|\n)+)/)?.[1].replace(/^ {10}/gm, '');
+  assert.ok(script);
+  const needs = Object.fromEntries(required.map((id) => [id, { result: 'success' }]));
+  needs.detect.outputs = { has_scenarios: 'true', has_backends: 'true' };
+  const run = () =>
+    spawnSync('bash', ['-e', '-c', script], {
+      env: { ...process.env, NEEDS: JSON.stringify(needs) },
+      encoding: 'utf8',
+    });
+  assert.equal(run().status, 0);
+  for (const id of required) {
+    for (const result of ['failure', 'cancelled', 'skipped']) {
+      needs[id].result = result;
+      assert.notEqual(run().status, 0, `${id}: ${result} must block merging`);
+    }
+    needs[id].result = 'success';
+  }
+  needs.detect.outputs.has_scenarios = 'false';
+  assert.notEqual(run().status, 0, 'an empty scenario matrix cannot pass');
+  needs.detect.outputs = {};
+  assert.notEqual(run().status, 0, 'missing discovery outputs cannot pass');
+  assert.doesNotMatch(gate, /actions\/checkout|pnpm|secrets\./);
+  assert.match(gate, /statuses: write/);
+  assert.match(gate, /statuses\/\$TARGET_SHA/);
+  assert.match(gate, /context='Integration required'/);
+});
 
 test('native inbox model E2E is discovered as a packed-plugin gateway scenario', () => {
   const directory = mkdtempSync(join(tmpdir(), 'inbox-model-matrix-'));

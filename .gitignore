@@ -4,6 +4,7 @@ lib/
 !.github/scripts/integration/lib/
 *.tgz
 *.log
+performance-results.json
 .DS_Store
 .idea/
 

@@ -1,5 +1,5 @@
 import { Context } from '@deepseek-ai/cordis';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { apply, inject, name } from './index.js';
 
 const backends = vi.hoisted(() => ({
@@ -361,11 +361,13 @@ describe('dsh-storage plugin', () => {
   it.each([
     [20, 'flush', 1],
     [70, 'flush', 3],
+    [1024, 'flush', 32],
     [20, 'archive', 1],
     [20, 'dispose', 1],
   ] as const)(
     'coalesces %i results with a %s barrier into %i bounded writes',
     async (count, barrier, writes) => {
+      onTestFinished(() => ctx.fiber.dispose());
       apply(ctx, enabledConfig);
       const backend = backends.instances[0];
       const rows = new Map<string, any>();
@@ -375,7 +377,6 @@ describe('dsh-storage plugin', () => {
       backend.readMessages.mockImplementation(async (_sessionId: string, id: string) =>
         rows.has(id) ? [rows.get(id)] : [],
       );
-      const session = { id: 's1' };
       const assistant = assistantEvent('', { inputTokens: 10, outputTokens: 5 }, 'model') as any;
       assistant.data.message.content = Array.from({ length: count }, (_, i) => ({
         type: 'tool-call',
@@ -383,6 +384,7 @@ describe('dsh-storage plugin', () => {
         name: 'read',
         arguments: '{}',
       }));
+      const session = { id: 's1', deriveMessages: () => [assistant.data.message] };
       ctx.events.emit('session/event', session, assistant);
       await ctx.events.parallel('session/flush', session);
       backend.upsertEvent.mockClear();
@@ -413,6 +415,7 @@ describe('dsh-storage plugin', () => {
       } else await ctx.events.parallel('session/flush', session);
       expect(backend.upsertEvent).toHaveBeenCalledTimes(writes);
       expect(backend.readMessages).toHaveBeenCalledTimes(writes);
+      expect(backend.readToolCallMessages).not.toHaveBeenCalled();
       expect(rows.get('model').toolCalls.map((call: any) => call.result.content[0].text)).toEqual(
         Array.from({ length: count }, (_, i) => String(i).repeat(1024)),
       );

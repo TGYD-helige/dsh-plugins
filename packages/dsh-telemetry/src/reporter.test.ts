@@ -1,6 +1,6 @@
 import { Context } from '@deepseek-ai/cordis';
 import { trace } from '@opentelemetry/api';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { adapters } from './adapters/index.js';
 import { TelemetryReporter } from './core/otel.js';
 import { apply, Config } from './index.js';
@@ -163,6 +163,65 @@ it('collects concurrent sessions without changing stream chunks and drains on fi
   expect(other.spanContext().traceId).not.toBe(llm.spanContext().traceId);
   expect(other.endTime).toBeDefined();
 });
+
+it.each([256, 16_384])(
+  'bounds capture work across %i chunks in concurrent sessions',
+  async (count) => {
+    const ctx = new Context();
+    onTestFinished(() => ctx.fiber.dispose());
+    await apply(ctx, Config({ enabled: true, backend: 'phoenix', maxPayloadBytes: 1024 }));
+    const delta = { type: 'text-delta', index: 0, text: 'x'.repeat(64) };
+    const stringify = vi.spyOn(JSON, 'stringify');
+    const mask = vi.spyOn(TelemetryReporter.prototype, 'mask');
+    await Promise.all(
+      Array.from({ length: 8 }, async (_, index) => {
+        const session = { id: `load-${index}`, header: { id: `load-${index}` } } as never;
+        const event = (type: string) =>
+          ctx.emit('session/event', session, {
+            type,
+            seq: 1,
+            time: Date.now(),
+            data: { turn: 0, reason: { kind: 'completed' } },
+          } as never);
+        event('turn/start');
+        let received = 0;
+        for await (const chunk of ctx.waterfall(
+          'llm/stream',
+          {
+            provider: 'test',
+            model: 'test',
+            messages: [],
+            sessionId: `load-${index}`,
+          } as never,
+          async function* () {
+            for (let i = 0; i < count; i++) yield delta as never;
+            yield { type: 'finish', reason: { kind: 'stop' } } as never;
+          },
+        )) {
+          if (received < count) expect(chunk).toBe(delta);
+          received++;
+        }
+        expect(received).toBe(count + 1);
+        event('turn/end');
+        await ctx.parallel('session/flush', session);
+      }),
+    );
+    // Once capture fills, later chunks must not trigger serialization or masking.
+    expect(stringify.mock.calls.filter(([value]) => value === delta).length).toBeLessThanOrEqual(
+      80,
+    );
+    expect(mask.mock.calls.length).toBeLessThanOrEqual(1024);
+    stringify.mockRestore();
+    expect(state.spans).toHaveLength(24);
+    for (const span of state.spans.filter((item) => item.name === 'llm-request')) {
+      expect(JSON.parse(String(span.attributes.metadata))).toMatchObject({
+        chunkCount: count + 1,
+        truncated: true,
+      });
+      expect(Buffer.byteLength(String(span.attributes['output.value']))).toBeLessThanOrEqual(1024);
+    }
+  },
+);
 
 it('swallows exporter failures and logs only a safe failure category', async () => {
   const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {});
