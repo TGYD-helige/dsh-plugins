@@ -59,7 +59,7 @@ export function apply(ctx) {
     try {
       source = next();
     } catch (error) {
-      outcome = 'error';
+      outcome = options.signal?.aborted ? 'aborted' : 'error';
       record();
       throw error;
     }

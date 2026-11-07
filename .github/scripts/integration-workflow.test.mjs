@@ -138,10 +138,17 @@ test('model performance preserves synchronous errors, stream errors, cancellatio
     },
     (received) => received === error,
   );
+  assert.throws(
+    () =>
+      ctx.waterfall('llm/stream', { signal: abort.signal }, () => {
+        throw error;
+      }),
+    (received) => received === error,
+  );
   const rows = records();
   assert.deepEqual(
     rows.map((row) => row.outcome),
-    ['error', 'error', 'stop', 'consumer-closed', 'aborted'],
+    ['error', 'error', 'stop', 'consumer-closed', 'aborted', 'aborted'],
   );
   assert.equal(rows[2].firstTokenMs, null);
   assert.equal(rows[2].outputTokensPerSecond, null);
