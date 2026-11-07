@@ -351,7 +351,24 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
         executor: {
           async execute(request, bus) {
             const waiting = new Promise<void>((release) => {
-              running.set(request.taskId, { contextId: request.contextId, release });
+              running.set(request.taskId, {
+                contextId: request.contextId,
+                release() {
+                  bus.publish(
+                    AgentEvent.statusUpdate({
+                      taskId: request.taskId,
+                      contextId: request.contextId,
+                      status: {
+                        state: TaskState.TASK_STATE_CANCELED,
+                        message: undefined,
+                        timestamp: undefined,
+                      },
+                      metadata: undefined,
+                    }),
+                  );
+                  release();
+                },
+              });
             });
             bus.publish(
               AgentEvent.task(
