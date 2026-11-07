@@ -245,7 +245,8 @@ async function benchmark(provider) {
           10,
           '32 backend writes must saturate the actual backend pool',
         );
-        pool.backendQueuedWrites = 32;
+        pool.backendConcurrentWrites = 32;
+        pool.backendQueuedWrites = 32 - blockedConnections;
         pool.backendBlockedConnections = blockedConnections;
         unlock();
         await Promise.all([writing, transaction]);
