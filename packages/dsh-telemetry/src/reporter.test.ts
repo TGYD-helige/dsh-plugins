@@ -309,10 +309,15 @@ it('exports the first token as a timed event once, even without content capture'
   reporter.endGeneration(generation, { completionStartTime: new Date() });
   reporter.endSpan(root);
   await reporter.shutdown();
+  expect(state.spans[0].attributes).toMatchObject({
+    'llm.time_to_first_token_ms': 250,
+    'llm.time_to_first_token_seconds': 0.25,
+  });
+  expect(state.spans[1].attributes['llm.time_to_first_token_ms']).toBeUndefined();
   expect(state.spans[0].events).toEqual([
     {
       name: 'first_token',
-      attributes: {},
+      attributes: { time_to_first_token_ms: 250, time_to_first_token_seconds: 0.25 },
       time: [1767225600, 250000000],
       droppedAttributesCount: 0,
     },
@@ -488,5 +493,26 @@ it.each(['session_disposed', 'plugin_unloaded'])(
     const compact = state.spans.find((s) => s.name === 'compaction')!;
     expect(JSON.parse(String(compact.attributes.metadata))).toMatchObject({ terminatedBy: reason });
     expect(compact.status.code).toBe(0);
+  },
+);
+
+it.each([undefined, new Date('invalid'), new Date('2025-12-31T23:59:59Z')])(
+  'does not invent a first-token duration for unavailable or invalid timestamps: %s',
+  async (completionStartTime) => {
+    const reporter = new TelemetryReporter(
+      { backend: 'phoenix', captureContent: false },
+      adapters.phoenix,
+    );
+    await reporter.ready;
+    const root = reporter.openTrace({ name: 'turn' });
+    const generation = reporter.startGeneration(root, {
+      name: 'llm',
+      startTime: new Date('2026-01-01T00:00:00Z'),
+    });
+    reporter.endGeneration(generation, { completionStartTime });
+    reporter.endSpan(root);
+    await reporter.shutdown();
+    expect(state.spans[0].attributes['llm.time_to_first_token_seconds']).toBeUndefined();
+    expect(state.spans[0].events).toEqual([]);
   },
 );

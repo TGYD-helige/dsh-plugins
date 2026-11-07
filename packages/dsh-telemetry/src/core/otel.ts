@@ -28,6 +28,7 @@ export interface ReporterConfig extends ConnectionConfig {
 }
 interface Observation {
   span: Span;
+  startedAt: number;
   data: ObservationData;
   ended?: boolean;
   contextMetadata?: Record<string, unknown>;
@@ -144,11 +145,16 @@ export class TelemetryReporter implements InstrumentationReporter {
       const context = parent
         ? api.trace.setSpanContext(api.ROOT_CONTEXT, parent)
         : api.ROOT_CONTEXT;
+      const startedAt = startTime?.getTime() ?? Date.now();
       const span = ids.withTraceId(traceId, () =>
-        tracer.startSpan(this.mask(data.name ?? 'span'), { startTime }, context),
+        tracer.startSpan(
+          this.mask(data.name ?? 'span'),
+          { startTime: new Date(startedAt) },
+          context,
+        ),
       );
       const handle = {};
-      this.observations.set(handle, { span, data: this.mask(data) });
+      this.observations.set(handle, { span, startedAt, data: this.mask(data) });
       return handle;
     } catch {
       this.failure('span creation');
@@ -289,8 +295,24 @@ export class TelemetryReporter implements InstrumentationReporter {
     try {
       observation.span.updateName(this.mask(observation.data.name ?? 'span'));
       observation.span.setAttributes(this.attributes(observation.data));
-      if (observation.data.kind === 'generation' && observation.data.completionStartTime)
-        observation.span.addEvent('first_token', observation.data.completionStartTime);
+      if (observation.data.kind === 'generation' && observation.data.completionStartTime) {
+        const milliseconds = observation.data.completionStartTime.getTime() - observation.startedAt;
+        if (Number.isFinite(milliseconds) && milliseconds >= 0) {
+          const seconds = milliseconds / 1000;
+          observation.span.setAttributes({
+            'llm.time_to_first_token_ms': milliseconds,
+            'llm.time_to_first_token_seconds': seconds,
+          });
+          observation.span.addEvent(
+            'first_token',
+            {
+              time_to_first_token_ms: milliseconds,
+              time_to_first_token_seconds: seconds,
+            },
+            observation.data.completionStartTime,
+          );
+        }
+      }
       observation.span.setStatus({
         code: observation.data.level === 'ERROR' ? 2 : observation.data.level === 'WARNING' ? 0 : 1,
         message: this.config.captureContent ? this.mask(observation.data.statusMessage) : undefined,

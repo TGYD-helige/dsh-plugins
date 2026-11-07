@@ -175,6 +175,15 @@ export function evaluatePhoenixSemantics(observations) {
         at > Date.parse(span.endTime)
       )
         problems.push('missing or invalid first token event');
+      const milliseconds = Number(span.attributes['llm.time_to_first_token_ms']);
+      const seconds = span.attributes['llm.time_to_first_token_seconds'];
+      if (
+        !Number.isFinite(milliseconds) ||
+        milliseconds < 0 ||
+        milliseconds / 1000 !== seconds ||
+        Math.abs(at - Date.parse(span.startTime) - milliseconds) > 1
+      )
+        problems.push('missing or invalid first token duration');
     }
     const attributes = span.attributes;
     if (span.input?.provider && attributes['llm.system'] !== span.input.provider)

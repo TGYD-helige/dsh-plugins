@@ -42,6 +42,7 @@ const attributes = (values) =>
       key,
       value.stringValue ??
         value.intValue ??
+        value.doubleValue ??
         value.boolValue ??
         value.arrayValue?.values.map((v) => v.stringValue),
     ]),
@@ -145,6 +146,8 @@ try {
       assert.equal(llm.events.length, 1);
       assert.equal(llm.events[0].name, 'first_token');
       assert.equal(llm.events[0].timeUnixNano, '1767225600250000000');
+      assert.equal(attributes(llm.attributes)['llm.time_to_first_token_seconds'], 0.25);
+      assert.equal(Number(attributes(llm.events[0].attributes).time_to_first_token_ms), 250);
       assert.equal(
         Buffer.from(turn.traceId).toString('hex'),
         taskRoot ? '33333333333333333333333333333333' : '11111111111111111111111111111111',
