@@ -38,6 +38,12 @@ test('every published plugin has unit tests and a discoverable integration scena
 });
 
 test('the Integration gate covers every job and rejects failed, cancelled or skipped work', () => {
+  const pending = workflow.match(/^ {2}status:\n[\s\S]*?(?=^ {2}[\w-]+:)/m)?.[0];
+  assert.ok(pending, 'full runs must invalidate earlier success before testing');
+  assert.match(pending, /if:.*inputs\.scenario == ''/);
+  assert.match(pending, /statuses: write/);
+  assert.match(pending, /state=pending -f context='Integration required'/);
+  assert.doesNotMatch(pending, /needs:|actions\/checkout|pnpm|secrets\./);
   const gate = workflow.match(/^ {2}gate:\n[\s\S]*$/m)?.[0];
   assert.ok(gate, 'Integration needs a fixed summary gate');
   assert.match(gate, /if:.*always\(\).*inputs\.scenario == ''/);

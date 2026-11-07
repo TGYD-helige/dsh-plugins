@@ -43,6 +43,24 @@ env:
   INTEGRATION_CHECKOUT_REF: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
 
 jobs:
+  status:
+    name: Mark integration pending
+    if: ${{ inputs.scenario == '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      statuses: write
+    steps:
+      - name: Invalidate earlier success for the tested revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ env.INTEGRATION_CHECKOUT_REF }}
+        run: |
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$TARGET_SHA" \
+            -f state=pending -f context='Integration required' \
+            -f description='Full integration is running' \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
   detect:
     name: Detect integration scenarios
     runs-on: ubuntu-latest
@@ -417,7 +435,7 @@ jobs:
 
   gate:
     name: Integration gate
-    needs: [detect, integration-approval, scenario, a2a-protocol, native-inbox, native-ownership, graceful-retention, scenario-backends]
+    needs: [status, detect, integration-approval, scenario, a2a-protocol, native-inbox, native-ownership, graceful-retention, scenario-backends]
     if: ${{ always() && inputs.scenario == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
