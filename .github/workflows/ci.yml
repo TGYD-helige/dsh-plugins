@@ -86,4 +86,4 @@ jobs:
           name: performance-results
           path: performance-results.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 7
