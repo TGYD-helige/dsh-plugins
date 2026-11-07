@@ -1,0 +1,80 @@
+name: Performance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  performance:
+    name: Performance budgets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:performance
+      - run: pnpm test:performance:network
+      - run: pnpm test:performance:database
+      - run: pnpm test:performance:combined
+      - name: Upload performance results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: performance-results
+          path: performance-*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  database:
+    name: Performance PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: performance-only
+          POSTGRES_DB: dsh_performance
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d dsh_performance"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Verify database queries, pool saturation and row locks
+        env:
+          DSH_PERFORMANCE_DB_PROVIDER: postgresql
+          DSH_PERFORMANCE_DB_URL: postgresql://postgres:performance-only@127.0.0.1:5432/dsh_performance
+        run: pnpm test:performance:database
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: performance-postgresql
+          path: performance-database-postgresql.json
+          if-no-files-found: error
+          retention-days: 7

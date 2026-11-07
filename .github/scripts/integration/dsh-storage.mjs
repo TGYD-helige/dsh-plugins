@@ -25,7 +25,13 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
-import { integrationModel, netEnv, requireEnv, run } from './lib/ci-shared.mjs';
+import {
+  integrationModel,
+  modelPerformancePatch,
+  netEnv,
+  requireEnv,
+  run,
+} from './lib/ci-shared.mjs';
 
 const workDir = join(process.env.RUNNER_TEMP ?? tmpdir(), 'dsh-storage-e2e');
 mkdirSync(workDir, { recursive: true });
@@ -100,6 +106,7 @@ writeFileSync(
     # Scenarios need only short answers; dsh's 256000 default is rejected by
     # smaller-cap models (glm-5.3-flash caps max_tokens at 131072).
     maxTokens: 16384
+${modelPerformancePatch(dshHome)}
 `,
 );
 console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);

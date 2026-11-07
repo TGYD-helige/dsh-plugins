@@ -10,7 +10,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { integrationModel, netEnv, requireEnv, run } from './ci-shared.mjs';
+import { integrationModel, modelPerformancePatch, netEnv, requireEnv, run } from './ci-shared.mjs';
 
 export function assert(cond, msg) {
   if (!cond) throw new Error(`assertion failed: ${msg}`);
@@ -84,7 +84,8 @@ export async function bootA2a({ tag, extraPatch = '', reuse = false, inbox = fal
     provider: deepseek-official
     model: ${integrationModel()}
 
-${extraPatch}`,
+${extraPatch}
+${modelPerformancePatch(dshHome, 'web')}`,
   );
   console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);
 

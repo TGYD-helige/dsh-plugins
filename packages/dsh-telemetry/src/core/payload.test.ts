@@ -1,7 +1,52 @@
 import { describe, expect, it, vi } from 'vitest';
 import { boundPayload, newPayloadBudget } from './payload.js';
+import { PayloadPrivacy } from './privacy.js';
 
 describe('bounded payload previews', () => {
+  it.each([
+    ['messages', 100],
+    ['messages', 10_000],
+    ['tools', 100],
+    ['tools', 10_000],
+  ] as const)('bounds traversal of %s with %i entries before masking', (key, count) => {
+    const secret = 'sk-perf-fixture';
+    const privacy = new PayloadPrivacy({ secrets: [secret], redactFields: ['password'] });
+    let visited = 0;
+    const input = {
+      [key]: Array.from({ length: count }, () => ({
+        get description() {
+          visited++;
+          return `${secret} 中文😀 `.repeat(16);
+        },
+        password: 'private-field-value',
+      })),
+    };
+    const mask = vi.spyOn(privacy, 'mask');
+    const budget = newPayloadBudget(1024);
+    const output = boundPayload(input, budget, privacy);
+    expect(visited).toBeGreaterThan(0);
+    expect(visited).toBeLessThanOrEqual(8);
+    expect(mask.mock.calls.length).toBeLessThanOrEqual(64);
+    const wire = JSON.stringify(output);
+    expect(Buffer.byteLength(wire)).toBeLessThanOrEqual(1024);
+    expect(wire).not.toContain(secret);
+    expect(wire).not.toContain('private-field-value');
+    expect(budget.truncated).toBe(true);
+  });
+
+  it('bounds deeply nested JSON arguments while redacting credentials', () => {
+    const privacy = new PayloadPrivacy({ secrets: ['perf-secret'], redactFields: ['password'] });
+    let args: unknown = { password: 'private-value', credential: 'perf-secret' };
+    for (let depth = 0; depth < 64; depth++) args = { nested: args };
+    const input = { arguments: JSON.stringify(args) };
+    const wire = JSON.stringify(boundPayload(input, newPayloadBudget(1024), privacy));
+    expect(Buffer.byteLength(wire)).toBeLessThanOrEqual(1024);
+    expect(wire).not.toContain('perf-secret');
+    expect(wire).not.toContain('private-value');
+    expect(wire).toContain('[REDACTED]');
+    expect(input.arguments).toContain('private-value');
+  });
+
   it('uses a constant number of serialization passes for an oversized value', () => {
     const input = { text: 'large payload '.repeat(30_000) };
     const stringify = vi.spyOn(JSON, 'stringify');

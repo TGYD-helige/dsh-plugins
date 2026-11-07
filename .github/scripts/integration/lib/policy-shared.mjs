@@ -22,7 +22,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { integrationModel, netEnv, requireEnv, run } from './ci-shared.mjs';
+import { integrationModel, modelPerformancePatch, netEnv, requireEnv, run } from './ci-shared.mjs';
 
 export async function runPolicyScenario({
   tag,
@@ -87,6 +87,7 @@ ${rulesYaml}
     # Scenarios need only short answers; dsh's 256000 default is rejected by
     # smaller-cap models (glm-5.3-flash caps max_tokens at 131072).
     maxTokens: 16384
+${modelPerformancePatch(dshHome)}
 `,
   );
   console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);

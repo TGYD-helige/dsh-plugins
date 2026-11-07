@@ -9,7 +9,13 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { integrationModel, netEnv, requireEnv, run } from './lib/ci-shared.mjs';
+import {
+  integrationModel,
+  modelPerformancePatch,
+  netEnv,
+  requireEnv,
+  run,
+} from './lib/ci-shared.mjs';
 
 function upstreamUrl(baseUrl, route) {
   const base = baseUrl.replace(/\/+$/, '');
@@ -79,6 +85,7 @@ writeFileSync(
   config:
     thinking: disabled
     maxTokens: 16384
+${modelPerformancePatch(dshHome)}
 `,
 );
 

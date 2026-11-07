@@ -42,7 +42,14 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { expandAssistantStream } from '@deepseek-ai/dsh-llm/assistant-stream';
-import { integrationModel, integrationRevision, netEnv, requireEnv, run } from './ci-shared.mjs';
+import {
+  integrationModel,
+  integrationRevision,
+  modelPerformancePatch,
+  netEnv,
+  requireEnv,
+  run,
+} from './ci-shared.mjs';
 import { runPhoenixVerification } from './phoenix-shared.mjs';
 
 // ---------------------------------------------------------------------------
@@ -1021,6 +1028,7 @@ ${
     # smaller-cap models (glm-5.3-flash caps max_tokens at 131072).
     maxTokens: 16384
 ${hookPatch}
+${modelPerformancePatch(dshHome)}
 `,
   );
   if (!realMode) console.log(`--- ${patchPath} ---\n${readFileSync(patchPath, 'utf8')}`);

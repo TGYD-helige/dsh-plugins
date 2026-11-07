@@ -89,14 +89,19 @@ it('persists completion while the sending client is stalled', async () => {
   }
 });
 
-it.each([false, true])(
-  'bounds slow writer backlog and drains the task (objectMode=%s)',
-  async (objectMode) => {
+it.each([
+  [false, 100],
+  [false, 10_000],
+  [true, 100],
+  [true, 10_000],
+] as const)(
+  'bounds slow writer backlog and drains the task (objectMode=%s, frames=%i)',
+  async (objectMode, count) => {
     const output = new Writable({ objectMode, highWaterMark: 1, write() {} });
     const sdk = handler();
     let consumed = 0;
     vi.spyOn(sdk, 'sendMessageStream').mockImplementation(async function* () {
-      for (let index = 0; index < 100; index++) {
+      for (let index = 0; index < count; index++) {
         consumed++;
         yield frame(String(index));
       }
@@ -112,7 +117,7 @@ it.each([false, true])(
         output.write(objectMode ? event : Buffer.alloc(64 * 1024));
       }
     });
-    expect(consumed).toBe(100);
+    expect(consumed).toBe(count);
     expect(delivered).toBeGreaterThan(1);
     expect(delivered).toBeLessThanOrEqual(18);
     expect(output.destroyed).toBe(true);
