@@ -19,6 +19,38 @@ describe('compileRules', () => {
 });
 
 describe('evaluate', () => {
+  it.each([10, 1000])(
+    'evaluates %i rules over long shell input without repeating args checks',
+    (count) => {
+      const rules = compileRules([
+        ...Array.from({ length: count }, () => ({
+          tool: 'bash',
+          decision: 'deny' as const,
+          argsPattern: { marker: '^blocked$' },
+          commandPrefix: 'rm',
+        })),
+        { tool: '*', decision: 'allow', priority: 1 },
+        { tool: 'bash', decision: 'deny', commandPrefix: 'rm', priority: 10 },
+      ]);
+      const matches = rules
+        .slice(0, count)
+        .map((rule) => vi.spyOn(rule.argsConds![0].res[0], 'test'));
+      const args = {
+        marker: 'safe',
+        command: `${'echo "$(printf safe)";'.repeat(1000)}rm /fixture`,
+      };
+      const stringify = vi.spyOn(JSON, 'stringify');
+      try {
+        expect(evaluate(rules, 'bash', args, KEYS)?.decision).toBe('deny');
+        expect(stringify.mock.calls.filter(([value]) => value === args)).toHaveLength(1);
+        expect(matches.every((match) => match.mock.calls.length === 1)).toBe(true);
+      } finally {
+        stringify.mockRestore();
+        for (const match of matches) match.mockRestore();
+      }
+    },
+  );
+
   it('checks whole-call arguments once while preserving per-segment deny decisions', () => {
     const rules = compileRules([
       { tool: 'bash', decision: 'allow', commandPrefix: 'echo' },

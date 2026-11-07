@@ -1,6 +1,9 @@
 import { getEventListeners, once } from 'node:events';
+import { writeFileSync } from 'node:fs';
 import { createServer, request, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+import { fileURLToPath } from 'node:url';
 import {
   type AgentCard,
   Artifact,
@@ -29,13 +32,20 @@ import {
 } from '@a2a-js/sdk/server';
 import { A2AService } from '@a2a-js/sdk/server/grpc';
 import { credentials, Metadata, makeGenericClientConstructor } from '@grpc/grpc-js';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { type A2aServer, startA2aServer } from '../../../packages/dsh-a2a/src/server.js';
 import {
   type ManagedTaskStore,
   MemoryTaskStore,
   SanitizedTaskStore,
 } from '../../../packages/dsh-a2a/src/task-store.js';
+
+const networkMetrics: unknown[] = [];
+const networkReport = () =>
+  writeFileSync(
+    fileURLToPath(new URL('../../../performance-network.json', import.meta.url)),
+    JSON.stringify({ revision: process.env.GITHUB_SHA ?? null, results: networkMetrics }, null, 2),
+  );
 
 // A stub executor with the same event contract the real one uses: a task
 // anchor first (A2A 1.0 stream ordering), then working, then input-required.
@@ -183,6 +193,148 @@ describe('A2A HTTP server (v1 + legacy compat)', () => {
       ...extra,
     },
   });
+
+  it.skipIf(process.env.DSH_PERFORMANCE_NETWORK !== 'true').each([1, 16, 64])(
+    'performance: real HTTP/SSE/gRPC concurrency %i',
+    async (concurrency) => {
+      await server.close();
+      server = await startA2aServer({
+        host: '127.0.0.1',
+        port: 0,
+        basePath: '/a2a',
+        rest: true,
+        grpc: { enabled: true, port: 0 },
+        card: { name: 'performance', description: '', version: '0.0.1' },
+        executor: stubExecutor,
+        taskStore: new SanitizedTaskStore(new MemoryTaskStore()),
+      });
+      base = `http://127.0.0.1:${server.port}`;
+      const Client = makeGenericClientConstructor(A2AService, 'A2AService');
+      const client = new Client(`127.0.0.1:${server.grpcPort}`, credentials.createInsecure());
+      onTestFinished(() => client.close());
+      const metadata = new Metadata();
+      metadata.set('a2a-version', '1.0');
+      for (const transport of ['http', 'sse', 'grpc']) {
+        const latencies: number[] = [];
+        const firstFrames: number[] = [];
+        const loop = monitorEventLoopDelay({ resolution: 10 });
+        loop.enable();
+        const started = performance.now();
+        try {
+          for (let offset = 0; offset < 64; offset += concurrency)
+            await Promise.all(
+              Array.from({ length: Math.min(concurrency, 64 - offset) }, async () => {
+                const start = performance.now();
+                if (transport === 'grpc') {
+                  const events: any[] = [];
+                  await new Promise<void>((resolve, reject) =>
+                    client
+                      .sendStreamingMessage(
+                        SendMessageRequest.fromJSON(v1Message('load')),
+                        metadata,
+                        { deadline: Date.now() + 10_000 },
+                      )
+                      .on('data', (event: unknown) => {
+                        if (!events.length) firstFrames.push(performance.now() - start);
+                        events.push(event);
+                      })
+                      .on('end', resolve)
+                      .on('error', reject),
+                  );
+                  expect(events[0].payload.$case).toBe('task');
+                  expect(events.at(-1).payload.value.status.state).toBe(
+                    TaskState.TASK_STATE_INPUT_REQUIRED,
+                  );
+                } else if (transport === 'sse') {
+                  const response = await rpc('SendStreamingMessage', v1Message('load'));
+                  expect(response.status).toBe(200);
+                  const reader = response.body!.getReader();
+                  let wire = '';
+                  for (;;) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    if (!wire) firstFrames.push(performance.now() - start);
+                    wire += new TextDecoder().decode(value);
+                  }
+                  const events = wire
+                    .split('\n\n')
+                    .filter((frame) => frame.startsWith('data: '))
+                    .map((frame) => JSON.parse(frame.slice(6)));
+                  expect(events[0].result.task).toBeDefined();
+                  expect(events.at(-1).result.statusUpdate.status.state).toBe(
+                    'TASK_STATE_INPUT_REQUIRED',
+                  );
+                } else {
+                  const response = await fetch(`${base}/a2a/rest/message:send`, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/a2a+json', 'A2A-Version': '1.0' },
+                    body: JSON.stringify(v1Message('load')),
+                  });
+                  expect(response.status).toBe(200);
+                  expect((await response.json()).task.status.state).toBe(
+                    'TASK_STATE_INPUT_REQUIRED',
+                  );
+                }
+                latencies.push(performance.now() - start);
+              }),
+            );
+        } finally {
+          loop.disable();
+        }
+        expect(latencies).toHaveLength(64);
+        if (transport !== 'http') expect(firstFrames).toHaveLength(64);
+        const percentile = (values: number[], fraction: number) =>
+          [...values].sort((a, b) => a - b)[Math.floor((values.length - 1) * fraction)];
+        networkMetrics.push({
+          transport,
+          concurrency,
+          requests: 64,
+          requestsPerSecond: 64_000 / (performance.now() - started),
+          p50Ms: percentile(latencies, 0.5),
+          p95Ms: percentile(latencies, 0.95),
+          firstFrameP95Ms: firstFrames.length ? percentile(firstFrames, 0.95) : undefined,
+          eventLoopMaxMs: loop.max / 1e6,
+        });
+      }
+      networkReport();
+    },
+    30_000,
+  );
+
+  it.skipIf(process.env.DSH_PERFORMANCE_NETWORK !== 'true')(
+    'performance: cancellation drains concurrent subscriptions',
+    async () => {
+      const latencies = await Promise.all(
+        Array.from({ length: 32 }, async () => {
+          const sent = await json(await rpc('SendMessage', v1Message('cancel-load')));
+          const id = sent.result.task.id;
+          const response = await rpc('SubscribeToTask', { id });
+          const reader = response.body!.getReader();
+          await reader.read();
+          const started = performance.now();
+          try {
+            const reading = (async () => {
+              let wire = '';
+              for (;;) {
+                const { value, done } = await reader.read();
+                if (done) return wire;
+                wire += new TextDecoder().decode(value);
+              }
+            })();
+            const cancelled = await json(await rpc('CancelTask', { id }));
+            expect(cancelled.result.status.state).toBe('TASK_STATE_CANCELED');
+            expect(await reading).toContain('TASK_STATE_CANCELED');
+            return performance.now() - started;
+          } finally {
+            await reader.cancel();
+          }
+        }),
+      );
+      networkMetrics.push({ transport: 'sse-cancel', concurrency: 32, latenciesMs: latencies });
+      networkReport();
+    },
+    30_000,
+  );
 
   it('shares task state between the official REST and JSON-RPC bindings', async () => {
     await server.close();

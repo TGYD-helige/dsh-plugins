@@ -26,8 +26,12 @@ const workload = {
   chunkBytes: 64,
 };
 const median = (values) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
+const soakSeconds = Number(
+  process.env.DSH_PERFORMANCE_SOAK_SECONDS ?? (process.argv.includes('--soak') ? 1800 : 0),
+);
+assert.ok(Number.isInteger(soakSeconds) && soakSeconds >= 0 && soakSeconds <= 3600);
 
-async function worker(mode, port) {
+async function worker(mode, port, durationSeconds) {
   assert.ok(modes.includes(mode));
   assert.ok(Number.isInteger(port) && port > 0 && port < 65536);
   assert.equal(typeof globalThis.gc, 'function', 'worker requires --expose-gc');
@@ -89,11 +93,21 @@ async function worker(mode, port) {
     }
   }
   const samples = [];
+  let batches = 0;
+  let elapsedMs = 0;
   let shutdownMs;
   try {
     await turns(workload.warmupTurns);
     await ctx.parallel('session/flush', { id: 'checkpoint' });
-    for (let sample = 0; sample < workload.samples; sample++) {
+    const loadStarted = performance.now();
+    let recordedAt = -Infinity;
+    for (
+      let sample = 0;
+      durationSeconds
+        ? performance.now() - loadStarted < durationSeconds * 1000
+        : sample < workload.samples;
+      sample++
+    ) {
       globalThis.gc();
       const heapBeforeBytes = process.memoryUsage().heapUsed;
       const cpuStart = process.cpuUsage();
@@ -107,15 +121,26 @@ async function worker(mode, port) {
       globalThis.gc();
       const heapAfterGcBytes = process.memoryUsage().heapUsed;
       assert.ok(streamMs > 0 && Number.isFinite(streamMs));
-      samples.push({
-        streamMs,
-        flushMs,
-        cpuUserMs: cpu.user / 1000,
-        cpuSystemMs: cpu.system / 1000,
-        turnsPerSecond: (workload.turnsPerSample * 1000) / streamMs,
-        heapBeforeBytes,
-        heapAfterGcBytes,
-      });
+      batches++;
+      elapsedMs = performance.now() - loadStarted;
+      if (
+        !durationSeconds ||
+        elapsedMs - recordedAt >= 10_000 ||
+        elapsedMs >= durationSeconds * 1000
+      ) {
+        recordedAt = elapsedMs;
+        samples.push({
+          elapsedMs,
+          streamMs,
+          flushMs,
+          cpuUserMs: cpu.user / 1000,
+          cpuSystemMs: cpu.system / 1000,
+          turnsPerSecond: (workload.turnsPerSample * 1000) / streamMs,
+          heapBeforeBytes,
+          heapAfterGcBytes,
+          activeResources: process.getActiveResourcesInfo(),
+        });
+      }
     }
   } finally {
     const started = performance.now();
@@ -128,8 +153,12 @@ async function worker(mode, port) {
     startupMs,
     shutdownMs,
     samples,
+    batches,
+    totalTurns: sessionNumber,
+    elapsedMs,
     peakHeapBytes,
     heapAfterShutdownGcBytes: process.memoryUsage().heapUsed,
+    activeResourcesAfterShutdown: process.getActiveResourcesInfo(),
     maxRssBytes: process.resourceUsage().maxRSS * 1024,
     medianStreamMs: median(samples.map((sample) => sample.streamMs)),
     medianCpuMs: median(samples.map((sample) => sample.cpuUserMs + sample.cpuSystemMs)),
@@ -138,7 +167,7 @@ async function worker(mode, port) {
 }
 
 if (process.argv[2] === '--worker') {
-  console.log(JSON.stringify(await worker(process.argv[3], Number(process.argv[4]))));
+  console.log(JSON.stringify(await worker(process.argv[3], Number(process.argv[4]), soakSeconds)));
 } else {
   const root = await protobuf.load(fileURLToPath(new URL('./otlp-trace.proto', import.meta.url)));
   const Request = root.lookupType('ExportTraceServiceRequest');
@@ -163,7 +192,7 @@ if (process.argv[2] === '--worker') {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const results = [];
   try {
-    for (const mode of modes) {
+    for (const mode of soakSeconds ? ['phoenix-content-on'] : modes) {
       const { stdout } = await promisify(execFile)(
         process.execPath,
         [
@@ -173,22 +202,29 @@ if (process.argv[2] === '--worker') {
           mode,
           String(server.address().port),
         ],
-        { timeout: 60_000 },
+        {
+          timeout: soakSeconds * 1000 + 60_000,
+          env: { ...process.env, DSH_PERFORMANCE_SOAK_SECONDS: String(soakSeconds) },
+        },
       );
       const result = JSON.parse(stdout);
       assert.equal(result.mode, mode);
-      assert.equal(result.samples.length, workload.samples);
-      const exportedSpans = received.get(`/${mode}/v1/traces`) ?? 0;
+      if (soakSeconds) {
+        assert.ok(result.elapsedMs >= soakSeconds * 1000);
+        assert.ok(result.samples.length > 0);
+      } else assert.equal(result.samples.length, workload.samples);
       assert.equal(
-        exportedSpans,
-        mode === 'disabled'
-          ? 0
-          : 3 * (workload.warmupTurns + workload.samples * workload.turnsPerSample),
+        result.totalTurns,
+        workload.warmupTurns + result.batches * workload.turnsPerSample,
       );
+      const exportedSpans = received.get(`/${mode}/v1/traces`) ?? 0;
+      assert.equal(exportedSpans, mode === 'disabled' ? 0 : 3 * result.totalTurns);
       const baseline = results[0] ?? result;
       result.exportedSpans = exportedSpans;
-      result.streamTimeRatioVsDisabled = result.medianStreamMs / baseline.medianStreamMs;
-      result.cpuRatioVsDisabled = result.medianCpuMs / baseline.medianCpuMs;
+      if (!soakSeconds) {
+        result.streamTimeRatioVsDisabled = result.medianStreamMs / baseline.medianStreamMs;
+        result.cpuRatioVsDisabled = result.medianCpuMs / baseline.medianCpuMs;
+      }
       results.push(result);
       console.log(
         `${mode}: ${result.medianStreamMs.toFixed(2)} ms stream, ${result.medianCpuMs.toFixed(2)} ms CPU, ${exportedSpans} spans`,
@@ -198,7 +234,7 @@ if (process.argv[2] === '--worker') {
     await new Promise((resolve) => server.close(resolve));
   }
   writeFileSync(
-    'performance-metrics.json',
+    soakSeconds ? 'performance-soak.json' : 'performance-metrics.json',
     `${JSON.stringify(
       {
         revision: process.env.GITHUB_SHA ?? null,
@@ -207,6 +243,7 @@ if (process.argv[2] === '--worker') {
         arch: process.arch,
         cpu: cpus()[0]?.model,
         workload,
+        soakSeconds,
         results,
         note: 'Synthetic local workload; receiver CPU excluded. Timings and GC/RSS observations have no fixed pass/fail threshold.',
       },

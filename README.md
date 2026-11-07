@@ -177,6 +177,9 @@ pnpm build        # tsc per package
 pnpm typecheck
 pnpm test         # vitest (packages with a test script)
 pnpm test:performance  # deterministic budgets + JSON results; no credentials
+pnpm test:performance:network   # real loopback HTTP/SSE/gRPC and attachment paths
+pnpm test:performance:database  # disposable SQLite benchmark
+pnpm test:performance:combined  # real A2A + storage + telemetry + policy, synthetic agent
 ```
 
 The [Performance workflow](.github/workflows/performance.yml) runs the **Performance
@@ -194,6 +197,11 @@ against a loopback OTLP receiver in separate processes.
 | Lifecycle | 32 plugin lifecycles with 32 sessions each; no leftover fake-clock timers or late event handling |
 | Slow exporters | 1,000 LLM calls while exports stall; pinned OTel queue/batch limits, failure/timeout handling and unload completion |
 | Large payloads | Up to 10,000 entries, 64-level JSON and split credentials; bounded traversal/bytes and preserved redaction on both adapters |
+| Policy scale | 10/1,000 candidate rules and 1,000 shell substitutions; one argument serialization and one args check per candidate, preserving deny decisions |
+| Protocol load | 64 requests each over HTTP, SSE and gRPC at concurrency 1/16/64; first-frame/request percentiles, throughput and event-loop delay; 32 concurrent subscription cancellations |
+| Attachments/media | 24 MiB real chunked download, 64 MiB cap refusal and cancellation without leftover files; 128 images sharing a 4 MiB read budget, including ignored-read cancellation |
+| Real databases | 1,000/5,000 rows, oldest tool-call lookup, query plans, 32 concurrent reads and archive verification on SQLite/PostgreSQL; PostgreSQL additionally saturates a two-connection pool and verifies a row-lock wait does not block unrelated reads |
+| Combined plugins | A2A alone versus A2A + Storage + Telemetry + Policy over real HTTP/SQLite/OTLP, with eight warmup tasks and 64 measured tasks at concurrency eight; verifies policy rejection, all 144 message rows and 72 exported generations |
 
 `performance-results.json` records unit-test outcomes and durations.
 `performance-metrics.json` compares disabled telemetry with content capture off/on
@@ -203,10 +211,40 @@ startup, streaming, flush and shutdown time, CPU usage, turns/second, sampled he
 post-GC retained heap growth, process peak RSS and ratios against disabled mode.
 The receiver runs outside the measured worker, so its CPU is excluded.
 
+The workflow also uploads `performance-network.json`, `performance-media.json`,
+`performance-database-sqlite.json`, `performance-combined.json` and the transport
+test report. The separate PostgreSQL job uploads `performance-database-postgresql.json`.
+Combined-plugin CPU includes its co-located client/server/receiver; it is a total
+fixture observation, unlike the isolated telemetry worker measurements.
+
+SQLite runs in temporary WAL databases. PostgreSQL uses a disposable CI service;
+local runs require an explicit loopback database named `dsh_performance`:
+
+```sh
+DSH_PERFORMANCE_DB_PROVIDER=postgresql \
+DSH_PERFORMANCE_DB_URL=postgresql://postgres:performance-only@127.0.0.1:5432/dsh_performance \
+pnpm test:performance:database
+```
+
+For a sustained unique-session workload, manually dispatch **Performance** with
+`soak_minutes` set to `15`, `30` or `60`. This runs Phoenix content capture and
+records heap/RSS, active resource types, CPU and flush/stream timings periodically
+in `performance-soak.json`; it verifies every expected span reaches the receiver.
+The default dispatch value `0` runs short checks only. Normal PRs exercise the
+same runner for ten seconds without adding a long-duration job.
+
+```sh
+pnpm test:performance:soak  # 30 minutes by default
+DSH_PERFORMANCE_SOAK_SECONDS=10 pnpm test:performance:soak  # local smoke test
+```
+
 Both reports are retained for seven days. Capacity and work limits fail the check;
 hardware-dependent timing/memory figures are observations without fixed thresholds.
-The synthetic workload and mocked backend tests do not establish production
-latency, throughput, database performance or a long-duration memory-leak guarantee.
+The agents and responses are synthetic, even in the real transport/database tests.
+Reports do not establish production capacity or leak freedom. Query plans are
+recorded rather than required to choose a particular index on a small fixture;
+MySQL/SQL Server performance, real image decoding and production-network behavior
+are not covered by these benchmarks.
 
 ## Current limitations
 
