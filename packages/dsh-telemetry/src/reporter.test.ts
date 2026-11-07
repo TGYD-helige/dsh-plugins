@@ -44,7 +44,7 @@ afterEach(() => {
   state.spans.length = 0;
   state.fail = false;
   state.hold = false;
-  state.pending.splice(0).forEach((callback) => callback({ code: 0 }));
+  for (const callback of state.pending.splice(0)) callback({ code: 0 });
   state.batches.length = 0;
   vi.restoreAllMocks();
   vi.useRealTimers();
@@ -395,12 +395,9 @@ it.each(['release', 'failure', 'timeout'])(
       state.hold = false;
       if (outcome === 'timeout') await vi.advanceTimersByTimeAsync(30_001);
       else
-        state.pending
-          .splice(0)
-          .forEach((callback) =>
-            callback(
-              outcome === 'release' ? { code: 0 } : { code: 1, error: new Error('ETIMEDOUT') },
-            ),
+        for (const callback of state.pending.splice(0))
+          callback(
+            outcome === 'release' ? { code: 0 } : { code: 1, error: new Error('ETIMEDOUT') },
           );
       await disposal;
       expect(disposed).toBe(true);
@@ -409,7 +406,7 @@ it.each(['release', 'failure', 'timeout'])(
         expect(errors).toHaveBeenCalledWith(expect.stringMatching(/^\[dsh-telemetry\]/));
     } finally {
       state.hold = false;
-      state.pending.splice(0).forEach((callback) => callback({ code: 0 }));
+      for (const callback of state.pending.splice(0)) callback({ code: 0 });
       await ctx.fiber.dispose();
     }
   },

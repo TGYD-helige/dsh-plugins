@@ -4,8 +4,8 @@ import { execFile } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { cpus } from 'node:os';
-import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { gunzipSync } from 'node:zlib';
 import { Context } from '@deepseek-ai/cordis';
 import protobuf from 'protobufjs';
@@ -49,10 +49,12 @@ async function worker(mode, port) {
   const startupMs = performance.now() - startup;
   const delta = { type: 'text-delta', index: 0, text: 'x'.repeat(workload.chunkBytes) };
   let sequence = 0;
+  let sessionNumber = 0;
   let peakHeapBytes = 0;
   async function turns(count) {
     for (let turn = 0; turn < count; turn++) {
-      const session = { id: `session-${turn}`, header: { id: `session-${turn}` } };
+      const id = `session-${sessionNumber++}`;
+      const session = { id, header: { id } };
       const event = (type, data) =>
         ctx.emit('session/event', session, {
           type,
