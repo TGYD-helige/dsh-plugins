@@ -1,4 +1,5 @@
 /** Phoenix API read-back, normalized to the existing backend-independent shape evaluators. */
+import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 
 export function phoenixObservation(span) {
@@ -34,17 +35,49 @@ export function phoenixObservation(span) {
     sessionId: attr('session.id'),
     spanKind: kind,
     attributes,
+    events: span.events ?? [],
     statusCode: span.status_code,
     startTime: span.start_time,
     endTime: span.end_time,
   };
 }
 
-export async function runPhoenixVerification({ fromStartTime, codeword, evaluate }) {
-  const origin = process.env.PHOENIX_COLLECTOR_ENDPOINT.replace(/\/v1\/traces\/?$/, '').replace(
-    /\/$/,
-    '',
+function phoenixOrigin() {
+  return process.env.PHOENIX_COLLECTOR_ENDPOINT.replace(/\/v1\/traces\/?$/, '').replace(/\/$/, '');
+}
+
+export async function verifyPhoenixSessionIO(sessionId, expectedInput, expectedOutput) {
+  const origin = phoenixOrigin();
+  const headers = { Authorization: `Bearer ${process.env.PHOENIX_API_KEY}` };
+  const response = await fetch(`${origin}/v1/sessions/${encodeURIComponent(sessionId)}`, {
+    headers,
+    signal: AbortSignal.timeout(15_000),
+  });
+  assert.ok(response.ok, `Phoenix session read-back HTTP ${response.status}`);
+  const session = await response.json();
+  assert.equal(session.data.session_id, sessionId);
+  const result = await fetch(`${origin}/graphql`, {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    signal: AbortSignal.timeout(15_000),
+    body: JSON.stringify({
+      query: `query { node(id: ${JSON.stringify(session.data.id)}) { ... on ProjectSession { firstInput { value } lastOutput { value } } } }`,
+    }),
+  });
+  assert.ok(result.ok, `Phoenix session IO HTTP ${result.status}`);
+  const body = await result.json();
+  assert.ok(!body.errors?.length, 'Phoenix session IO query failed');
+  const input = body.data?.node?.firstInput?.value;
+  const output = body.data?.node?.lastOutput?.value;
+  assert.ok(typeof input === 'string' && input === expectedInput, 'missing session first input');
+  assert.ok(
+    typeof output === 'string' && output.trim() && output === expectedOutput,
+    'missing session last output',
   );
+}
+
+export async function runPhoenixVerification({ fromStartTime, codeword, evaluate }) {
+  const origin = phoenixOrigin();
   const project = encodeURIComponent(process.env.PHOENIX_PROJECT_NAME);
   const deadline = Date.now() + 5 * 60_000;
   let state = 'no matching Phoenix trace';
@@ -86,21 +119,7 @@ export async function runPhoenixVerification({ fromStartTime, codeword, evaluate
     for (const traceId of traces) {
       const trace = observations.filter((o) => o.traceId === traceId);
       const problems = [...evaluate(trace, codeword), ...evaluatePhoenixSemantics(trace)];
-      for (const span of trace) {
-        if (
-          !span.startTime ||
-          !span.endTime ||
-          Date.parse(span.endTime) < Date.parse(span.startTime)
-        )
-          problems.push('invalid timestamps');
-        if (
-          span.parentObservationId &&
-          !trace.some((parent) => parent.id === span.parentObservationId) &&
-          span.name !== 'a2a-task'
-        )
-          problems.push(`missing parent of ${span.name}`);
-      }
-      if (!problems.length) return { ok: true, state: 'Phoenix API read-back verified' };
+      if (!problems.length) return { ok: true, state: 'Phoenix API read-back verified', trace };
       state = problems.join('; ');
     }
     await delay(Math.min(10_000, Math.max(0, deadline - Date.now())));
@@ -111,7 +130,12 @@ export async function runPhoenixVerification({ fromStartTime, codeword, evaluate
 /** Preserve backend semantics that the cross-backend display normalization cannot express. */
 export function evaluatePhoenixSemantics(observations) {
   const problems = [];
+  const ids = new Set(observations.map((span) => span.id));
   for (const span of observations) {
+    if (!span.startTime || !span.endTime || Date.parse(span.endTime) < Date.parse(span.startTime))
+      problems.push('invalid timestamps');
+    if (span.parentObservationId && !ids.has(span.parentObservationId))
+      problems.push(`missing parent of ${span.name}`);
     const expectedKind =
       span.name === 'dsh-turn' ||
       span.name === 'agent:turn' ||
@@ -127,7 +151,40 @@ export function evaluatePhoenixSemantics(observations) {
               : undefined;
     if (expectedKind && span.spanKind !== expectedKind)
       problems.push(`${span.name} must have OpenInference kind ${expectedKind}`);
+    if (span.type === 'TOOL') {
+      if (span.attributes['tool.name'] !== span.metadata?.toolName || !span.metadata?.toolName)
+        problems.push('missing clean tool name');
+      if (span.attributes['tool.id'] !== span.metadata?.callId || !span.metadata?.callId)
+        problems.push('missing tool call ID');
+    }
     if (span.type !== 'GENERATION') continue;
+    if (
+      span.metadata?.source !== 'compaction/summary' &&
+      span.output &&
+      (typeof span.output === 'string' ||
+        span.output.content ||
+        span.output.thinking?.length ||
+        span.output.tool_calls?.length)
+    ) {
+      const firstTokens = (span.events ?? []).filter((event) => event.name === 'first_token');
+      const at = Date.parse(firstTokens[0]?.timestamp);
+      if (
+        firstTokens.length !== 1 ||
+        !Number.isFinite(at) ||
+        at < Date.parse(span.startTime) ||
+        at > Date.parse(span.endTime)
+      )
+        problems.push('missing or invalid first token event');
+      const milliseconds = Number(span.attributes['llm.time_to_first_token_ms']);
+      const seconds = span.attributes['llm.time_to_first_token_seconds'];
+      if (
+        !Number.isFinite(milliseconds) ||
+        milliseconds < 0 ||
+        milliseconds / 1000 !== seconds ||
+        Math.abs(at - Date.parse(span.startTime) - milliseconds) > 1
+      )
+        problems.push('missing or invalid first token duration');
+    }
     const attributes = span.attributes;
     if (span.input?.provider && attributes['llm.system'] !== span.input.provider)
       problems.push('missing LLM system/provider');

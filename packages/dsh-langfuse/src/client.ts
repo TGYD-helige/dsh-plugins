@@ -36,7 +36,11 @@ import { langfuseContextAttributes } from '@amaster.ai/dsh-telemetry/langfuse';
  * plugin fiber has been awaited.
  */
 
-import { PayloadPrivacy, usageOf } from '@amaster.ai/dsh-telemetry/instrumentation';
+import {
+  createTraceIdGenerator,
+  PayloadPrivacy,
+  usageOf,
+} from '@amaster.ai/dsh-telemetry/instrumentation';
 import type { TokenUsage } from '@deepseek-ai/dsh-llm';
 import type { LangfuseGeneration, LangfuseSpan } from '@langfuse/tracing';
 import type { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
@@ -119,6 +123,7 @@ export class LangfuseReporter extends PayloadPrivacy {
   private tracing: typeof import('@langfuse/tracing') | null = null;
   private api: typeof import('@opentelemetry/api') | null = null;
   private provider: NodeTracerProvider | null = null;
+  private ids: ReturnType<typeof createTraceIdGenerator> | null = null;
   /**
    * Observation → its trace's correlating attributes; children inherit their
    * parent's. Stamped on every observation (`session.id`,
@@ -178,15 +183,31 @@ export class LangfuseReporter extends PayloadPrivacy {
           return this.mask(data);
         },
       });
-      this.provider = new sdkNode.NodeTracerProvider({ spanProcessors: [processor] });
-      // Isolated provider, not provider.register(): the process-global OTEL
-      // provider stays untouched. Set `tracing` last — observation methods
-      // gate on it, and it must never be visible before the provider is wired.
-      tracing.setLangfuseTracerProvider(this.provider);
+      this.ids = createTraceIdGenerator(new sdkNode.RandomIdGenerator());
+      this.provider = new sdkNode.NodeTracerProvider({
+        spanProcessors: [processor],
+        idGenerator: this.ids,
+      });
+      // Publish readiness only after the isolated pipeline is wired.
       this.api = api;
       this.tracing = tracing;
     } catch (error) {
       console.error('[dsh-langfuse] client init failed:', error);
+    }
+  }
+
+  /** SDK creation is synchronous; restore its shared provider before any other caller runs. */
+  private withProvider<T>(create: () => T): T {
+    const tracing = this.tracing!;
+    const api = this.api!;
+    const current = tracing.getLangfuseTracerProvider();
+    // The SDK getter resolves its null fallback; restore that fallback across host reloads.
+    const previous = current === api.trace.getTracerProvider() ? null : current;
+    tracing.setLangfuseTracerProvider(this.provider);
+    try {
+      return api.context.with(api.ROOT_CONTEXT, create);
+    } finally {
+      tracing.setLangfuseTracerProvider(previous);
     }
   }
 
@@ -213,19 +234,18 @@ export class LangfuseReporter extends PayloadPrivacy {
   }): LangfuseSpan | null {
     const tracing = this.tracing;
     const api = this.api;
-    if (!tracing || !api) return null;
+    const ids = this.ids;
+    if (!tracing || !api || !ids) return null;
     try {
       const externalParent = parentContext(input.context?.traceparent);
-      const parent =
-        externalParent === NO_PARENT && input.traceId
-          ? { traceId: input.traceId, spanId: '0000000000000001', traceFlags: 1 }
-          : externalParent;
       input = this.mask(input);
-      const root = api.context.with(api.ROOT_CONTEXT, () =>
-        tracing.startObservation(
-          input.name,
-          { metadata: input.metadata },
-          { parentSpanContext: parent, startTime: input.startTime },
+      const root = ids.withTraceId(externalParent === NO_PARENT ? input.traceId : undefined, () =>
+        this.withProvider(() =>
+          tracing.startObservation(
+            input.name,
+            { metadata: input.metadata },
+            { parentSpanContext: externalParent, startTime: input.startTime },
+          ),
         ),
       );
       this.stampTraceContext(root, {
@@ -280,7 +300,7 @@ export class LangfuseReporter extends PayloadPrivacy {
     if (!parent || !api) return null;
     try {
       input = this.mask(input);
-      const generation = api.context.with(api.ROOT_CONTEXT, () =>
+      const generation = this.withProvider(() =>
         parent.startObservation(
           input.name,
           {
@@ -356,7 +376,7 @@ export class LangfuseReporter extends PayloadPrivacy {
         input: input.input,
         metadata: input.metadata,
       };
-      const span = api.context.with(api.ROOT_CONTEXT, () =>
+      const span = this.withProvider(() =>
         input.startTime && this.tracing
           ? this.tracing.startObservation(input.name, attributes, {
               parentSpanContext: parent.otelSpan.spanContext(),
@@ -471,10 +491,6 @@ export class LangfuseReporter extends PayloadPrivacy {
       await provider.shutdown();
     } catch (error) {
       console.error('[dsh-langfuse] shutdown failed:', error);
-    } finally {
-      // Release the module-global isolated-provider slot so a reloaded fiber
-      // starts clean — even when the shutdown flush failed.
-      tracing.setLangfuseTracerProvider(null);
     }
   }
 }

@@ -42,18 +42,21 @@ const attributes = (values) =>
       key,
       value.stringValue ??
         value.intValue ??
+        value.doubleValue ??
         value.boolValue ??
         value.arrayValue?.values.map((v) => v.stringValue),
     ]),
   );
 try {
-  for (const [backend, prefix] of [
+  for (const [backend, prefix, taskRoot = false] of [
     ['phoenix', ''],
     ['langfuse', ''],
     ['phoenix', '/prefix'],
     ['langfuse', '/prefix'],
     ['phoenix', '/slow'],
     ['phoenix', '/compressed'],
+    ['phoenix', '/task', true],
+    ['langfuse', '/task', true],
   ]) {
     const previousCompression = process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION;
     if (prefix === '/compressed') process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION = 'gzip';
@@ -75,11 +78,16 @@ try {
         name: 'turn',
         sessionId: 's',
         startTime: new Date('2026-01-01T00:00:00Z'),
-        context: { traceparent: '00-11111111111111111111111111111111-2222222222222222-01' },
+        traceId: taskRoot ? '33333333333333333333333333333333' : undefined,
+        context: taskRoot
+          ? undefined
+          : { traceparent: '00-11111111111111111111111111111111-2222222222222222-01' },
       });
+      if (taskRoot) reporter.updateSpan(parent, { input: 'task prompt' });
       const child = reporter.startGeneration(parent, {
         name: 'llm',
         model: 'test',
+        startTime: new Date('2026-01-01T00:00:00Z'),
         input: {
           messages: [
             {
@@ -94,12 +102,13 @@ try {
       });
       reporter.endGeneration(child, {
         output: 'world',
+        completionStartTime: new Date('2026-01-01T00:00:00.250Z'),
         usage: { inputTokens: 2, outputTokens: 3 },
         level: 'ERROR',
       });
       reporter.endSpan(
         parent,
-        { output: 'external owner must retain trace IO' },
+        { output: taskRoot ? 'task answer' : 'external owner must retain trace IO' },
         new Date('2026-01-01T00:00:01Z'),
       );
       await reporter.flush();
@@ -134,8 +143,30 @@ try {
       assert.equal(spans.length, 2);
       const llm = spans.find((s) => s.name === 'llm');
       const turn = spans.find((s) => s.name === 'turn');
-      assert.equal(Buffer.from(turn.traceId).toString('hex'), '11111111111111111111111111111111');
-      assert.equal(Buffer.from(turn.parentSpanId).toString('hex'), '2222222222222222');
+      assert.equal(llm.events.length, 1);
+      assert.equal(llm.events[0].name, 'first_token');
+      assert.equal(llm.events[0].timeUnixNano, '1767225600250000000');
+      assert.equal(attributes(llm.attributes)['llm.time_to_first_token_seconds'], 0.25);
+      assert.equal(Number(attributes(llm.events[0].attributes).time_to_first_token_ms), 250);
+      assert.equal(
+        Buffer.from(turn.traceId).toString('hex'),
+        taskRoot ? '33333333333333333333333333333333' : '11111111111111111111111111111111',
+      );
+      assert.equal(
+        Buffer.from(turn.parentSpanId ?? []).toString('hex'),
+        taskRoot ? '' : '2222222222222222',
+      );
+      if (taskRoot) {
+        const rootAttrs = attributes(turn.attributes);
+        assert.equal(
+          rootAttrs[backend === 'phoenix' ? 'input.value' : 'langfuse.observation.input'],
+          'task prompt',
+        );
+        assert.equal(
+          rootAttrs[backend === 'phoenix' ? 'output.value' : 'langfuse.observation.output'],
+          'task answer',
+        );
+      }
       assert.deepEqual(llm.traceId, turn.traceId);
       assert.deepEqual(llm.parentSpanId, turn.spanId);
       assert.equal(turn.startTimeUnixNano, '1767225600000000000');
@@ -151,7 +182,10 @@ try {
           backend === 'phoenix' ? 'phoenix-private' : 'sk-test',
         ),
       );
-      assert.equal(attributes(turn.attributes)['langfuse.trace.output'], undefined);
+      assert.equal(
+        attributes(turn.attributes)['langfuse.trace.output'],
+        taskRoot && backend === 'langfuse' ? 'task answer' : undefined,
+      );
     } finally {
       await reporter.shutdown();
       if (previousCompression === undefined)

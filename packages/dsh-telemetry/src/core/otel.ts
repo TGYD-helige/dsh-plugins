@@ -8,6 +8,7 @@ import type {
 } from '../adapters/types.js';
 import {
   boundPayload,
+  createTraceIdGenerator,
   type InstrumentationReporter,
   newPayloadBudget,
   PayloadPrivacy,
@@ -27,6 +28,7 @@ export interface ReporterConfig extends ConnectionConfig {
 }
 interface Observation {
   span: Span;
+  startedAt: number;
   data: ObservationData;
   ended?: boolean;
   contextMetadata?: Record<string, unknown>;
@@ -38,6 +40,7 @@ export class TelemetryReporter implements InstrumentationReporter {
   private api?: typeof import('@opentelemetry/api');
   private provider?: NodeTracerProvider;
   private tracer?: Tracer;
+  private ids?: ReturnType<typeof createTraceIdGenerator>;
   private observations = new WeakMap<object, Observation>();
   private privacy: PayloadPrivacy;
   constructor(
@@ -88,7 +91,9 @@ export class TelemetryReporter implements InstrumentationReporter {
         url: connection.endpoint,
         headers: connection.headers,
       });
+      this.ids = createTraceIdGenerator(new sdk.RandomIdGenerator());
       this.provider = new sdk.NodeTracerProvider({
+        idGenerator: this.ids,
         resource: resources.resourceFromAttributes({
           'service.name': 'dsh-telemetry',
           ...this.mask(connection.resourceAttributes),
@@ -126,15 +131,30 @@ export class TelemetryReporter implements InstrumentationReporter {
       isRemote: true,
     };
   }
-  private start(data: ObservationData, parent?: SpanContext, startTime?: Date): object | null {
-    if (!this.api || !this.tracer) return null;
+  private start(
+    data: ObservationData,
+    parent?: SpanContext,
+    startTime?: Date,
+    traceId?: string,
+  ): object | null {
+    const api = this.api;
+    const tracer = this.tracer;
+    const ids = this.ids;
+    if (!api || !tracer || !ids) return null;
     try {
       const context = parent
-        ? this.api.trace.setSpanContext(this.api.ROOT_CONTEXT, parent)
-        : this.api.ROOT_CONTEXT;
-      const span = this.tracer.startSpan(this.mask(data.name ?? 'span'), { startTime }, context);
+        ? api.trace.setSpanContext(api.ROOT_CONTEXT, parent)
+        : api.ROOT_CONTEXT;
+      const startedAt = startTime?.getTime() ?? Date.now();
+      const span = ids.withTraceId(traceId, () =>
+        tracer.startSpan(
+          this.mask(data.name ?? 'span'),
+          { startTime: new Date(startedAt) },
+          context,
+        ),
+      );
       const handle = {};
-      this.observations.set(handle, { span, data: this.mask(data) });
+      this.observations.set(handle, { span, startedAt, data: this.mask(data) });
       return handle;
     } catch {
       this.failure('span creation');
@@ -150,11 +170,6 @@ export class TelemetryReporter implements InstrumentationReporter {
     traceId?: string;
   }): object | null {
     const external = this.parent(input.context?.traceparent);
-    const parent =
-      external ??
-      (input.traceId
-        ? { traceId: input.traceId, spanId: '0000000000000001', traceFlags: 1 }
-        : undefined);
     const handle = this.start(
       {
         kind: 'root',
@@ -168,8 +183,9 @@ export class TelemetryReporter implements InstrumentationReporter {
         environment: this.config.environment,
         release: this.config.release,
       },
-      parent,
+      external,
       input.startTime,
+      external ? undefined : input.traceId,
     );
     if (handle) this.observations.get(handle)!.contextMetadata = this.mask(input.context?.metadata);
     return handle;
@@ -279,6 +295,24 @@ export class TelemetryReporter implements InstrumentationReporter {
     try {
       observation.span.updateName(this.mask(observation.data.name ?? 'span'));
       observation.span.setAttributes(this.attributes(observation.data));
+      if (observation.data.kind === 'generation' && observation.data.completionStartTime) {
+        const milliseconds = observation.data.completionStartTime.getTime() - observation.startedAt;
+        if (Number.isFinite(milliseconds) && milliseconds >= 0) {
+          const seconds = milliseconds / 1000;
+          observation.span.setAttributes({
+            'llm.time_to_first_token_ms': milliseconds,
+            'llm.time_to_first_token_seconds': seconds,
+          });
+          observation.span.addEvent(
+            'first_token',
+            {
+              time_to_first_token_ms: milliseconds,
+              time_to_first_token_seconds: seconds,
+            },
+            observation.data.completionStartTime,
+          );
+        }
+      }
       observation.span.setStatus({
         code: observation.data.level === 'ERROR' ? 2 : observation.data.level === 'WARNING' ? 0 : 1,
         message: this.config.captureContent ? this.mask(observation.data.statusMessage) : undefined,

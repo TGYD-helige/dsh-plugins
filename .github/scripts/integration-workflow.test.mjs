@@ -478,6 +478,104 @@ test('reasoning validation follows the source stream instead of requiring the mo
   );
 });
 
+test('subagent verification requires a successful completed read of the fixture', async () => {
+  const { evaluateSubagentTrace } = await import('./integration/lib/langfuse-shared.mjs');
+  const marker = 'ci-subagent-read';
+  const tree = [
+    { id: 'root', type: 'SPAN', name: 'dsh-turn', endTime: 1 },
+    {
+      id: 'delegate',
+      type: 'TOOL',
+      name: 'tool:subagent',
+      parentObservationId: 'root',
+      endTime: 1,
+    },
+    { id: 'child', type: 'SPAN', name: 'subagent', parentObservationId: 'delegate', endTime: 1 },
+    {
+      id: 'llm',
+      type: 'GENERATION',
+      parentObservationId: 'child',
+      model: integration.integrationModel(),
+      endTime: 1,
+    },
+    {
+      id: 'read',
+      type: 'TOOL',
+      name: 'tool:read',
+      parentObservationId: 'child',
+      endTime: 1,
+      input: { file_path: `/work/${marker}.txt` },
+      output: `${marker}-content`,
+    },
+  ];
+  assert.deepEqual(evaluateSubagentTrace(tree, marker), []);
+  assert.ok(
+    evaluateSubagentTrace(
+      [...tree, ...Array.from({ length: 4 }, (_, i) => ({ ...tree[3], id: `extra-${i}` }))],
+      marker,
+    ).includes('fixture subagent exceeded four LLM calls'),
+    'a one-file read must not pass after an extended search loop',
+  );
+  assert.ok(
+    evaluateSubagentTrace(
+      [
+        ...tree,
+        { ...tree[1], id: 'second-delegate' },
+        { ...tree[2], id: 'second-child', parentObservationId: 'second-delegate' },
+        ...Array.from({ length: 4 }, (_, i) => ({
+          ...tree[3],
+          id: `second-${i}`,
+          parentObservationId: 'second-child',
+        })),
+      ],
+      marker,
+    ).includes('fixture subagent exceeded four LLM calls'),
+    'repeated delegations must share the fixture call budget',
+  );
+  for (const update of [
+    { level: 'ERROR', output: `cannot read /work/${marker}.txt` },
+    { statusCode: 'ERROR', output: `cannot read /work/${marker}.txt` },
+    { endTime: null },
+    { output: undefined },
+    { name: 'tool:bash' },
+  ]) {
+    assert.ok(
+      evaluateSubagentTrace([...tree.slice(0, -1), { ...tree.at(-1), ...update }], marker).length,
+      'failed, unfinished or unrelated tools must not satisfy the read scenario',
+    );
+  }
+});
+
+test('Langfuse session verification checks both task traces and CI identity through the session API', async (t) => {
+  const { verifyLangfuseSession } = await import('./integration/lib/langfuse-shared.mjs');
+  const trace = {
+    id: 'first',
+    sessionId: 'session',
+    environment: 'ci',
+    release: 'head',
+    tags: ['ci', 'run:1'],
+  };
+  let body = { id: 'session', traces: [trace, { ...trace, id: 'second' }] };
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    assert.equal(String(url), 'https://langfuse.invalid/api/public/sessions/session');
+    return new Response(JSON.stringify(body), { status: 200 });
+  });
+  const options = {
+    baseUrl: 'https://langfuse.invalid',
+    publicKey: 'pk-fixture',
+    secretKey: 'sk-fixture',
+    sessionId: 'session',
+    traceIds: ['first', 'second'],
+    release: 'head',
+    tags: ['ci', 'run:1'],
+  };
+  await verifyLangfuseSession(options);
+  body = { ...body, traces: [trace] };
+  await assert.rejects(verifyLangfuseSession(options), /missing task trace/);
+  body = { ...body, traces: [trace, { ...trace, id: 'second', tags: [] }] };
+  await assert.rejects(verifyLangfuseSession(options));
+});
+
 test('reasoning evidence reads current durable model streams and fails on missing evidence', async () => {
   const { readReasoningSource } = await import('./integration/lib/langfuse-shared.mjs');
   const directory = mkdtempSync(join(tmpdir(), 'reasoning-source-'));
@@ -520,5 +618,63 @@ test('reasoning evidence reads current durable model streams and fails on missin
     );
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Phoenix rejects an A2A root that points to a missing parent', async () => {
+  const { evaluatePhoenixSemantics } = await import('./integration/lib/phoenix-shared.mjs');
+  const root = {
+    id: 'task-root',
+    name: 'a2a-task',
+    spanKind: 'AGENT',
+    type: 'SPAN',
+    startTime: '2026-01-01T00:00:00Z',
+    endTime: '2026-01-01T00:00:01Z',
+    parentObservationId: '0000000000000001',
+  };
+  assert.deepEqual(evaluatePhoenixSemantics([root]), ['missing parent of a2a-task']);
+  assert.deepEqual(evaluatePhoenixSemantics([{ ...root, parentObservationId: null }]), []);
+});
+
+test('Phoenix session verification requires the first input and last output', async (t) => {
+  const { verifyPhoenixSessionIO } = await import('./integration/lib/phoenix-shared.mjs');
+  const oldEndpoint = process.env.PHOENIX_COLLECTOR_ENDPOINT;
+  const oldKey = process.env.PHOENIX_API_KEY;
+  process.env.PHOENIX_COLLECTOR_ENDPOINT = 'http://phoenix.test/v1/traces';
+  process.env.PHOENIX_API_KEY = 'unit-test-key';
+  let firstInput = null;
+  let lastOutput = { value: 'task completed' };
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.equal(options.headers.Authorization, 'Bearer unit-test-key');
+    if (String(url).endsWith('/v1/sessions/task-session'))
+      return Response.json({
+        data: { id: 'UHJvamVjdFNlc3Npb246MQ==', session_id: 'task-session' },
+      });
+    assert.equal(String(url), 'http://phoenix.test/graphql');
+    assert.match(JSON.parse(options.body).query, /firstInput/);
+    return Response.json({ data: { node: { firstInput, lastOutput } } });
+  });
+  try {
+    await assert.rejects(
+      () => verifyPhoenixSessionIO('task-session', 'read ci-marker.txt', 'task completed'),
+      /session first input/,
+    );
+    firstInput = { value: 'read ci-marker.txt' };
+    await verifyPhoenixSessionIO('task-session', 'read ci-marker.txt', 'task completed');
+    lastOutput = { value: 'previous task response' };
+    await assert.rejects(
+      () => verifyPhoenixSessionIO('task-session', 'read ci-marker.txt', 'task completed'),
+      /session last output/,
+    );
+    lastOutput = null;
+    await assert.rejects(
+      () => verifyPhoenixSessionIO('task-session', 'read ci-marker.txt', 'task completed'),
+      /session last output/,
+    );
+  } finally {
+    if (oldEndpoint === undefined) delete process.env.PHOENIX_COLLECTOR_ENDPOINT;
+    else process.env.PHOENIX_COLLECTOR_ENDPOINT = oldEndpoint;
+    if (oldKey === undefined) delete process.env.PHOENIX_API_KEY;
+    else process.env.PHOENIX_API_KEY = oldKey;
   }
 });

@@ -83,10 +83,15 @@ Emit before the next root/turn starts. The collector snapshots strict JSON metad
 | Turn / A2A task | `AGENT` | `SPAN` root, trace/session context |
 | Subagent | `AGENT` | `SPAN`, nested under delegation tool |
 | LLM | `LLM`, indexed messages/tool calls/model/usage | `GENERATION`, model, disjoint usage buckets |
-| Tool | `TOOL` | `TOOL` |
+| Tool | `TOOL`, clean `tool.name` and `tool.id` | `TOOL` |
+| Compaction | `CHAIN` lifecycle + `LLM` usage, counted once | `SPAN` lifecycle + `GENERATION` usage, counted once |
 | Hook / raw request | `CHAIN` | `SPAN` |
 
 Phoenix prompt totals include cache buckets; completion totals already include reasoning. Langfuse usage buckets exclude overlapping cache/reasoning counts. Reasoning remains in generation `thinking` output and raw request chunks; Phoenix also gets indexed reasoning text. Parent IDs, clocks and OTel status belong to the shared instrumentation, not adapters.
+
+Generations export a timed `first_token` event for streaming latency. Expand that event to read `time_to_first_token_seconds` / `time_to_first_token_ms`, or open Attributes for `llm.time_to_first_token_seconds` / `llm.time_to_first_token_ms`. These are elapsed durations from LLM span start, not wall-clock timestamps. Metadata retains the requested model/provider and normalized finish reason. With content capture enabled, `providerResponse` also shows the adapter's original response-level facts (such as response ID, served model or native stop reason when supplied), bounded and redacted like other payloads; a requested route is never presented as a confirmed served model. Phoenix exposes the timestamp in the span's Events tab rather than a dedicated TTFT column.
+
+Abandoned turns show `terminatedBy` (`superseded`, `session_disposed`, or `plugin_unloaded`) and warning status, retaining partial output. Compaction shows summary output, model/provider and the replaced range's token count; that historical count is metadata, not additional billed usage. Calls marked by dsh's `llmStreamCall` are counted through `llm/stream` only; external summarizers supply their own usage. This lifecycle integration requires `@deepseek-ai/dsh-compaction >=0.2.2-rc.1`. Other auxiliary calls are captured when they use the same LLM seam; no usage is inferred from opaque tool results.
 
 ## Content and media
 

@@ -62,7 +62,11 @@ try {
     metadata: { password: 'ambient-private' },
   };
   const root = propagateAttributes(ambient, () =>
-    reporter.openTrace({ name: 'dsh-turn', sessionId: 'sdk-session' }),
+    reporter.openTrace({
+      name: 'dsh-turn',
+      sessionId: 'sdk-session',
+      traceId: '33333333333333333333333333333333',
+    }),
   );
   assert.ok(root, 'SDK initialization must create a real observation');
   reporter.updateSpan(root, { input: { prompt: 'sdk-marker', password: 'private-value' } });
@@ -94,6 +98,7 @@ try {
   reporter.endSpan(root, { output: 'sdk-answer' });
   const external = reporter.openTrace({
     name: 'sdk-external',
+    traceId: '44444444444444444444444444444444',
     context: {
       traceparent: '00-1234567890abcdef1234567890abcdef-1234567890abcdef-01',
     },
@@ -104,6 +109,8 @@ try {
   assert.equal(captured.length, 5, 'all ended SDK observations must reach OTLP ingestion');
   const own = captured.find((span) => span.name === 'dsh-turn');
   const joined = captured.find((span) => span.name === 'sdk-external');
+  assert.equal(own.traceId, '33333333333333333333333333333333');
+  assert.ok(!own.parentSpanId, 'a task trace must not invent a parent');
   assert.equal(attribute(own, keys.IS_APP_ROOT), true);
   assert.deepEqual(JSON.parse(attribute(own, keys.TRACE_INPUT)), {
     prompt: 'sdk-marker',
@@ -679,6 +686,63 @@ try {
     'disposing a pending idle turn must not create a root',
   );
   await checkMetadataWire({ require, connection, captured });
+  const tracing = await import(require.resolve('@langfuse/tracing'));
+  const previousProvider = tracing.getLangfuseTracerProvider();
+  const secondCapture = [];
+  const secondServer = await startFakeIngestion(secondCapture);
+  const first = new LangfuseReporter(connection);
+  const second = new LangfuseReporter({
+    ...connection,
+    baseUrl: `http://127.0.0.1:${secondServer.address().port}`,
+  });
+  try {
+    await Promise.all([first.ready, second.ready]);
+    const offset = captured.length;
+    for (const [owner, digit] of [
+      [first, '5'],
+      [second, '6'],
+    ]) {
+      const root = owner.openTrace({ name: `owner-${digit}`, traceId: digit.repeat(32) });
+      assert.equal(root.traceId, digit.repeat(32), 'each reporter must retain its requested ID');
+      const generation = owner.startGeneration(root, { name: `generation-${digit}` });
+      owner.endGeneration(generation, { output: 'answer' });
+      const child = owner.startSpan(root, { name: `child-${digit}`, startTime: new Date() });
+      owner.endSpan(child, { output: 'done' });
+      owner.endSpan(root, { output: 'done' });
+      assert.equal(tracing.getLangfuseTracerProvider(), previousProvider);
+    }
+    await Promise.all([first.flush(), second.flush()]);
+    assert.deepEqual(
+      captured
+        .slice(offset)
+        .map((span) => span.name)
+        .sort(),
+      ['child-5', 'generation-5', 'owner-5'],
+    );
+    assert.deepEqual(secondCapture.map((span) => span.name).sort(), [
+      'child-6',
+      'generation-6',
+      'owner-6',
+    ]);
+  } finally {
+    await Promise.all([first.shutdown(), second.shutdown()]);
+    await new Promise((resolve) => secondServer.close(resolve));
+  }
+  assert.equal(tracing.getLangfuseTracerProvider(), previousProvider);
+  const { NodeTracerProvider } = await import(require.resolve('@opentelemetry/sdk-trace-node'));
+  const replacement = new NodeTracerProvider();
+  try {
+    api.trace.disable();
+    assert.equal(api.trace.setGlobalTracerProvider(replacement), true);
+    assert.equal(
+      tracing.getLangfuseTracerProvider(),
+      api.trace.getTracerProvider(),
+      'reporters must preserve the SDK fallback when the host provider reloads',
+    );
+  } finally {
+    api.trace.disable();
+    await replacement.shutdown();
+  }
   console.log('real Langfuse SDK / OTLP checks passed');
 } finally {
   if (hookWorkDir) rmSync(hookWorkDir, { recursive: true, force: true });

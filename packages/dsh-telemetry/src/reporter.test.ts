@@ -13,6 +13,7 @@ const state = vi.hoisted(() => ({
     parentSpanContext?: { spanId: string };
     spanContext(): { traceId: string; spanId: string };
     status: { code: number };
+    events: Array<{ name: string; time: number[] }>;
     startTime: number[];
     endTime: number[];
   }>,
@@ -53,6 +54,7 @@ describe('shared isolated OTel pipeline', () => {
       await reporter.ready;
       const root = reporter.openTrace({
         name: 'turn',
+        traceId: 'abcdefabcdefabcdefabcdefabcdefab',
         sessionId: 's',
         startTime: new Date('2026-01-01T00:00:00Z'),
         context: {
@@ -245,5 +247,272 @@ it.each(['phoenix', 'langfuse'] as const)(
       expect(
         generation.attributes['llm.output_messages.0.message.contents.0.message_content.text'],
       ).toBe('Check the file.');
+  },
+);
+
+it.each(['phoenix', 'langfuse'] as const)(
+  'exports a parentless task with its requested trace ID on %s',
+  async (backend) => {
+    const reporter = new TelemetryReporter(
+      { backend, publicKey: 'pk-test', secretKey: 'sk-test', captureContent: true },
+      adapters[backend],
+    );
+    await reporter.ready;
+    const task = reporter.openTrace({
+      name: 'a2a-task',
+      sessionId: 'task-session',
+      traceId: 'abcdefabcdefabcdefabcdefabcdefab',
+    });
+    const turn = reporter.startSpan(task, { name: 'agent:turn', asType: 'agent' });
+    reporter.endSpan(turn);
+    reporter.endSpan(task, { input: 'first user input', output: 'last assistant output' });
+    reporter.endSpan(reporter.openTrace({ name: 'ordinary-turn', sessionId: 'other-session' }));
+    await reporter.shutdown();
+    const root = state.spans.find((span) => span.name === 'a2a-task')!;
+    const child = state.spans.find((span) => span.name === 'agent:turn')!;
+    expect(root.spanContext().traceId).toBe('abcdefabcdefabcdefabcdefabcdefab');
+    expect(root.parentSpanContext).toBeUndefined();
+    expect(child.parentSpanContext?.spanId).toBe(root.spanContext().spanId);
+    expect(child.spanContext().traceId).toBe(root.spanContext().traceId);
+    expect(
+      state.spans.find((span) => span.name === 'ordinary-turn')!.spanContext().traceId,
+    ).not.toBe(root.spanContext().traceId);
+    const sessionRoot = state.spans.find(
+      (span) => !span.parentSpanContext && span.attributes['session.id'] === 'task-session',
+    );
+    const prefix = backend === 'phoenix' ? '' : 'langfuse.observation.';
+    expect(sessionRoot?.attributes[backend === 'phoenix' ? 'input.value' : `${prefix}input`]).toBe(
+      'first user input',
+    );
+    expect(
+      sessionRoot?.attributes[backend === 'phoenix' ? 'output.value' : `${prefix}output`],
+    ).toBe('last assistant output');
+  },
+);
+
+it('exports the first token as a timed event once, even without content capture', async () => {
+  const reporter = new TelemetryReporter(
+    { backend: 'phoenix', captureContent: false },
+    adapters.phoenix,
+  );
+  await reporter.ready;
+  const root = reporter.openTrace({ name: 'turn' });
+  const generation = reporter.startGeneration(root, {
+    name: 'llm',
+    startTime: new Date('2026-01-01T00:00:00Z'),
+  });
+  reporter.endGeneration(
+    generation,
+    { completionStartTime: new Date('2026-01-01T00:00:00.250Z') },
+    new Date('2026-01-01T00:00:01Z'),
+  );
+  reporter.endGeneration(generation, { completionStartTime: new Date() });
+  reporter.endSpan(root);
+  await reporter.shutdown();
+  expect(state.spans[0].attributes).toMatchObject({
+    'llm.time_to_first_token_ms': 250,
+    'llm.time_to_first_token_seconds': 0.25,
+  });
+  expect(state.spans[1].attributes['llm.time_to_first_token_ms']).toBeUndefined();
+  expect(state.spans[0].events).toEqual([
+    {
+      name: 'first_token',
+      attributes: { time_to_first_token_ms: 250, time_to_first_token_seconds: 0.25 },
+      time: [1767225600, 250000000],
+      droppedAttributesCount: 0,
+    },
+  ]);
+});
+
+it.each(['superseded', 'session_disposed', 'plugin_unloaded'])(
+  'labels an abandoned turn as %s',
+  async (reason) => {
+    const ctx = new Context();
+    await apply(ctx, Config({ enabled: true, backend: 'phoenix' }));
+    const session = { id: 'abandoned', header: { id: 'abandoned' } } as never;
+    const event = (type: string, data: unknown) =>
+      ctx.emit('session/event', session, { type, seq: 1, time: Date.now(), data } as never);
+    event('turn/start', { turn: 0 });
+    event('user/message', { role: 'user', content: [{ type: 'text', text: 'hello' }] });
+    if (reason === 'superseded') event('turn/start', { turn: 1 });
+    if (reason === 'session_disposed') ctx.emit('session/disposed', session);
+    await ctx.fiber.dispose();
+    expect(JSON.parse(String(state.spans[0].attributes.metadata))).toMatchObject({
+      terminatedBy: reason,
+    });
+    expect(state.spans[0].status.code).toBe(0);
+  },
+);
+
+it.each([true, false])(
+  'records bounded provider response facts with captureContent=%s',
+  async (captureContent) => {
+    const ctx = new Context();
+    await apply(
+      ctx,
+      Config({
+        enabled: true,
+        backend: 'phoenix',
+        captureContent,
+        apiKey: 'secret-value',
+        maxPayloadBytes: 512,
+      }),
+    );
+    for await (const _ of ctx.waterfall(
+      'llm/stream',
+      { provider: 'route', model: 'requested', messages: [] } as never,
+      async function* () {
+        yield {
+          type: 'finish',
+          reason: { kind: 'max-tokens' },
+          replayState: {
+            response: {
+              id: 'response-1',
+              model: 'served',
+              stop_reason: 'length',
+              credential: 'secret-value',
+            },
+          },
+        } as never;
+      },
+    )) {
+    }
+    await ctx.fiber.dispose();
+    const llm = state.spans.find((s) => s.attributes['openinference.span.kind'] === 'LLM')!;
+    const metadata = JSON.parse(String(llm.attributes.metadata));
+    expect(metadata).toMatchObject({
+      requestedModel: 'requested',
+      requestedProvider: 'route',
+      finishReason: 'max-tokens',
+    });
+    if (captureContent)
+      expect(metadata.providerResponse).toEqual({
+        id: 'response-1',
+        model: 'served',
+        stop_reason: 'length',
+        credential: '[REDACTED]',
+      });
+    else expect(metadata.providerResponse).toBeUndefined();
+  },
+);
+
+it.each([
+  [true, false],
+  [false, false],
+  [true, true],
+  [false, true],
+])(
+  'records compaction lifecycle without double-counting llmStreamCall=%s child=%s',
+  async (llmStreamCall, child) => {
+    const ctx = new Context();
+    await apply(ctx, Config({ enabled: true, backend: 'phoenix', captureContent: true }));
+    const session = {
+      id: 'summary-session',
+      header: {
+        id: 'summary-session',
+        ...(child ? { parentSession: 'parent', origin: 'subagent', delegationDepth: 1 } : {}),
+      },
+    } as never;
+    if (child) {
+      ctx.emit('session/created', session);
+      ctx.emit('subagent/start', {
+        runId: 'run-summary',
+        provider: 'spawn',
+        id: 'summary-session',
+        local: true,
+      } as never);
+    }
+    let seq = 0;
+    const event = (type: string, data: unknown) =>
+      ctx.emit('session/event', session, { type, seq: ++seq, time: Date.now(), data } as never);
+    event('compaction/start', { compactionId: 'compact-1', turn: null });
+    if (llmStreamCall) {
+      for await (const _ of ctx.waterfall(
+        'llm/stream',
+        {
+          provider: 'summary-provider',
+          model: 'summary-model',
+          messages: [],
+          sessionId: 'summary-session',
+          purpose: 'compaction',
+        } as never,
+        async function* () {
+          yield { type: 'text-delta', index: 0, text: 'summary' } as never;
+          yield { type: 'usage', usage: { inputTokens: 7, outputTokens: 3 } } as never;
+          yield { type: 'finish', reason: { kind: 'stop' } } as never;
+        },
+      )) {
+      }
+    }
+    event('compaction/summary', {
+      compactionId: 'compact-1',
+      summary: [{ type: 'text', text: 'summary' }],
+      shadowedRange: { start: 1, end: 5 },
+      shadowedSeqs: [1, 3, 5],
+      shadowedTokenCount: 100,
+      provider: 'summary-provider',
+      model: 'summary-model',
+      usage: { inputTokens: 7, outputTokens: 3 },
+      ...(llmStreamCall
+        ? { llmStreamCall: true, rawOutput: [{ type: 'text', text: 'summary' }] }
+        : {}),
+    });
+    event('compaction/end', { compactionId: 'compact-1', turn: null });
+    await ctx.parallel('session/flush', session);
+    const generations = state.spans.filter(
+      (s) => s.attributes['openinference.span.kind'] === 'LLM',
+    );
+    expect(generations).toHaveLength(1);
+    expect(generations[0].attributes['llm.token_count.total']).toBe(10);
+    expect(generations[0].attributes['llm.model_name']).toBe('summary-model');
+    const compaction = state.spans.find((s) => s.name === 'compaction')!;
+    expect(compaction.attributes['output.value']).toContain('summary');
+    expect(JSON.parse(String(compaction.attributes.metadata))).toMatchObject({
+      compactionId: 'compact-1',
+      shadowedTokenCount: 100,
+    });
+    expect(generations[0].parentSpanContext?.spanId).toBe(compaction.spanContext().spanId);
+    await ctx.fiber.dispose();
+  },
+);
+
+it.each(['session_disposed', 'plugin_unloaded'])(
+  'closes unfinished compaction with %s and no content leak',
+  async (reason) => {
+    const ctx = new Context();
+    await apply(ctx, Config({ enabled: true, backend: 'phoenix', captureContent: false }));
+    const session = { id: 'compact-abandoned', header: { id: 'compact-abandoned' } } as never;
+    ctx.emit('session/event', session, {
+      type: 'compaction/start',
+      seq: 1,
+      time: Date.now(),
+      data: { compactionId: 'compact-1', turn: null },
+    } as never);
+    if (reason === 'session_disposed') ctx.emit('session/disposed', session);
+    await ctx.fiber.dispose();
+    const compact = state.spans.find((s) => s.name === 'compaction')!;
+    expect(JSON.parse(String(compact.attributes.metadata))).toMatchObject({ terminatedBy: reason });
+    expect(compact.status.code).toBe(0);
+  },
+);
+
+it.each([undefined, new Date('invalid'), new Date('2025-12-31T23:59:59Z')])(
+  'does not invent a first-token duration for unavailable or invalid timestamps: %s',
+  async (completionStartTime) => {
+    const reporter = new TelemetryReporter(
+      { backend: 'phoenix', captureContent: false },
+      adapters.phoenix,
+    );
+    await reporter.ready;
+    const root = reporter.openTrace({ name: 'turn' });
+    const generation = reporter.startGeneration(root, {
+      name: 'llm',
+      startTime: new Date('2026-01-01T00:00:00Z'),
+    });
+    reporter.endGeneration(generation, { completionStartTime });
+    reporter.endSpan(root);
+    await reporter.shutdown();
+    expect(state.spans[0].attributes['llm.time_to_first_token_seconds']).toBeUndefined();
+    expect(state.spans[0].events).toEqual([]);
   },
 );

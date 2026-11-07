@@ -35,6 +35,7 @@
  *   exit   : non-zero on any failure
  */
 
+import strictAssert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -406,6 +407,14 @@ export function evaluateSubagentTrace(observations, codeword) {
 
   const childGeneration = generations.find((o) => subSpan && o.parentObservationId === subSpan.id);
   need(childGeneration, 'no generation nested under the "subagent" span');
+  const childIds = new Set(
+    spans.filter((o) => o.name === 'subagent' || o.name?.startsWith('subagent:')).map((o) => o.id),
+  );
+  // A fixture read needs two model calls; allow two retries, but catch search loops in CI.
+  need(
+    generations.filter((o) => childIds.has(o.parentObservationId)).length <= 4,
+    'fixture subagent exceeded four LLM calls',
+  );
   if (childGeneration) {
     need(
       childGeneration.model === EXPECTED_MODEL,
@@ -418,10 +427,14 @@ export function evaluateSubagentTrace(observations, codeword) {
     (o) =>
       subSpan &&
       o.parentObservationId === subSpan.id &&
-      o.name?.startsWith('tool:') &&
-      JSON.stringify(o.input ?? '').includes(codeword),
+      o.name?.startsWith('tool:read') &&
+      o.level !== 'ERROR' &&
+      o.statusCode !== 'ERROR' &&
+      o.endTime != null &&
+      JSON.stringify(o.input ?? '').includes(codeword) &&
+      JSON.stringify(o.output ?? '').includes(codeword),
   );
-  need(childTool, 'no codeword-bearing tool span under the "subagent" span');
+  need(childTool, 'no successful completed fixture read under the "subagent" span');
   if (childTool) need(childTool.type === 'TOOL', 'child tool observation must have type TOOL');
   return problems;
 }
@@ -469,6 +482,7 @@ function spanToObservation(span) {
     input: otlpJsonAttr(span, 'langfuse.observation.input'),
     output: otlpJsonAttr(span, 'langfuse.observation.output'),
     model: otlpAttr(span, 'langfuse.observation.model.name') ?? undefined,
+    level: otlpAttr(span, 'langfuse.observation.level') ?? 'DEFAULT',
     usageDetails: otlpJsonAttr(span, 'langfuse.observation.usage_details'),
     sessionId: otlpAttr(span, 'session.id') ?? undefined,
     metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
@@ -676,7 +690,11 @@ export async function runVerification({
         }
         const problems = evaluate(observations, codeword);
         if (problems.length === 0) {
-          return { ok: true, state: `trace ${traceId} matches the expected dsh-langfuse shape` };
+          return {
+            ok: true,
+            state: `trace ${traceId} matches the expected dsh-langfuse shape`,
+            trace: observations,
+          };
         }
         lastState = `trace ${traceId} incomplete: ${problems.join('; ')}`;
         console.log(`  not complete yet: ${problems.join('; ')}`);
@@ -730,6 +748,42 @@ export async function startFakeIngestion(captured) {
   return server;
 }
 
+export async function verifyLangfuseSession({
+  baseUrl,
+  publicKey,
+  secretKey,
+  sessionId,
+  traceIds,
+  release,
+  tags,
+}) {
+  const response = await fetch(
+    `${baseUrl.replace(/\/$/, '')}/api/public/sessions/${encodeURIComponent(sessionId)}`,
+    {
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString('base64')}`,
+      },
+      signal: AbortSignal.timeout(15_000),
+    },
+  );
+  strictAssert.ok(response.ok, `Langfuse session read-back HTTP ${response.status}`);
+  let session;
+  try {
+    session = JSON.parse(await response.text());
+  } catch {
+    throw new Error('Langfuse session read-back returned invalid JSON');
+  }
+  strictAssert.equal(session.id, sessionId);
+  for (const id of traceIds) {
+    const trace = session.traces?.find((trace) => trace.id === id);
+    strictAssert.ok(trace, 'missing task trace in Langfuse session');
+    strictAssert.equal(trace.sessionId, sessionId);
+    strictAssert.equal(trace.environment, 'ci');
+    strictAssert.equal(trace.release, release);
+    strictAssert.deepEqual(new Set(trace.tags), new Set(tags));
+  }
+}
+
 /**
  * Run one leg to green: { tag, name, prompt, evaluate, hook?, toolHooks?, cancelHook?, metadata? }. The marker file
  * `${codeword}.txt` is written into the workspace and its name is the
@@ -742,6 +796,10 @@ export async function runScenario(opts) {
     console.error(`::error::${error.message}`);
     process.exit(1);
   }
+}
+
+export function subagentPrompt(markerFile, workDir) {
+  return `请调用 subagent 工具，委派一个子代理用 read 工具读取绝对路径 ${JSON.stringify(join(workDir, markerFile))} 并原样返回文件内容，然后立即结束。委派时须完整保留该路径，不要猜测或改写路径；不要搜索其他文件。你自己不要读取。`;
 }
 
 async function scenarioMain({
@@ -1019,7 +1077,7 @@ ${hookPatch}
     console.log(`\n(${name} attempt ${attempt}/${maxAttempts})`);
     captured.length = 0;
     const runStartedAt = new Date(Date.now() - 1000).toISOString();
-    await runQuery(prompt(markerFile));
+    await runQuery(prompt(markerFile, workDir));
     const source = reasoning ? readReasoningSource(dshHome, runStartedAt) : undefined;
     if (source) console.log(`Source reasoning: ${source.length} model stream(s)`);
     const evaluateRun = (observations, marker) => [
