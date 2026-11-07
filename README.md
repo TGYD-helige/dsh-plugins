@@ -179,7 +179,7 @@ pnpm test         # vitest (packages with a test script)
 pnpm test:performance  # deterministic budgets + JSON results; no credentials
 ```
 
-CI runs a separate **Performance budgets** check. Its focused test modules cover
+The [Performance workflow](.github/workflows/performance.yml) runs the **Performance budgets** check. Its focused test modules cover
 slow-consumer backlog at 100 and 10,000 frames, storage batching at up to 1,024
 tool results, and eight concurrent telemetry streams at 256 and 16,384 chunks.
 The hard limits are queue size, database calls, capture work and payload bytes;
