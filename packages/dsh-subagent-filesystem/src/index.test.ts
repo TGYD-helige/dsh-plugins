@@ -82,6 +82,7 @@ async function setup(
     await ctx.serial('agent/created', { agent: child, source: 'startup' });
     return {
       childId: child.id,
+      name: `agent-${agents.length}`,
       result: Promise.resolve({
         stopReason: 'completed',
         output: [{ type: 'text', text: 'role worked' }],
@@ -166,7 +167,7 @@ it.each([
   expect(h.ctx.tools.get('subagent_inventory_analyst', h.parent)).toBeUndefined();
   expect(errors).toHaveBeenCalledWith(
     '[dsh-subagent-filesystem] Role discovery failed',
-    expect.any(String),
+    expect.stringContaining('invalid.md'),
   );
 });
 
@@ -234,6 +235,7 @@ it('restores a background role snapshot and releases only owned children on unlo
     run_in_background: true,
   });
   expect(result.isError).toBe(false);
+  expect(JSON.stringify(result.content)).toContain('started subagent \\"agent-2\\"');
   expect(h.start.mock.calls[0][0].delivery).toBe('parent');
   expect(h.dispose).not.toHaveBeenCalled();
   const child = h.agents[1];
@@ -293,6 +295,7 @@ it('cancels and drains an active foreground delegation when the plugin unloads',
   const h = await setup();
   h.start.mockImplementationOnce(async () => ({
     childId: SessionId('active-child'),
+    name: 'agent-1',
     result: new Promise((resolve) => {
       h.dispose.mockImplementationOnce(async () => {
         resolve({ stopReason: 'aborted', output: [] });
@@ -343,6 +346,7 @@ it('contains provider and result failures and always disposes an accepted foregr
   const h = await setup();
   h.start.mockImplementationOnce(async () => ({
     childId: SessionId('failed'),
+    name: 'agent-1',
     result: Promise.reject(new Error('model failed')),
     dispose: h.dispose,
   }));
@@ -359,6 +363,7 @@ it.each(['error', 'aborted', 'max-tokens', 'refusal'])(
     const h = await setup();
     h.start.mockImplementationOnce(async () => ({
       childId: SessionId('failed-child'),
+      name: 'agent-1',
       result: Promise.resolve({ stopReason, output: [], diagnostic: 'Child could not finish' }),
       dispose: h.dispose,
     }));
@@ -368,6 +373,19 @@ it.each(['error', 'aborted', 'max-tokens', 'refusal'])(
     expect(h.dispose).toHaveBeenCalledOnce();
   },
 );
+
+it('reports a completed foreground child that left no text', async () => {
+  const h = await setup();
+  h.start.mockImplementationOnce(async () => ({
+    childId: SessionId('quiet-child'),
+    name: 'agent-1',
+    result: Promise.resolve({ stopReason: 'completed', output: [] }),
+    dispose: h.dispose,
+  }));
+  const result = await h.delegate();
+  expect(result.isError).toBe(false);
+  expect(JSON.stringify(result.content)).toContain('completed without a text report');
+});
 
 it('contains activation cleanup failures as tool errors', async () => {
   const h = await setup();

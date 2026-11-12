@@ -51,9 +51,9 @@ The example exposes `subagent_inventory_analyst`; its description tells the pare
 | --- | --- |
 | `prompt` | Required: a complete, self-contained task delivered as the child's user message |
 | `description` | Required: the native subagent's short task label |
-| `run_in_background` | Default false: wait for a report; true: return a continuable child id |
+| `run_in_background` | Default false: wait for a report; true: return the child's model-facing name and id for `send_message` |
 
-Background children use native completion notifications and `send_message` for follow-up. Native subagent services retain model defaults, delegation depth, sandbox boundaries, and approval rules. Definition files cannot override models, tools, or permissions. Foreground failures become tool errors; accepted runs always reach native cleanup.
+Background children use native completion notifications and `send_message` for follow-up. Native subagent services retain model defaults, delegation depth, sandbox boundaries, and approval rules. Definition files cannot override models, tools, or permissions. Foreground failures become tool errors; a completed child without text reports that instead of an empty result. Accepted runs always reach native cleanup. Discovery errors name the offending role file in the `[dsh-subagent-filesystem]` log.
 
 Named tools belong only to the consuming parent agent. They do not leak into other agents or workspaces, or automatically copy to children. A `subagent-filesystem/role` session event stores the child's role instructions and resource path. Cold restoration reinstalls the original snapshot rather than changing an existing role when its source file changes. Protect these instruction snapshots through the consuming application's existing session storage and access controls.
 

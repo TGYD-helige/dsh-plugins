@@ -195,13 +195,22 @@ export function apply(ctx: Context, config: Config): void {
       const names = new Set<string>();
       for (const entry of await fs.listDir(root, signal)) {
         if (entry.type !== 'file' || !entry.name.endsWith('.md')) continue;
-        if ((entry.size ?? 0) > 1024 * 1024) throw new DefinitionError('Role file exceeds 1 MiB');
+        if ((entry.size ?? 0) > 1024 * 1024)
+          throw new DefinitionError(`Role file exceeds 1 MiB: ${entry.target.displayPath}`);
         const bytes = await fs.readBytes(entry.target, signal, 1024 * 1024);
-        const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-        const role = parseRole(text, entry.target.displayPath);
+        let role: Role;
+        try {
+          const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+          role = parseRole(text, entry.target.displayPath);
+        } catch (error) {
+          const reason = error instanceof DefinitionError ? error.message : 'Invalid role file';
+          throw new DefinitionError(`${reason}: ${entry.target.displayPath}`);
+        }
         const toolName = `subagent_${role.name.replaceAll('-', '_')}`;
         if (names.has(toolName) || agent.ctx.get('tools')!.get(toolName, agent))
-          throw new DefinitionError('Duplicate role or tool name');
+          throw new DefinitionError(
+            `Duplicate role or tool name ${toolName}: ${entry.target.displayPath}`,
+          );
         names.add(toolName);
         roles.push(role);
       }
@@ -252,7 +261,7 @@ export function apply(ctx: Context, config: Config): void {
                     if (args.run_in_background) {
                       background.add(child);
                       void child.result.catch(() => {}).finally(() => background.delete(child));
-                      return `started subagent ${child.childId}; use send_message to continue it`;
+                      return `started subagent "${child.name}" (id ${child.childId}); use send_message to continue it`;
                     }
                     // Activation signals cover admission only; foreground calls own later cancellation.
                     let cleanup: Promise<void> | undefined;
@@ -266,10 +275,11 @@ export function apply(ctx: Context, config: Config): void {
                       const outcome = await child.result;
                       if (outcome.stopReason !== 'completed')
                         throw new Error(outcome.diagnostic ?? `Subagent ${outcome.stopReason}`);
-                      return outcome.output
+                      const report = outcome.output
                         .filter((block) => block.type === 'text')
                         .map((block) => block.text)
                         .join('');
+                      return report || 'The subagent completed without a text report.';
                     } finally {
                       signal.removeEventListener('abort', cancel);
                       await dispose();
