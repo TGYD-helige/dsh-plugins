@@ -1,6 +1,6 @@
 /** Native DSH input ownership with standard A2A task delivery. */
 import { randomUUID } from 'node:crypto';
-import { Message, Role, type Task, TaskState } from '@a2a-js/sdk';
+import { Message, Part, Role, type Task, TaskState } from '@a2a-js/sdk';
 import { RequestMalformedError } from '@a2a-js/sdk/errors';
 import {
   AgentEvent,
@@ -1178,6 +1178,55 @@ export class NativeInbox implements A2aInbox {
   }
   private pending(run: ContextRun) {
     return [...run.entry.handle.agent.inbox.nextStep, ...run.entry.handle.agent.inbox.nextTurn];
+  }
+
+  /**
+   * The task that already owns this client message ID in its context, so a
+   * retry follows that task instead of creating a duplicate failed task.
+   */
+  async retriedTask(message: Message, context: ServerCallContext): Promise<string | undefined> {
+    const contextId =
+      message.contextId ||
+      (message.taskId ? (await this.store.load(message.taskId, context))?.contextId : undefined);
+    if (!message.messageId || !contextId) return undefined;
+    let run: ContextRun;
+    try {
+      run = await this.context(contextId, context);
+    } catch {
+      return undefined; // execute reports the same failure on the request's own task
+    }
+    const owner = this.messageOwner(run, message.messageId);
+    if (!owner) return undefined;
+    const parts = (item: Message) => JSON.stringify(item.parts.map((part) => Part.toJSON(part)));
+    if (parts(owner.message) !== parts(message))
+      throw new RequestMalformedError(
+        'messageId is already used by a different message in this context.',
+      );
+    return owner.taskId;
+  }
+
+  private messageOwner(
+    run: ContextRun,
+    messageId: string,
+  ): { taskId: string; message: Message } | undefined {
+    for (const owned of run.tasks.values()) {
+      const message = owned.task.history.find((item) => item.messageId === messageId);
+      if (message) return { taskId: owned.task.id, message };
+    }
+    // Settled tasks are not resident after a restart; their input persists in the session.
+    const encoded = JSON.stringify(messageId);
+    const sources = [
+      ...this.pending(run).map((item) => item.source),
+      ...run.entry.handle.agent.session
+        .snapshotEvents()
+        .flatMap((event) => (event.type === 'user/message' ? [event.data.source] : [])),
+    ];
+    for (const source of sources) {
+      if (source?.kind !== 'a2a' || !source.message.includes(encoded)) continue;
+      const message = Message.fromJSON(JSON.parse(source.message));
+      if (message.messageId === messageId) return { taskId: source.taskId, message };
+    }
+    return undefined;
   }
 
   private task(task: Task, bus: ExecutionEventBus, context: ServerCallContext): TaskRun {
