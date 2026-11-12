@@ -78,12 +78,7 @@ async function setup(
   } as unknown as SessionQuery);
   const dispose = vi.fn(async () => {});
   const start = vi.fn(async (spec) => {
-    const { request } = spec;
-    const child = agent(
-      `child-${agents.length}`,
-      request.parent.session.header.cwd,
-      request.parent,
-    );
+    const child = agent(`child-${agents.length}`, spec.parent.session.header.cwd, spec.parent);
     await ctx.serial('agent/created', { agent: child, source: 'startup' });
     return {
       childId: child.id,
@@ -102,7 +97,7 @@ async function setup(
     })),
     resolveMaxDepth: vi.fn(() => 2),
     startActivation: start,
-    drainChildren: vi.fn(async () => {}),
+    interrupt: vi.fn(),
   } as unknown as Subagents);
   const plugin = ctx.plugin({ apply, inject }, config);
   await plugin;
@@ -138,9 +133,7 @@ it('discovers remote Markdown roles and adds literal child system instructions w
   expect(result.isError).toBe(false);
   expect(result.content).toEqual([{ type: 'text', text: 'role worked' }]);
   expect(h.start.mock.calls[0][0].delivery).toBe('caller');
-  expect(h.start.mock.calls[0][0].request.prompt).toEqual([
-    { type: 'text', text: 'Explain discrepancy' },
-  ]);
+  expect(h.start.mock.calls[0][0].prompt).toEqual([{ type: 'text', text: 'Explain discrepancy' }]);
   const child = h.agents[1];
   const prompt = await h.ctx.systemPrompt.assemble({ scope: child, agent: child });
   expect(prompt.sections.map((s) => s.text).join('\n')).toContain('Application rules');
@@ -230,6 +223,11 @@ it('isolates simultaneous delegations with the same name across remote workspace
 
 it('restores a background role snapshot and releases only owned children on unload', async () => {
   const h = await setup();
+  const startChild = h.start.getMockImplementation()!;
+  h.start.mockImplementationOnce(async (spec) => ({
+    ...(await startChild(spec)),
+    result: new Promise(() => {}),
+  }));
   const result = await h.delegate(h.parent, {
     description: 'Stock check',
     prompt: 'Inspect stock',
@@ -248,7 +246,12 @@ it('restores a background role snapshot and releases only owned children on unlo
     (await h.ctx.systemPrompt.assemble({ scope: restored })).sections.map((s) => s.text).join('\n'),
   ).toContain('Compare movements.');
   await h.plugin.dispose();
-  expect(h.ctx.subagents.drainChildren).toHaveBeenCalledWith(h.parent, [child.id, restored.id]);
+  expect(h.dispose).toHaveBeenCalledOnce();
+  expect(h.ctx.subagents.interrupt).toHaveBeenCalledOnce();
+  expect(h.ctx.subagents.interrupt).toHaveBeenCalledWith(restored.id, {
+    kind: 'ancestor',
+    agent: h.parent,
+  });
   expect(h.ctx.tools.get('subagent_inventory_analyst', h.parent)).toBeUndefined();
   expect(
     (await h.ctx.systemPrompt.assemble({ scope: child })).sections.some(
@@ -314,7 +317,7 @@ it('honors the tool policy gate and passes the native depth limit and cancellati
   expect(h.start).not.toHaveBeenCalled();
   off();
   await h.delegate();
-  expect(h.start.mock.calls[0][0].request.maxDepth).toBe(2);
+  expect(h.start.mock.calls[0][0].maxDepth).toBe(2);
   const abort = new AbortController();
   abort.abort();
   expect(

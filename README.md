@@ -40,23 +40,23 @@ This is an early dsh-preview ecosystem. The plugin shapes, config schemas, and s
 
 | @amaster.ai/dsh-* | dsh | cordis | @a2a-js/sdk (dsh-a2a) |
 | --- | --- | --- | --- |
-| 0.1.x | `>=0.1.5-rc.1 || >=0.1.6-alpha.1 || >=0.1.7-alpha.1 || >=0.2.0-rc.1 || >=0.2.1-rc.1 || >=0.2.2-rc.1` (peer floor) / `0.2.2-rc.1` (tested) | `^4.0.1` (tested `4.1.0`) | `^1.1.0` (A2A 1.0 + v0.3 compat) |
+| 0.1.x | `>=0.1.5-rc.1 || >=0.1.6-alpha.1 || >=0.1.7-alpha.1 || >=0.2.0-rc.1 || >=0.2.1-rc.1 || >=0.2.2-rc.1` (peer floor) / `0.2.2-rc.2` (tested) | `^4.0.1` (tested `4.1.0`) | `^1.1.0` (A2A 1.0 + v0.3 compat) |
 
 dsh is in developer preview and **will** break compatibility between releases. Plugins declare the oldest compatible dsh version as a fixed peer floor and every release records the tested dsh version in this matrix; the floor moves only when a plugin starts requiring a newer dsh API. Installs ride `dsh plugin add`, which is pnpm-only — pnpm's peer matching has no prerelease gate, so any newer dsh (alpha or stable) satisfies the floor without warnings. npm consumers are gated differently: npm never lets a prerelease satisfy a range unless the range names that release tuple with a prerelease comparator, so the peer ranges also name the 0.1.6, 0.1.7, 0.2.0, 0.2.1, and 0.2.2 prerelease tuples. Drop each union member once that line ships a final release.
 
-`dsh-a2a` inbox execution additionally tests the unmodified official DSH `0.2.2-rc.1` npm runtime. Its agent peer floor is `>=0.2.2-rc.1`, for initial model selection through agent options and the scoped model-switch notice hook. Queueing uses `Agent.send`; no core patch is required.
+`dsh-a2a` inbox execution additionally tests the unmodified official DSH `0.2.2-rc.2` npm runtime. Its agent peer floor is `>=0.2.2-rc.1`, for initial model selection through agent options and the scoped model-switch notice hook. Queueing uses `Agent.send`; no core patch is required.
 
-`dsh-a2a`'s optional Goal integration consumes `@deepseek-ai/dsh-goal >=0.2.0-rc.2 || >=0.2.1-alpha.1 || >=0.2.2-rc.1` and preserves official Goal round validation (tested with the Goal service and round driver at `0.2.2-rc.1`).
+`dsh-a2a`'s optional Goal integration consumes `@deepseek-ai/dsh-goal >=0.2.0-rc.2 || >=0.2.1-alpha.1 || >=0.2.2-rc.1` and preserves official Goal round validation (tested with the Goal service and round driver at `0.2.2-rc.2`).
 
-`dsh-a2a`'s approval bridge has an optional `@deepseek-ai/dsh-user-approval` peer floor of `>=0.1.6-alpha.2 || >=0.1.7-alpha.1 || >=0.2.0-rc.1 || >=0.2.1-rc.1 || >=0.2.2-rc.1` (tested at `0.2.2-rc.1`).
+`dsh-a2a`'s approval bridge has an optional `@deepseek-ai/dsh-user-approval` peer floor of `>=0.1.6-alpha.2 || >=0.1.7-alpha.1 || >=0.2.0-rc.1 || >=0.2.1-rc.1 || >=0.2.2-rc.1` (tested at `0.2.2-rc.2`).
 
 `dsh-a2a` requires `@deepseek-ai/dsh-session >=0.2.1-rc.5 || >=0.2.2-rc.1` for the owner-scoped `SessionStore.flush` durability barrier used by native inbox operations and checkpointed invalidations. Optional subagent streaming also consumes the session lifecycle offset to distinguish new children from restored sessions.
 
-`dsh-langfuse`'s optional image display uses `@deepseek-ai/dsh-attachment >=0.2.0-rc.1 || >=0.2.2-rc.1` (tested at `0.2.2-rc.1`); metadata-only tracing does not require an attachment backend.
+`dsh-langfuse`'s optional image display uses `@deepseek-ai/dsh-attachment >=0.2.0-rc.1 || >=0.2.2-rc.1` (tested at `0.2.2-rc.2`); metadata-only tracing does not require an attachment backend.
 
-`dsh-subagent-filesystem` requires `@deepseek-ai/dsh-subagent >=0.2.1-rc.2 || >=0.2.2-rc.1` (tested at `0.2.2-rc.1`) and the native in-process `spawn` provider. It supports foreground reports and continuable background children; Markdown definitions cannot override models, tools, or permissions.
+`dsh-subagent-filesystem` requires `@deepseek-ai/dsh-subagent >=0.2.2-rc.2` (tested at `0.2.2-rc.2`) and the native in-process `spawn` provider. It supports foreground reports and continuable background children; Markdown definitions cannot override models, tools, or permissions.
 
-`dsh-telemetry` tests the same dsh `0.2.2-rc.1` collector with OTel API `1.9.1`, SDK/resources `2.10.0`, and OTLP/HTTP protobuf exporter `0.221.0`. It needs no Langfuse SDK. See its README for backend server/version limits, project configuration and migration; enable one collector per profile.
+`dsh-telemetry` tests the same dsh `0.2.2-rc.2` collector with OTel API `1.9.1`, SDK/resources `2.10.0`, and OTLP/HTTP protobuf exporter `0.221.0`. It needs no Langfuse SDK. See its README for backend server/version limits, project configuration and migration; enable one collector per profile.
 
 ## Install
 
@@ -148,7 +148,7 @@ The logical message id rides in `metadata.id`; message rows use a deterministic 
 
 Task updates use standard A2A streaming/subscriptions, snapshots, and optional [official SDK Push Notifications](packages/dsh-a2a/README.md#standard-a2a-notifications). Enable `pushNotifications: true` to let clients register standard task webhooks.
 
-**Native inbox mode is opt-in and uses the official DSH APIs**; it is tested with the unmodified `0.2.2-rc.1` npm runtime. See [native inbox execution](packages/dsh-a2a/README.md#native-inbox-execution) for queueing, steering, pause/recovery semantics and the runtime integration checks.
+**Native inbox mode is opt-in and uses the official DSH APIs**; it is tested with the unmodified `0.2.2-rc.2` npm runtime. See [native inbox execution](packages/dsh-a2a/README.md#native-inbox-execution) for queueing, steering, pause/recovery semantics and the runtime integration checks.
 
 Opt into `inbox: { enabled: true, shutdown: retain-pending }` to retain unclaimed A2A steering and future turns across graceful host restarts. Retain both the session persistence and TaskStore storage; hosts still discover and wake eligible work. Explicit cancellation and context clearing remain terminal. See [the shutdown contract](packages/dsh-a2a/README.md#graceful-host-shutdown).
 

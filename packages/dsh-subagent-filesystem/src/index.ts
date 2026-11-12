@@ -5,7 +5,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-fs';
 import type { SessionId } from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-session-query';
-import type {} from '@deepseek-ai/dsh-subagent';
+import type { SubagentActivation } from '@deepseek-ai/dsh-subagent';
 import type {} from '@deepseek-ai/dsh-system-prompt';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import Schema from '@deepseek-ai/schemastery';
@@ -91,7 +91,8 @@ export function apply(ctx: Context, config: Config): void {
   const lifecycle = new AbortController();
   const delegation = new AsyncLocalStorage<{ parent: Agent; role: Role }>();
   const registrations = new Map<Agent, (() => void)[]>();
-  const children = new Map<Agent, SessionId[]>();
+  const restored = new Map<Agent, SessionId[]>();
+  const background = new Set<SubagentActivation>();
   const pending = new Set<Promise<unknown>>();
   function track<T>(work: Promise<T>): Promise<T> {
     pending.add(work);
@@ -107,10 +108,10 @@ export function apply(ctx: Context, config: Config): void {
   const remove = (agent: Agent) => {
     for (const dispose of registrations.get(agent) ?? []) dispose();
     registrations.delete(agent);
-    children.delete(agent);
+    restored.delete(agent);
   };
 
-  // Verified against dsh-agent@0.2.0-rc.1: this serial event precedes the first prompt.
+  // Verified against dsh-agent/dsh-subagent@0.2.2-rc.2: this serial event precedes the first prompt.
   ctx.on('agent/created', ({ agent, source, signal }) => {
     return track(initialize(agent, source, signal)).then(
       () => undefined,
@@ -124,9 +125,13 @@ export function apply(ctx: Context, config: Config): void {
   ctx.effect(() => async () => {
     lifecycle.abort();
     await Promise.allSettled([...pending]);
-    const released = await Promise.allSettled(
-      [...children].map(([parent, ids]) => ctx.subagents.drainChildren(parent, ids)),
-    );
+    // DSH 0.2.2-rc.2 releases only exact activations; restored children can only be interrupted.
+    const released = await Promise.allSettled([
+      ...[...background].map((child) => child.dispose()),
+      ...[...restored].flatMap(([parent, ids]) =>
+        ids.map(async (id) => ctx.subagents.interrupt(id, { kind: 'ancestor', agent: parent })),
+      ),
+    ]);
     for (const result of released) {
       if (result.status === 'rejected')
         console.error('[dsh-subagent-filesystem] Child cleanup failed');
@@ -159,9 +164,9 @@ export function apply(ctx: Context, config: Config): void {
         }
         const parent = ctx.get('agents')?.get(agent.session.header.parentSession);
         if (role && parent) {
-          const ids = children.get(parent) ?? [];
+          const ids = restored.get(parent) ?? [];
           if (!ids.includes(agent.id)) ids.push(agent.id);
-          children.set(parent, ids);
+          restored.set(parent, ids);
         }
       }
       if (role) {
@@ -235,23 +240,18 @@ export function apply(ctx: Context, config: Config): void {
                 signal.throwIfAborted();
                 return track(
                   delegation.run({ parent: agent, role }, async () => {
-                    const request = {
-                      parent: agent,
-                      prompt: [{ type: 'text' as const, text: args.prompt }],
-                      maxDepth: agent.ctx.get('subagents')!.resolveMaxDepth(),
-                    };
                     const child = await agent.ctx.get('subagents')!.startActivation({
                       provider: 'spawn',
                       label: args.description,
-                      request,
+                      parent: agent,
+                      prompt: [{ type: 'text' as const, text: args.prompt }],
+                      maxDepth: agent.ctx.get('subagents')!.resolveMaxDepth(),
                       signal,
                       delivery: args.run_in_background ? 'parent' : 'caller',
                     });
                     if (args.run_in_background) {
-                      void child.result.catch(() => {});
-                      const ids = children.get(agent) ?? [];
-                      ids.push(child.childId);
-                      children.set(agent, ids);
+                      background.add(child);
+                      void child.result.catch(() => {}).finally(() => background.delete(child));
                       return `started subagent ${child.childId}; use send_message to continue it`;
                     }
                     // Activation signals cover admission only; foreground calls own later cancellation.
