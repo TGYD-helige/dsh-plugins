@@ -59,6 +59,9 @@ import {
   withStreamConnection,
 } from './stream-connection.js';
 
+const isWorking = (state?: TaskState) =>
+  state === TaskState.TASK_STATE_WORKING || state === TaskState.TASK_STATE_SUBMITTED;
+
 /** One advertised agent-card skill. */
 export interface CardSkill {
   id: string;
@@ -348,11 +351,53 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
         throw new RequestMalformedError(error instanceof Error ? error.message : String(error));
       }
     }
+    private async retriedTask(message: Message | undefined, context: ServerCallContext) {
+      return message && options.inbox?.retriedTask(message, context);
+    }
+    /** Follow a retried message's original task until it settles, as the first send did. */
+    private async *followRetry(
+      id: string,
+      params: Parameters<DefaultRequestHandler['sendMessage']>[0],
+      context: ServerCallContext,
+      follow: boolean,
+    ): AsyncGenerator<StreamResponse, void, undefined> {
+      const request = { tenant: params.tenant, id };
+      const task = await this.getTask(
+        { ...request, historyLength: params.configuration?.historyLength },
+        context,
+      );
+      if (!follow || !isWorking(task.status?.state)) {
+        yield { payload: { $case: 'task', value: task } };
+        return;
+      }
+      for await (const event of this.resubscribe(request, context)) {
+        yield event;
+        const payload = event.payload;
+        if (
+          (payload?.$case === 'task' || payload?.$case === 'statusUpdate') &&
+          !isWorking(payload.value.status?.state)
+        )
+          return;
+      }
+    }
     override async sendMessage(...args: Parameters<DefaultRequestHandler['sendMessage']>) {
       const release = guardApproval(args[0].message);
       const admission = await acquireAdmission(args[0].message);
       let releaseAdmission: undefined | (() => void);
       try {
+        const retried = release ? undefined : await this.retriedTask(args[0].message, args[1]);
+        if (retried) {
+          admission.release();
+          const follow = !args[0].configuration?.returnImmediately;
+          let task: Task | undefined;
+          for await (const event of this.followRetry(retried, args[0], args[1], follow)) {
+            const payload = event.payload;
+            if (payload?.$case === 'task') task = payload.value;
+            else if (payload?.$case === 'statusUpdate' && task)
+              task = { ...task, status: payload.value.status };
+          }
+          return task ?? (await this.getTask({ tenant: args[0].tenant, id: retried }, args[1]));
+        }
         if (!release) await beforeWorkingTaskMessage(args[0].message, args[1]);
         if (!release) releaseAdmission = await this.beforeMessage(args[0].message, args[1]);
         return await approvalReply.run(Boolean(release), () =>
@@ -372,6 +417,12 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
       const admission = await acquireAdmission(args[0].message);
       let releaseAdmission: undefined | (() => void);
       try {
+        const retried = release ? undefined : await this.retriedTask(args[0].message, args[1]);
+        if (retried) {
+          admission.release();
+          yield* this.followRetry(retried, args[0], args[1], true);
+          return;
+        }
         if (!release) await beforeWorkingTaskMessage(args[0].message, args[1]);
         if (!release) releaseAdmission = await this.beforeMessage(args[0].message, args[1]);
         const stream = admission.run(() => observeTask(super.sendMessageStream(...args)));

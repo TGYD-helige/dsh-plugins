@@ -18,6 +18,8 @@ dsh plugin --profile my-agent add @amaster.ai/dsh-a2a
 
 Standard `SendMessage` / `SendStreamingMessage`, task queries, cancellation and task subscriptions keep their official meanings. Optional inbox metadata forwards `target` and `wakeup` to DSH. `wakeup: false` leaves an idle driver parked; it does not prevent an active driver from consuming pending input. A later real waking message releases pending input.
 
+A resent `messageId` in the same context is a retry: with or without `taskId`, and after a restart through the session, the plugin returns the task that already owns it instead of admitting the message again. Blocking and streaming retries follow a working task until it settles; finished tasks return as they are. A retry with different parts is rejected. Without `inbox.enabled`, message IDs are not deduplicated.
+
 The same-process `a2aInbox` service exposes `recoveryCandidates`, `resolve`, `content`, `enqueue`, `promote`, `cancel`, `get`, `update`, `move`, `remove`, `clearPending`, and `executePending`, plus the existing pause/wake/resume controls. Pending-only clearing preserves active work; context clearing discards all work.
 
 Pause is process-local and writes no custom required session event. After restart, restored input stays parked until a waking admission or explicit execution. Retention recovery accepts snapshots under the historical extension URI as well as the current URI, writes only the current metadata key, and clears both keys after consumption. Explicit resume durably transfers input to a fresh task before waking it; retry after an interrupted cleanup reuses the existing replacement instead of replaying its input.

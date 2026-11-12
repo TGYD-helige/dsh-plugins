@@ -1247,7 +1247,8 @@ it('streams committed steering between replies while parked inputs retain FIFO o
     },
     configuration: { returnImmediately: true },
   });
-  expect(duplicate.error).toBeDefined();
+  expect(duplicate.error).toBeUndefined();
+  expect(duplicate.result.task.id).toBe(active.id);
   expect(
     agent.session
       .snapshotEvents()
@@ -1583,6 +1584,88 @@ it('accepts controls without negotiation and rejects steering without an active 
   await f.completed(task.id);
   await f.completed(trigger.id);
   await f.completed(unnegotiated.result.task.id);
+});
+
+describe('message retries', () => {
+  const retry = (id: string, text = id, taskId?: string) => ({
+    message: {
+      messageId: id,
+      role: 'ROLE_USER',
+      contextId: 'native-test',
+      taskId,
+      parts: [{ text }],
+    },
+  });
+  const streamed = async (port: number, params: unknown) =>
+    (
+      await (
+        await fetch(`http://127.0.0.1:${port}/a2a/`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'A2A-Version': '1.0' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'SendStreamingMessage', params }),
+        })
+      ).text()
+    )
+      .split('\n\n')
+      .filter((frame) => frame.startsWith('data: '))
+      .map((frame) => JSON.parse(frame.slice(6)));
+
+  it('returns the original task instead of a new failed task', async () => {
+    const f = await boot();
+    const original = await f.send('once');
+    await f.completed(original.id);
+    for (const taskId of [undefined, original.id]) {
+      const again = await f.rpc('SendMessage', retry('once', 'once', taskId));
+      expect(again.error).toBeUndefined();
+      expect(again.result.task.id).toBe(original.id);
+      expect(again.result.task.status.state).toBe('TASK_STATE_COMPLETED');
+    }
+    const frames = await streamed(f.server.port, retry('once'));
+    expect(frames.map((frame) => frame.error)).toEqual([undefined]);
+    expect(frames[0].result.task.id).toBe(original.id);
+    const changed = await f.rpc('SendMessage', retry('once', 'different'));
+    expect(changed.error?.message).toContain('different message');
+    const listed = await f.rpc('ListTasks', { contextId: 'native-test' });
+    expect(listed.result.tasks.map((task) => task.id)).toEqual([original.id]);
+    expect(f.adapter.requests).toHaveLength(1);
+  });
+
+  it('waits for a working original task to settle', async () => {
+    const f = await boot();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    cleanups.push(async () => release());
+    f.ctx.on('a2a/before-step', () => gate);
+    const original = await f.send('busy');
+    const blocking = f.rpc('SendMessage', retry('busy'));
+    const streaming = streamed(f.server.port, retry('busy'));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    release();
+    const [again, frames] = await Promise.all([blocking, streaming]);
+    expect(again.error).toBeUndefined();
+    expect(again.result.task.id).toBe(original.id);
+    expect(again.result.task.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(frames.every((frame) => frame.error === undefined)).toBe(true);
+    expect(frames.at(-1).result.statusUpdate.status.state).toBe('TASK_STATE_COMPLETED');
+    expect(f.adapter.requests).toHaveLength(1);
+  });
+
+  it('recognizes a retry after restart from the persisted session', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'a2a-message-retry-'));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const first = await boot({ root });
+    const original = await first.send('durable');
+    await first.completed(original.id);
+    await first.ctx.parallel('session/flush', (await first.inbox.resolve('native-test')).session);
+    await first.bridge.dispose();
+    const second = await boot({ root, backend: first.backend });
+    const again = await second.rpc('SendMessage', retry('durable'));
+    expect(again.error).toBeUndefined();
+    expect(again.result.task.id).toBe(original.id);
+    expect(second.adapter.requests).toHaveLength(0);
+  });
 });
 
 it('keeps CancelTask terminal and removes only its queued input', async () => {
