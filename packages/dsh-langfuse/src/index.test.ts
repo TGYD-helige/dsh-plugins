@@ -3392,13 +3392,31 @@ describe('dsh-langfuse plugin', () => {
       await setup();
       await drain(
         ctx.waterfall('llm/stream', optionsOf(), () =>
-          streamOf(textDelta('partial'), finishError('provider exploded')),
+          streamOf(textDelta('partial'), {
+            type: 'finish',
+            reason: {
+              kind: 'error',
+              failure: {
+                message: 'provider exploded',
+                code: 'BOOM',
+                status: 429,
+                requestId: 'req-1',
+                providerRetryAfterMs: 2000,
+              },
+            },
+          } as StreamChunk),
         ),
       );
       expect(lastUpdate(fakeObs(mocks.roots[0]).generations[0])).toMatchObject({
         level: 'ERROR',
         statusMessage: 'provider exploded',
-        metadata: { finishReason: 'error', errorCode: 'BOOM' },
+        metadata: {
+          finishReason: 'error',
+          errorCode: 'BOOM',
+          errorStatus: 429,
+          providerRequestId: 'req-1',
+          providerRetryAfterMs: 2000,
+        },
       });
     });
 
@@ -3712,7 +3730,9 @@ describe('dsh-langfuse plugin', () => {
         metadata: { childSessionId: 'c1', delegationDepth: 1 },
       });
       // subagent/start enriches with provider facts.
-      expect(subSpan.updates).toContainEqual({ metadata: { provider: 'spawn', local: true } });
+      expect(subSpan.updates).toContainEqual({
+        metadata: { provider: 'spawn', local: true, runId: 'run-c1' },
+      });
       // The child's generation nests under the subagent span, not the trace.
       expect(subSpan.generations).toHaveLength(1);
       expect(subSpan.generations[0].name).toBe('llm-call [child answer]');
@@ -3789,6 +3809,30 @@ describe('dsh-langfuse plugin', () => {
       expect(subSpan.updates).toContainEqual({
         metadata: { mode: 'one-shot', provider: 'spawn' },
       });
+    });
+
+    it('records the subagent run id and the parent catalog name', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/created', childSessionOf('c1', 's1'));
+      ctx.emit('subagent/start', subagentStart('c1'));
+      ctx.emit(
+        'session/event',
+        sessionOf('s1'),
+        ev('subagent/catalog', {
+          version: 1,
+          childId: 'c1',
+          childCreatedAt: 1,
+          mode: 'resident',
+          label: 'reviewer',
+          name: 'reviewer-1',
+        }),
+      );
+      const subSpan = fakeObs(mocks.roots[0]).spans[0];
+      expect(subSpan.updates).toContainEqual({
+        metadata: expect.objectContaining({ runId: 'run-c1' }),
+      });
+      expect(subSpan.updates).toContainEqual({ metadata: { subagentName: 'reviewer-1' } });
     });
 
     it('marks a failed subagent run as ERROR', async () => {

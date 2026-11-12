@@ -325,6 +325,10 @@ export class TelemetryReporter implements InstrumentationReporter {
       } catch {
         this.failure('span end');
       }
+      // Late children of a completed turn only inherit request dimensions; drop payloads.
+      const { kind, name, sessionId, traceName, userId, tags, environment, release } =
+        observation.data;
+      observation.data = { kind, name, sessionId, traceName, userId, tags, environment, release };
     }
   }
   endGeneration(handle: object | null, update: SpanUpdate, endedAt?: Date) {

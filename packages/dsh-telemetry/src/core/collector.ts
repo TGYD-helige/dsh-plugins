@@ -905,7 +905,9 @@ export function collect(
     const child = children.get(info.id);
     if (!child) return; // remote (ACP) runs have no local session — nothing to nest
     child.started = true;
-    reporter.updateSpan(child.span, { metadata: { provider: info.provider, local: info.local } });
+    reporter.updateSpan(child.span, {
+      metadata: { provider: info.provider, local: info.local, runId: info.runId },
+    });
   });
 
   ctx.on('subagent/end', (info) => {
@@ -1076,6 +1078,14 @@ export function collect(
     }
     if (event.type === 'turn/end' || event.type === 'turn/start') toolCalls.delete(sessionId);
     if (event.type === 'turn/end') closeHooks(sessionId, true);
+    // The parent's catalog fact names a direct child; the name is how send_message addresses it.
+    if (event.type === 'subagent/catalog') {
+      if (config.captureContent && 'name' in event.data)
+        reporter.updateSpan(children.get(event.data.childId)?.span ?? null, {
+          metadata: { subagentName: event.data.name },
+        });
+      return;
+    }
     const child = children.get(sessionId);
     if (child && !event.type.startsWith('compaction/')) {
       if (event.type === 'turn/start') child.turn = event.data.turn;
@@ -1503,6 +1513,9 @@ export function collect(
                 finishReason: finish?.kind,
                 providerResponse,
                 errorCode: failure?.failure?.code,
+                errorStatus: failure?.failure?.status,
+                providerRequestId: failure?.failure?.requestId,
+                providerRetryAfterMs: failure?.failure?.providerRetryAfterMs,
                 incomplete: finish ? undefined : true,
                 terminatedBy,
                 toolCallCount: toolCallCount > 0 ? toolCallCount : undefined,
@@ -1729,11 +1742,7 @@ export function collect(
         if (result.isError && !declined) noteError(sessionId);
         const update = {
           output: config.captureContent ? result.content : undefined,
-          level: (result.isError
-            ? declined
-              ? 'WARNING'
-              : 'ERROR'
-            : 'DEFAULT') as ObservationLevel,
+          level: (!result.isError ? 'DEFAULT' : declined ? 'WARNING' : 'ERROR') as ObservationLevel,
           statusMessage: result.isError ? contentMessage(config, result.error.message) : undefined,
           metadata: { errorCode: info?.code, errorName: info?.name },
         };
