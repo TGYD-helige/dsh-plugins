@@ -24,7 +24,7 @@ import Schema from '@deepseek-ai/schemastery';
 import { A2aBridge } from './bridge.js';
 import { DshAgentExecutor } from './executor.js';
 import { INBOX_EXTENSION, NativeInbox } from './inbox.js';
-import { startA2aServer } from './server.js';
+import { type CardSkill, startA2aServer } from './server.js';
 import { FilesystemTaskStore } from './stores/filesystem.js';
 import { GcsTaskStore } from './stores/gcs.js';
 import { RedisTaskStore } from './stores/redis.js';
@@ -94,6 +94,14 @@ export const name = 'dsh-a2a';
 /** The bridge creates and owns agents through the registry service. */
 export const inject = ['agents'];
 
+const cardSkill: Schema<CardSkill> = Schema.object({
+  id: Schema.string().required(),
+  name: Schema.string().required(),
+  description: Schema.string().default(''),
+  tags: Schema.array(Schema.string()).default([]),
+  examples: Schema.array(Schema.string()).default([]),
+});
+
 export const Config = Schema.object({
   inbox: Schema.object({
     enabled: Schema.boolean().default(false),
@@ -154,6 +162,8 @@ export const Config = Schema.object({
     description: Schema.string().default('DeepSeek Harness agent over A2A'),
     version: Schema.string().default('0.1.0'),
     publicUrl: Schema.string().default(''),
+    /** Advertised A2A skills, so registries and routers can discover what the agent does. */
+    skills: Schema.array(cardSkill).default([]),
   }),
   /**
    * A2A task snapshots, including protocol history. dsh-storage separately
@@ -193,7 +203,13 @@ export interface A2aPluginConfig {
   urlDownloads?: { allowPrivate?: boolean; allowedHosts: string[] };
   subagentTools: { enabled: boolean };
   agent: { provider: string; model: string; preset: string };
-  card: { name: string; description: string; version: string; publicUrl: string };
+  card: {
+    name: string;
+    description: string;
+    version: string;
+    publicUrl: string;
+    skills?: CardSkill[];
+  };
   taskStore: 'memory' | 'filesystem' | 'redis' | 'gcs';
   filesystem?: { root: string };
   redis: { url: string; keyPrefix: string; ttlSeconds: number };
@@ -305,6 +321,7 @@ export function apply(
         description: config.card.description,
         version: config.card.version,
         publicUrl: config.card.publicUrl || undefined,
+        skills: config.card.skills,
       },
       executor,
       taskStore: store,

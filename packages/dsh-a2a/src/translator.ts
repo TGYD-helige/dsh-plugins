@@ -53,11 +53,14 @@ interface DshAgentEventMetadata {
   dshAgent: {
     kind: 'text-content' | 'thought' | 'tool-call' | 'tool-result' | 'state-change';
     reason?: string;
+    /** Cancellation cause kind for an `aborted` turn, e.g. `user`, `parent`, `hook`. */
+    cause?: string;
     source?: SubagentToolSource;
   };
   model?: string;
   usage?: TokenUsage;
   error?: string;
+  errorCode?: string;
 }
 
 /** Immediate delegation edge; tool call IDs are scoped by their source session. */
@@ -201,6 +204,7 @@ export class SessionTranslator {
               result: flattenContent(message.content),
               isError: message.isError === true || error !== undefined,
               ...(error ? { error: `${error.name}: ${error.code}` } : {}),
+              ...(error?.reason ? { errorReason: error.reason } : {}),
               ...(meta !== undefined ? { meta } : {}),
             }),
           ),
@@ -258,7 +262,11 @@ export class SessionTranslator {
       case 'aborted':
         return this.status(
           TaskState.TASK_STATE_CANCELED,
-          { kind: 'state-change', reason: 'aborted' },
+          {
+            kind: 'state-change',
+            reason: 'aborted',
+            ...(reason.reason?.kind ? { cause: reason.reason.kind } : {}),
+          },
           undefined,
         );
       case 'blocked':
@@ -274,6 +282,7 @@ export class SessionTranslator {
           { kind: 'state-change', reason: 'error' },
           agentTextMessage(this.taskId, this.contextId, message),
           message,
+          reason.error.code,
         );
       }
       default:
@@ -288,6 +297,7 @@ export class SessionTranslator {
     dshAgent: DshAgentEventMetadata['dshAgent'],
     message?: Message,
     error?: string,
+    errorCode?: string,
   ): AgentExecutionEvent {
     const metadata: Record<string, unknown> = {
       dshAgent: this.source ? { ...dshAgent, source: this.source } : dshAgent,
@@ -296,6 +306,7 @@ export class SessionTranslator {
     const terminal = state !== TaskState.TASK_STATE_WORKING;
     if (terminal && this.usage) metadata.usage = this.usage;
     if (error) metadata.error = error;
+    if (errorCode) metadata.errorCode = errorCode;
     return AgentEvent.statusUpdate({
       taskId: this.taskId,
       contextId: this.contextId,

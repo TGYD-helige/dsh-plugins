@@ -216,14 +216,15 @@ describe('SessionTranslator (A2A 1.0 model)', () => {
             isError: true,
             source: { kind: 'tool', callId: 'c9' },
           },
-          error: { name: 'ToolError', code: 'EXEC_FAILED' },
+          error: { name: 'PolicyError', code: 'POLICY_DENIED', reason: 'npm is not allowed' },
         } as never),
       ),
     );
     const part = out[0].status?.message?.parts[0];
     const data = part?.content?.$case === 'data' ? part.content.value : undefined;
     expect(data.isError).toBe(true);
-    expect(data.error).toBe('ToolError: EXEC_FAILED');
+    expect(data.error).toBe('PolicyError: POLICY_DENIED');
+    expect(data.errorReason).toBe('npm is not allowed');
   });
 
   it('ends a completed turn input-required (continuable) with the assembled text and usage', () => {
@@ -268,9 +269,13 @@ describe('SessionTranslator (A2A 1.0 model)', () => {
   it('maps aborted to canceled and error/blocked to failed', () => {
     const t = new SessionTranslator('task1', 'ctx1');
     t.handle(turnStart());
-    expect(
-      updates(t.handle(turnEnd({ kind: 'aborted', reason: { kind: 'user' } })))[0].status?.state,
-    ).toBe(TaskState.TASK_STATE_CANCELED);
+    const canceled = updates(t.handle(turnEnd({ kind: 'aborted', reason: { kind: 'user' } })))[0];
+    expect(canceled.status?.state).toBe(TaskState.TASK_STATE_CANCELED);
+    expect(canceled.metadata?.dshAgent).toEqual({
+      kind: 'state-change',
+      reason: 'aborted',
+      cause: 'user',
+    });
 
     t.handle(turnStart(2));
     const failed = updates(
@@ -286,6 +291,7 @@ describe('SessionTranslator (A2A 1.0 model)', () => {
     );
     expect(failed[0].status?.state).toBe(TaskState.TASK_STATE_FAILED);
     expect(failed[0].metadata?.error).toBe('provider down');
+    expect(failed[0].metadata?.errorCode).toBe('HTTP_500');
     expect(textPartOf(failed[0].status?.message)).toBe('provider down');
 
     t.handle(turnStart(3));

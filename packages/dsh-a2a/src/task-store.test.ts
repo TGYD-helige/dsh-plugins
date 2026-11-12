@@ -403,6 +403,41 @@ describe('SanitizedTaskStore', () => {
     ).toEqual({ $case: 'text', value: 'AB' });
   });
 
+  it('serves SDK per-event loads of a live task without reading the backend', async () => {
+    const store = new SanitizedTaskStore(inner);
+    await store.save(task(TaskState.TASK_STATE_SUBMITTED), ctx);
+    for (let i = 0; i < 3; i++) {
+      const loaded = (await store.load('t1', ctx))!;
+      loaded.status!.state = TaskState.TASK_STATE_WORKING;
+      await store.save(loaded, ctx);
+    }
+    expect(inner.load).not.toHaveBeenCalled();
+    expect((await store.load('t1', ctx))?.status?.state).toBe(TaskState.TASK_STATE_WORKING);
+    await store.save(task(TaskState.TASK_STATE_COMPLETED), ctx);
+    await store.load('t1', ctx);
+    expect(inner.load).toHaveBeenCalledTimes(1);
+  });
+
+  it('serves the committed state while a newer save is still writing', async () => {
+    const inner = new MemoryTaskStore();
+    const store = new SanitizedTaskStore(inner);
+    await store.save(task(TaskState.TASK_STATE_WORKING), ctx);
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const save = inner.save;
+    inner.save = async (...args) => {
+      await blocked;
+      return save.apply(inner, args);
+    };
+    const pending = store.save(task(TaskState.TASK_STATE_INPUT_REQUIRED), ctx);
+    expect((await store.load('t1', ctx))?.status?.state).toBe(TaskState.TASK_STATE_WORKING);
+    release();
+    await pending;
+    expect((await store.load('t1', ctx))?.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
+  });
+
   it('recovers a settled reply through a fresh store wrapper', async () => {
     const inner = new MemoryTaskStore();
     const first = new SanitizedTaskStore(inner);
