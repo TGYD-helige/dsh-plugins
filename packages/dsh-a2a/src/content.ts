@@ -5,8 +5,9 @@
  *   - `text` parts stay text;
  *   - file parts (inline `raw` bytes or a `url`) are downloaded by the plugin
  *     (http/https only, size- and time-bounded) when they carry a URL;
- *   - an optional deployment materializer puts non-image files into the
- *     active execution world instead of saving a host attachment;
+ *   - an optional deployment materializer puts non-image files, and images
+ *     the attachment store refuses, into the active execution world instead
+ *     of saving a host attachment;
  *   - without a materializer, non-image files persist under the configured
  *     upload root even when an attachment store exists (default `<OS temp>/
  *     dsh-a2a-uploads/<date>/`) and the prompt references them by path;
@@ -179,11 +180,19 @@ async function fileContent(
     mediaType.toLowerCase() as ImageMediaType,
   );
   if (attachments && image) {
-    const block = await saveAttachment(attachments, bytes, mediaType, part.filename, signal);
+    const block = await saveAttachment(
+      attachments,
+      bytes,
+      mediaType,
+      part.filename,
+      // A refused image follows the non-image path, so remote contexts still get a readable path.
+      !materialization,
+      signal,
+    );
     signal?.throwIfAborted();
     if (block) return block;
   }
-  if (materialization && !image) {
+  if (materialization) {
     try {
       const { readablePath } = await materialization.materializer.materializeFile({
         contextId: materialization.contextId,
@@ -217,6 +226,7 @@ async function saveAttachment(
   bytes: Uint8Array,
   mediaType: string,
   filename: string,
+  fileFallback: boolean,
   signal?: AbortSignal,
 ): Promise<ContentBlock | undefined> {
   const name = filename || undefined;
@@ -234,6 +244,7 @@ async function saveAttachment(
     }
   }
   signal?.throwIfAborted();
+  if (!fileFallback) return undefined;
   try {
     const attachment = await attachments.saveFile({ data: bytes, name });
     return { type: 'file', attachment };
@@ -336,7 +347,7 @@ function note(
 /** JSON text stand-in for a structured data part. */
 function dataText(value: unknown): string {
   try {
-    return `<data>\n${JSON.stringify(value, null, 2) ?? String(value)}\n</data>`;
+    return `<data>\n${JSON.stringify(value) ?? String(value)}\n</data>`;
   } catch {
     return `<data>\n${String(value)}\n</data>`;
   }

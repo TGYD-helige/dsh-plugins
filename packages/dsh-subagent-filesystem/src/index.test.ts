@@ -78,15 +78,11 @@ async function setup(
   } as unknown as SessionQuery);
   const dispose = vi.fn(async () => {});
   const start = vi.fn(async (spec) => {
-    const { request } = spec;
-    const child = agent(
-      `child-${agents.length}`,
-      request.parent.session.header.cwd,
-      request.parent,
-    );
+    const child = agent(`child-${agents.length}`, spec.parent.session.header.cwd, spec.parent);
     await ctx.serial('agent/created', { agent: child, source: 'startup' });
     return {
       childId: child.id,
+      name: `agent-${agents.length}`,
       result: Promise.resolve({
         stopReason: 'completed',
         output: [{ type: 'text', text: 'role worked' }],
@@ -102,7 +98,7 @@ async function setup(
     })),
     resolveMaxDepth: vi.fn(() => 2),
     startActivation: start,
-    drainChildren: vi.fn(async () => {}),
+    interrupt: vi.fn(),
   } as unknown as Subagents);
   const plugin = ctx.plugin({ apply, inject }, config);
   await plugin;
@@ -138,9 +134,7 @@ it('discovers remote Markdown roles and adds literal child system instructions w
   expect(result.isError).toBe(false);
   expect(result.content).toEqual([{ type: 'text', text: 'role worked' }]);
   expect(h.start.mock.calls[0][0].delivery).toBe('caller');
-  expect(h.start.mock.calls[0][0].request.prompt).toEqual([
-    { type: 'text', text: 'Explain discrepancy' },
-  ]);
+  expect(h.start.mock.calls[0][0].prompt).toEqual([{ type: 'text', text: 'Explain discrepancy' }]);
   const child = h.agents[1];
   const prompt = await h.ctx.systemPrompt.assemble({ scope: child, agent: child });
   expect(prompt.sections.map((s) => s.text).join('\n')).toContain('Application rules');
@@ -173,7 +167,7 @@ it.each([
   expect(h.ctx.tools.get('subagent_inventory_analyst', h.parent)).toBeUndefined();
   expect(errors).toHaveBeenCalledWith(
     '[dsh-subagent-filesystem] Role discovery failed',
-    expect.any(String),
+    expect.stringContaining('invalid.md'),
   );
 });
 
@@ -230,12 +224,18 @@ it('isolates simultaneous delegations with the same name across remote workspace
 
 it('restores a background role snapshot and releases only owned children on unload', async () => {
   const h = await setup();
+  const startChild = h.start.getMockImplementation()!;
+  h.start.mockImplementationOnce(async (spec) => ({
+    ...(await startChild(spec)),
+    result: new Promise(() => {}),
+  }));
   const result = await h.delegate(h.parent, {
     description: 'Stock check',
     prompt: 'Inspect stock',
     run_in_background: true,
   });
   expect(result.isError).toBe(false);
+  expect(JSON.stringify(result.content)).toContain('started subagent \\"agent-2\\"');
   expect(h.start.mock.calls[0][0].delivery).toBe('parent');
   expect(h.dispose).not.toHaveBeenCalled();
   const child = h.agents[1];
@@ -248,7 +248,12 @@ it('restores a background role snapshot and releases only owned children on unlo
     (await h.ctx.systemPrompt.assemble({ scope: restored })).sections.map((s) => s.text).join('\n'),
   ).toContain('Compare movements.');
   await h.plugin.dispose();
-  expect(h.ctx.subagents.drainChildren).toHaveBeenCalledWith(h.parent, [child.id, restored.id]);
+  expect(h.dispose).toHaveBeenCalledOnce();
+  expect(h.ctx.subagents.interrupt).toHaveBeenCalledOnce();
+  expect(h.ctx.subagents.interrupt).toHaveBeenCalledWith(restored.id, {
+    kind: 'ancestor',
+    agent: h.parent,
+  });
   expect(h.ctx.tools.get('subagent_inventory_analyst', h.parent)).toBeUndefined();
   expect(
     (await h.ctx.systemPrompt.assemble({ scope: child })).sections.some(
@@ -290,6 +295,7 @@ it('cancels and drains an active foreground delegation when the plugin unloads',
   const h = await setup();
   h.start.mockImplementationOnce(async () => ({
     childId: SessionId('active-child'),
+    name: 'agent-1',
     result: new Promise((resolve) => {
       h.dispose.mockImplementationOnce(async () => {
         resolve({ stopReason: 'aborted', output: [] });
@@ -314,7 +320,7 @@ it('honors the tool policy gate and passes the native depth limit and cancellati
   expect(h.start).not.toHaveBeenCalled();
   off();
   await h.delegate();
-  expect(h.start.mock.calls[0][0].request.maxDepth).toBe(2);
+  expect(h.start.mock.calls[0][0].maxDepth).toBe(2);
   const abort = new AbortController();
   abort.abort();
   expect(
@@ -340,6 +346,7 @@ it('contains provider and result failures and always disposes an accepted foregr
   const h = await setup();
   h.start.mockImplementationOnce(async () => ({
     childId: SessionId('failed'),
+    name: 'agent-1',
     result: Promise.reject(new Error('model failed')),
     dispose: h.dispose,
   }));
@@ -356,6 +363,7 @@ it.each(['error', 'aborted', 'max-tokens', 'refusal'])(
     const h = await setup();
     h.start.mockImplementationOnce(async () => ({
       childId: SessionId('failed-child'),
+      name: 'agent-1',
       result: Promise.resolve({ stopReason, output: [], diagnostic: 'Child could not finish' }),
       dispose: h.dispose,
     }));
@@ -365,6 +373,19 @@ it.each(['error', 'aborted', 'max-tokens', 'refusal'])(
     expect(h.dispose).toHaveBeenCalledOnce();
   },
 );
+
+it('reports a completed foreground child that left no text', async () => {
+  const h = await setup();
+  h.start.mockImplementationOnce(async () => ({
+    childId: SessionId('quiet-child'),
+    name: 'agent-1',
+    result: Promise.resolve({ stopReason: 'completed', output: [] }),
+    dispose: h.dispose,
+  }));
+  const result = await h.delegate();
+  expect(result.isError).toBe(false);
+  expect(JSON.stringify(result.content)).toContain('completed without a text report');
+});
 
 it('contains activation cleanup failures as tool errors', async () => {
   const h = await setup();

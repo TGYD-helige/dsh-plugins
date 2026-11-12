@@ -261,7 +261,7 @@ describe('buildMessageContent', () => {
     );
     expect(blocks.map((b) => b.type)).toEqual(['text', 'text', 'text']);
     expect(textOf(blocks[0])).toBe('a');
-    expect(textOf(blocks[1])).toBe('<data>\n{\n  "x": 1\n}\n</data>');
+    expect(textOf(blocks[1])).toBe('<data>\n{"x":1}\n</data>');
     expect(textOf(blocks[2])).toBe('b');
   });
 
@@ -509,6 +509,26 @@ describe('buildMessageContent', () => {
     expect(materializeFile).toHaveBeenCalledTimes(1);
     expect(store.saveFile).not.toHaveBeenCalled();
     expect(textOf(blocks[0])).toContain('path="/remote/report.txt"');
+  });
+
+  it('sends a refused image to the remote materializer instead of a host attachment', async () => {
+    const store = fakeStore();
+    store.saveImage.mockRejectedValueOnce(new Error('image too large'));
+    const materializeFile = vi.fn(async () => ({ readablePath: '/remote/pic.png' }));
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const blocks = await buildMessageContent(
+        [part({ $case: 'raw', value: Buffer.from([0x89]) }, 'image/png', 'pic.png')],
+        store as unknown as AttachmentStore,
+        dir,
+        { contextId: 'ctx-1', materializer: { materializeFile } },
+      );
+      expect(store.saveFile).not.toHaveBeenCalled();
+      expect(materializeFile).toHaveBeenCalledTimes(1);
+      expect(textOf(blocks[0])).toContain('path="/remote/pic.png"');
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it('notes a part with an unknown content kind instead of dropping it silently', async () => {

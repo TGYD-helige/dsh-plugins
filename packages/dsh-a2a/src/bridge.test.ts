@@ -2114,8 +2114,6 @@ describe('A2aBridge + DshAgentExecutor', () => {
     it('falls back to a file attachment when image admission rejects the bytes', async () => {
       const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
       const store = fakeAttachments();
-      const materializeFile = vi.fn();
-      ctx.provide('a2aFileMaterializer', { materializeFile });
       store.saveImage.mockRejectedValue(new Error('not a png'));
       const message: Message = {
         ...userMessage(''),
@@ -2123,7 +2121,6 @@ describe('A2aBridge + DshAgentExecutor', () => {
       };
       await executeMessage('t1', 'ctx1', message);
       expect(store.saveFile).toHaveBeenCalledTimes(1);
-      expect(materializeFile).not.toHaveBeenCalled();
       expect(agents.created[0].contents[0][0].type).toBe('file');
       expect(spy.mock.calls.some(([p]) => String(p).includes('[dsh-a2a]'))).toBe(true);
       spy.mockRestore();
@@ -2220,7 +2217,7 @@ describe('A2aBridge + DshAgentExecutor', () => {
       const { seen } = await executeMessage('t1', 'ctx1', message);
       const prompt = agents.created[0].prompts[0];
       expect(prompt).toContain('<data>');
-      expect(prompt).toContain('"type": "error"');
+      expect(prompt).toContain('{"type":"error","line":3}');
       expect(statusUpdates(seen).at(-1)!.status?.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED);
     });
   });

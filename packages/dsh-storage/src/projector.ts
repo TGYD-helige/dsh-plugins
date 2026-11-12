@@ -61,17 +61,21 @@ function toolPartsOf(message: any): unknown[] | undefined {
   return calls.length > 0 ? calls : undefined;
 }
 
+/** `main` for top-level sessions; a subagent child session writes as its own id. */
+export const agentIdOf = (session: any, sessionId: string): string =>
+  session?.header?.parentSession ? sessionId : 'main';
+
 /**
  * Map one session event to zero or one message row. Returns null for events
  * that should not be persisted as standalone rows (log-only events: chunks,
  * turn/step lifecycle, approvals, ...).
  */
-export function projectEvent(_session: any, event: any, sessionId: string): MessageRow | null {
+export function projectEvent(session: any, event: any, sessionId: string): MessageRow | null {
   const data = event?.data ?? {};
   const base = {
     sessionId,
     historyId: null,
-    agentId: 'main',
+    agentId: agentIdOf(session, sessionId),
     createdAt: new Date(event?.time ?? Date.now()),
   };
 

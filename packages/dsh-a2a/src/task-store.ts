@@ -171,7 +171,11 @@ export class SanitizedTaskStore implements ManagedTaskStore {
   private readonly lastState = new Map<string, TaskState>();
   private readonly writes = new Map<string, Promise<void>>();
   private readonly terminalStates = new Map<string, { state: TaskState; expiresAt: number }>();
-  private readonly liveHistory = new Map<string, { scope: string; history: Task['history'] }>();
+  // `committed` is the last snapshot this process wrote, so SDK per-event loads skip the backend.
+  private readonly liveHistory = new Map<
+    string,
+    { scope: string; history: Task['history']; committed?: Task }
+  >();
   // ponytail: deleted ids stay tombstoned until plugin unload; use expiring ids if clear volume grows.
   private readonly deleted = new Set<string>();
 
@@ -261,12 +265,21 @@ export class SanitizedTaskStore implements ManagedTaskStore {
       else history.push(final);
     }
     const previousHistory = this.liveHistory.get(task.id);
-    const live = { scope: scopeOf(context), history };
+    const scope = scopeOf(context);
+    const live = {
+      scope,
+      history,
+      committed: previousHistory?.scope === scope ? previousHistory.committed : undefined,
+    };
     this.liveHistory.set(task.id, live);
     if (!checkpoint && state !== undefined && this.lastState.get(task.id) === state) return;
-    const write = (this.writes.get(task.id) ?? Promise.resolve()).then(() =>
-      this.inner.save(sanitizeTask({ ...task, history }), context),
-    );
+    const snapshot = sanitizeTask({ ...task, history });
+    const write = (this.writes.get(task.id) ?? Promise.resolve()).then(async () => {
+      await this.inner.save(snapshot, context);
+      // A concurrent load must see committed state, not this save's pending one.
+      const current = this.liveHistory.get(task.id);
+      if (current?.scope === scope) current.committed = structuredClone(snapshot);
+    });
     const tail = write.catch(() => {});
     this.writes.set(task.id, tail);
     try {
@@ -290,9 +303,12 @@ export class SanitizedTaskStore implements ManagedTaskStore {
   }
 
   async load(taskId: string, context: ServerCallContext): Promise<Task | undefined> {
-    const task = await this.inner.load(taskId, context);
     const live = this.liveHistory.get(taskId);
-    if (!task || live?.scope !== scopeOf(context)) return task;
+    if (live?.scope !== scopeOf(context)) return this.inner.load(taskId, context);
+    const task = live.committed
+      ? structuredClone(live.committed)
+      : await this.inner.load(taskId, context);
+    if (!task) return task;
     const history = structuredClone(live.history);
     const current = task.status?.message;
     const message = current && history.find((entry) => entry.messageId === current.messageId);

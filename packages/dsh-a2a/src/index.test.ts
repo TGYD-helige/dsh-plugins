@@ -77,7 +77,15 @@ describe('dsh-a2a plugin', () => {
       throw new Error('Unauthorized');
     });
     ctx.provide('a2aExtendedCard', extendedAgentCard);
-    const started = await apply(ctx, config({ rest: true, grpc: { enabled: true, port: 0 } }));
+    const skill = { id: 'review', name: 'Code review', description: 'Reviews diffs' };
+    const started = await apply(
+      ctx,
+      config({
+        rest: true,
+        grpc: { enabled: true, port: 0 },
+        card: { ...config().card, skills: [skill] },
+      }),
+    );
     const card = (await (
       await fetch(`http://127.0.0.1:${started!.port}/.well-known/agent-card.json`, {
         headers: { 'A2A-Version': '1.0' },
@@ -85,8 +93,12 @@ describe('dsh-a2a plugin', () => {
     ).json()) as {
       supportedInterfaces: { protocolBinding: string; url: string }[];
       capabilities: { extendedAgentCard: boolean };
+      defaultInputModes: string[];
+      skills: { id: string; name: string; description: string }[];
     };
     expect(card.capabilities.extendedAgentCard).toBe(true);
+    expect(card.skills).toEqual([expect.objectContaining(skill)]);
+    expect(card.defaultInputModes).toContain('text/plain');
     expect(started!.grpcPort).toBeGreaterThan(0);
     expect(card.supportedInterfaces).toContainEqual(
       expect.objectContaining({ protocolBinding: 'GRPC', url: `127.0.0.1:${started!.grpcPort}` }),

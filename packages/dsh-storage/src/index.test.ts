@@ -230,6 +230,21 @@ describe('dsh-storage plugin', () => {
     });
   });
 
+  it('attributes subagent child rows to the child and links its parent session', async () => {
+    apply(ctx, enabledConfig);
+    const backend = backends.instances[0];
+    const child = { id: 'child-1', header: { parentSession: 'parent-1' } };
+    ctx.events.emit('session/event', child, userEvent('delegated task', 'm1'));
+    await flush();
+    expect(backend.upsertMessage.mock.calls[0][0]).toMatchObject({
+      sessionId: 'child-1',
+      agentId: 'child-1',
+    });
+    expect(backend.upsertSession.mock.calls.at(-1)?.[0].metadata).toMatchObject({
+      'dsh-storage:parentSessionId': 'parent-1',
+    });
+  });
+
   it('archives after queued writes and starts a fresh session rollup', async () => {
     apply(ctx, enabledConfig);
     const backend = backends.instances[0];

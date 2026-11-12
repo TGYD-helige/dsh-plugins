@@ -93,6 +93,7 @@ export function apply(ctx: Context, config: PolicyPluginConfig): void {
           return {
             kind: 'deny',
             reason: hit.rule.message ?? `denied by policy: ${describeRule(hit.rule)}`,
+            info: { name: 'PolicyError', code: 'POLICY_DENIED' },
           };
         case 'ask':
           return { kind: 'ask', reason: hit.rule.message };
@@ -100,7 +101,11 @@ export function apply(ctx: Context, config: PolicyPluginConfig): void {
     } catch (error) {
       // Keep the agent loop alive without turning a broken policy into an allow.
       console.error('[dsh-policy] evaluation failed:', error);
-      return { kind: 'deny', reason: 'policy evaluation failed' };
+      return {
+        kind: 'deny',
+        reason: 'policy evaluation failed',
+        info: { name: 'PolicyError', code: 'POLICY_EVALUATION_FAILED' },
+      };
     }
   });
 }

@@ -99,6 +99,23 @@ describe('shared isolated OTel pipeline', () => {
       await reporter.shutdown();
     },
   );
+  it('drops ended payloads while late children still inherit request dimensions', async () => {
+    const reporter = new TelemetryReporter(
+      { backend: 'phoenix', apiKey: 'phoenix-test-key', captureContent: true },
+      adapters.phoenix,
+    );
+    await reporter.ready;
+    const root = reporter.openTrace({ name: 'turn', sessionId: 'late-session' });
+    reporter.endSpan(root, { output: 'x'.repeat(10_000) });
+    const observations = (
+      reporter as unknown as { observations: WeakMap<object, { data: object }> }
+    ).observations;
+    expect(observations.get(root!)?.data).not.toHaveProperty('output');
+    reporter.endSpan(reporter.startSpan(root, { name: 'late-hook' }));
+    await reporter.shutdown();
+    const late = state.spans.find((span) => span.name === 'late-hook')!;
+    expect(late.attributes['session.id']).toBe('late-session');
+  });
   it('applies final content and credential safeguards after backend mapping', async () => {
     const reporter = new TelemetryReporter(
       {

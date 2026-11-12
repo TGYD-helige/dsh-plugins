@@ -59,6 +59,15 @@ import {
   withStreamConnection,
 } from './stream-connection.js';
 
+/** One advertised agent-card skill. */
+export interface CardSkill {
+  id: string;
+  name: string;
+  description?: string;
+  tags?: string[];
+  examples?: string[];
+}
+
 export interface A2aServerOptions {
   inbox?: NativeInbox;
   extensions?: AgentExtension[];
@@ -71,6 +80,7 @@ export interface A2aServerOptions {
     version: string;
     /** Public base URL advertised in the card, e.g. https://agent.example.com */
     publicUrl?: string;
+    skills?: CardSkill[];
   };
   executor: AgentExecutor;
   taskStore: TaskStore;
@@ -152,9 +162,19 @@ export async function startA2aServer(options: A2aServerOptions): Promise<A2aServ
     },
     securitySchemes: {},
     securityRequirements: [],
-    defaultInputModes: ['text'],
-    defaultOutputModes: ['text'],
-    skills: [],
+    // Media types: text, JSON data parts, and file parts of any type.
+    defaultInputModes: ['text/plain', 'application/json', 'application/octet-stream'],
+    defaultOutputModes: ['text/plain', 'application/json'],
+    skills: (options.card.skills ?? []).map((skill) => ({
+      id: skill.id,
+      name: skill.name,
+      description: skill.description ?? '',
+      tags: skill.tags ?? [],
+      examples: skill.examples ?? [],
+      inputModes: [],
+      outputModes: [],
+      securityRequirements: [],
+    })),
     signatures: [],
   };
 

@@ -1,3 +1,4 @@
+import { agentIdOf } from './projector.js';
 import type { MessageRow } from './types.js';
 
 function recordedData(block: any): { text: string } {
@@ -87,7 +88,7 @@ export function compressionSnapshot(session: any, event: any): MessageRow | null
     id: event.data.compactionId,
     sessionId: session.id,
     historyId: null,
-    agentId: 'main',
+    agentId: agentIdOf(session, session.id),
     type: 'utility_compressor',
     content: JSON.stringify(content),
     model: 'agent-history-provider-summarizer',

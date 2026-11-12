@@ -8,6 +8,7 @@ const execOf = (toolName: string, args: unknown): ToolExecution =>
 
 /** The downstream chain's answer when the plugin delegates. */
 const downstream = (): Promise<PreToolDecision> => Promise.resolve({ kind: 'allow' });
+const DENIED = { name: 'PolicyError', code: 'POLICY_DENIED' };
 
 const allowAll = {
   enabled: true,
@@ -94,7 +95,11 @@ describe('dsh-policy plugin', () => {
       execOf('bash', { command: 'npm install' }),
       downstream,
     );
-    expect(result).toEqual({ kind: 'deny', reason: 'npm is not allowed. Use bun instead.' });
+    expect(result).toEqual({
+      kind: 'deny',
+      reason: 'npm is not allowed. Use bun instead.',
+      info: DENIED,
+    });
   });
 
   it('supplies a default deny reason naming the matched rule', async () => {
@@ -110,6 +115,7 @@ describe('dsh-policy plugin', () => {
     expect(result).toEqual({
       kind: 'deny',
       reason: 'denied by policy: tool "bash", commandPrefix "npm" (priority 200)',
+      info: DENIED,
     });
   });
 
@@ -130,7 +136,11 @@ describe('dsh-policy plugin', () => {
       execOf('bash', { command: 'bun run lint && npm i' }),
       downstream,
     );
-    expect(result).toEqual({ kind: 'deny', reason: 'npm is not allowed. Use bun instead.' });
+    expect(result).toEqual({
+      kind: 'deny',
+      reason: 'npm is not allowed. Use bun instead.',
+      info: DENIED,
+    });
   });
 
   it('keeps a piped compound denied when one segment hits a deny', async () => {
@@ -235,7 +245,11 @@ describe('dsh-policy plugin', () => {
     circular.self = circular;
     const next = vi.fn(downstream);
     const result = await ctx.waterfall('tools/pre-execute', execOf('bash', circular), next);
-    expect(result).toEqual({ kind: 'deny', reason: 'policy evaluation failed' });
+    expect(result).toEqual({
+      kind: 'deny',
+      reason: 'policy evaluation failed',
+      info: { name: 'PolicyError', code: 'POLICY_EVALUATION_FAILED' },
+    });
     expect(next).not.toHaveBeenCalled();
     expect(errorSpy).toHaveBeenCalledWith('[dsh-policy] evaluation failed:', expect.any(Error));
     errorSpy.mockRestore();

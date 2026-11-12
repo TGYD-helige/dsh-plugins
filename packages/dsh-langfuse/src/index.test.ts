@@ -87,9 +87,16 @@ const mocks = vi.hoisted(() => {
       this.ended += 1;
     }
 
-    startObservation(name: string, attrs?: Record<string, unknown>, opts?: { asType?: string }) {
+    startTime?: Date;
+
+    startObservation(
+      name: string,
+      attrs?: Record<string, unknown>,
+      opts?: { asType?: string; startTime?: Date },
+    ) {
       if (state.failCreate) throw new Error('ingestion down');
       const child = new MockObservation(name, attrs ?? {}, opts?.asType ?? 'span');
+      child.startTime = opts?.startTime;
       (child.asType === 'generation' ? this.generations : this.spans).push(child);
       return child;
     }
@@ -2102,6 +2109,21 @@ describe('dsh-langfuse plugin', () => {
       expect(lastUpdate(tool)).toMatchObject({ level: 'ERROR', statusMessage: 'blocked' });
     });
 
+    it('reports cancelled and declined tools as warnings without marking the run errored', async () => {
+      await setup();
+      const session = sessionOf('s1');
+      ctx.emit('session/event', session, turnStart(0));
+      const exec = execOf();
+      await ctx.waterfall('tools/pre-execute', exec, async () => ({ kind: 'allow' }));
+      ctx.emit('tools/result', exec, errResult('rejected', 'APPROVAL_REJECTED'));
+      expect(lastUpdate(mocks.roots[0].spans[0])).toMatchObject({
+        level: 'WARNING',
+        metadata: { errorCode: 'APPROVAL_REJECTED', errorName: 'ToolError' },
+      });
+      ctx.emit('session/event', session, turnEnd(0));
+      expect(lastUpdate(mocks.roots[0]).metadata).not.toHaveProperty('hadErrors');
+    });
+
     it('reports a hook invocation and result as one span inside the turn trace', async () => {
       await setup();
       const session = sessionOf('s1');
@@ -2935,6 +2957,31 @@ describe('dsh-langfuse plugin', () => {
       expect(root.generations[0].body).toMatchObject({ metadata: { purpose: 'compaction' } });
     });
 
+    it('records the compaction summary and dates its external generation from compaction start', async () => {
+      await setup();
+      const session = sessionOf('s1');
+      ctx.emit('session/event', session, turnStart(0));
+      ctx.emit('session/event', session, ev('compaction/start', { compactionId: 'k1', turn: 0 }));
+      ctx.emit(
+        'session/event',
+        session,
+        ev('compaction/summary', {
+          compactionId: 'k1',
+          summary: [{ type: 'text', text: 'the summary' }],
+          shadowedRange: { start: 1, end: 3 },
+          shadowedTokenCount: 50,
+          provider: 'p',
+          model: 'm',
+          usage: { inputTokens: 5, outputTokens: 2 },
+        }),
+      );
+      const compaction = mocks.roots[0].spans.find((span) => span.name === 'compaction')!;
+      expect(
+        compaction.updates.some((update) => JSON.stringify(update.output).includes('the summary')),
+      ).toBe(true);
+      expect(compaction.generations[0].startTime).toEqual(new Date(1700000000000));
+    });
+
     it('captures tool calls from block-end chunks into the output', async () => {
       await setup();
       await drain(
@@ -3345,13 +3392,31 @@ describe('dsh-langfuse plugin', () => {
       await setup();
       await drain(
         ctx.waterfall('llm/stream', optionsOf(), () =>
-          streamOf(textDelta('partial'), finishError('provider exploded')),
+          streamOf(textDelta('partial'), {
+            type: 'finish',
+            reason: {
+              kind: 'error',
+              failure: {
+                message: 'provider exploded',
+                code: 'BOOM',
+                status: 429,
+                requestId: 'req-1',
+                providerRetryAfterMs: 2000,
+              },
+            },
+          } as StreamChunk),
         ),
       );
       expect(lastUpdate(fakeObs(mocks.roots[0]).generations[0])).toMatchObject({
         level: 'ERROR',
         statusMessage: 'provider exploded',
-        metadata: { finishReason: 'error', errorCode: 'BOOM' },
+        metadata: {
+          finishReason: 'error',
+          errorCode: 'BOOM',
+          errorStatus: 429,
+          providerRequestId: 'req-1',
+          providerRetryAfterMs: 2000,
+        },
       });
     });
 
@@ -3665,7 +3730,9 @@ describe('dsh-langfuse plugin', () => {
         metadata: { childSessionId: 'c1', delegationDepth: 1 },
       });
       // subagent/start enriches with provider facts.
-      expect(subSpan.updates).toContainEqual({ metadata: { provider: 'spawn', local: true } });
+      expect(subSpan.updates).toContainEqual({
+        metadata: { provider: 'spawn', local: true, runId: 'run-c1' },
+      });
       // The child's generation nests under the subagent span, not the trace.
       expect(subSpan.generations).toHaveLength(1);
       expect(subSpan.generations[0].name).toBe('llm-call [child answer]');
@@ -3742,6 +3809,30 @@ describe('dsh-langfuse plugin', () => {
       expect(subSpan.updates).toContainEqual({
         metadata: { mode: 'one-shot', provider: 'spawn' },
       });
+    });
+
+    it('records the subagent run id and the parent catalog name', async () => {
+      await setup();
+      ctx.emit('session/event', sessionOf('s1'), turnStart(0));
+      ctx.emit('session/created', childSessionOf('c1', 's1'));
+      ctx.emit('subagent/start', subagentStart('c1'));
+      ctx.emit(
+        'session/event',
+        sessionOf('s1'),
+        ev('subagent/catalog', {
+          version: 1,
+          childId: 'c1',
+          childCreatedAt: 1,
+          mode: 'resident',
+          label: 'reviewer',
+          name: 'reviewer-1',
+        }),
+      );
+      const subSpan = fakeObs(mocks.roots[0]).spans[0];
+      expect(subSpan.updates).toContainEqual({
+        metadata: expect.objectContaining({ runId: 'run-c1' }),
+      });
+      expect(subSpan.updates).toContainEqual({ metadata: { subagentName: 'reviewer-1' } });
     });
 
     it('marks a failed subagent run as ERROR', async () => {

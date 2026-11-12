@@ -23,7 +23,7 @@ Enable the bundle in the profile's `cordis.patch.yml`:
 
 Disabled by default. `root` defaults to `agents`, relative to the agent's initial workspace directory; sandbox deployments can explicitly select `/agents`. Discovery scans direct `*.md` children only. A missing root produces an empty catalog. Files are loaded when the agent is created; create a new agent to pick up changes. Watching and hot reload are outside the initial scope.
 
-Requires the `fs`, `tools`, `subagents`, `systemPrompt`, and `sessionQuery` services, plus the native in-process provider registered as `spawn`. The standard headless profile supplies these capabilities. DSH peer floor: `>=0.2.1-rc.2 || >=0.2.2-rc.1`; tested DSH: `0.2.2-rc.1`; tested Cordis: `4.1.0`. This version uses managed activations and requires DSH 0.2.1-rc.2 or newer; use plugin v0.1.27 with DSH 0.2.0.
+Requires the `fs`, `tools`, `subagents`, `systemPrompt`, and `sessionQuery` services, plus the native in-process provider registered as `spawn`. The standard headless profile supplies these capabilities. DSH subagent peer floor: `>=0.2.2-rc.2`; tested DSH: `0.2.2-rc.2`; tested Cordis: `4.1.0`. This version uses the flattened activation spec introduced in DSH 0.2.2-rc.2; use the previous plugin release with DSH 0.2.1-rc.2 through 0.2.2-rc.1, and plugin v0.1.27 with DSH 0.2.0.
 
 ## Definition format
 
@@ -51,13 +51,13 @@ The example exposes `subagent_inventory_analyst`; its description tells the pare
 | --- | --- |
 | `prompt` | Required: a complete, self-contained task delivered as the child's user message |
 | `description` | Required: the native subagent's short task label |
-| `run_in_background` | Default false: wait for a report; true: return a continuable child id |
+| `run_in_background` | Default false: wait for a report; true: return the child's model-facing name and id for `send_message` |
 
-Background children use native completion notifications and `send_message` for follow-up. Native subagent services retain model defaults, delegation depth, sandbox boundaries, and approval rules. Definition files cannot override models, tools, or permissions. Foreground failures become tool errors; accepted runs always reach native cleanup.
+Background children use native completion notifications and `send_message` for follow-up. Native subagent services retain model defaults, delegation depth, sandbox boundaries, and approval rules. Definition files cannot override models, tools, or permissions. Foreground failures become tool errors; a completed child without text reports that instead of an empty result. Accepted runs always reach native cleanup. Discovery errors name the offending role file in the `[dsh-subagent-filesystem]` log.
 
 Named tools belong only to the consuming parent agent. They do not leak into other agents or workspaces, or automatically copy to children. A `subagent-filesystem/role` session event stores the child's role instructions and resource path. Cold restoration reinstalls the original snapshot rather than changing an existing role when its source file changes. Protect these instruction snapshots through the consuming application's existing session storage and access controls.
 
-Unloading cancels outstanding delegations, removes registrations and listeners, and releases background children started by the plugin. Role restoration requires the plugin to remain enabled. The initial version supports native in-process spawn; external ACP/Codex/Claude providers and application configuration downloads are outside its scope.
+Unloading cancels outstanding delegations, removes registrations and listeners, releases background children started by this process, and interrupts restored role children. DSH 0.2.2-rc.2 has no selected-child release, so restored children stay resident with their inbox until DSH tears down their tree; a later `send_message` continues them without the role instructions. Role restoration requires the plugin to remain enabled. The initial version supports native in-process spawn; external ACP/Codex/Claude providers and application configuration downloads are outside its scope.
 
 ## Tests
 

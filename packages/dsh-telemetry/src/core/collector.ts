@@ -118,6 +118,15 @@ interface ChildSession {
   hasInput: boolean;
 }
 
+/** Cancelled or declined tool calls (dsh-tools codes plus dsh-policy denials): WARNING, not a run error. */
+const DECLINED_TOOL_CODES = new Set([
+  'ABORTED',
+  'ABORTED_BEFORE_DISPATCH',
+  'APPROVAL_REJECTED',
+  'APPROVAL_CANCELLED',
+  'POLICY_DENIED',
+]);
+
 const messageOf = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
@@ -896,7 +905,9 @@ export function collect(
     const child = children.get(info.id);
     if (!child) return; // remote (ACP) runs have no local session — nothing to nest
     child.started = true;
-    reporter.updateSpan(child.span, { metadata: { provider: info.provider, local: info.local } });
+    reporter.updateSpan(child.span, {
+      metadata: { provider: info.provider, local: info.local, runId: info.runId },
+    });
   });
 
   ctx.on('subagent/end', (info) => {
@@ -1067,6 +1078,14 @@ export function collect(
     }
     if (event.type === 'turn/end' || event.type === 'turn/start') toolCalls.delete(sessionId);
     if (event.type === 'turn/end') closeHooks(sessionId, true);
+    // The parent's catalog fact names a direct child; the name is how send_message addresses it.
+    if (event.type === 'subagent/catalog') {
+      if (config.captureContent && 'name' in event.data)
+        reporter.updateSpan(children.get(event.data.childId)?.span ?? null, {
+          metadata: { subagentName: event.data.name },
+        });
+      return;
+    }
     const child = children.get(sessionId);
     if (child && !event.type.startsWith('compaction/')) {
       if (event.type === 'turn/start') child.turn = event.data.turn;
@@ -1494,6 +1513,9 @@ export function collect(
                 finishReason: finish?.kind,
                 providerResponse,
                 errorCode: failure?.failure?.code,
+                errorStatus: failure?.failure?.status,
+                providerRequestId: failure?.failure?.requestId,
+                providerRetryAfterMs: failure?.failure?.providerRetryAfterMs,
                 incomplete: finish ? undefined : true,
                 terminatedBy,
                 toolCallCount: toolCallCount > 0 ? toolCallCount : undefined,
@@ -1715,12 +1737,14 @@ export function collect(
       operationSessions.set(closeTool, sessionId);
       toolResults.set(exec, (result) => {
         if (closed) return;
-        if (result.isError) noteError(sessionId);
+        const info = result.isError ? result.error.info : undefined;
+        const declined = info !== undefined && DECLINED_TOOL_CODES.has(info.code);
+        if (result.isError && !declined) noteError(sessionId);
         const update = {
           output: config.captureContent ? result.content : undefined,
-          level: (result.isError ? 'ERROR' : 'DEFAULT') as ObservationLevel,
+          level: (!result.isError ? 'DEFAULT' : declined ? 'WARNING' : 'ERROR') as ObservationLevel,
           statusMessage: result.isError ? contentMessage(config, result.error.message) : undefined,
-          metadata: { errorCode: result.isError ? result.error.info?.code : undefined },
+          metadata: { errorCode: info?.code, errorName: info?.name },
         };
         if (
           span &&

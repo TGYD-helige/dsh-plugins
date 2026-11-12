@@ -73,9 +73,12 @@ Plugin-level fields: `enabled` (master switch) and `commandKeys` (argument keys 
 ### Matching semantics
 
 - **Every condition on a rule must hold** for the rule to match (AND). A rule with no conditions beyond `tool` matches every call of that tool.
-- **Shell commands are checked segment by segment.** Compound commands (`a && b | c`, newlines, background `&`) are split, quote-aware, and the executable command word is normalized through quotes, escapes and line continuations. Bash `$( )`, backtick and `<()` / `>()` substitutions are extracted as their own segments; here-doc bodies are data, except for real substitutions in unquoted bodies. PowerShell backticks are escapes, not Bash-style substitutions.
+- **Shell commands are checked segment by segment.** Compound commands (`a && b | c`, newlines, background `&`) are split, quote-aware, and the executable command word is normalized through quotes, escapes and line continuations. Fd redirections such as `2>&1` and `&>file` stay inside their segment. Bash `$( )`, backtick and `<()` / `>()` substitutions are extracted as their own segments; here-doc bodies are data, except for real substitutions in unquoted bodies. PowerShell backticks are escapes, not Bash-style substitutions.
+- **Bash grouping is stripped before matching.** Subshell parens, `{ … }`, `!`, `time`, and the `if`/`then`/`else`/`while`/`do` keywords are removed, so `(npm i)` and `if x; then npm i; fi` check `npm i`. `deny` and `ask` rules also match the segment without leading `NAME=value` assignments and with the command path reduced to its basename (`FOO=1 /usr/bin/npm i` matches `npm`). `allow` rules match the command as written, so they never cover a changed environment or another binary. Every unquoted paren splits, so an array assignment such as `arr=(a b)` or a `case` pattern becomes an extra segment; such extra segments can add a deny or ask match but never an allow.
+- **Wrappers are not unwrapped.** `env`, `sudo`, `command`, `exec`, `xargs`, `eval`, `sh -c` and similar launchers are the segment's command word. Deny or ask those launchers explicitly when a deny rule must hold.
 - **Priority resolves competition within one segment**; across segments the aggregation is conservative: any segment's `deny` denies the whole call, then any `ask` escalates, and `allow` requires every segment decided allow. A broad deny is still overridable by a specific allow because both compete on the same segment (`bun run lint` at 300 vs `bun run` at 200).
 - **No rule matches → the call passes through** to the rest of the `tools/pre-execute` chain (`next()`), so dsh's own gates and other plugins keep their say. Invalid regexes are config errors and fail the plugin load; a runtime evaluation failure is logged with the `[dsh-policy]` prefix and denied (fail-closed) without breaking the agent loop.
+- **Denials carry a routable identity**: `info: { name: 'PolicyError', code: 'POLICY_DENIED' }`, or `POLICY_EVALUATION_FAILED` for a failed evaluation. Telemetry and clients can tell policy denials from tool failures.
 
 ### What the gate covers
 
@@ -111,7 +114,7 @@ A policy plugin is advisory gating, not containment: deny rules keep a well-beha
 
 | @amaster.ai/dsh-policy | dsh | cordis |
 | --- | --- | --- |
-| 0.1.x | `>=0.1.5-rc.1 || >=0.1.6-alpha.1 || >=0.1.7-alpha.1 || >=0.2.0-rc.1 || >=0.2.1-rc.1 || >=0.2.2-rc.1` (tested `0.2.2-rc.1`) | `^4.0.1` (tested `4.1.0`) |
+| 0.1.x | `>=0.1.5-rc.1 || >=0.1.6-alpha.1 || >=0.1.7-alpha.1 || >=0.2.0-rc.1 || >=0.2.1-rc.1 || >=0.2.2-rc.1` (tested `0.2.2-rc.2`) | `^4.0.1` (tested `4.1.0`) |
 
 Peer dependency: `@deepseek-ai/dsh-tools` (the `tools/pre-execute` gate). The approval seam (`@deepseek-ai/dsh-user-approval`) is optional and only involved in `ask` decisions.
 
