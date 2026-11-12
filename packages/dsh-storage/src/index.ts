@@ -76,6 +76,7 @@ interface SessionAccum {
 const LAST_USAGE_KEY = 'dsh-storage:lastUsage';
 const TOKEN_BASELINE_KEY = 'dsh-storage:token-baseline';
 const ARCHIVE_IN_PROGRESS = 'dsh-storage:archive-in-progress';
+const PARENT_SESSION_KEY = 'dsh-storage:parentSessionId';
 
 /** Shape-guarded restore of our usage sample from arbitrary metadata. */
 function usageSampleOfMetadata(value: unknown): SessionAccum['usageSample'] {
@@ -328,6 +329,8 @@ export function apply(ctx: Context, config: StoragePluginConfig): void {
     // Stage every change on a copy. The live accumulator advances only
     // after the message + rollup transaction commits.
     const accum: SessionAccum = { ...stored, metadata: { ...stored.metadata } };
+    if (session?.header?.parentSession)
+      accum.metadata[PARENT_SESSION_KEY] = session.header.parentSession;
 
     let row: MessageRow | null = projectEvent(session, event, sessionId);
     if (row && session.header?.createdAt !== undefined) {

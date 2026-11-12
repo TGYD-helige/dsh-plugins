@@ -52,8 +52,8 @@ Adjacent queued tool results for the same assistant row are merged before writin
 
 ## Data model
 
-- **`ai_messages`** — user and model rows, with `thoughts`, `tokens`, `tool_calls`, `agent_id`, `metadata` JSON columns and soft-delete. A `tool/result` updates the matching model row's `tool_calls` entry by call ID; it does not create a `type=tool` row.
-- **`ai_chat_histories`** — per-session rollup (message count, total tokens, first/last message timestamps).
+- **`ai_messages`** — user and model rows, with `thoughts`, `tokens`, `tool_calls`, `agent_id`, `metadata` JSON columns and soft-delete. A `tool/result` updates the matching model row's `tool_calls` entry by call ID; it does not create a `type=tool` row. `agent_id` is `main` for top-level sessions and the child session id for subagent sessions.
+- **`ai_chat_histories`** — per-session rollup (message count, total tokens, first/last message timestamps). A subagent child session records its creator under the `dsh-storage:parentSessionId` metadata key.
 
 The logical message id rides in `metadata.id`; message rows use a deterministic hash of `(session_id, message id)` as their primary key, so re-projected events upsert in place rather than duplicate — on every connector. Session rows are matched by `session_id` and keep their cuid primary keys. One deviation from the source project: no `user_id` column — tenancy rides on `session_id`.
 
