@@ -69,3 +69,26 @@ describe('matchesPrefix', () => {
     expect(matchesPrefix('npm', 'npm')).toBe(true);
   });
 });
+
+describe('splitSegments shell syntax', () => {
+  it('keeps fd redirections inside their segment', () => {
+    expect(splitSegments('npm test 2>&1 | grep x')).toEqual(['npm test 2>&1', 'grep x']);
+    expect(splitSegments('npm test &>/dev/null & echo bg')).toEqual([
+      'npm test &>/dev/null',
+      'echo bg',
+    ]);
+    expect(splitSegments('cat <&3')).toEqual(['cat <&3']);
+    expect(splitSegments('echo a\\>&rm -rf /')).toEqual(['echo a\\>', 'rm -rf /']);
+  });
+
+  it('drops grouping and compound-command keywords around commands', () => {
+    expect(splitSegments('{ npm i; }')).toEqual(['npm i']);
+    expect(splitSegments('(cd /tmp && npm i)')).toEqual(['cd /tmp', 'npm i']);
+    expect(splitSegments('while true; do npm i; done')).toEqual(['true', 'npm i']);
+    expect(splitSegments('if true; then a; else b; fi')).toEqual(['true', 'a', 'b']);
+  });
+
+  it('leaves PowerShell parens alone', () => {
+    expect(splitSegments('Write-Output (Get-Date)', 'pwsh')).toEqual(['Write-Output (Get-Date)']);
+  });
+});

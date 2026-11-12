@@ -72,6 +72,37 @@ export function matchesPrefix(
   return trimmed.startsWith(prefix) && isWordBoundary(trimmed[prefix.length]);
 }
 
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\])*\s+/;
+
+/**
+ * The Bash segment without leading `NAME=value` assignments and with an
+ * absolute or relative command path reduced to its basename
+ * (`FOO=1 /usr/bin/npm i` → `npm i`). Only deny/ask rules match this form,
+ * so an allow rule never covers an altered environment or another binary.
+ */
+export function bareCommand(segment: string): string {
+  let rest = segment.trimStart();
+  for (let match = ASSIGNMENT.exec(rest); match; match = ASSIGNMENT.exec(rest)) {
+    rest = rest.slice(match[0].length);
+  }
+  const normalized = normalizeCommandWord(rest);
+  const word = /^\S*/.exec(normalized)?.[0] ?? '';
+  return normalized.slice(word.lastIndexOf('/') + 1);
+}
+
+// Grouping and compound-command keywords before the command word, e.g. `{ npm i`, `then npm i`.
+const LEADING_SYNTAX = /^(?:[{!]|if|then|elif|else|while|until|do|time)(?:\s+|$)/;
+// A segment that only closes a group or compound command runs nothing.
+const CLOSER = /^(?:\}|fi|done|esac)$/;
+
+function stripLeadingSyntax(segment: string): string {
+  let rest = segment;
+  for (let match = LEADING_SYNTAX.exec(rest); match; match = LEADING_SYNTAX.exec(rest)) {
+    rest = rest.slice(match[0].length);
+  }
+  return CLOSER.test(rest) ? '' : rest;
+}
+
 /** Read a `$(`...`)` body starting just after the opening paren. */
 function readParenSubshell(text: string, start: number): { body: string; end: number } {
   let depth = 1;
@@ -209,8 +240,9 @@ export function splitSegments(command: string, dialect: ShellDialect = 'bash'): 
   const segments: string[] = [];
   let buf = '';
   let quote: string | undefined;
+  let escaped = -1;
   const push = () => {
-    const trimmed = buf.trim();
+    const trimmed = dialect === 'bash' ? stripLeadingSyntax(buf.trim()) : buf.trim();
     if (trimmed !== '') segments.push(trimmed);
     buf = '';
   };
@@ -289,10 +321,18 @@ export function splitSegments(command: string, dialect: ShellDialect = 'bash'): 
     }
     if (dialect === 'bash' && ch === '\\' && i + 1 < command.length) {
       buf += ch + command[i + 1];
+      escaped = i + 1;
       i += 2;
       continue;
     }
-    if (ch === ';' || ch === '\n' || ch === '|' || ch === '&') {
+    // `2>&1`, `<&3` and `&>file` are redirections, not background separators; `\>&` is not.
+    const redirect =
+      ch === '&' &&
+      (((command[i - 1] === '>' || command[i - 1] === '<') && escaped !== i - 1) ||
+        command[i + 1] === '>');
+    // Unquoted Bash parens delimit subshells, so `(npm i)` checks `npm i`.
+    const paren = dialect === 'bash' && (ch === '(' || ch === ')');
+    if (paren || (!redirect && (ch === ';' || ch === '\n' || ch === '|' || ch === '&'))) {
       push();
       i += command[i + 1] === ch && (ch === '|' || ch === '&') ? 2 : 1;
       continue;

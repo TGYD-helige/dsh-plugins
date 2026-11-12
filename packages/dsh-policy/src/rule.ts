@@ -10,7 +10,9 @@
  * - `commandRegex` is anchored at the segment start (Gemini anchors it at the
  *   command start) — use `.*` to match mid-segment.
  * - Shell commands are checked segment by segment (see shell.ts): a compound
- *   command cannot launder a denied command behind an allowed one.
+ *   command cannot launder a denied command behind an allowed one. Deny/ask
+ *   rules also match the segment without leading assignments and with the
+ *   command path reduced to its basename; allow rules match it as written.
  * - Priority resolves rules competing for the SAME segment; ties break
  *   fail-closed (deny > ask > allow). Across segments deny wins outright,
  *   then ask; allow only when EVERY segment decided allow.
@@ -18,7 +20,13 @@
  *   of the `tools/pre-execute` chain (dsh's own gates keep their say).
  */
 
-import { matchesPrefix, normalizeCommandWord, type ShellDialect, splitSegments } from './shell.js';
+import {
+  bareCommand,
+  matchesPrefix,
+  normalizeCommandWord,
+  type ShellDialect,
+  splitSegments,
+} from './shell.js';
 
 export type PolicyDecisionKind = 'allow' | 'deny' | 'ask';
 
@@ -162,9 +170,15 @@ function matchesSegment(
   const hasCommandCondition = rule.commandPrefixes !== undefined || rule.commandRes !== undefined;
   // No command string on this call: command conditions cannot be satisfied.
   if (segment === undefined) return !hasCommandCondition;
+  const matches = (form: string) =>
+    anyMatch(rule.commandPrefixes, (prefix) => matchesPrefix(form, prefix, dialect)) &&
+    anyMatch(rule.commandRes, (re) => re.test(normalizeCommandWord(form, dialect)));
+  if (matches(segment)) return true;
   return (
-    anyMatch(rule.commandPrefixes, (prefix) => matchesPrefix(segment, prefix, dialect)) &&
-    anyMatch(rule.commandRes, (re) => re.test(normalizeCommandWord(segment, dialect)))
+    hasCommandCondition &&
+    rule.decision !== 'allow' &&
+    dialect === 'bash' &&
+    matches(bareCommand(segment))
   );
 }
 

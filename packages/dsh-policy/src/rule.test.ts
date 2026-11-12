@@ -368,3 +368,35 @@ describe('describeRule', () => {
     );
   });
 });
+
+describe('shell syntax around the command word', () => {
+  const denyNpm: PolicyRuleConfig[] = [
+    { tool: 'bash', decision: 'allow', commandPrefix: 'echo' },
+    { tool: 'bash', decision: 'deny', commandPrefix: 'npm' },
+  ];
+
+  it.each([
+    'FOO=1 npm i',
+    'A="x y" B=2 npm i',
+    '/usr/bin/npm i',
+    './node_modules/.bin/npm i',
+    '(npm i)',
+    '{ npm i; }',
+    'if true; then npm i; fi',
+    'for x in a; do npm i; done',
+    '! npm i',
+    'time npm i',
+    'echo ok && (cd /tmp && npm i)',
+  ])('denies %s', (command) => {
+    expect(run(denyNpm, 'bash', bash(command))?.decision).toBe('deny');
+  });
+
+  it('does not widen allow rules to altered environments or other binaries', () => {
+    const allowNpm: PolicyRuleConfig[] = [
+      { tool: 'bash', decision: 'allow', commandPrefix: 'npm' },
+    ];
+    expect(run(allowNpm, 'bash', bash('LD_PRELOAD=x.so npm i'))).toBeUndefined();
+    expect(run(allowNpm, 'bash', bash('/tmp/npm i'))).toBeUndefined();
+    expect(run(allowNpm, 'bash', bash('{ npm i; }'))?.decision).toBe('allow');
+  });
+});
