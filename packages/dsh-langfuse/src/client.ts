@@ -294,23 +294,27 @@ export class LangfuseReporter extends PayloadPrivacy {
       input?: unknown;
       modelParameters?: Record<string, string | number>;
       metadata?: Record<string, unknown>;
+      startTime?: Date;
     },
   ): LangfuseGeneration | null {
     const api = this.api;
     if (!parent || !api) return null;
     try {
       input = this.mask(input);
+      const attributes = {
+        model: input.model,
+        input: input.input,
+        modelParameters: input.modelParameters,
+        metadata: input.metadata,
+      };
       const generation = this.withProvider(() =>
-        parent.startObservation(
-          input.name,
-          {
-            model: input.model,
-            input: input.input,
-            modelParameters: input.modelParameters,
-            metadata: input.metadata,
-          },
-          { asType: 'generation' },
-        ),
+        input.startTime && this.tracing
+          ? this.tracing.startObservation(input.name, attributes, {
+              asType: 'generation',
+              parentSpanContext: parent.otelSpan.spanContext(),
+              startTime: input.startTime,
+            })
+          : parent.startObservation(input.name, attributes, { asType: 'generation' }),
       );
       this.stampTraceContext(generation, this.traceContext.get(parent));
       return generation;
@@ -404,19 +408,27 @@ export class LangfuseReporter extends PayloadPrivacy {
    */
   updateSpan(
     span: Observation | null,
-    update: { name?: string; input?: unknown; metadata?: Record<string, unknown> },
+    update: {
+      name?: string;
+      input?: unknown;
+      output?: unknown;
+      metadata?: Record<string, unknown>;
+    },
   ): void {
     if (!span) return;
     try {
       const budget = newPayloadBudget(this.config.maxPayloadBytes ?? 256 * 1024);
       const input =
         update.input === undefined ? undefined : boundPayload(update.input, budget, this);
+      const output =
+        update.output === undefined ? undefined : boundPayload(update.output, budget, this);
       update = this.mask({
         ...update,
         input,
+        output,
         ...(budget.truncated ? { metadata: { ...update.metadata, truncated: true } } : {}),
       });
-      span.update({ input: update.input, metadata: update.metadata });
+      span.update({ input: update.input, output: update.output, metadata: update.metadata });
       if (update.name) span.otelSpan.updateName(update.name);
       if (update.input !== undefined && this.roots.has(span)) {
         span.setTraceIO({ input: update.input });

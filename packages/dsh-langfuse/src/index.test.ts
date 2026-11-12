@@ -87,9 +87,16 @@ const mocks = vi.hoisted(() => {
       this.ended += 1;
     }
 
-    startObservation(name: string, attrs?: Record<string, unknown>, opts?: { asType?: string }) {
+    startTime?: Date;
+
+    startObservation(
+      name: string,
+      attrs?: Record<string, unknown>,
+      opts?: { asType?: string; startTime?: Date },
+    ) {
       if (state.failCreate) throw new Error('ingestion down');
       const child = new MockObservation(name, attrs ?? {}, opts?.asType ?? 'span');
+      child.startTime = opts?.startTime;
       (child.asType === 'generation' ? this.generations : this.spans).push(child);
       return child;
     }
@@ -2102,6 +2109,21 @@ describe('dsh-langfuse plugin', () => {
       expect(lastUpdate(tool)).toMatchObject({ level: 'ERROR', statusMessage: 'blocked' });
     });
 
+    it('reports cancelled and declined tools as warnings without marking the run errored', async () => {
+      await setup();
+      const session = sessionOf('s1');
+      ctx.emit('session/event', session, turnStart(0));
+      const exec = execOf();
+      await ctx.waterfall('tools/pre-execute', exec, async () => ({ kind: 'allow' }));
+      ctx.emit('tools/result', exec, errResult('rejected', 'APPROVAL_REJECTED'));
+      expect(lastUpdate(mocks.roots[0].spans[0])).toMatchObject({
+        level: 'WARNING',
+        metadata: { errorCode: 'APPROVAL_REJECTED', errorName: 'ToolError' },
+      });
+      ctx.emit('session/event', session, turnEnd(0));
+      expect(lastUpdate(mocks.roots[0]).metadata).not.toHaveProperty('hadErrors');
+    });
+
     it('reports a hook invocation and result as one span inside the turn trace', async () => {
       await setup();
       const session = sessionOf('s1');
@@ -2933,6 +2955,31 @@ describe('dsh-langfuse plugin', () => {
       expect(mocks.roots).toHaveLength(1);
       expect(root.generations[0].name).toBe('llm-call [compaction]');
       expect(root.generations[0].body).toMatchObject({ metadata: { purpose: 'compaction' } });
+    });
+
+    it('records the compaction summary and dates its external generation from compaction start', async () => {
+      await setup();
+      const session = sessionOf('s1');
+      ctx.emit('session/event', session, turnStart(0));
+      ctx.emit('session/event', session, ev('compaction/start', { compactionId: 'k1', turn: 0 }));
+      ctx.emit(
+        'session/event',
+        session,
+        ev('compaction/summary', {
+          compactionId: 'k1',
+          summary: [{ type: 'text', text: 'the summary' }],
+          shadowedRange: { start: 1, end: 3 },
+          shadowedTokenCount: 50,
+          provider: 'p',
+          model: 'm',
+          usage: { inputTokens: 5, outputTokens: 2 },
+        }),
+      );
+      const compaction = mocks.roots[0].spans.find((span) => span.name === 'compaction')!;
+      expect(
+        compaction.updates.some((update) => JSON.stringify(update.output).includes('the summary')),
+      ).toBe(true);
+      expect(compaction.generations[0].startTime).toEqual(new Date(1700000000000));
     });
 
     it('captures tool calls from block-end chunks into the output', async () => {

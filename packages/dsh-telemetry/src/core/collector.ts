@@ -118,6 +118,15 @@ interface ChildSession {
   hasInput: boolean;
 }
 
+/** Cancelled or declined tool calls (dsh-tools codes plus dsh-policy denials): WARNING, not a run error. */
+const DECLINED_TOOL_CODES = new Set([
+  'ABORTED',
+  'ABORTED_BEFORE_DISPATCH',
+  'APPROVAL_REJECTED',
+  'APPROVAL_CANCELLED',
+  'POLICY_DENIED',
+]);
+
 const messageOf = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
@@ -1715,12 +1724,18 @@ export function collect(
       operationSessions.set(closeTool, sessionId);
       toolResults.set(exec, (result) => {
         if (closed) return;
-        if (result.isError) noteError(sessionId);
+        const info = result.isError ? result.error.info : undefined;
+        const declined = info !== undefined && DECLINED_TOOL_CODES.has(info.code);
+        if (result.isError && !declined) noteError(sessionId);
         const update = {
           output: config.captureContent ? result.content : undefined,
-          level: (result.isError ? 'ERROR' : 'DEFAULT') as ObservationLevel,
+          level: (result.isError
+            ? declined
+              ? 'WARNING'
+              : 'ERROR'
+            : 'DEFAULT') as ObservationLevel,
           statusMessage: result.isError ? contentMessage(config, result.error.message) : undefined,
-          metadata: { errorCode: result.isError ? result.error.info?.code : undefined },
+          metadata: { errorCode: info?.code, errorName: info?.name },
         };
         if (
           span &&
