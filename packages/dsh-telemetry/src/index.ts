@@ -23,10 +23,6 @@ export const Config = Schema.object({
   baseUrl: Schema.string().default(''),
   traceName: Schema.string().default('dsh-turn'),
   captureContent: Schema.boolean().default(true),
-  maxPayloadBytes: Schema.number()
-    .min(1)
-    .step(1)
-    .default(256 * 1024),
   redactFields: Schema.array(Schema.string()).default([]),
   userId: Schema.string().default(''),
   tags: Schema.array(Schema.string()).default([]),

@@ -816,8 +816,8 @@ describe('dsh-langfuse plugin', () => {
       expect(raw.map((chunk) => chunk.type)).toEqual(chunks.map((chunk) => chunk.type));
     });
 
-    it('redacts a fragmented secret before dropping oversized raw chunks', async () => {
-      await setup({ ...enabledConfig, maxPayloadBytes: 128, redactFields: ['password'] });
+    it('redacts fragmented secrets while keeping complete raw chunks', async () => {
+      await setup({ ...enabledConfig, redactFields: ['password'] });
       const chunks: StreamChunk[] = [
         {
           type: 'tool-call-delta',
@@ -840,11 +840,11 @@ describe('dsh-langfuse plugin', () => {
       const request = mocks.roots[0].generations[0].spans[0];
       expect(JSON.stringify(lastUpdate(request).output)).not.toContain('fragmented-');
       expect(JSON.stringify(lastUpdate(request).output)).not.toContain('secret-value');
-      expect(lastUpdate(request).metadata).toMatchObject({ truncated: true });
+      expect(lastUpdate(request).metadata).not.toHaveProperty('truncated');
     });
 
-    it('redacts assembled text before applying the final output bound', async () => {
-      await setup({ ...enabledConfig, maxPayloadBytes: 96, redactFields: ['password'] });
+    it('redacts complete assembled text', async () => {
+      await setup({ ...enabledConfig, redactFields: ['password'] });
       const chunks = [
         textDelta('{"password":"assembled-'),
         textDelta(`secret-value","padding":"${'x'.repeat(200)}"}`),
@@ -858,39 +858,7 @@ describe('dsh-langfuse plugin', () => {
       const output = JSON.stringify(lastUpdate(generation).output) ?? '';
       expect(output).not.toContain('assembled-');
       expect(output).not.toContain('secret-value');
-      expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
-    });
-
-    it('bounds streaming buffers while dropping fragmented secrets as a whole', async () => {
-      const maskSpy = vi.spyOn(LangfuseReporter.prototype, 'mask');
-      try {
-        await setup({ ...enabledConfig, maxPayloadBytes: 128, redactFields: ['password'] });
-        const chunks = [
-          textDelta('{"password":"stream-'),
-          textDelta(`secret-value","padding":"${'x'.repeat(1000)}"}`),
-          ...Array.from({ length: 40 }, () => textDelta('y')),
-          finishStop(),
-        ];
-
-        const received = await drain(
-          ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks)),
-        );
-
-        expect(received).toEqual(chunks);
-        const generation = fakeObs(mocks.roots[0]).generations[0];
-        const request = generation.spans[0];
-        expect(lastUpdate(request).output).toEqual([]);
-        expect(lastUpdate(generation).output).toBeUndefined();
-        expect(lastUpdate(request).metadata).toMatchObject({ truncated: true });
-        expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
-        for (const [payload] of maskSpy.mock.calls) {
-          const serialized =
-            typeof payload === 'string' ? payload : (JSON.stringify(payload) ?? '');
-          expect(Buffer.byteLength(serialized)).toBeLessThan(512);
-        }
-      } finally {
-        maskSpy.mockRestore();
-      }
+      expect(lastUpdate(generation).metadata).not.toHaveProperty('truncated');
     });
 
     it('redacts excerpt sources before extracting and truncating observation names', async () => {
@@ -915,8 +883,8 @@ describe('dsh-langfuse plugin', () => {
       expect(exported).not.toContain(secretKey.slice(0, 70));
     });
 
-    it('bounds turn-root IO at the reporting boundary without mutating messages', async () => {
-      await setup({ ...enabledConfig, maxPayloadBytes: 1024 });
+    it('keeps full turn-root IO without mutating messages', async () => {
+      await setup({ ...enabledConfig });
       const session = sessionOf('s1');
       const input = 'x'.repeat(100_000);
       const output = 'y'.repeat(100_000);
@@ -930,13 +898,9 @@ describe('dsh-langfuse plugin', () => {
       );
       ctx.emit('session/event', session, turnEnd(0));
       const root = mocks.roots[0];
-      expect(
-        Buffer.byteLength(JSON.stringify(root.attributes['langfuse.trace.input'])),
-      ).toBeLessThanOrEqual(1024);
-      expect(
-        Buffer.byteLength(JSON.stringify(root.attributes['langfuse.trace.output'])),
-      ).toBeLessThanOrEqual(1024);
-      expect(metadataOf(root)).toMatchObject({ truncated: true });
+      expect(root.attributes['langfuse.trace.input']).toBe(input);
+      expect(root.attributes['langfuse.trace.output']).toBe(output);
+      expect(metadataOf(root)).not.toHaveProperty('truncated');
       expect(message.content[0].text).toBe(input);
       expect(root.ended).toBe(1);
     });
@@ -1163,13 +1127,13 @@ describe('dsh-langfuse plugin', () => {
       expect(generation.ended).toBe(1);
     });
 
-    it('uses a fresh request budget for image enrichment after initial truncation', async () => {
+    it('keeps image enrichment alongside the full request', async () => {
       const readImage = vi.fn(async () => ({
         ref: image.attachment,
         data: Uint8Array.of(1, 2, 3),
       }));
       ctx.provide('attachments', { readImage } as unknown as AttachmentStore);
-      await setup({ ...enabledConfig, captureMedia: true, maxPayloadBytes: 512 });
+      await setup({ ...enabledConfig, captureMedia: true });
       const options = optionsOf({
         messages: [
           {
@@ -1191,7 +1155,7 @@ describe('dsh-langfuse plugin', () => {
           (JSON.stringify(update.input) ?? '').includes('data:image/png;base64,AQID'),
         ),
       ).toBe(true);
-      expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
+      expect(lastUpdate(generation).metadata).not.toHaveProperty('truncated');
       expect(JSON.stringify(options)).toBe(before);
     });
 
@@ -3080,256 +3044,63 @@ describe('dsh-langfuse plugin', () => {
       expect(request.body.input).toEqual(expectedInput);
     });
 
-    it('bounds captured payloads and preserves the original stream', async () => {
-      await setup({ ...enabledConfig, maxPayloadBytes: 48 });
-      const chunks = [textDelta('x'.repeat(200)), finishStop()];
-      const received = await drain(
-        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks)),
-      );
-      expect(received).toEqual(chunks);
-
-      const generation = fakeObs(mocks.roots[0]).generations[0];
-      const request = generation.spans[0];
-      expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
-      expect(lastUpdate(request).metadata).toMatchObject({ truncated: true });
-      expect((JSON.stringify(lastUpdate(generation).output) ?? '').length).toBeLessThan(200);
-      expect((JSON.stringify(lastUpdate(request).output) ?? '').length).toBeLessThan(200);
-    });
-
-    it('bounds oversized request inputs and marks both observations', async () => {
-      await setup({ ...enabledConfig, maxPayloadBytes: 64 });
-      await drain(
-        ctx.waterfall(
-          'llm/stream',
-          optionsOf({
-            messages: [{ role: 'user', content: [{ type: 'text', text: 'p'.repeat(500) }] }],
-          }),
-          () => streamOf(finishStop()),
-        ),
-      );
-
-      const generation = fakeObs(mocks.roots[0]).generations[0];
-      expect(generation.body.input).toMatchObject({ truncated: true });
-      expect(generation.spans[0].body.input).toMatchObject({ truncated: true });
-      expect(JSON.stringify(generation.body.input).length).toBeLessThan(500);
-      expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
-    });
-
-    it('bounds oversized request structure before full masking or serialization', async () => {
-      const secret = 'peak-private-value';
-      const requestText = JSON.stringify({ password: secret, padding: 'p'.repeat(200_000) });
+    it('keeps large request structure and full streamed output without mutating originals', async () => {
+      await setup({ ...enabledConfig, redactFields: ['password'] });
+      const text = '中文 "quoted"\n'.repeat(40_000);
       const options = optionsOf({
-        messages: [{ role: 'user', content: [{ type: 'text', text: requestText }] }],
-      });
-      const chunks = [textDelta('visible'), finishStop()];
-      const maskSpy = vi.spyOn(LangfuseReporter.prototype, 'mask');
-      const stringifySpy = vi.spyOn(JSON, 'stringify');
-      try {
-        await setup({ ...enabledConfig, maxPayloadBytes: 128, redactFields: ['password'] });
-        const received = await drain(
-          ctx.waterfall('llm/stream', options, () => streamOf(...chunks)),
-        );
-
-        expect(received).toEqual(chunks);
-        expect(
-          maskSpy.mock.calls.filter(
-            ([payload]) => payload && typeof payload === 'object' && 'messages' in payload,
-          ),
-        ).toHaveLength(0);
-        const serializedLengths = stringifySpy.mock.results.map((result) =>
-          typeof result.value === 'string' ? result.value.length : 0,
-        );
-        expect(Math.max(...serializedLengths, 0)).toBeLessThan(4096);
-        const generation = fakeObs(mocks.roots[0]).generations[0];
-        expect(JSON.stringify(generation.body.input)).not.toContain(secret);
-        expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
-        const originalBlock = options.messages[0].content[0];
-        expect(originalBlock.type).toBe('text');
-        if (originalBlock.type === 'text') expect(originalBlock.text).toBe(requestText);
-      } finally {
-        maskSpy.mockRestore();
-        stringifySpy.mockRestore();
-      }
-    });
-
-    it('stops object traversal and masking after the payload budget is exhausted', async () => {
-      const secret = 'stop-private-value';
-      const fields = Object.fromEntries([
-        ['password', `${secret}${'x'.repeat(1000)}`],
-        ...Array.from({ length: 5000 }, (_, index) => [`field${index}`, 'value']),
-      ]);
-      const options = optionsOf({ futurePayload: fields } as Partial<GenerateOptions>);
-      const chunks = [textDelta('visible'), finishStop()];
-      const entriesSpy = vi.spyOn(Object, 'entries');
-      const maskSpy = vi.spyOn(LangfuseReporter.prototype, 'mask');
-      const fieldSpy = vi.spyOn(LangfuseReporter.prototype, 'shouldRedactField');
-      try {
-        await setup({ ...enabledConfig, maxPayloadBytes: 128, redactFields: ['password'] });
-        const received = await drain(
-          ctx.waterfall('llm/stream', options, () => streamOf(...chunks)),
-        );
-
-        expect(received).toEqual(chunks);
-        expect(entriesSpy.mock.calls.filter(([value]) => value === fields)).toHaveLength(0);
-        expect(maskSpy.mock.calls.length).toBeLessThan(100);
-        expect(fieldSpy.mock.calls.length).toBeLessThan(100);
-        const generation = fakeObs(mocks.roots[0]).generations[0];
-        expect(JSON.stringify(generation.body.input)).not.toContain(secret);
-        expect(Buffer.byteLength(JSON.stringify(generation.body.input))).toBeLessThanOrEqual(128);
-        expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
-      } finally {
-        entriesSpy.mockRestore();
-        maskSpy.mockRestore();
-        fieldSpy.mockRestore();
-      }
-    });
-
-    it('redacts structured request fields before truncating previews without changing the stream', async () => {
-      const secret = 'request-private-value';
-      const requestJson = JSON.stringify({ password: secret, padding: 'p'.repeat(400) });
-      const chunks = [textDelta('visible'), finishStop()];
-      await setup({ ...enabledConfig, maxPayloadBytes: 224, redactFields: ['password'] });
-
-      const received = await drain(
-        ctx.waterfall(
-          'llm/stream',
-          optionsOf({
-            messages: [{ role: 'user', content: [{ type: 'text', text: requestJson }] }],
-          }),
-          () => streamOf(...chunks),
-        ),
+        messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+        futurePayload: { password: 'private-value', last: 'last-field' },
+      } as Partial<GenerateOptions>);
+      const chunks = [textDelta(text), textDelta('last-delta'), finishStop()];
+      expect(await drain(ctx.waterfall('llm/stream', options, () => streamOf(...chunks)))).toEqual(
+        chunks,
       );
-
-      expect(received).toEqual(chunks);
       const generation = fakeObs(mocks.roots[0]).generations[0];
-      const request = generation.spans[0];
-      const exported = JSON.stringify({
-        generationInput: generation.body.input,
-        requestInput: request.body.input,
-        rawOutput: lastUpdate(request).output,
-      });
-      expect(exported).not.toContain(secret);
-      expect(exported).toContain('[REDACTED]');
-      expect(generation.body.input).toMatchObject({ truncated: true });
-      expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
+      const { signal: _, ...body } = options;
+      const expected = { ...body, futurePayload: { password: '[REDACTED]', last: 'last-field' } };
+      expect(generation.body.input).toEqual(expected);
+      expect(generation.spans[0].body.input).toEqual(expected);
+      expect(lastUpdate(generation).output).toBe(`${text}last-delta`);
+      expect(lastUpdate(generation.spans[0]).output).toEqual(chunks);
+      expect(lastUpdate(generation).metadata).not.toHaveProperty('truncated');
+      expect(JSON.stringify(options)).toContain('private-value');
     });
 
-    it('redacts structured tool arguments before truncating assembled output', async () => {
-      const secret = 'tool-private-value';
-      const args = JSON.stringify({ password: secret, padding: 'x'.repeat(400) });
+    it('keeps full tool arguments while redacting structured credentials', async () => {
+      await setup({ ...enabledConfig, redactFields: ['password'] });
+      const padding = 'x'.repeat(300_000);
+      const args = JSON.stringify({ password: 'private-value', padding });
       const chunks = [toolCallEnd('write_file', args), finishStop()];
-      await setup({ ...enabledConfig, maxPayloadBytes: 224, redactFields: ['password'] });
-
-      const received = await drain(
-        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks)),
-      );
-
-      expect(received).toEqual(chunks);
-      expect(chunks[0]).toEqual(toolCallEnd('write_file', args));
+      expect(
+        await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks))),
+      ).toEqual(chunks);
       const generation = fakeObs(mocks.roots[0]).generations[0];
-      expect(JSON.stringify(lastUpdate(generation).output)).not.toContain(secret);
-      expect(JSON.stringify(lastUpdate(generation).output)).toContain('[REDACTED]');
-      expect(JSON.stringify(lastUpdate(generation.spans[0]).output)).not.toContain(secret);
-      expect(lastUpdate(generation).metadata).toMatchObject({ truncated: true });
+      const output = lastUpdate(generation).output as {
+        tool_calls: Array<{ function: { arguments: string } }>;
+      };
+      expect(JSON.parse(output.tool_calls[0].function.arguments)).toEqual({
+        password: '[REDACTED]',
+        padding,
+      });
+      expect(JSON.stringify(lastUpdate(generation.spans[0]).output)).not.toContain('private-value');
+      expect(lastUpdate(generation).metadata).toMatchObject({ toolCallCount: 1 });
     });
 
-    it('bounds tool-call overhead and final serialized output for empty arguments', async () => {
-      await setup({ ...enabledConfig, maxPayloadBytes: 96 });
+    it('keeps every tool call including empty arguments', async () => {
+      await setup();
       const chunks = [
         ...Array.from({ length: 20 }, () => toolCallEnd('write_file', '')),
         finishStop(),
       ];
-
-      const received = await drain(
-        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks)),
-      );
-
-      expect(received).toEqual(chunks);
-      const generation = fakeObs(mocks.roots[0]).generations[0];
-      const output = lastUpdate(generation);
-      expect(JSON.stringify(output.output).length).toBeLessThan(500);
-      expect(output.metadata).toMatchObject({ truncated: true, toolCallCount: 20 });
-    });
-
-    it.each([1, 2, 17, 31, 64])(
-      'keeps truncated JSON exports within the %i-byte serialized cap',
-      async (maxPayloadBytes) => {
-        await setup({ ...enabledConfig, maxPayloadBytes });
-        const chunks = [textDelta('x'.repeat(200)), finishStop()];
-        await drain(
-          ctx.waterfall(
-            'llm/stream',
-            optionsOf({
-              messages: [{ role: 'user', content: [{ type: 'text', text: 'p'.repeat(500) }] }],
-            }),
-            () => streamOf(...chunks),
-          ),
-        );
-
-        const generation = fakeObs(mocks.roots[0]).generations[0];
-        const values = [
-          generation.body.input,
-          generation.spans[0].body.input,
-          lastUpdate(generation.spans[0]).output,
-          lastUpdate(generation).output,
-        ];
-        for (const value of values) {
-          if (value === undefined) continue;
-          const serialized = JSON.stringify(value);
-          expect(serialized).toBeDefined();
-          expect(Buffer.byteLength(serialized!)).toBeLessThanOrEqual(maxPayloadBytes);
-        }
-      },
-    );
-
-    it('counts raw array brackets and commas after redaction in the serialized cap', async () => {
-      const chunks = [textDelta('a'), finishStop()];
-      const maxPayloadBytes = chunks.reduce(
-        (total, chunk) => total + Buffer.byteLength(JSON.stringify(chunk)),
-        0,
-      );
-      await setup({ ...enabledConfig, maxPayloadBytes });
-
       expect(
         await drain(ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks))),
       ).toEqual(chunks);
-      const request = mocks.roots[0].generations[0].spans[0];
-      expect(Buffer.byteLength(JSON.stringify(lastUpdate(request).output))).toBeLessThanOrEqual(
-        maxPayloadBytes,
+      const generation = fakeObs(mocks.roots[0]).generations[0];
+      expect(lastUpdate(generation).output).toMatchObject({ tool_calls: expect.any(Array) });
+      expect((lastUpdate(generation).output as { tool_calls: unknown[] }).tool_calls).toHaveLength(
+        20,
       );
-      expect(lastUpdate(request).metadata).toMatchObject({ truncated: true });
-    });
-
-    it('keeps an exact-length raw array unchanged through final reporter masking', async () => {
-      const chunks = [finishStop()];
-      const maxPayloadBytes = Buffer.byteLength(JSON.stringify(chunks));
-      await setup({ ...enabledConfig, maxPayloadBytes });
-
-      const received = await drain(
-        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks)),
-      );
-
-      expect(received).toEqual(chunks);
-      const request = mocks.roots[0].generations[0].spans[0];
-      expect(lastUpdate(request).output).toEqual(chunks);
-      expect(Buffer.byteLength(JSON.stringify(lastUpdate(request).output))).toBe(maxPayloadBytes);
-    });
-
-    it('bounds non-delta secrets after final reporter masking at the exact cap', async () => {
-      const chunks = [toolCallEnd('sk', 'sk'), finishStop()];
-      const maxPayloadBytes = Buffer.byteLength(JSON.stringify(chunks));
-      await setup({ ...enabledConfig, maxPayloadBytes });
-
-      const received = await drain(
-        ctx.waterfall('llm/stream', optionsOf(), () => streamOf(...chunks)),
-      );
-
-      expect(received).toEqual(chunks);
-      const request = mocks.roots[0].generations[0].spans[0];
-      const output = lastUpdate(request).output;
-      expect(Buffer.byteLength(JSON.stringify(output))).toBeLessThanOrEqual(maxPayloadBytes);
-      expect(JSON.stringify(output)).not.toContain('sk');
-      expect(lastUpdate(request).metadata).toMatchObject({ truncated: true });
+      expect(lastUpdate(generation).metadata).toMatchObject({ toolCallCount: 20 });
     });
 
     it('sets completionStartTime at the first token delta, not at block boundaries', async () => {
@@ -3614,8 +3385,8 @@ describe('dsh-langfuse plugin', () => {
   });
 
   describe('tools/execute', () => {
-    it('bounds tool telemetry without changing the original result or losing error metadata', async () => {
-      await setup({ ...enabledConfig, maxPayloadBytes: 1024, redactFields: ['secret'] });
+    it('keeps full tool telemetry without changing the original result or losing error metadata', async () => {
+      await setup({ ...enabledConfig, redactFields: ['secret'] });
       const exec = execOf({ arguments: { secret: 'PRIVATE', path: 'x'.repeat(100_000) } });
       const result = {
         ...errResult('x'.repeat(100_000)),
@@ -3624,13 +3395,13 @@ describe('dsh-langfuse plugin', () => {
       expect(await dispatchTool(ctx, exec, async () => result)).toBe(result);
       expect(result.content[0].text).toHaveLength(100_000);
       const span = fakeObs(mocks.roots[0]).spans[0];
-      expect(Buffer.byteLength(JSON.stringify(span.body.input))).toBeLessThanOrEqual(1024);
+      expect(span.body.input).toEqual({ secret: '[REDACTED]', path: 'x'.repeat(100_000) });
       const update = lastUpdate(span);
-      expect(Buffer.byteLength(JSON.stringify(update.output))).toBeLessThanOrEqual(1024);
+      expect(update.output).toEqual(result.content);
       expect(JSON.stringify(span)).not.toContain('PRIVATE');
       expect(update.level).toBe('ERROR');
-      expect(String(update.statusMessage ?? '')).toHaveLength(0);
-      expect(update.metadata).toMatchObject({ truncated: true });
+      expect(update.statusMessage).toBe('x'.repeat(100_000));
+      expect(update.metadata).not.toHaveProperty('truncated');
     });
 
     it("spans one tool dispatch under the agent's session trace", async () => {

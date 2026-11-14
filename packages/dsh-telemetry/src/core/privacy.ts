@@ -1,12 +1,5 @@
 export class PayloadPrivacy {
   constructor(private privacyConfig: { secrets: string[]; redactFields?: string[] }) {}
-  /** Whether a payload property should be replaced without inspecting its value. */
-  shouldRedactField(key: string): boolean {
-    return !!this.privacyConfig.redactFields?.some(
-      (field) => field.toLowerCase() === key.toLowerCase(),
-    );
-  }
-
   /** Clone telemetry only; never mutate harness-owned messages or tool results. */
   mask<T>(data: T): T {
     const secrets = [...this.privacyConfig.secrets].filter(Boolean);

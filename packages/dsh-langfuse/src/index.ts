@@ -59,13 +59,6 @@ export const Config = Schema.object({
   traceName: Schema.string().default('dsh-turn'),
   /** Include full message/tool payloads in Langfuse IO. Disable to log metadata only. */
   captureContent: Schema.boolean().default(true),
-  maxPayloadBytes: Schema.number()
-    .min(1)
-    .step(1)
-    .default(256 * 1024)
-    .description(
-      'maximum captured request, raw-stream, assembled-output, or tool input/output/status bytes',
-    ),
   redactFields: Schema.array(Schema.string())
     .default([])
     .description('case-insensitive payload fields to redact'),
@@ -91,7 +84,6 @@ export interface LangfusePluginConfig extends CollectorConfig {
   baseUrl: string;
   traceName: string;
   captureContent: boolean;
-  maxPayloadBytes?: number;
   redactFields?: string[];
   userId?: string;
   tags?: string[];

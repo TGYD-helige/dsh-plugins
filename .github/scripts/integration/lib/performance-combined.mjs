@@ -134,7 +134,6 @@ for (const combined of [false, true]) {
           endpoint: `http://127.0.0.1:${receiver.address().port}/v1/traces`,
           apiKey: 'benchmark-only',
           project: 'performance',
-          maxPayloadBytes: 4096,
         }),
       );
       storage(

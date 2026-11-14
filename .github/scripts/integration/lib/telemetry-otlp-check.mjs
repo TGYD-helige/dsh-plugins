@@ -55,6 +55,8 @@ try {
     ['langfuse', '/prefix'],
     ['phoenix', '/slow'],
     ['phoenix', '/compressed'],
+    ['phoenix', '/large'],
+    ['langfuse', '/large'],
     ['phoenix', '/task', true],
     ['langfuse', '/task', true],
   ]) {
@@ -84,24 +86,29 @@ try {
           : { traceparent: '00-11111111111111111111111111111111-2222222222222222-01' },
       });
       if (taskRoot) reporter.updateSpan(parent, { input: 'task prompt' });
+      const largeText = '中文 "quoted" \\ newline\n'.repeat(40_000);
+      const input = {
+        messages: [
+          {
+            role: 'user',
+            content:
+              prefix === '/large'
+                ? largeText
+                : prefix === '/compressed'
+                  ? 'large prompt '.repeat(10_000)
+                  : 'hello phoenix-private sk-test',
+          },
+        ],
+      };
+      const expectedOutput = prefix === '/large' ? `${largeText}last-delta` : 'world';
       const child = reporter.startGeneration(parent, {
         name: 'llm',
         model: 'test',
         startTime: new Date('2026-01-01T00:00:00Z'),
-        input: {
-          messages: [
-            {
-              role: 'user',
-              content:
-                prefix === '/compressed'
-                  ? 'large prompt '.repeat(10_000)
-                  : 'hello phoenix-private sk-test',
-            },
-          ],
-        },
+        input,
       });
       reporter.endGeneration(child, {
-        output: 'world',
+        output: expectedOutput,
         completionStartTime: new Date('2026-01-01T00:00:00.250Z'),
         usage: { inputTokens: 2, outputTokens: 3 },
         level: 'ERROR',
@@ -173,6 +180,18 @@ try {
       assert.equal(turn.endTimeUnixNano, '1767225601000000000');
       assert.equal(llm.status.code, 2);
       const attrs = attributes(llm.attributes);
+      if (prefix === '/large') {
+        assert.ok(Buffer.byteLength(largeText) > 262144);
+        assert.deepEqual(
+          JSON.parse(attrs[backend === 'phoenix' ? 'input.value' : 'langfuse.observation.input']),
+          input,
+        );
+        assert.equal(
+          attrs[backend === 'phoenix' ? 'output.value' : 'langfuse.observation.output'],
+          expectedOutput,
+        );
+      }
+
       assert.equal(
         attrs[backend === 'phoenix' ? 'openinference.span.kind' : 'langfuse.observation.type'],
         backend === 'phoenix' ? 'LLM' : 'generation',

@@ -122,7 +122,6 @@ describe('shared isolated OTel pipeline', () => {
         backend: 'phoenix',
         apiKey: 'phoenix-secret',
         captureContent: false,
-        maxPayloadBytes: 128,
         redactFields: ['password'],
       },
       adapters.phoenix,
@@ -193,12 +192,84 @@ it('collects concurrent sessions without changing stream chunks and drains on fi
   expect(other.endTime).toBeDefined();
 });
 
+it.each(['phoenix', 'langfuse'] as const)(
+  'exports complete large structured requests and responses on %s',
+  async (backend) => {
+    const ctx = new Context();
+    onTestFinished(() => ctx.fiber.dispose());
+    const secret = 'large-payload-credential';
+    await apply(
+      ctx,
+      Config({
+        enabled: true,
+        backend,
+        apiKey: secret,
+        publicKey: 'pk-fixture',
+        secretKey: secret,
+        redactFields: ['password'],
+      }),
+    );
+    const text = '中文 "quoted" \\ newline\n'.repeat(20_000);
+    const input = {
+      provider: 'test',
+      model: 'test',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text }] },
+        { role: 'user', content: [{ type: 'text', text: 'last-message' }] },
+      ],
+      tools: [
+        {
+          name: 'last-tool',
+          description: text,
+          parameters: { password: 'private-field', token: secret },
+        },
+      ],
+    };
+    const chunks = [
+      { type: 'text-delta', index: 0, text },
+      { type: 'text-delta', index: 0, text: 'last-delta' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ];
+    const received = [];
+    for await (const chunk of ctx.waterfall('llm/stream', input as never, async function* () {
+      yield* chunks as never[];
+    }))
+      received.push(chunk);
+    expect(received).toEqual(chunks);
+    await ctx.fiber.dispose();
+    const generation = state.spans.find(
+      (span) =>
+        span.attributes['openinference.span.kind'] === 'LLM' ||
+        span.attributes['langfuse.observation.type'] === 'generation',
+    )!;
+    const prefix = backend === 'phoenix' ? '' : 'langfuse.observation.';
+    const request = JSON.parse(
+      String(generation.attributes[backend === 'phoenix' ? 'input.value' : `${prefix}input`]),
+    );
+    expect(request.messages).toEqual(input.messages);
+    expect(request.tools).toEqual([
+      { ...input.tools[0], parameters: { password: '[REDACTED]', token: '[REDACTED]' } },
+    ]);
+    expect(generation.attributes[backend === 'phoenix' ? 'output.value' : `${prefix}output`]).toBe(
+      `${text}last-delta`,
+    );
+    const raw = state.spans.find((span) => span.name === 'llm-request')!;
+    expect(
+      JSON.parse(
+        String(raw.attributes[backend === 'phoenix' ? 'output.value' : `${prefix}output`]),
+      ),
+    ).toEqual(chunks);
+    expect(JSON.stringify(state.spans.map((span) => span.attributes))).not.toContain(secret);
+    expect(input.tools[0].parameters.password).toBe('private-field');
+  },
+);
+
 it.each([256, 16_384])(
-  'bounds capture work across %i chunks in concurrent sessions',
+  'captures all %i chunks without per-chunk serialization in concurrent sessions',
   async (count) => {
     const ctx = new Context();
     onTestFinished(() => ctx.fiber.dispose());
-    await apply(ctx, Config({ enabled: true, backend: 'phoenix', maxPayloadBytes: 1024 }));
+    await apply(ctx, Config({ enabled: true, backend: 'phoenix' }));
     const delta = { type: 'text-delta', index: 0, text: 'x'.repeat(64) };
     const stringify = vi.spyOn(JSON, 'stringify');
     const mask = vi.spyOn(TelemetryReporter.prototype, 'mask');
@@ -235,7 +306,7 @@ it.each([256, 16_384])(
         await ctx.parallel('session/flush', session);
       }),
     );
-    // Once capture fills, later chunks must not trigger serialization or masking.
+    // Serialize at export, rather than on every incoming chunk.
     expect(stringify.mock.calls.filter(([value]) => value === delta).length).toBeLessThanOrEqual(
       80,
     );
@@ -245,9 +316,11 @@ it.each([256, 16_384])(
     for (const span of state.spans.filter((item) => item.name === 'llm-request')) {
       expect(JSON.parse(String(span.attributes.metadata))).toMatchObject({
         chunkCount: count + 1,
-        truncated: true,
       });
-      expect(Buffer.byteLength(String(span.attributes['output.value']))).toBeLessThanOrEqual(1024);
+      const output = JSON.parse(String(span.attributes['output.value']));
+      expect(output).toHaveLength(count + 1);
+      expect(output[0]).toEqual(delta);
+      expect(output.at(-1)).toEqual({ type: 'finish', reason: { kind: 'stop' } });
     }
   },
 );
@@ -266,7 +339,6 @@ it.each(['phoenix', 'langfuse'] as const)(
         apiKey: secret,
         publicKey: 'pk-fixture',
         secretKey: secret,
-        maxPayloadBytes: 1024,
         redactFields: ['password'],
       }),
     );
@@ -305,16 +377,15 @@ it.each(['phoenix', 'langfuse'] as const)(
         span.attributes['langfuse.observation.type'] === 'generation',
     );
     expect(generation).toBeDefined();
-    for (const span of state.spans)
-      for (const key of [
-        'input.value',
-        'output.value',
-        'langfuse.observation.input',
-        'langfuse.observation.output',
-      ]) {
-        const value = span.attributes[key];
-        if (value !== undefined) expect(Buffer.byteLength(String(value))).toBeLessThanOrEqual(1024);
-      }
+    const exportedInput = JSON.parse(
+      String(
+        generation!.attributes[
+          backend === 'phoenix' ? 'input.value' : 'langfuse.observation.input'
+        ],
+      ),
+    );
+    expect(exportedInput.messages).toHaveLength(1000);
+    expect(exportedInput.tools).toHaveLength(100);
     expect(input.messages[0].content[0].text).toContain(secret);
   },
 );
@@ -610,7 +681,7 @@ it.each(['superseded', 'session_disposed', 'plugin_unloaded'])(
 );
 
 it.each([true, false])(
-  'records bounded provider response facts with captureContent=%s',
+  'records provider response facts with captureContent=%s',
   async (captureContent) => {
     const ctx = new Context();
     await apply(
@@ -620,7 +691,6 @@ it.each([true, false])(
         backend: 'phoenix',
         captureContent,
         apiKey: 'secret-value',
-        maxPayloadBytes: 512,
       }),
     );
     for await (const _ of ctx.waterfall(

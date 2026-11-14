@@ -39,7 +39,6 @@ async function worker(mode, port) {
       enabled: mode !== 'disabled',
       backend: mode.startsWith('langfuse') ? 'langfuse' : 'phoenix',
       captureContent: mode.endsWith('-on'),
-      maxPayloadBytes: 32 * 1024,
       endpoint: `http://127.0.0.1:${port}/${mode}/v1/traces`,
       apiKey: 'benchmark-only',
       publicKey: 'benchmark-only',

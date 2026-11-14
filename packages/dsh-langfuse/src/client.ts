@@ -44,7 +44,6 @@ import {
 import type { TokenUsage } from '@deepseek-ai/dsh-llm';
 import type { LangfuseGeneration, LangfuseSpan } from '@langfuse/tracing';
 import type { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
-import { boundPayload, newPayloadBudget } from './payload.js';
 
 export interface LangfuseConnectionConfig {
   publicKey: string;
@@ -57,7 +56,6 @@ export interface LangfuseConnectionConfig {
   tags?: string[];
   captureContent?: boolean;
   captureMedia?: boolean;
-  maxPayloadBytes?: number;
 }
 
 export type ObservationLevel = 'DEFAULT' | 'WARNING' | 'ERROR';
@@ -417,17 +415,7 @@ export class LangfuseReporter extends PayloadPrivacy {
   ): void {
     if (!span) return;
     try {
-      const budget = newPayloadBudget(this.config.maxPayloadBytes ?? 256 * 1024);
-      const input =
-        update.input === undefined ? undefined : boundPayload(update.input, budget, this);
-      const output =
-        update.output === undefined ? undefined : boundPayload(update.output, budget, this);
-      update = this.mask({
-        ...update,
-        input,
-        output,
-        ...(budget.truncated ? { metadata: { ...update.metadata, truncated: true } } : {}),
-      });
+      update = this.mask(update);
       span.update({ input: update.input, output: update.output, metadata: update.metadata });
       if (update.name) span.otelSpan.updateName(update.name);
       if (update.input !== undefined && this.roots.has(span)) {
@@ -456,14 +444,7 @@ export class LangfuseReporter extends PayloadPrivacy {
   ): void {
     if (!span) return;
     try {
-      const budget = newPayloadBudget(this.config.maxPayloadBytes ?? 256 * 1024);
-      const output =
-        update.output === undefined ? undefined : boundPayload(update.output, budget, this);
-      update = this.mask({
-        ...update,
-        output,
-        ...(budget.truncated ? { metadata: { ...update.metadata, truncated: true } } : {}),
-      });
+      update = this.mask(update);
       span.update(update);
       if (update.output !== undefined && this.roots.has(span)) {
         span.setTraceIO({ output: update.output });

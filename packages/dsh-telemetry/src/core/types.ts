@@ -29,7 +29,6 @@ export interface SpanUpdate {
 export interface InstrumentationReporter {
   readonly ready: Promise<void>;
   mask<T>(data: T): T;
-  shouldRedactField(key: string): boolean;
   openTrace(input: {
     name: string;
     sessionId?: string;

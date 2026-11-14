@@ -7,10 +7,8 @@ import type {
   ObservationData,
 } from '../adapters/types.js';
 import {
-  boundPayload,
   createTraceIdGenerator,
   type InstrumentationReporter,
-  newPayloadBudget,
   PayloadPrivacy,
   type SpanInput,
   type SpanUpdate,
@@ -19,7 +17,6 @@ import {
 
 export interface ReporterConfig extends ConnectionConfig {
   captureContent: boolean;
-  maxPayloadBytes?: number;
   redactFields?: string[];
   environment?: string;
   release?: string;
@@ -52,9 +49,6 @@ export class TelemetryReporter implements InstrumentationReporter {
   }
   mask<T>(data: T): T {
     return this.privacy.mask(data);
-  }
-  shouldRedactField(key: string) {
-    return this.privacy.shouldRedactField(key);
   }
   private failure(operation: string, error?: unknown) {
     const errors = Array.isArray(error) ? error : [error];
@@ -103,7 +97,7 @@ export class TelemetryReporter implements InstrumentationReporter {
         }),
         spanLimits: {
           attributeCountLimit: 2048,
-          attributeValueLengthLimit: this.config.maxPayloadBytes ?? 256 * 1024,
+          attributeValueLengthLimit: Number.POSITIVE_INFINITY,
         },
         spanProcessors: [
           new sdk.BatchSpanProcessor(transport, {
@@ -260,16 +254,14 @@ export class TelemetryReporter implements InstrumentationReporter {
     }
   }
   private attributes(data: ObservationData): Attributes {
-    const cap = this.config.maxPayloadBytes ?? 256 * 1024;
-    const bounded = { ...data };
-    for (const key of ['input', 'output'] as const) {
-      if (!this.config.captureContent) delete bounded[key];
-      else if (bounded[key] !== undefined)
-        bounded[key] = boundPayload(bounded[key], newPayloadBudget(cap), this);
+    const captured = { ...data };
+    if (!this.config.captureContent) {
+      delete captured.input;
+      delete captured.output;
+      delete captured.statusMessage;
     }
-    if (!this.config.captureContent) delete bounded.statusMessage;
-    const attributes = this.adapter.attributes(bounded);
-    // Final safeguard AFTER adaptation, including indexed OpenInference messages and JSON fields.
+    const attributes = this.adapter.attributes(captured);
+    // Mask after adaptation too, including indexed messages and JSON fields.
     const safe: Attributes = {};
     for (const [key, value] of Object.entries(attributes)) {
       if (
@@ -277,7 +269,7 @@ export class TelemetryReporter implements InstrumentationReporter {
         this.adapter.contentPrefixes.some((prefix) => key.startsWith(prefix))
       )
         continue;
-      const item = boundPayload(value, newPayloadBudget(cap), this);
+      const item = this.mask(value);
       safe[this.mask(key)] = Array.isArray(item)
         ? (item as string[])
         : typeof item === 'object'

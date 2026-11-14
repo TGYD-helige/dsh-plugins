@@ -15,7 +15,6 @@ import type {} from '@deepseek-ai/dsh-subagent';
 import type {} from '@deepseek-ai/dsh-tools';
 import { isHookInvoked, isHookResult } from './hooks.js';
 import { displayBlocks } from './media.js';
-import { boundPayload, newPayloadBudget, type PayloadBudget, takePayloadText } from './payload.js';
 import type { InstrumentationReporter, ObservationLevel, TraceContext } from './types.js';
 
 export { appendHookEvent, type HookInvoked, type HookResult } from './hooks.js';
@@ -53,7 +52,6 @@ declare module '@deepseek-ai/cordis' {
 export interface CollectorConfig {
   traceName: string;
   captureContent: boolean;
-  maxPayloadBytes?: number;
   captureMedia?: boolean;
   maxMediaBytes?: number;
   mediaTimeoutMs?: number;
@@ -193,87 +191,6 @@ function requestBodyOf(options: GenerateOptions, captureContent: boolean): Recor
   }
   const { signal: _, ...body } = options;
   return body;
-}
-
-/** Keep only whole chunks that fit; stream accounting still processes every original chunk. */
-function capturePayloadChunk(
-  chunk: StreamChunk,
-  chunks: StreamChunk[],
-  budget: PayloadBudget,
-): void {
-  if (budget.remaining <= 0) {
-    budget.truncated = true;
-    return;
-  }
-  let serialized: string;
-  try {
-    serialized = JSON.stringify(chunk) ?? '';
-  } catch {
-    chunks.length = 0;
-    budget.truncated = true;
-    budget.remaining = 0;
-    return;
-  }
-  // Account for the final raw array too: [] around the first chunk and one
-  // comma per additional retained chunk, after redaction has changed lengths.
-  const bytes = Buffer.byteLength(serialized) + (chunks.length === 0 ? 2 : 1);
-  if (bytes > budget.remaining) {
-    // Partial groups are unsafe: a retained prefix may be a secret fragment.
-    chunks.length = 0;
-    budget.truncated = true;
-    budget.remaining = 0;
-    return;
-  }
-  chunks.push(chunk);
-  budget.remaining -= bytes;
-}
-
-/** Append only while the full assembled text fits; otherwise drop the whole channel. */
-function appendAssembledText(current: string, delta: string, budget: PayloadBudget): string {
-  const bytes = Buffer.byteLength(delta);
-  if (bytes > budget.remaining) {
-    budget.truncated = true;
-    budget.remaining = 0;
-    return '';
-  }
-  budget.remaining -= bytes;
-  return current + delta;
-}
-
-interface CapturedToolCall {
-  id: string;
-  type: 'function';
-  function: { name: string; arguments: string };
-}
-
-/** Charge the whole tool-call envelope, not only its argument text. */
-function captureToolCall(
-  call: CapturedToolCall,
-  calls: CapturedToolCall[],
-  budget: PayloadBudget,
-): void {
-  if (budget.remaining <= 0) {
-    budget.truncated = true;
-    return;
-  }
-  const envelope = {
-    ...call,
-    function: { ...call.function, arguments: '' },
-  };
-  const bytes = Buffer.byteLength(JSON.stringify(envelope));
-  if (bytes > budget.remaining) {
-    budget.truncated = true;
-    budget.remaining = 0;
-    return;
-  }
-  budget.remaining -= bytes;
-  calls.push({
-    ...call,
-    function: {
-      ...call.function,
-      arguments: takePayloadText(call.function.arguments, budget),
-    },
-  });
 }
 
 /** Generation names carry the reply's first non-empty line (capped) for list readability. */
@@ -1152,13 +1069,7 @@ export function collect(
       case 'compaction/summary': {
         const entry = compactions.get(sessionId);
         if (!entry || entry.id !== event.data.compactionId) break;
-        const output = config.captureContent
-          ? boundPayload(
-              event.data.summary,
-              newPayloadBudget(config.maxPayloadBytes ?? 256 * 1024),
-              reporter,
-            )
-          : undefined;
+        const output = config.captureContent ? reporter.mask(event.data.summary) : undefined;
         reporter.updateSpan(entry.span, {
           output,
           metadata: {
@@ -1182,11 +1093,7 @@ export function collect(
             {
               output:
                 config.captureContent && event.data.rawOutput
-                  ? boundPayload(
-                      event.data.rawOutput,
-                      newPayloadBudget(config.maxPayloadBytes ?? 256 * 1024),
-                      reporter,
-                    )
+                  ? reporter.mask(event.data.rawOutput)
                   : output,
               usage: event.data.usage,
             },
@@ -1356,12 +1263,8 @@ export function collect(
     const oneOffRoot = options.sessionId ? null : parent;
     const generationName = options.purpose ? `llm-call [${options.purpose}]` : 'llm-call';
     const modelParameters = modelParametersOf(options, config.captureContent);
-    const maxPayloadBytes = config.maxPayloadBytes ?? 256 * 1024;
-    const requestBudget = newPayloadBudget(maxPayloadBytes);
-    const rawBudget = newPayloadBudget(maxPayloadBytes);
-    const outputBudget = newPayloadBudget(maxPayloadBytes);
     const requestBody = requestBodyOf(options, config.captureContent);
-    const input = boundPayload(requestBody, requestBudget, reporter);
+    const input = reporter.mask(requestBody);
     const generation = reporter.startGeneration(parent, {
       name: generationName,
       model: options.model,
@@ -1394,10 +1297,7 @@ export function collect(
             ),
           })),
         ).then((messages) => {
-          const enrichmentBudget = newPayloadBudget(maxPayloadBytes);
-          const enriched = boundPayload({ ...requestBody, messages }, enrichmentBudget, reporter);
-          requestBudget.truncated ||= enrichmentBudget.truncated;
-          return enriched;
+          return reporter.mask({ ...requestBody, messages });
         }),
         options.sessionId,
       );
@@ -1467,14 +1367,8 @@ export function collect(
         level = 'WARNING';
         statusMessage = 'stream closed before the terminal finish chunk';
       }
-      // Redact complete grouped deltas before the final serialized bound;
-      // streaming capture has already bounded memory and dropped overflow whole.
-      const finalRawBudget = newPayloadBudget(maxPayloadBytes);
-      const rawOutput = boundPayload(
-        reporter.mask(redactChunks(rawChunks, reporter)),
-        finalRawBudget,
-      );
-      rawBudget.truncated ||= finalRawBudget.truncated;
+      // Redact grouped deltas together so credentials split across chunks stay hidden.
+      const rawOutput = reporter.mask(redactChunks(rawChunks, reporter));
       reporter.endSpan(
         requestSpan,
         {
@@ -1483,17 +1377,12 @@ export function collect(
           statusMessage,
           metadata: {
             chunkCount,
-            truncated: requestBudget.truncated || rawBudget.truncated || undefined,
           },
         },
         endedAt,
       );
       if (level === 'ERROR') noteError(options.sessionId);
-      // A final independent safety bound covers the complete output envelope;
-      // an exhausted streaming budget must not erase an otherwise valid prefix.
-      const finalOutputBudget = newPayloadBudget(maxPayloadBytes);
-      const output = boundPayload(outputBody(), finalOutputBudget, reporter);
-      outputBudget.truncated ||= finalOutputBudget.truncated;
+      const output = reporter.mask(outputBody());
       // Partial progress counts on every path: whatever streamed is kept.
       afterMedia(
         generation,
@@ -1519,11 +1408,6 @@ export function collect(
                 incomplete: finish ? undefined : true,
                 terminatedBy,
                 toolCallCount: toolCallCount > 0 ? toolCallCount : undefined,
-                truncated:
-                  requestBudget.truncated ||
-                  rawBudget.truncated ||
-                  outputBudget.truncated ||
-                  undefined,
               },
             },
             endedAt,
@@ -1552,7 +1436,7 @@ export function collect(
             continue;
           }
           chunkCount += 1;
-          if (config.captureContent) capturePayloadChunk(chunk, rawChunks, rawBudget);
+          if (config.captureContent) rawChunks.push(chunk);
           // TTFT is the first real token — block boundaries, usage frames and
           // empty heartbeat deltas are not completions (the predicate above).
           if (completionStartTime === undefined && isTokenDelta(chunk)) {
@@ -1560,44 +1444,23 @@ export function collect(
           }
           switch (chunk.type) {
             case 'text-delta':
-              if (config.captureContent) text = appendAssembledText(text, chunk.text, outputBudget);
+              if (config.captureContent) text += chunk.text;
               break;
             case 'reasoning-delta':
-              if (config.captureContent)
-                reasoning = appendAssembledText(reasoning, chunk.text, outputBudget);
+              if (config.captureContent) reasoning += chunk.text;
               break;
             case 'block-end':
               if (chunk.block.type === 'tool-call') {
                 toolCallCount += 1;
                 if (config.captureContent) {
-                  if (outputBudget.remaining <= 0) {
-                    outputBudget.truncated = true;
-                    break;
-                  }
-                  const envelopeBytes = Buffer.byteLength(
-                    JSON.stringify({
-                      id: chunk.block.id,
-                      type: 'function',
-                      function: { name: chunk.block.name, arguments: '' },
-                    }),
-                  );
-                  if (envelopeBytes > outputBudget.remaining) {
-                    outputBudget.truncated = true;
-                    outputBudget.remaining = 0;
-                    break;
-                  }
-                  captureToolCall(
-                    {
-                      id: chunk.block.id,
-                      type: 'function',
-                      function: {
-                        name: chunk.block.name,
-                        arguments: reporter.mask(chunk.block.arguments),
-                      },
+                  toolCalls.push({
+                    id: chunk.block.id,
+                    type: 'function',
+                    function: {
+                      name: chunk.block.name,
+                      arguments: reporter.mask(chunk.block.arguments),
                     },
-                    toolCalls,
-                    outputBudget,
-                  );
+                  });
                 }
               }
               break;
@@ -1608,11 +1471,7 @@ export function collect(
               finish = chunk.reason;
               // Adapter-owned response facts stay opaque; never guess a served model from a route.
               if (config.captureContent && chunk.replayState)
-                providerResponse = boundPayload(
-                  chunk.replayState.response,
-                  newPayloadBudget(maxPayloadBytes),
-                  reporter,
-                );
+                providerResponse = reporter.mask(chunk.replayState.response);
               break;
           }
           yield chunk;
@@ -1644,11 +1503,7 @@ export function collect(
       // it — it rides this dispatch's (same one-off rule as llm/stream).
       const oneOffRoot = sessionId ? null : parent;
       // Argument summaries are argument content — they ride captureContent.
-      const maxPayloadBytes = config.maxPayloadBytes ?? 256 * 1024;
-      const inputBudget = newPayloadBudget(maxPayloadBytes);
-      const args = config.captureContent
-        ? boundPayload(exec.arguments, inputBudget, reporter)
-        : undefined;
+      const args = config.captureContent ? reporter.mask(exec.arguments) : undefined;
       const argSummary = config.captureContent ? toolCallSummary(args) : undefined;
       const span = reporter.startSpan(parent, {
         name: `tool:${exec.name}${argSummary ? ` [${argSummary}]` : ''}`,
@@ -1696,31 +1551,7 @@ export function collect(
           else openToolSpans.delete(sessionId);
         }
         const end = (output = update.output) => {
-          const outputBudget = newPayloadBudget(maxPayloadBytes);
-          const bounded =
-            output === undefined ? undefined : boundPayload(output, outputBudget, reporter);
-          const statusBudget = newPayloadBudget(maxPayloadBytes);
-          const status =
-            update.statusMessage === undefined
-              ? undefined
-              : boundPayload(update.statusMessage, statusBudget, reporter);
-          reporter.endSpan(
-            span,
-            {
-              ...update,
-              output: bounded,
-              statusMessage: typeof status === 'string' ? status : undefined,
-              metadata: {
-                ...update.metadata,
-                truncated:
-                  inputBudget.truncated ||
-                  outputBudget.truncated ||
-                  statusBudget.truncated ||
-                  undefined,
-              },
-            },
-            endedAt,
-          );
+          reporter.endSpan(span, reporter.mask({ ...update, output }), endedAt);
           reporter.endSpan(oneOffRoot, {}, endedAt);
         };
         if (display)
