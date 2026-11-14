@@ -51,6 +51,55 @@ afterEach(() => {
 });
 describe('shared isolated OTel pipeline', () => {
   it.each(['phoenix', 'langfuse'] as const)(
+    'captures requests above 256 KiB by default and honors maxPayloadBytes on %s',
+    async (backend) => {
+      expect(Config({}).maxPayloadBytes).toBe(4 * 1024 * 1024);
+      const input = {
+        provider: 'test',
+        model: 'test',
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'text', text: 'large prompt '.repeat(30_000) }],
+          },
+        ],
+      };
+      for (const maxPayloadBytes of [undefined, 1024]) {
+        const ctx = new Context();
+        onTestFinished(() => ctx.fiber.dispose());
+        await apply(
+          ctx,
+          Config({
+            enabled: true,
+            backend,
+            publicKey: 'pk-fixture',
+            secretKey: 'sk-fixture',
+            ...(maxPayloadBytes === undefined ? {} : { maxPayloadBytes }),
+          }),
+        );
+        for await (const _ of ctx.waterfall('llm/stream', input as never, async function* () {
+          yield { type: 'finish', reason: { kind: 'stop' } } as never;
+        })) {
+        }
+        await ctx.fiber.dispose();
+        const generation = state.spans.find(
+          (span) =>
+            span.attributes['openinference.span.kind'] === 'LLM' ||
+            span.attributes['langfuse.observation.type'] === 'generation',
+        )!;
+        const exported = String(
+          generation.attributes[
+            backend === 'phoenix' ? 'input.value' : 'langfuse.observation.input'
+          ],
+        );
+        if (maxPayloadBytes === undefined) expect(JSON.parse(exported)).toEqual(input);
+        else expect(Buffer.byteLength(exported)).toBeLessThanOrEqual(maxPayloadBytes);
+        state.spans.length = 0;
+      }
+    },
+  );
+
+  it.each(['phoenix', 'langfuse'] as const)(
     'preserves parent ownership, clocks and status on %s',
     async (backend) => {
       const global = trace.getTracerProvider();

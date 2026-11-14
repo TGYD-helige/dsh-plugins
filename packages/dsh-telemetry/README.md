@@ -100,11 +100,13 @@ Abandoned turns show `terminatedBy` (`superseded`, `session_disposed`, or `plugi
 | Setting | Default | Behavior |
 | --- | --- | --- |
 | `captureContent` | `true` | `false` suppresses prompt/reply/tool payloads and content-derived status/name details; structural metadata, usage and caller request dimensions remain |
-| `maxPayloadBytes` | `262144` | Per captured request, response, tool IO or final adapted attribute, measured as serialized UTF-8 bytes |
+| `maxPayloadBytes` | `4194304` (4 MiB) | Per captured request, response, tool IO or final adapted attribute, measured as serialized UTF-8 bytes |
 | `redactFields` | `[]` | Case-insensitive structured field names, including JSON arguments |
 | `captureMedia` | `false` | Opt in to bounded attachment image reads and inline data-URI display |
 | `maxMediaBytes` | `5242880` | Image-byte budget per display payload, also subject to the payload cap |
 | `mediaTimeoutMs` | `5000` | Abort image reads on timeout/cancellation |
+
+Set `maxPayloadBytes` in the profile config to override the 4 MiB default, for example `maxPayloadBytes: 16777216` for 16 MiB. Existing explicit values remain unchanged.
 
 Configured Phoenix and Langfuse credentials, including encoded authorization, are masked again **after adaptation**. Content-disabled mode strips backend-specific IO/indexed-message fields at the final boundary. Payload truncation happens only after atomic redaction. Never put credentials in arbitrary metadata.
 

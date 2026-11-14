@@ -417,7 +417,7 @@ export class LangfuseReporter extends PayloadPrivacy {
   ): void {
     if (!span) return;
     try {
-      const budget = newPayloadBudget(this.config.maxPayloadBytes ?? 256 * 1024);
+      const budget = newPayloadBudget(this.config.maxPayloadBytes ?? 4 * 1024 * 1024);
       const input =
         update.input === undefined ? undefined : boundPayload(update.input, budget, this);
       const output =
@@ -456,7 +456,7 @@ export class LangfuseReporter extends PayloadPrivacy {
   ): void {
     if (!span) return;
     try {
-      const budget = newPayloadBudget(this.config.maxPayloadBytes ?? 256 * 1024);
+      const budget = newPayloadBudget(this.config.maxPayloadBytes ?? 4 * 1024 * 1024);
       const output =
         update.output === undefined ? undefined : boundPayload(update.output, budget, this);
       update = this.mask({

@@ -62,7 +62,7 @@ export const Config = Schema.object({
   maxPayloadBytes: Schema.number()
     .min(1)
     .step(1)
-    .default(256 * 1024)
+    .default(4 * 1024 * 1024)
     .description(
       'maximum captured request, raw-stream, assembled-output, or tool input/output/status bytes',
     ),

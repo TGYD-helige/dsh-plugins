@@ -103,7 +103,7 @@ export class TelemetryReporter implements InstrumentationReporter {
         }),
         spanLimits: {
           attributeCountLimit: 2048,
-          attributeValueLengthLimit: this.config.maxPayloadBytes ?? 256 * 1024,
+          attributeValueLengthLimit: this.config.maxPayloadBytes ?? 4 * 1024 * 1024,
         },
         spanProcessors: [
           new sdk.BatchSpanProcessor(transport, {
@@ -260,7 +260,7 @@ export class TelemetryReporter implements InstrumentationReporter {
     }
   }
   private attributes(data: ObservationData): Attributes {
-    const cap = this.config.maxPayloadBytes ?? 256 * 1024;
+    const cap = this.config.maxPayloadBytes ?? 4 * 1024 * 1024;
     const bounded = { ...data };
     for (const key of ['input', 'output'] as const) {
       if (!this.config.captureContent) delete bounded[key];
