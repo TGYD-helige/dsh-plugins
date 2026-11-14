@@ -1155,7 +1155,7 @@ export function collect(
         const output = config.captureContent
           ? boundPayload(
               event.data.summary,
-              newPayloadBudget(config.maxPayloadBytes ?? 256 * 1024),
+              newPayloadBudget(config.maxPayloadBytes ?? 4 * 1024 * 1024),
               reporter,
             )
           : undefined;
@@ -1184,7 +1184,7 @@ export function collect(
                 config.captureContent && event.data.rawOutput
                   ? boundPayload(
                       event.data.rawOutput,
-                      newPayloadBudget(config.maxPayloadBytes ?? 256 * 1024),
+                      newPayloadBudget(config.maxPayloadBytes ?? 4 * 1024 * 1024),
                       reporter,
                     )
                   : output,
@@ -1356,7 +1356,7 @@ export function collect(
     const oneOffRoot = options.sessionId ? null : parent;
     const generationName = options.purpose ? `llm-call [${options.purpose}]` : 'llm-call';
     const modelParameters = modelParametersOf(options, config.captureContent);
-    const maxPayloadBytes = config.maxPayloadBytes ?? 256 * 1024;
+    const maxPayloadBytes = config.maxPayloadBytes ?? 4 * 1024 * 1024;
     const requestBudget = newPayloadBudget(maxPayloadBytes);
     const rawBudget = newPayloadBudget(maxPayloadBytes);
     const outputBudget = newPayloadBudget(maxPayloadBytes);
@@ -1644,7 +1644,7 @@ export function collect(
       // it — it rides this dispatch's (same one-off rule as llm/stream).
       const oneOffRoot = sessionId ? null : parent;
       // Argument summaries are argument content — they ride captureContent.
-      const maxPayloadBytes = config.maxPayloadBytes ?? 256 * 1024;
+      const maxPayloadBytes = config.maxPayloadBytes ?? 4 * 1024 * 1024;
       const inputBudget = newPayloadBudget(maxPayloadBytes);
       const args = config.captureContent
         ? boundPayload(exec.arguments, inputBudget, reporter)
