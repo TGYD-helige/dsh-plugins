@@ -44,7 +44,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Prepare isolated DSH directories
         run: |
@@ -67,7 +67,7 @@ jobs:
 
       - name: Install DSH (pinned)
         run: |
-          npm install --global @deepseek-ai/dsh@0.2.2-rc.2
+          npm install --global @deepseek-ai/dsh@0.2.2-rc.4
           dsh --version
 
       - name: Prepare untrusted PR data for review
