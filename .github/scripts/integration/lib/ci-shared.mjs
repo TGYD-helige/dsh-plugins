@@ -40,9 +40,12 @@ export function integrationRevision() {
 // If the runner routes egress through a host-level proxy, fetch to the
 // gateway can break — drop proxy vars from the LLM-carrying process.
 export function netEnv() {
-  return Object.fromEntries(
+  const env = Object.fromEntries(
     Object.entries(process.env).filter(([k]) => !/^(https?_proxy|all_proxy|no_proxy)$/i.test(k)),
   );
+  // Keep searches on the model gateway when dsh defaults to a separate Messages endpoint.
+  env.DSH_WEB_SEARCH_PROVIDER = env.DSH_WEB_SEARCH_PROVIDER?.trim() || 'deepseek-search-api';
+  return env;
 }
 
 export function run(cmd, args, { cwd, env = {} } = {}) {
