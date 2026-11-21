@@ -499,6 +499,22 @@ test('missing Stage B credentials fail the job instead of reporting a successful
   assert.match(result.stdout, /::error::/);
 });
 
+test('integration model processes keep Search API routing unless explicitly overridden', (t) => {
+  const key = 'DSH_WEB_SEARCH_PROVIDER';
+  const previous = process.env[key];
+  t.after(() => {
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
+  });
+
+  delete process.env[key];
+  assert.equal(integration.netEnv()[key], 'deepseek-search-api');
+  process.env[key] = '';
+  assert.equal(integration.netEnv()[key], 'deepseek-search-api');
+  process.env[key] = 'deepseek-official';
+  assert.equal(integration.netEnv()[key], 'deepseek-official');
+});
+
 test('integration scenarios use the dsh version pinned by the workspace', () => {
   const manifest = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
   const version = manifest.devDependencies['@deepseek-ai/dsh-agent'];
