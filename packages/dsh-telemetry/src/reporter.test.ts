@@ -310,6 +310,30 @@ it('logs background export errors without exposing the response', async () => {
   }
 });
 
+it('reports a shorter HTTP transport timeout as a timeout', async () => {
+  vi.useFakeTimers();
+  const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const reporter = new TelemetryReporter(
+    { backend: 'phoenix', captureContent: false },
+    adapters.phoenix,
+  );
+  try {
+    await reporter.ready;
+    state.hold = true;
+    reporter.endSpan(reporter.openTrace({ name: 'slow collector' }));
+    await vi.advanceTimersByTimeAsync(1000);
+    state.pending.shift()!({
+      code: 1,
+      error: new DOMException('private response', 'TimeoutError'),
+    });
+    await reporter.shutdown();
+    expect(diagnostic.mock.calls).toEqual([['[dsh-telemetry] export failed (Timeout)']]);
+  } finally {
+    for (const callback of state.pending.splice(0)) callback({ code: 0 });
+    await reporter.shutdown();
+  }
+});
+
 it('reports the export deadline once even if the collector later responds', async () => {
   vi.useFakeTimers();
   const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {});

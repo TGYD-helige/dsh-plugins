@@ -36,6 +36,11 @@ interface Observation {
 
 const exportTimeoutMillis = 30_000;
 
+function httpStatus(error: unknown) {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  return typeof code === 'number' && code >= 100 && code <= 599 ? code : undefined;
+}
+
 /** One isolated OTel tree and one exporter, independent of the selected attribute adapter. */
 export class TelemetryReporter implements InstrumentationReporter {
   readonly ready: Promise<void>;
@@ -63,8 +68,9 @@ export class TelemetryReporter implements InstrumentationReporter {
     const errors = Array.isArray(error) ? error : [error];
     const categories = errors.map((item) => {
       if (!(item instanceof Error)) return 'unknown';
-      const code = (item as Error & { code?: number }).code;
-      if (typeof code === 'number') return `HTTP ${code}`;
+      if (item.name === 'TimeoutError') return 'Timeout';
+      const code = httpStatus(item);
+      if (code !== undefined) return `HTTP ${code}`;
       const match = item.message.match(
         /\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|Timeout|timeout|timed out|aborted)\b/,
       );
@@ -110,7 +116,7 @@ export class TelemetryReporter implements InstrumentationReporter {
               wire.export(batch, resolve, budget),
             );
             if (result.code === 0 || controller.signal.aborted) return result;
-            const code = (result.error as (Error & { code?: number }) | undefined)?.code;
+            const code = httpStatus(result.error);
             if (code === 413 && batch.length > 1) {
               const midpoint = Math.floor(batch.length / 2);
               const first = await send(batch.slice(0, midpoint));
@@ -118,7 +124,9 @@ export class TelemetryReporter implements InstrumentationReporter {
               return first.code === 0 ? second : first;
             }
             reporter.failure('export', result.error);
-            const error = new Error('OTLP trace export failed');
+            const error = new Error(
+              result.error?.name === 'TimeoutError' ? 'Timeout' : 'OTLP trace export failed',
+            );
             return {
               code: result.code,
               error: typeof code === 'number' ? Object.assign(error, { code }) : error,
