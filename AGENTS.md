@@ -2,6 +2,10 @@
 
 ## Scope and workflow
 
+Use skills from [ponytail](https://github.com/DietrichGebert/ponytail) and
+[mattpocock/skills](https://github.com/mattpocock/skills/blob/main/skills/engineering/README.md)
+when available. Follow this workflow directly when skill loading is unavailable.
+
 1. **Scope.** For plugin work, use the [package map](README.md#packages) and the affected
    package README to find the documented dsh seams. Before changing or reviewing plugin
    behavior, read the relevant implementation and tests.
@@ -9,10 +13,11 @@
    and waterfalls. Keep application identity headers, database fields, and workflows in the
    consuming application. Establish a concrete use case outside that application before
    adding a plugin option or compatibility path.
-2. **Plan.** Apply ponytail by reusing existing seams and helpers before reaching for standard
-   or installed primitives. Before non-trivial implementation, define the behavior and
-   split the work into verifiable changes. Use `to-spec` or `to-tickets` when explicitly
-   requested. Publish to the tracker with authorization.
+2. **Plan.** Confirm the change is needed. Reuse existing seams, helpers, standard APIs,
+   or installed dependencies. Keep simple operations free of new dependencies.
+   Before non-trivial implementation, define the behavior and split the work into
+   verifiable changes. Use `to-spec` or `to-tickets` when explicitly requested.
+   Create or update GitHub issues only with explicit user authorization.
 3. **Implement.** Use `diagnosing-bugs` for bug fixes. Reproduce the failure and verify its
    cause before fixing it. Use the reported transport, backend, and configuration where
    feasible. Sanitize payload fixtures and check other callers, backends, and legacy reads.
@@ -65,11 +70,12 @@
 - **Storage.** For database changes, follow the [Prisma client packaging contract](packages/dsh-storage/README.md#install)
   and [SQL Server JSON serialization](packages/dsh-storage/README.md#data-model).
 - **Tracing.** For telemetry field changes, inspect serialized exports, test redaction
-  with dummy credentials, and document what leaves the process. For `dsh-langfuse`, keep
-  the tracer provider isolated, end the root span at turn end, and preserve
-  [legacy trace I/O attributes](packages/dsh-langfuse/README.md#trace-overview-compatibility).
-  Run `pnpm test:sdk` for Langfuse SDK changes and `pnpm test:otlp` for `dsh-telemetry`
-  OTLP changes.
+  with dummy credentials, and document what leaves the process. In `dsh-langfuse` and
+  `dsh-telemetry`, keep tracer providers isolated and end each turn's span at `turn/end`.
+  Preserve [legacy trace I/O attributes](packages/dsh-langfuse/README.md#trace-overview-compatibility)
+  on independently owned roots exported to Langfuse. Run `pnpm test:sdk` for Langfuse SDK
+  changes and `pnpm test:otlp` for native OTLP changes. Run both for changes to shared
+  tracing code or the `dsh-telemetry` Langfuse adapter.
 
 ## Tests and CI
 
@@ -90,11 +96,12 @@
 - **Automated review.** In the [review workflow](.github/workflows/dsh-review.yml), run trusted
   base-branch tooling and use PR-head files only as review data. Run dsh as `nobody` with
   a scrubbed environment, keep secrets in the runner-owned loopback proxy, and grant
-  only directory traversal on private ancestors. Distinguish local checks from runs of
-  the merged workflow because `pull_request_target` uses the base workflow.
-- **Workflow lint.** Run CI's pinned `actionlint` with `shellcheck` on `PATH`.
+  only directory traversal on private ancestors.
+- **Workflow checks.** Run CI's pinned `actionlint` with `shellcheck` on `PATH`.
   Use `$RUNNER_TEMP` in `run:` steps or the script default. The `runner` context is
-  unavailable in job-level `env:`.
+  unavailable in job-level `env:`. For any [`pull_request_target` workflow](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target),
+  PR runs use the workflow already on the base repository's default branch. Report
+  local and PR checks separately from runs of the updated workflow after merge.
 - **Release.** Follow the [publish workflow](.github/workflows/npm-publish.yml) for uniform
   versions. Verify every expected package version and dist-tag in npm before reporting publication.
 
