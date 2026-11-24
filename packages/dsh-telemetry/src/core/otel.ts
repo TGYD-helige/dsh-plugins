@@ -1,5 +1,5 @@
 import type { Span, SpanContext, Tracer } from '@opentelemetry/api';
-import type { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
+import type { NodeTracerProvider, SpanExporter } from '@opentelemetry/sdk-trace-node';
 import type {
   Attributes,
   BackendAdapter,
@@ -34,11 +34,19 @@ interface Observation {
   contextMetadata?: Record<string, unknown>;
 }
 
+const exportTimeoutMillis = 30_000;
+
+function httpStatus(error: unknown) {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  return typeof code === 'number' && code >= 100 && code <= 599 ? code : undefined;
+}
+
 /** One isolated OTel tree and one exporter, independent of the selected attribute adapter. */
 export class TelemetryReporter implements InstrumentationReporter {
   readonly ready: Promise<void>;
   private api?: typeof import('@opentelemetry/api');
   private provider?: NodeTracerProvider;
+  private transport?: SpanExporter;
   private tracer?: Tracer;
   private ids?: ReturnType<typeof createTraceIdGenerator>;
   private observations = new WeakMap<object, Observation>();
@@ -60,8 +68,9 @@ export class TelemetryReporter implements InstrumentationReporter {
     const errors = Array.isArray(error) ? error : [error];
     const categories = errors.map((item) => {
       if (!(item instanceof Error)) return 'unknown';
-      const code = (item as Error & { code?: number }).code;
-      if (typeof code === 'number') return `HTTP ${code}`;
+      if (item.name === 'TimeoutError') return 'Timeout';
+      const code = httpStatus(item);
+      if (code !== undefined) return `HTTP ${code}`;
       const match = item.message.match(
         /\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|Timeout|timeout|timed out|aborted)\b/,
       );
@@ -84,13 +93,82 @@ export class TelemetryReporter implements InstrumentationReporter {
       const [api, sdk, exporter, resources] = await Promise.all([
         import('@opentelemetry/api'),
         import('@opentelemetry/sdk-trace-node'),
-        import('@opentelemetry/exporter-trace-otlp-proto'),
+        import('./otlp-http.js'),
         import('@opentelemetry/resources'),
       ]);
-      const transport = new exporter.OTLPTraceExporter({
-        url: connection.endpoint,
-        headers: connection.headers,
-      });
+      const reporter = this;
+      const wire = await exporter.createTraceExporter(connection.endpoint, connection.headers);
+      const transport = new (class implements SpanExporter {
+        private pending = new Set<Promise<void>>();
+        private activeBatches = 0;
+        private closing?: Promise<void>;
+
+        export(...[spans, callback]: Parameters<SpanExporter['export']>) {
+          type Result = Parameters<typeof callback>[0];
+          const controller = new AbortController();
+          const budget = {
+            signal: controller.signal,
+            expiresAt: performance.now() + exportTimeoutMillis,
+          };
+          const send = async (batch: typeof spans): Promise<Result> => {
+            if (controller.signal.aborted) return { code: 1, error: new Error('Timeout') };
+            const result = await new Promise<Result>((resolve) =>
+              wire.export(batch, resolve, budget),
+            );
+            if (result.code === 0 || controller.signal.aborted) return result;
+            const code = httpStatus(result.error);
+            if (code === 413 && batch.length > 1) {
+              const midpoint = Math.floor(batch.length / 2);
+              const first = await send(batch.slice(0, midpoint));
+              const second = await send(batch.slice(midpoint));
+              return first.code === 0 ? second : first;
+            }
+            reporter.failure('export', result.error);
+            const error = new Error(
+              result.error?.name === 'TimeoutError' ? 'Timeout' : 'OTLP trace export failed',
+            );
+            return {
+              code: result.code,
+              error: typeof code === 'number' ? Object.assign(error, { code }) : error,
+            };
+          };
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const deadline = new Promise<Result>((resolve) => {
+            timer = setTimeout(() => {
+              controller.abort();
+              const error = new Error('Timeout');
+              reporter.failure('export', error);
+              resolve({ code: 1, error });
+            }, exportTimeoutMillis);
+          });
+          this.activeBatches++;
+          const exporting = send(spans).finally(() => {
+            this.activeBatches--;
+          });
+          const finished = Promise.race([exporting, deadline])
+            .catch((error) => {
+              reporter.failure('export', error);
+              return { code: 1, error: new Error('OTLP trace export failed') } as Result;
+            })
+            .then(callback)
+            .finally(() => {
+              clearTimeout(timer);
+              this.pending.delete(finished);
+            });
+          this.pending.add(finished);
+        }
+
+        shutdown() {
+          this.closing ??= Promise.allSettled(this.pending).then(() => {
+            const closing = wire.shutdown();
+            if (this.activeBatches === 0) return closing;
+            // Only aborted batches remain. The SDK can finish processing their close events.
+            void closing.catch((error) => reporter.failure('transport shutdown', error));
+          });
+          return this.closing;
+        }
+      })();
+      this.transport = transport;
       this.ids = createTraceIdGenerator(new sdk.RandomIdGenerator());
       this.provider = new sdk.NodeTracerProvider({
         idGenerator: this.ids,
@@ -108,6 +186,7 @@ export class TelemetryReporter implements InstrumentationReporter {
         spanProcessors: [
           new sdk.BatchSpanProcessor(transport, {
             scheduledDelayMillis: 1000,
+            exportTimeoutMillis,
           }),
         ],
       });
@@ -345,13 +424,20 @@ export class TelemetryReporter implements InstrumentationReporter {
   async shutdown() {
     await this.ready;
     const provider = this.provider;
+    const transport = this.transport;
     this.provider = undefined;
+    this.transport = undefined;
     this.tracer = undefined;
     this.api = undefined;
     try {
       await provider?.shutdown();
     } catch (error) {
       this.failure('shutdown', error);
+    }
+    try {
+      await transport?.shutdown();
+    } catch (error) {
+      this.failure('transport shutdown', error);
     }
   }
 }

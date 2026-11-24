@@ -1,19 +1,30 @@
 /** Real shared protobuf exporter → loopback receiver, no backend/LLM credentials. */
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { createServer } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { gunzipSync } from 'node:zlib';
+import { Context } from '@deepseek-ai/cordis';
 import protobuf from 'protobufjs';
 import { adapters } from '../../../../packages/dsh-telemetry/lib/adapters/index.js';
 import { TelemetryReporter } from '../../../../packages/dsh-telemetry/lib/core/otel.js';
+import { apply, Config } from '../../../../packages/dsh-telemetry/lib/index.js';
 
 const root = await protobuf.load(fileURLToPath(new URL('./otlp-trace.proto', import.meta.url)));
 const Request = root.lookupType('ExportTraceServiceRequest');
 const captured = [];
 let responsesSent = 0;
+let expiredRequestCancelled = false;
+const retryTimes = [];
 const server = createServer(async (req, res) => {
   try {
+    if (req.url === '/host-log') {
+      const reply = setTimeout(() => res.writeHead(200).end(), 30_250);
+      res.once('close', () => clearTimeout(reply));
+      return;
+    }
     assert.equal(req.headers['content-type'], 'application/x-protobuf');
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -28,6 +39,45 @@ const server = createServer(async (req, res) => {
       compression,
       bytes: wire.length,
     });
+    if (req.url.startsWith('/limited/') && wire.length > 512 * 1024) {
+      res.writeHead(413).end();
+      return;
+    }
+    if (req.url.startsWith('/short-retry/')) {
+      retryTimes.push(performance.now());
+      if (retryTimes.length === 1) {
+        res.writeHead(429, { 'Retry-After': '1' }).end();
+        return;
+      }
+    }
+    if (req.url.startsWith('/deadline/') || req.url.startsWith('/mixed/')) {
+      const spans = payload.resourceSpans.flatMap(({ scopeSpans }) =>
+        scopeSpans.flatMap(({ spans }) => spans),
+      );
+      if (spans.some(({ name }) => name === 'expires first')) {
+        if (req.url.includes('/split/') && spans.length > 1) {
+          await delay(15_000);
+          res.writeHead(413).end();
+          return;
+        }
+        if (req.url.includes('/retry/') || req.url.includes('/split/')) {
+          res.writeHead(503, { 'Retry-After': req.url.includes('/retry/') ? '36' : '22' }).end();
+          return;
+        }
+        const fallback = setTimeout(() => res.end(), 40_000);
+        res.once('close', () => {
+          clearTimeout(fallback);
+          expiredRequestCancelled = !res.writableEnded;
+        });
+        return;
+      }
+      if (spans.some(({ name }) => name === 'queued failure')) {
+        res.writeHead(401).end();
+        return;
+      }
+      if (!spans.some(({ name }) => name === 'split sibling'))
+        await delay(req.url.startsWith('/deadline/') ? 3500 : 1250);
+    }
     if (req.url.startsWith('/slow/')) await delay(6000);
     responsesSent++;
     res.writeHead(200, { 'content-type': 'application/x-protobuf' }).end();
@@ -193,6 +243,156 @@ try {
       else process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION = previousCompression;
     }
   }
+  const ctx = new Context();
+  let finishLocalWrite;
+  const localWrite = new Promise((resolve) => {
+    finishLocalWrite = resolve;
+  });
+  ctx.on('session/flush', () => localWrite);
+  await apply(
+    ctx,
+    Config({
+      enabled: true,
+      backend: 'phoenix',
+      endpoint: `http://127.0.0.1:${server.address().port}/slow/checkpoint`,
+    }),
+  );
+  const baseline = captured.length;
+  try {
+    const session = { id: 'checkpoint', header: { id: 'checkpoint' } };
+    const completeTurn = (turn) => {
+      const event = (type, data, offset) =>
+        ctx.emit('session/event', session, {
+          type,
+          seq: 3 * turn + offset,
+          time: Date.now(),
+          data,
+        });
+      event('turn/start', { turn }, 1);
+      event('user/message', { role: 'user', content: [{ type: 'text', text: 'checkpoint' }] }, 2);
+      event('turn/end', { turn, reason: { kind: 'completed' } }, 3);
+    };
+    completeTurn(0);
+    for (let attempts = 0; captured.length === baseline && attempts < 300; attempts++)
+      await delay(10);
+    assert.equal(captured.at(-1).path, '/slow/checkpoint/v1/traces');
+    assert.equal(responsesSent, baseline);
+    completeTurn(1);
+    let checkpointCompleted = false;
+    const checkpointStarted = performance.now();
+    const checkpoint = ctx.parallel('session/flush', session).then(() => {
+      checkpointCompleted = true;
+    });
+    await delay(0);
+    assert.equal(checkpointCompleted, false);
+    finishLocalWrite();
+    await checkpoint;
+    assert.equal(responsesSent, baseline, 'checkpoint must complete before the collector responds');
+    console.log(
+      `OTLP_CHECKPOINT_OK (${Math.round(performance.now() - checkpointStarted)} ms while collector response is pending)`,
+    );
+  } finally {
+    finishLocalWrite();
+    await ctx.fiber.dispose();
+  }
+  assert.equal(responsesSent, baseline + 2, 'graceful shutdown must drain both exports');
+  const reporterAt = (prefix) =>
+    new TelemetryReporter(
+      {
+        backend: 'phoenix',
+        endpoint: `http://127.0.0.1:${server.address().port}/${prefix}`,
+        captureContent: true,
+      },
+      adapters.phoenix,
+    );
+  const previousCompression = process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION;
+  process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION = 'none';
+  const limited = reporterAt('limited');
+  try {
+    await limited.ready;
+    const responsesBefore = responsesSent;
+    for (const name of ['first turn', 'second turn'])
+      limited.endSpan(limited.openTrace({ name }), { input: 'x'.repeat(300 * 1024) });
+    await limited.flush();
+    const sizes = captured.slice(-3).map(({ bytes }) => bytes);
+    assert.ok(sizes[0] > 512 * 1024 && sizes.slice(1).every((size) => size <= 512 * 1024));
+    assert.equal(responsesSent, responsesBefore + 2, 'both split requests must be accepted');
+  } finally {
+    await limited.shutdown();
+    if (previousCompression === undefined) delete process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION;
+    else process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION = previousCompression;
+  }
+  const mixed = reporterAt('mixed');
+  try {
+    await mixed.ready;
+    const responsesBefore = responsesSent;
+    const requestsBefore = captured.length;
+    mixed.endSpan(mixed.openTrace({ name: 'in flight' }));
+    for (let attempts = 0; captured.length === requestsBefore && attempts < 300; attempts++)
+      await delay(10);
+    assert.equal(captured.at(-1).path, '/mixed/v1/traces');
+    mixed.endSpan(mixed.openTrace({ name: 'queued failure' }));
+    await mixed.shutdown();
+    assert.equal(captured.length, requestsBefore + 2);
+    assert.equal(responsesSent, responsesBefore + 1, 'shutdown must await the earlier success');
+  } finally {
+    await mixed.shutdown();
+  }
+  const retry = reporterAt('short-retry');
+  try {
+    await retry.ready;
+    const before = responsesSent;
+    retry.endSpan(retry.openTrace({ name: 'retry within budget' }));
+    await retry.shutdown();
+    assert.equal(responsesSent, before + 1);
+    assert.equal(retryTimes.length, 2);
+    assert.ok(retryTimes[1] - retryTimes[0] >= 990, 'honor Retry-After when it fits');
+  } finally {
+    await retry.shutdown();
+  }
+  const responsesBeforeExit = responsesSent;
+  const exitResults = await Promise.all(
+    ['held', 'retry', 'split'].map(async (scenario) => {
+      const { stdout, stderr } = await promisify(execFile)(
+        process.execPath,
+        [
+          fileURLToPath(new URL('./telemetry-exit-child.mjs', import.meta.url)),
+          `http://127.0.0.1:${server.address().port}/deadline/${scenario}`,
+        ],
+        { env: { ...process.env, OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: '60000' }, timeout: 55_000 },
+      );
+      const result = JSON.parse(stdout);
+      console.log(`OTLP_EXIT ${scenario}`, result);
+      return { scenario, stderr, ...result };
+    }),
+  );
+  for (const { scenario, stderr, disposedMs, exitMs, logStatus } of exitResults) {
+    const batches = captured.filter(({ path }) => path === `/deadline/${scenario}/v1/traces`);
+    assert.equal(
+      batches.length,
+      scenario === 'split' ? 4 : 2,
+      `${scenario}: unexpected retry or missing sibling`,
+    );
+    if (scenario === 'held') {
+      assert.match(stderr, /\[dsh-telemetry\] export failed \(Timeout\)/);
+      assert.ok(
+        expiredRequestCancelled,
+        'the collector must observe the expired request disconnect',
+      );
+      assert.equal(
+        logStatus,
+        200,
+        'the host diagnostic HTTP request must survive the batch deadline',
+      );
+    }
+    assert.ok(disposedMs >= 3400 && disposedMs < 5000, 'shutdown must wait for the live batch');
+    assert.ok(exitMs < 5000, `${scenario}: expired work must not keep the child process alive`);
+  }
+  assert.equal(
+    responsesSent,
+    responsesBeforeExit + 4,
+    'each live batch and the split sibling must arrive',
+  );
   console.log(
     'OTLP_OK (both adapters: protobuf, auth, resource, IDs, parents, clocks, status, redaction)',
   );

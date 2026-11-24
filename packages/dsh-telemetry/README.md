@@ -11,11 +11,10 @@ dsh plugin --profile my-agent add @amaster.ai/dsh-telemetry
 dsh plugin --profile my-agent add \
   @opentelemetry/api@1.9.1 \
   @opentelemetry/sdk-trace-node@2.10.0 \
-  @opentelemetry/resources@2.10.0 \
-  @opentelemetry/exporter-trace-otlp-proto@0.221.0
+  @opentelemetry/resources@2.10.0
 ```
 
-The bundle inserts the `telemetry` row, disabled by default. This plugin supports either backend without installing the Langfuse SDK. The legacy Langfuse plugin remains available; enable only one collector per profile. dsh service/event consumers are peers, supplied by the profile. The four OTel packages are optional peers and load lazily only when enabled.
+The bundle inserts the `telemetry` row, disabled by default. This plugin supports either backend without installing the Langfuse SDK. The legacy Langfuse plugin remains available; enable only one collector per profile. dsh service/event consumers are peers, supplied by the profile. The three OTel packages above are optional peers. The plugin installs its OTLP serializer and exporter base as optional dependencies and loads them when tracing is enabled.
 
 ## Phoenix
 
@@ -62,7 +61,9 @@ YAML `publicKey`, `secretKey` and `baseUrl` override the corresponding environme
 
 ## Observations and request context
 
-Coverage reuses the existing collector: turn roots, LLM generations plus nested `llm-request` spans, tools, hooks, subagents, and native A2A inbox tasks. Session checkpoints flush completed spans; fiber unload closes outstanding work and shuts down the same exporter. Streams and tool results pass through unchanged. Export/init failures log a `[dsh-telemetry]` diagnostic and do not break the agent loop.
+Coverage reuses the existing collector: turn roots, LLM generations plus nested `llm-request` spans, tools, hooks, subagents, and native A2A inbox tasks. OpenTelemetry exports completed spans in bounded batches in the background. Session checkpoints never wait for remote trace exports. When inline media capture is enabled, a checkpoint still finishes its session's pending media so that slow attachments do not consume the host's shutdown window. The separate legacy `dsh-langfuse` plugin retains its checkpoint export behavior.
+
+The exporter splits a batch rejected with HTTP 413 within its 30-second export deadline. An oversized single span is still rejected. Fiber unload closes outstanding spans and waits for each queued or in-flight batch until it finishes or reaches its deadline, even if another batch fails. The batch deadline applies to its HTTP requests, retry waits and 413 splits. The exporter skips retries that would start after the remaining budget and cancels its own unfinished requests at the deadline. Other batches and the host’s diagnostic HTTP requests can finish independently. A full queue, failed export or abrupt exit can lose spans without losing session history. Export failures and deadline expirations log a `[dsh-telemetry]` diagnostic without the collector's response body.
 
 ```ts
 import type { TelemetryTraceContext } from '@amaster.ai/dsh-telemetry';

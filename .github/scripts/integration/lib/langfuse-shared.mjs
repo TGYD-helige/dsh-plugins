@@ -918,12 +918,13 @@ async function scenarioMain({
       'add',
       ...(telemetryBackend
         ? ['@opentelemetry/resources@2.10.0']
-        : ['@langfuse/tracing@5.10.1', '@langfuse/otel@5.10.1']),
+        : [
+            '@langfuse/tracing@5.10.1',
+            '@langfuse/otel@5.10.1',
+            '@opentelemetry/exporter-trace-otlp-http@0.221.0',
+          ]),
       '@opentelemetry/sdk-trace-node@2.10.0',
       '@opentelemetry/api@1.9.1',
-      telemetryBackend
-        ? '@opentelemetry/exporter-trace-otlp-proto@0.221.0'
-        : '@opentelemetry/exporter-trace-otlp-http@0.221.0',
     ],
     { cwd: workDir, env: dshHomeEnv },
   );

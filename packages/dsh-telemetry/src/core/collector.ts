@@ -1766,11 +1766,12 @@ export function collect(
     toolResults.get(exec)?.(result);
   });
 
-  // Durability checkpoint: the store awaits every session/flush listener.
-  ctx.on('session/flush', async (session) => {
-    await drainMedia(session.id);
-    await reporter.flush();
-  });
+  if (contextEvent === 'langfuse/context' || mediaOptions.enabled) {
+    ctx.on('session/flush', async (session) => {
+      await drainMedia(session.id);
+      if (contextEvent === 'langfuse/context') await reporter.flush();
+    });
+  }
 
   // Lifecycle: this cordis fork has no ready/dispose events — cleanup rides
   // the fiber unload via ctx.effect() (shutdown() chains behind the lazy
