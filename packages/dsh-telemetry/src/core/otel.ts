@@ -1,3 +1,6 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { channel } from 'node:diagnostics_channel';
+import type { ClientRequest } from 'node:http';
 import type { Span, SpanContext, Tracer } from '@opentelemetry/api';
 import type { NodeTracerProvider, SpanExporter } from '@opentelemetry/sdk-trace-node';
 import type {
@@ -35,6 +38,33 @@ interface Observation {
 }
 
 const exportTimeoutMillis = 30_000;
+const httpRequestStart = channel('http.client.request.start');
+const batchSignal = new AsyncLocalStorage<AbortSignal>();
+let activeHttpExports = 0;
+
+// The OTLP exporter does not expose its ClientRequest. Scope cancellation to the
+// HTTP requests it starts for this batch, including 413 splits and transport retries.
+function cancelRequestOnDeadline(message: unknown) {
+  const signal = batchSignal.getStore();
+  if (!signal) return;
+  const { request } = message as { request: ClientRequest };
+  const abort = () => request.destroy(new Error('OTLP export timed out'));
+  if (signal.aborted) {
+    abort();
+  } else {
+    signal.addEventListener('abort', abort, { once: true });
+    request.once('close', () => signal.removeEventListener('abort', abort));
+  }
+}
+
+async function withBatchSignal<T>(signal: AbortSignal, send: () => Promise<T>) {
+  if (activeHttpExports++ === 0) httpRequestStart.subscribe(cancelRequestOnDeadline);
+  try {
+    return await batchSignal.run(signal, send);
+  } finally {
+    if (--activeHttpExports === 0) httpRequestStart.unsubscribe(cancelRequestOnDeadline);
+  }
+}
 
 /** One isolated OTel tree and one exporter, independent of the selected attribute adapter. */
 export class TelemetryReporter implements InstrumentationReporter {
@@ -98,11 +128,14 @@ export class TelemetryReporter implements InstrumentationReporter {
 
         override export(...[spans, callback]: Parameters<SpanExporter['export']>) {
           type Result = Parameters<typeof callback>[0];
-          let expired = false;
+          const controller = new AbortController();
           const send = async (batch: typeof spans): Promise<Result> => {
-            if (expired) return { code: 1, error: new Error('Timeout') };
-            const result = await new Promise<Result>((resolve) => super.export(batch, resolve));
-            if (result.code === 0 || expired) return result;
+            if (controller.signal.aborted) return { code: 1, error: new Error('Timeout') };
+            const result = await withBatchSignal(
+              controller.signal,
+              () => new Promise<Result>((resolve) => super.export(batch, resolve)),
+            );
+            if (result.code === 0 || controller.signal.aborted) return result;
             const code = (result.error as (Error & { code?: number }) | undefined)?.code;
             if (code === 413 && batch.length > 1) {
               const midpoint = Math.floor(batch.length / 2);
@@ -120,7 +153,7 @@ export class TelemetryReporter implements InstrumentationReporter {
           let timer: ReturnType<typeof setTimeout> | undefined;
           const deadline = new Promise<Result>((resolve) => {
             timer = setTimeout(() => {
-              expired = true;
+              controller.abort();
               const error = new Error('Timeout');
               reporter.failure('export', error);
               resolve({ code: 1, error });
@@ -147,7 +180,7 @@ export class TelemetryReporter implements InstrumentationReporter {
           this.closing ??= Promise.allSettled(this.pending).then(() => {
             const closing = super.shutdown();
             if (this.activeBatches === 0) return closing;
-            // Only expired batches can still be in flight. Let the SDK finish closing their sockets.
+            // Only aborted batches remain. The SDK can finish processing their close events.
             void closing.catch((error) => reporter.failure('transport shutdown', error));
           });
           return this.closing;

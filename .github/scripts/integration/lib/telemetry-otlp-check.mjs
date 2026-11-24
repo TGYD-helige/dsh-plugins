@@ -1,8 +1,10 @@
 /** Real shared protobuf exporter → loopback receiver, no backend/LLM credentials. */
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { createServer } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { gunzipSync } from 'node:zlib';
 import { Context } from '@deepseek-ai/cordis';
 import protobuf from 'protobufjs';
@@ -14,7 +16,7 @@ const root = await protobuf.load(fileURLToPath(new URL('./otlp-trace.proto', imp
 const Request = root.lookupType('ExportTraceServiceRequest');
 const captured = [];
 let responsesSent = 0;
-let deadlineResponse;
+let expiredRequestCancelled = false;
 const server = createServer(async (req, res) => {
   try {
     assert.equal(req.headers['content-type'], 'application/x-protobuf');
@@ -35,19 +37,23 @@ const server = createServer(async (req, res) => {
       res.writeHead(413).end();
       return;
     }
-    if (req.url.startsWith('/deadline/')) {
-      deadlineResponse = res;
-      return;
-    }
-    if (req.url.startsWith('/mixed/')) {
+    if (req.url.startsWith('/deadline/') || req.url.startsWith('/mixed/')) {
       const spans = payload.resourceSpans.flatMap(({ scopeSpans }) =>
         scopeSpans.flatMap(({ spans }) => spans),
       );
+      if (spans.some(({ name }) => name === 'expires first')) {
+        const fallback = setTimeout(() => res.end(), 40_000);
+        res.once('close', () => {
+          clearTimeout(fallback);
+          expiredRequestCancelled = !res.writableEnded;
+        });
+        return;
+      }
       if (spans.some(({ name }) => name === 'queued failure')) {
         res.writeHead(401).end();
         return;
       }
-      await delay(1250);
+      await delay(req.url.startsWith('/deadline/') ? 3500 : 1250);
     }
     if (req.url.startsWith('/slow/')) await delay(6000);
     responsesSent++;
@@ -309,29 +315,22 @@ try {
   } finally {
     await mixed.shutdown();
   }
-  const previousTimeout = process.env.OTEL_EXPORTER_OTLP_TRACES_TIMEOUT;
-  process.env.OTEL_EXPORTER_OTLP_TRACES_TIMEOUT = '60000';
-  const deadline = reporterAt('deadline');
-  // Let an unbounded shutdown complete as well, so the assertion reports the regression.
-  let releaseResponse;
-  try {
-    await deadline.ready;
-    deadline.endSpan(deadline.openTrace({ name: 'collector still processing' }));
-    releaseResponse = setTimeout(() => deadlineResponse?.end(), 35_000);
-    const started = performance.now();
-    await deadline.shutdown();
-    assert.ok(performance.now() - started >= 29_000, 'shutdown must wait for the export deadline');
-    assert.ok(
-      deadlineResponse && !deadlineResponse.writableEnded && !deadlineResponse.destroyed,
-      'shutdown must return at the batch deadline while the collector request is still in flight',
-    );
-  } finally {
-    clearTimeout(releaseResponse);
-    deadlineResponse?.end();
-    await deadline.shutdown();
-    if (previousTimeout === undefined) delete process.env.OTEL_EXPORTER_OTLP_TRACES_TIMEOUT;
-    else process.env.OTEL_EXPORTER_OTLP_TRACES_TIMEOUT = previousTimeout;
-  }
+  const responsesBeforeExit = responsesSent;
+  const { stdout, stderr } = await promisify(execFile)(
+    process.execPath,
+    [
+      fileURLToPath(new URL('./telemetry-exit-child.mjs', import.meta.url)),
+      `http://127.0.0.1:${server.address().port}/deadline`,
+    ],
+    { env: { ...process.env, OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: '60000' }, timeout: 55_000 },
+  );
+  const { disposedMs, exitMs } = JSON.parse(stdout);
+  console.log(`OTLP_EXIT (dispose ${Math.round(disposedMs)} ms, exit ${Math.round(exitMs)} ms)`);
+  assert.match(stderr, /\[dsh-telemetry\] export failed \(Timeout\)/);
+  assert.ok(expiredRequestCancelled, 'the collector must observe the expired request disconnect');
+  assert.equal(responsesSent, responsesBeforeExit + 1, 'the other batch must still be delivered');
+  assert.ok(disposedMs >= 3400 && disposedMs < 5000, 'shutdown must wait for the live batch');
+  assert.ok(exitMs < 5000, 'the expired request must not keep the child process alive');
   console.log(
     'OTLP_OK (both adapters: protobuf, auth, resource, IDs, parents, clocks, status, redaction)',
   );
