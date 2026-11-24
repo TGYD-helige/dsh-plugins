@@ -93,6 +93,7 @@ export class TelemetryReporter implements InstrumentationReporter {
       const reporter = this;
       const transport = new (class extends exporter.OTLPTraceExporter {
         private pending = new Set<Promise<void>>();
+        private activeBatches = 0;
         private closing?: Promise<void>;
 
         override export(...[spans, callback]: Parameters<SpanExporter['export']>) {
@@ -101,9 +102,9 @@ export class TelemetryReporter implements InstrumentationReporter {
           const send = async (batch: typeof spans): Promise<Result> => {
             if (expired) return { code: 1, error: new Error('Timeout') };
             const result = await new Promise<Result>((resolve) => super.export(batch, resolve));
-            if (result.code === 0) return result;
+            if (result.code === 0 || expired) return result;
             const code = (result.error as (Error & { code?: number }) | undefined)?.code;
-            if (code === 413 && batch.length > 1 && !expired) {
+            if (code === 413 && batch.length > 1) {
               const midpoint = Math.floor(batch.length / 2);
               const first = await send(batch.slice(0, midpoint));
               const second = await send(batch.slice(midpoint));
@@ -120,10 +121,16 @@ export class TelemetryReporter implements InstrumentationReporter {
           const deadline = new Promise<Result>((resolve) => {
             timer = setTimeout(() => {
               expired = true;
-              resolve({ code: 1, error: new Error('Timeout') });
+              const error = new Error('Timeout');
+              reporter.failure('export', error);
+              resolve({ code: 1, error });
             }, exportTimeoutMillis);
           });
-          const finished = Promise.race([send(spans), deadline])
+          this.activeBatches++;
+          const exporting = send(spans).finally(() => {
+            this.activeBatches--;
+          });
+          const finished = Promise.race([exporting, deadline])
             .catch((error) => {
               reporter.failure('export', error);
               return { code: 1, error: new Error('OTLP trace export failed') } as Result;
@@ -137,7 +144,12 @@ export class TelemetryReporter implements InstrumentationReporter {
         }
 
         override shutdown() {
-          this.closing ??= Promise.allSettled(this.pending).then(() => super.shutdown());
+          this.closing ??= Promise.allSettled(this.pending).then(() => {
+            const closing = super.shutdown();
+            if (this.activeBatches === 0) return closing;
+            // Only expired batches can still be in flight. Let the SDK finish closing their sockets.
+            void closing.catch((error) => reporter.failure('transport shutdown', error));
+          });
           return this.closing;
         }
       })({

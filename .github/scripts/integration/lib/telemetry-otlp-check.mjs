@@ -14,6 +14,7 @@ const root = await protobuf.load(fileURLToPath(new URL('./otlp-trace.proto', imp
 const Request = root.lookupType('ExportTraceServiceRequest');
 const captured = [];
 let responsesSent = 0;
+let deadlineResponse;
 const server = createServer(async (req, res) => {
   try {
     assert.equal(req.headers['content-type'], 'application/x-protobuf');
@@ -32,6 +33,10 @@ const server = createServer(async (req, res) => {
     });
     if (req.url.startsWith('/limited/') && wire.length > 512 * 1024) {
       res.writeHead(413).end();
+      return;
+    }
+    if (req.url.startsWith('/deadline/')) {
+      deadlineResponse = res;
       return;
     }
     if (req.url.startsWith('/mixed/')) {
@@ -271,6 +276,8 @@ try {
       },
       adapters.phoenix,
     );
+  const previousCompression = process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION;
+  process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION = 'none';
   const limited = reporterAt('limited');
   try {
     await limited.ready;
@@ -283,6 +290,8 @@ try {
     assert.equal(responsesSent, responsesBefore + 2, 'both split requests must be accepted');
   } finally {
     await limited.shutdown();
+    if (previousCompression === undefined) delete process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION;
+    else process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION = previousCompression;
   }
   const mixed = reporterAt('mixed');
   try {
@@ -299,6 +308,29 @@ try {
     assert.equal(responsesSent, responsesBefore + 1, 'shutdown must await the earlier success');
   } finally {
     await mixed.shutdown();
+  }
+  const previousTimeout = process.env.OTEL_EXPORTER_OTLP_TRACES_TIMEOUT;
+  process.env.OTEL_EXPORTER_OTLP_TRACES_TIMEOUT = '60000';
+  const deadline = reporterAt('deadline');
+  // Let an unbounded shutdown complete as well, so the assertion reports the regression.
+  let releaseResponse;
+  try {
+    await deadline.ready;
+    deadline.endSpan(deadline.openTrace({ name: 'collector still processing' }));
+    releaseResponse = setTimeout(() => deadlineResponse?.end(), 35_000);
+    const started = performance.now();
+    await deadline.shutdown();
+    assert.ok(performance.now() - started >= 29_000, 'shutdown must wait for the export deadline');
+    assert.ok(
+      deadlineResponse && !deadlineResponse.writableEnded && !deadlineResponse.destroyed,
+      'shutdown must return at the batch deadline while the collector request is still in flight',
+    );
+  } finally {
+    clearTimeout(releaseResponse);
+    deadlineResponse?.end();
+    await deadline.shutdown();
+    if (previousTimeout === undefined) delete process.env.OTEL_EXPORTER_OTLP_TRACES_TIMEOUT;
+    else process.env.OTEL_EXPORTER_OTLP_TRACES_TIMEOUT = previousTimeout;
   }
   console.log(
     'OTLP_OK (both adapters: protobuf, auth, resource, IDs, parents, clocks, status, redaction)',

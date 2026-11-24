@@ -311,6 +311,32 @@ it('logs background export errors without exposing the response', async () => {
   }
 });
 
+it('reports the export deadline once even if the collector later responds', async () => {
+  vi.useFakeTimers();
+  const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const reporter = new TelemetryReporter(
+    { backend: 'phoenix', captureContent: false },
+    adapters.phoenix,
+  );
+  try {
+    await reporter.ready;
+    state.hold = true;
+    reporter.endSpan(reporter.openTrace({ name: 'late response' }));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(state.pending).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(diagnostic).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(diagnostic.mock.calls).toEqual([['[dsh-telemetry] export failed (Timeout)']]);
+    state.pending.shift()!({ code: 1, error: new Error('private collector response') });
+    await reporter.shutdown();
+    expect(diagnostic).toHaveBeenCalledTimes(1);
+  } finally {
+    for (const callback of state.pending.splice(0)) callback({ code: 0 });
+    await reporter.shutdown();
+  }
+});
+
 it('keeps accepted spans when a combined payload receives HTTP 413', async () => {
   vi.useFakeTimers();
   const reporter = new TelemetryReporter(
