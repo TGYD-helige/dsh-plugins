@@ -17,8 +17,14 @@ const Request = root.lookupType('ExportTraceServiceRequest');
 const captured = [];
 let responsesSent = 0;
 let expiredRequestCancelled = false;
+const retryTimes = [];
 const server = createServer(async (req, res) => {
   try {
+    if (req.url === '/host-log') {
+      const reply = setTimeout(() => res.writeHead(200).end(), 30_250);
+      res.once('close', () => clearTimeout(reply));
+      return;
+    }
     assert.equal(req.headers['content-type'], 'application/x-protobuf');
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -37,11 +43,27 @@ const server = createServer(async (req, res) => {
       res.writeHead(413).end();
       return;
     }
+    if (req.url.startsWith('/short-retry/')) {
+      retryTimes.push(performance.now());
+      if (retryTimes.length === 1) {
+        res.writeHead(429, { 'Retry-After': '1' }).end();
+        return;
+      }
+    }
     if (req.url.startsWith('/deadline/') || req.url.startsWith('/mixed/')) {
       const spans = payload.resourceSpans.flatMap(({ scopeSpans }) =>
         scopeSpans.flatMap(({ spans }) => spans),
       );
       if (spans.some(({ name }) => name === 'expires first')) {
+        if (req.url.includes('/split/') && spans.length > 1) {
+          await delay(15_000);
+          res.writeHead(413).end();
+          return;
+        }
+        if (req.url.includes('/retry/') || req.url.includes('/split/')) {
+          res.writeHead(503, { 'Retry-After': req.url.includes('/retry/') ? '36' : '22' }).end();
+          return;
+        }
         const fallback = setTimeout(() => res.end(), 40_000);
         res.once('close', () => {
           clearTimeout(fallback);
@@ -53,7 +75,8 @@ const server = createServer(async (req, res) => {
         res.writeHead(401).end();
         return;
       }
-      await delay(req.url.startsWith('/deadline/') ? 3500 : 1250);
+      if (!spans.some(({ name }) => name === 'split sibling'))
+        await delay(req.url.startsWith('/deadline/') ? 3500 : 1250);
     }
     if (req.url.startsWith('/slow/')) await delay(6000);
     responsesSent++;
@@ -315,22 +338,61 @@ try {
   } finally {
     await mixed.shutdown();
   }
+  const retry = reporterAt('short-retry');
+  try {
+    await retry.ready;
+    const before = responsesSent;
+    retry.endSpan(retry.openTrace({ name: 'retry within budget' }));
+    await retry.shutdown();
+    assert.equal(responsesSent, before + 1);
+    assert.equal(retryTimes.length, 2);
+    assert.ok(retryTimes[1] - retryTimes[0] >= 990, 'honor Retry-After when it fits');
+  } finally {
+    await retry.shutdown();
+  }
   const responsesBeforeExit = responsesSent;
-  const { stdout, stderr } = await promisify(execFile)(
-    process.execPath,
-    [
-      fileURLToPath(new URL('./telemetry-exit-child.mjs', import.meta.url)),
-      `http://127.0.0.1:${server.address().port}/deadline`,
-    ],
-    { env: { ...process.env, OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: '60000' }, timeout: 55_000 },
+  const exitResults = await Promise.all(
+    ['held', 'retry', 'split'].map(async (scenario) => {
+      const { stdout, stderr } = await promisify(execFile)(
+        process.execPath,
+        [
+          fileURLToPath(new URL('./telemetry-exit-child.mjs', import.meta.url)),
+          `http://127.0.0.1:${server.address().port}/deadline/${scenario}`,
+        ],
+        { env: { ...process.env, OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: '60000' }, timeout: 55_000 },
+      );
+      const result = JSON.parse(stdout);
+      console.log(`OTLP_EXIT ${scenario}`, result);
+      return { scenario, stderr, ...result };
+    }),
   );
-  const { disposedMs, exitMs } = JSON.parse(stdout);
-  console.log(`OTLP_EXIT (dispose ${Math.round(disposedMs)} ms, exit ${Math.round(exitMs)} ms)`);
-  assert.match(stderr, /\[dsh-telemetry\] export failed \(Timeout\)/);
-  assert.ok(expiredRequestCancelled, 'the collector must observe the expired request disconnect');
-  assert.equal(responsesSent, responsesBeforeExit + 1, 'the other batch must still be delivered');
-  assert.ok(disposedMs >= 3400 && disposedMs < 5000, 'shutdown must wait for the live batch');
-  assert.ok(exitMs < 5000, 'the expired request must not keep the child process alive');
+  for (const { scenario, stderr, disposedMs, exitMs, logStatus } of exitResults) {
+    const batches = captured.filter(({ path }) => path === `/deadline/${scenario}/v1/traces`);
+    assert.equal(
+      batches.length,
+      scenario === 'split' ? 4 : 2,
+      `${scenario}: unexpected retry or missing sibling`,
+    );
+    if (scenario === 'held') {
+      assert.match(stderr, /\[dsh-telemetry\] export failed \(Timeout\)/);
+      assert.ok(
+        expiredRequestCancelled,
+        'the collector must observe the expired request disconnect',
+      );
+      assert.equal(
+        logStatus,
+        200,
+        'the host diagnostic HTTP request must survive the batch deadline',
+      );
+    }
+    assert.ok(disposedMs >= 3400 && disposedMs < 5000, 'shutdown must wait for the live batch');
+    assert.ok(exitMs < 5000, `${scenario}: expired work must not keep the child process alive`);
+  }
+  assert.equal(
+    responsesSent,
+    responsesBeforeExit + 4,
+    'each live batch and the split sibling must arrive',
+  );
   console.log(
     'OTLP_OK (both adapters: protobuf, auth, resource, IDs, parents, clocks, status, redaction)',
   );

@@ -23,8 +23,8 @@ const state = vi.hoisted(() => ({
     endTime: number[];
   }>,
 }));
-vi.mock('@opentelemetry/exporter-trace-otlp-proto', () => ({
-  OTLPTraceExporter: class {
+vi.mock('./core/otlp-http.js', () => ({
+  createTraceExporter: () => ({
     export(spans: typeof state.spans, callback: (result: { code: number; error?: Error }) => void) {
       state.spans.push(...spans);
       state.batches.push(spans.length);
@@ -41,12 +41,11 @@ vi.mock('@opentelemetry/exporter-trace-otlp-proto', () => ({
           ? { code: 1, error: Object.assign(new Error('private-export-response'), { code: 401 }) }
           : { code: 0 },
       );
-    }
+    },
     async shutdown() {
       state.shutdown();
-    }
-    async forceFlush() {}
-  },
+    },
+  }),
 }));
 afterEach(() => {
   state.spans.length = 0;

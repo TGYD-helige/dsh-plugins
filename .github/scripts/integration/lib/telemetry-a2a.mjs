@@ -41,7 +41,6 @@ export async function runTelemetryA2a(backend) {
       '@opentelemetry/api@1.9.1',
       '@opentelemetry/sdk-trace-node@2.10.0',
       '@opentelemetry/resources@2.10.0',
-      '@opentelemetry/exporter-trace-otlp-proto@0.221.0',
     ],
     { cwd: workDir, env: { DSH_HOME: dshHome } },
   );

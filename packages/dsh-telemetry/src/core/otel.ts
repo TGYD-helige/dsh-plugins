@@ -1,6 +1,3 @@
-import { AsyncLocalStorage } from 'node:async_hooks';
-import { channel } from 'node:diagnostics_channel';
-import type { ClientRequest } from 'node:http';
 import type { Span, SpanContext, Tracer } from '@opentelemetry/api';
 import type { NodeTracerProvider, SpanExporter } from '@opentelemetry/sdk-trace-node';
 import type {
@@ -38,33 +35,6 @@ interface Observation {
 }
 
 const exportTimeoutMillis = 30_000;
-const httpRequestStart = channel('http.client.request.start');
-const batchSignal = new AsyncLocalStorage<AbortSignal>();
-let activeHttpExports = 0;
-
-// The OTLP exporter does not expose its ClientRequest. Scope cancellation to the
-// HTTP requests it starts for this batch, including 413 splits and transport retries.
-function cancelRequestOnDeadline(message: unknown) {
-  const signal = batchSignal.getStore();
-  if (!signal) return;
-  const { request } = message as { request: ClientRequest };
-  const abort = () => request.destroy(new Error('OTLP export timed out'));
-  if (signal.aborted) {
-    abort();
-  } else {
-    signal.addEventListener('abort', abort, { once: true });
-    request.once('close', () => signal.removeEventListener('abort', abort));
-  }
-}
-
-async function withBatchSignal<T>(signal: AbortSignal, send: () => Promise<T>) {
-  if (activeHttpExports++ === 0) httpRequestStart.subscribe(cancelRequestOnDeadline);
-  try {
-    return await batchSignal.run(signal, send);
-  } finally {
-    if (--activeHttpExports === 0) httpRequestStart.unsubscribe(cancelRequestOnDeadline);
-  }
-}
 
 /** One isolated OTel tree and one exporter, independent of the selected attribute adapter. */
 export class TelemetryReporter implements InstrumentationReporter {
@@ -117,23 +87,27 @@ export class TelemetryReporter implements InstrumentationReporter {
       const [api, sdk, exporter, resources] = await Promise.all([
         import('@opentelemetry/api'),
         import('@opentelemetry/sdk-trace-node'),
-        import('@opentelemetry/exporter-trace-otlp-proto'),
+        import('./otlp-http.js'),
         import('@opentelemetry/resources'),
       ]);
       const reporter = this;
-      const transport = new (class extends exporter.OTLPTraceExporter {
+      const wire = await exporter.createTraceExporter(connection.endpoint, connection.headers);
+      const transport = new (class implements SpanExporter {
         private pending = new Set<Promise<void>>();
         private activeBatches = 0;
         private closing?: Promise<void>;
 
-        override export(...[spans, callback]: Parameters<SpanExporter['export']>) {
+        export(...[spans, callback]: Parameters<SpanExporter['export']>) {
           type Result = Parameters<typeof callback>[0];
           const controller = new AbortController();
+          const budget = {
+            signal: controller.signal,
+            expiresAt: performance.now() + exportTimeoutMillis,
+          };
           const send = async (batch: typeof spans): Promise<Result> => {
             if (controller.signal.aborted) return { code: 1, error: new Error('Timeout') };
-            const result = await withBatchSignal(
-              controller.signal,
-              () => new Promise<Result>((resolve) => super.export(batch, resolve)),
+            const result = await new Promise<Result>((resolve) =>
+              wire.export(batch, resolve, budget),
             );
             if (result.code === 0 || controller.signal.aborted) return result;
             const code = (result.error as (Error & { code?: number }) | undefined)?.code;
@@ -176,19 +150,16 @@ export class TelemetryReporter implements InstrumentationReporter {
           this.pending.add(finished);
         }
 
-        override shutdown() {
+        shutdown() {
           this.closing ??= Promise.allSettled(this.pending).then(() => {
-            const closing = super.shutdown();
+            const closing = wire.shutdown();
             if (this.activeBatches === 0) return closing;
             // Only aborted batches remain. The SDK can finish processing their close events.
             void closing.catch((error) => reporter.failure('transport shutdown', error));
           });
           return this.closing;
         }
-      })({
-        url: connection.endpoint,
-        headers: connection.headers,
-      });
+      })();
       this.transport = transport;
       this.ids = createTraceIdGenerator(new sdk.RandomIdGenerator());
       this.provider = new sdk.NodeTracerProvider({
