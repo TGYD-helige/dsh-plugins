@@ -1,137 +1,119 @@
-# dsh-plugins — Agent Guidelines
+# dsh-plugins agent guide
 
-## Project Overview
+## Scope and workflow
 
-Monorepo of generic [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness) plugins (`packages/dsh-*`). Each package is a dsh **bundle**: a Cordis plugin (`export name/inject/Config/apply`) plus a `cordis.patch.yml`, installable via `dsh plugin add`. No dsh core patches — everything rides documented seams (services, typed events, waterfalls).
+1. **Scope.** For plugin work, use the [package map](README.md#packages) and the affected
+   package README to find the documented dsh seams. Before changing or reviewing plugin
+   behavior, read the relevant implementation and tests.
+   Build reusable dsh or protocol capabilities on documented Cordis services, typed events,
+   and waterfalls. Keep application identity headers, database fields, and workflows in the
+   consuming application. Establish a concrete use case outside that application before
+   adding a plugin option or compatibility path.
+2. **Plan.** Apply ponytail by reusing existing seams and helpers before reaching for standard
+   or installed primitives. Before non-trivial implementation, define the behavior and
+   split the work into verifiable changes. Use `to-spec` or `to-tickets` when explicitly
+   requested. Publish to the tracker with authorization.
+3. **Implement.** Use `diagnosing-bugs` for bug fixes. Reproduce the failure and verify its
+   cause before fixing it. Use the reported transport, backend, and configuration where
+   feasible. Sanitize payload fixtures and check other callers, backends, and legacy reads.
+   Use `tdd` for behavior changes and update affected README contracts and examples.
+   Limit repository documentation to user-facing usage. Keep agent work records outside
+   Git, including research notes, plans, review logs, and image prompts.
+4. **Verify.** For behavior changes, start with a focused check through the normal entry
+   point. Use [workspace scripts](package.json) and [CI](.github/workflows/ci.yml) to select
+   broader checks. For docs, verify links, commands, and claims against their sources.
+   For reviews, pin the diff and use `code-review` to check the requested behavior and
+   repository rules independently. Confirm findings against source or a focused check.
+   When fixing findings, rerun affected checks and review the revised diff until no
+   actionable findings remain.
+   Report the revision checked, results, remaining failures, and unverified integrations.
 
-**Scope boundary:** Implement reusable dsh or protocol capabilities that make sense across consuming applications. Keep one application's identity headers, database fields, and business workflows in that application. Before adding a plugin option or compatibility path for an application request, establish a concrete use case independent of that application.
+## Plugin changes
 
-Use the [root README](README.md) to find the plugin and its documented dsh extension points. Follow the package README for its configuration and compatibility matrix.
+- **Bundle and config.** Export `name`, `inject`, `Config`, and `apply` and ship
+  `cordis.patch.yml`. Use Schemastery, default plugins to disabled, and mark secrets with
+  `.role('secret')`. Support the unmodified dsh runtime.
+- **Compatibility.** Read the [compatibility matrix](README.md#compatibility) and manifests
+  before changing dsh seams or dependencies. Verify event shapes against the pinned dsh
+  source before relying on them or removing `TODO(verify)`. Mark unverified event
+  assumptions with `TODO(verify)` and the upstream doc path. Declare consumed dsh packages
+  as peers and pin tested versions in dev dependencies, including type-only imports.
+  Keep the minimum compatible peer floor, include each supported prerelease tuple for npm,
+  and update affected compatibility docs. Declare heavy backend clients as peers, mark
+  optional clients optional, and load them via dynamic import during backend initialization.
+- **Lifecycle.** Start work with `ctx.effect()` and return a disposer for fiber unload.
+  Tap settled events via `session/event(session, event)`, drain pending writes at the
+  awaited `session/flush(session)` checkpoint, and clean up on `session/disposed(session)`.
+  Use `agent/assistant-stream` for live deltas.
+- **Boundaries.** Keep Cordis context and I/O at plugin edges and backend behavior in
+  adapters. Pass helpers the fields or service they need. Share code across installable
+  packages when callers need the same contract and can evolve together. Name values after
+  their event, state, or protocol field and keep decision order visible.
+- **Failures.** Catch observer and mirror failures at event and waterfall boundaries
+  and report them via `console.error` with a `[dsh-*]` prefix so they cannot break the
+  agent loop. Preserve stored data after read or parse failures and fail closed at policy gates.
+- **Hot paths.** Count file, database, and network calls per turn. Reuse valid reads and
+  batch independent writes only when ordering, error handling, and the awaited flush
+  are preserved. Check for repeated parsing or copying of accumulated chunks and preserve
+  streaming and cancellation.
 
-Task stores in `dsh-a2a` own A2A task state. `dsh-storage` mirrors conversation history. Keep protocol state and conversation history in their respective packages. Generate Prisma clients at package build time so consumers can use the published clients directly. SQL Server stores JSON as serialized text.
+## Package-specific checks
 
-Langfuse uses an isolated tracer provider. End the root span at turn end so it exports, and preserve the legacy trace I/O attributes consumed by older Langfuse servers.
+- **A2A.** Keep [A2A task state](packages/dsh-a2a/README.md#task-stores) in `dsh-a2a` and
+  the conversation mirror in `dsh-storage`. For listener or deployment changes, preserve and
+  document the [loopback default and external authentication boundary](packages/dsh-a2a/README.md#security).
+- **Storage.** For database changes, follow the [Prisma client packaging contract](packages/dsh-storage/README.md#install)
+  and [SQL Server JSON serialization](packages/dsh-storage/README.md#data-model).
+- **Tracing.** For telemetry field changes, inspect serialized exports, test redaction
+  with dummy credentials, and document what leaves the process. For `dsh-langfuse`, keep
+  the tracer provider isolated, end the root span at turn end, and preserve
+  [legacy trace I/O attributes](packages/dsh-langfuse/README.md#trace-overview-compatibility).
+  Run `pnpm test:sdk` for Langfuse SDK changes and `pnpm test:otlp` for `dsh-telemetry`
+  OTLP changes.
 
-dsh is developer preview: **pin versions, keep README's compat matrix current**, and verify every `TODO(verify)` marker against the pinned dsh source before removing it.
+## Tests and CI
 
----
+- **Unit tests.** Colocate Vitest tests in `src/**/*.test.ts`, include them in no-emit
+  typechecking, and exclude them from build output. Test pure logic directly.
+  Drive plugin wiring with a real `@deepseek-ai/cordis` Context and mock external clients
+  with `vi.mock`. Cover startup, flush, and fiber disposal as applicable. Assert hook
+  failures are swallowed and logged at no-throw seams. Await events or use fake timers,
+  and register cleanup before assertions. Show regressions fail before the fix and pass after it.
+- **Integration.** Put tests needing a real dsh runtime, LLM, or database in
+  [.github/scripts/integration/](.github/scripts/integration/) and follow
+  [matrix discovery](.github/scripts/integration-matrix.mjs) for scenario and provider names.
+  Pin the dsh CLI under test. Keep backend-only jobs secret-free. In the
+  [integration workflow](.github/workflows/integration.yml), require protected
+  `fork-integration` approval before secret-backed fork runs execute PR code. Disable
+  persisted checkout credentials and scope secrets to the steps and scenarios that need them.
+  Run the [workflow guard tests](.github/scripts/integration-workflow.test.mjs) when changing this boundary.
+- **Automated review.** In the [review workflow](.github/workflows/dsh-review.yml), run trusted
+  base-branch tooling and use PR-head files only as review data. Run dsh as `nobody` with
+  a scrubbed environment, keep secrets in the runner-owned loopback proxy, and grant
+  only directory traversal on private ancestors. Distinguish local checks from runs of
+  the merged workflow because `pull_request_target` uses the base workflow.
+- **Workflow lint.** Run CI's pinned `actionlint` with `shellcheck` on `PATH`.
+  Use `$RUNNER_TEMP` in `run:` steps or the script default. The `runner` context is
+  unavailable in job-level `env:`.
+- **Release.** Follow the [publish workflow](.github/workflows/npm-publish.yml) for uniform
+  versions. Verify every expected package version and dist-tag in npm before reporting publication.
 
-## Required Agent Skills
+## Preview changes
 
-### ponytail — minimal-code discipline
-
-> [ponytail](kimi-code://skill/ponytail)
-
-Every change follows the ladder — stop at the first rung that holds:
-
-```
-1. Does this need to exist?   → no: skip it (YAGNI)
-2. Already in this codebase?  → reuse it (check sibling packages first)
-3. Stdlib does it?            → use it
-4. Native platform feature?   → use it
-5. Installed dependency?      → use it — no new deps for one-call problems
-6. One clear expression?      → use it
-7. Only then: the minimum that works
-```
-
-The ladder runs *after* understanding the problem, never instead of it. Never lazy about: no-throw guarantees (observability/mirroring must never break the agent loop), credential handling, cancellation propagation.
-
-### mattpocock/skills — engineering workflow
-
-> https://github.com/mattpocock/skills
-
-Use for process work: `to-spec`/`to-tickets` before non-trivial implementations, `tdd` for behavior changes, `diagnosing-bugs` (no fix without reproduced root cause), `code-review`, `research`, `resolving-merge-conflicts` as named.
-
----
-
-## Code Design
-
-- Keep the normal path easy to follow. Name values after the event, state, or protocol field they represent. Split a dense expression when readers must reconstruct the order of decisions.
-- Pass helpers the fields or service they use. Keep Cordis context access and backend I/O at plugin boundaries so mapping and policy decisions can run on plain inputs.
-- Keep backend-specific behavior in its adapter. Share logic across plugins when callers need the same behavior and can evolve together. Similar-looking code alone is a poor reason to couple separately installable packages.
-- In loops and stream handlers, count file, database, and network calls per turn. Reuse a read within the operation when its value stays valid. Batch independent writes only when ordering, failure handling, and the awaited flush guarantee are preserved.
-
-## Conventions
-
-- **Peer deps**: declare the dsh packages whose services, events, or types the plugin consumes as peers. Keep the minimum supported dsh version until the plugin needs a newer API. Include each supported prerelease tuple in the peer range for npm compatibility. Pin the tested dsh versions in devDependencies, including type-only event imports. Declare heavy backend clients as peers and mark optional backends as optional peers.
-- **Optional backends**: load via dynamic `import()` inside `init()`, so unused backends cost nothing.
-- **No-throw seams**: plugin hooks (waterfalls, event listeners) catch and `console.error` with a `[dsh-*]` prefix; never let observability/storage errors escape into the agent loop.
-- **Documentation**: Add only user-facing usage documentation. Keep research notes, implementation plans, review logs, generated-image prompts, and other agent-internal records out of the repository.
-- **Config**: Schemastery `Config` schema per plugin, everything disabled by default; secrets use `.role('secret')`.
-- **Lifecycle**: use `ctx.effect()` for startup and return a disposer for fiber unload. Observe settled session events through `session/event(session, event)` and drain pending writes at the awaited `session/flush(session)` checkpoint. Use `session/disposed(session)` for session cleanup and `agent/assistant-stream` for live assistant deltas.
-- **Events**: dsh event/payload shapes are pre-release — mark assumptions with `TODO(verify)` + the dsh doc path, instead of guessing silently.
-- **Security**: dsh has no authn/authz. `dsh-a2a` binds loopback by default; say so in docs, don't "fix" it in the plugin.
-
----
-
-## Change and Review Workflow
-
-- Read the affected package README and implementation. Update documented contracts and examples when behavior changes.
-- Reproduce bugs on the reported transport, backend, and configuration when possible. Use a minimal, sanitized fixture for payload-specific failures. Check other callers and backends for the same defect, including paths that read existing records.
-- On read or parse failure, preserve stored data and fail closed at policy gates.
-- When telemetry fields change, inspect the serialized export, test promised redaction with dummy credentials, and document what leaves the process.
-- On stream hooks, check for repeated parsing or copying of the accumulated payload as each chunk arrives. Preserve streaming and cancellation.
-- Report which revision and checks you verified, outstanding failures, and integrations still untested. Rerun affected checks after fixes.
-
----
-
-## Unit Test Convention
-
-Runner: **vitest** (per-package devDep, `"test": "vitest run"`; root `pnpm test` also runs the integration workflow guard tests).
-
-- **Location**: colocate `src/**/*.test.ts` next to the module under test.
-- **tsconfig split**: `tsconfig.json` typechecks everything (tests included, `--noEmit`); `tsconfig.build.json` emits and excludes `*.test.ts` — `lib/` must never contain test files.
-- **Pure logic** (projectors, mappers): direct input/output tests, no harness.
-- **Plugin wiring**: drive a real `Context` from `@deepseek-ai/cordis` (event dispatch, `ctx.effect`, fiber unload) and `vi.mock` the backend module — capture instances via `vi.hoisted`. Lifecycle assertions: init at load, cleanup via `ctx.fiber.dispose()`, drains at `session/flush`.
-- **External clients** (`@prisma/client`, `@langfuse/*`, redis, ...): `vi.mock` the module — unit tests never touch a real database or network.
-- **No-throw seams**: assert backend/hook errors are swallowed with the `[dsh-*]` `console.error` prefix (spy on `console.error`).
-- **Unit ≠ E2E**: anything needing the real dsh runtime, an LLM, or a real database belongs in `.github/scripts/integration/`, not here.
-- Regression tests reproduce the observable failure before the fix and pass afterward.
-- Await the event under test or use fake timers for clock behavior. Register cleanup so resources are released even when an assertion fails.
-
----
-
-## Preview Images
-
-All preview assets are `1672 x 941` PNGs. The repository ships an evergreen root `preview.png`; each package ships its own package-root `preview.png` for plugin listings and its README, and includes it in `package.json#files`.
-
-### Package previews
-
-- Use one shared layout: plugin name + tagline on the left, a beaver character in the center, and a compact domain system on the right. Keep the hierarchy readable at README-thumbnail size.
-- Match the accepted Pi-style beaver system in the existing previews: polished cartoon 3D, matte short-plush fur rendered in broad shapes, rounded face and paws, balanced expressive eyes, adult proportions, diffuse cloth, and dry surfaces. Keep highlights restrained; the result should feel soft rather than glossy or photoreal.
-- Give every plugin a genuinely distinct character identity, pose, outfit, and action — not one body template with recolored hair. Use a musical instrument when it fits; vary standing/seated poses and instrument families across packages.
-- Use a medium-deep navy underwater-tech gradient, matte floor, soft cyan fill, and enough ambient light to read the character and clothing. Accent colors distinguish packages; the violet-to-cyan `dsh-langfuse` gradient is the reference for observability visuals.
-- Integrate a bold white whale symbol into the functional system core and connect it to the plugin's real data flow. The core carries the symbol only; keep `deepseek` / `Harness` words out of it.
-- Make the right-side motifs specific and sparse: protocol transports/endpoints for A2A, mirrored database forms for storage, and traces/spans/metrics for Langfuse. Prefer a few differentiated motifs over repeated cards or robots.
-- Keep in-image copy to the exact plugin name, tagline, and essential protocol labels. Keep Pi / `π` marks and unrelated logos out of every preview.
-
-Use the current accepted package previews as primary style references when generating another package. A package preview is complete only when its text is exact, its character differs from every sibling, its domain flow is legible, and the PNG is `1672 x 941`.
-
-### Root preview
-
-- Keep root `preview.png` evergreen and character-free. Use the project name + tagline on the left and a generic, expandable plugin network on the right: one white-whale core, cyan-to-violet data paths, and abstract module sockets at varied depths.
-- Represent extensibility rather than the current package inventory. Do not encode a fixed plugin count, package names, mascots, instruments, or package-specific cards; adding a plugin must not require regenerating the root image.
-- Regenerate the root preview only when the repository name, tagline, or shared visual system changes. When a package name, tagline, or scope changes, regenerate that package's preview and update its package README plus the root README table.
-
-## Build & Test
-
-```bash
-pnpm install
-pnpm build        # tsc per package
-pnpm typecheck
-pnpm test         # vitest (packages with a test script)
-pnpm lint         # biome check .
-```
-
-Use `pnpm test:sdk` for changes to Langfuse SDK integration. [Release workflow](.github/workflows/npm-publish.yml) sets uniform package versions in its own workspace. Confirm each expected package version and dist-tag in npm before reporting a release as published.
-
-**Integration scenarios.** Add `.github/scripts/integration/<package>.mjs` or `<package>.<scenario>.mjs` for a dsh runtime scenario. Use `<package>.providers` for backend-only legs such as Redis or SQL databases. See [matrix discovery](.github/scripts/integration-matrix.mjs) and the [integration workflow](.github/workflows/integration.yml) for job wiring.
-
-**Integration credentials.** Keep backend legs secret-free. Gate secret-backed fork runs on reviewer approval through the protected `fork-integration` environment before executing PR code. Keep persisted checkout credentials disabled and pass gateway or Langfuse secrets only to the steps that need them. Run the [workflow guard tests](.github/scripts/integration-workflow.test.mjs) when changing this boundary.
-
-**Automated PR review.** The [review workflow](.github/workflows/dsh-review.yml) executes trusted base-branch tooling and treats PR-head files as untrusted input. Preserve OS isolation: run dsh as `nobody` with a scrubbed environment, keep secrets in the runner-owned loopback proxy, and grant only directory traversal on private ancestor directories. A PR run exercises the base version of a `pull_request_target` workflow. When editing one, distinguish local checks from a run of the merged workflow.
-
-Workflow-file rules (learned the hard way — the E2E silently never triggered on the first PR):
-
-- **Lint workflow files like code.** The `lint` job runs pinned `actionlint` on `.github/workflows/*.yml`. GitHub evaluates expressions only at run time, and a bad context/expression fails the whole workflow with zero job logs — YAML that parses fine is not enough. actionlint's shellcheck rule runs only when a `shellcheck` binary is on `PATH`: GitHub's ubuntu runners ship one, a bare macOS checkout does not — a local actionlint pass is not proof (this cost us a red lint job once). Lint locally with shellcheck next to actionlint.
-- **The `runner` context is not available in job-level `env:`** (only `github`, `inputs`, `matrix`, `needs`, `secrets`, `strategy`, `vars`). Use `$RUNNER_TEMP` inside `run:` steps, or let scripts default to it — never `${{ runner.temp }}` in `env:` blocks.
+- **Assets.** Use the accepted `preview.png` files as references. Export 1672 × 941 PNGs.
+  Ship package previews at the package root via `package.json#files`. When a package name,
+  tagline, or scope changes, update its preview, README, and the root package table.
+- **Package.** Put the exact name and tagline on the left, a beaver in the middle, and a
+  sparse view of the plugin's data flow on the right. Connect the flow to a core showing
+  only a white whale symbol. Use rounded matte 3D forms, short plush fur, diffuse fabric,
+  restrained highlights, a navy underwater gradient, a matte floor, and cyan fill.
+  Vary character, pose, outfit, action, and instrument family where applicable. Use
+  package-specific accents and the Langfuse violet-to-cyan treatment as the observability
+  reference. Limit lettering to the name, tagline, and essential protocol labels.
+  Leave out Pi marks and unrelated logos. Check text, character distinctness, and
+  legibility at README thumbnail size.
+- **Root.** Refresh the root preview only when the repository name, tagline, or shared style
+  changes. Put the project name and tagline on the left and an extensible, character-free
+  network on the right. Use a white whale core, cyan-to-violet paths, and generic sockets
+  at varied depths.
+  Keep package names, mascots, instruments, package-specific cards, and a fixed package count out.
