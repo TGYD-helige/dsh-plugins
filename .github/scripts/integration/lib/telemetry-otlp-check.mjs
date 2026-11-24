@@ -4,9 +4,11 @@ import { createServer } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
+import { Context } from '@deepseek-ai/cordis';
 import protobuf from 'protobufjs';
 import { adapters } from '../../../../packages/dsh-telemetry/lib/adapters/index.js';
 import { TelemetryReporter } from '../../../../packages/dsh-telemetry/lib/core/otel.js';
+import { apply, Config } from '../../../../packages/dsh-telemetry/lib/index.js';
 
 const root = await protobuf.load(fileURLToPath(new URL('./otlp-trace.proto', import.meta.url)));
 const Request = root.lookupType('ExportTraceServiceRequest');
@@ -193,6 +195,59 @@ try {
       else process.env.OTEL_EXPORTER_OTLP_TRACES_COMPRESSION = previousCompression;
     }
   }
+  const ctx = new Context();
+  let finishLocalWrite;
+  const localWrite = new Promise((resolve) => {
+    finishLocalWrite = resolve;
+  });
+  ctx.on('session/flush', () => localWrite);
+  await apply(
+    ctx,
+    Config({
+      enabled: true,
+      backend: 'phoenix',
+      endpoint: `http://127.0.0.1:${server.address().port}/slow/checkpoint`,
+    }),
+  );
+  const baseline = captured.length;
+  try {
+    const session = { id: 'checkpoint', header: { id: 'checkpoint' } };
+    const completeTurn = (turn) => {
+      const event = (type, data, offset) =>
+        ctx.emit('session/event', session, {
+          type,
+          seq: 3 * turn + offset,
+          time: Date.now(),
+          data,
+        });
+      event('turn/start', { turn }, 1);
+      event('user/message', { role: 'user', content: [{ type: 'text', text: 'checkpoint' }] }, 2);
+      event('turn/end', { turn, reason: { kind: 'completed' } }, 3);
+    };
+    completeTurn(0);
+    for (let attempts = 0; captured.length === baseline && attempts < 300; attempts++)
+      await delay(10);
+    assert.equal(captured.at(-1).path, '/slow/checkpoint/v1/traces');
+    assert.equal(responsesSent, baseline);
+    completeTurn(1);
+    let checkpointCompleted = false;
+    const checkpointStarted = performance.now();
+    const checkpoint = ctx.parallel('session/flush', session).then(() => {
+      checkpointCompleted = true;
+    });
+    await delay(0);
+    assert.equal(checkpointCompleted, false);
+    finishLocalWrite();
+    await checkpoint;
+    assert.equal(responsesSent, baseline, 'checkpoint must complete before the collector responds');
+    console.log(
+      `OTLP_CHECKPOINT_OK (${Math.round(performance.now() - checkpointStarted)} ms while collector response is pending)`,
+    );
+  } finally {
+    finishLocalWrite();
+    await ctx.fiber.dispose();
+  }
+  assert.equal(responsesSent, baseline + 2, 'graceful shutdown must drain both exports');
   console.log(
     'OTLP_OK (both adapters: protobuf, auth, resource, IDs, parents, clocks, status, redaction)',
   );

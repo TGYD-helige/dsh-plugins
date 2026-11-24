@@ -229,17 +229,76 @@ it('collects concurrent sessions without changing stream chunks and drains on fi
     received.push(chunk);
   expect(received).toEqual(chunks);
   event('one', 'turn/end', { turn: 0, reason: { kind: 'completed' } });
-  await ctx.parallel('session/flush', session('one'));
+  await ctx.fiber.dispose();
   expect(state.spans.filter((s) => s.attributes['openinference.span.kind'] === 'LLM')).toHaveLength(
     1,
   );
   const llm = state.spans.find((s) => s.attributes['openinference.span.kind'] === 'LLM')!;
   expect(llm.spanContext().traceId).toBe('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
   expect(llm.attributes.metadata).toContain('"tenant":"one"');
-  await ctx.fiber.dispose();
   const other = state.spans.find((s) => s.attributes['session.id'] === 'two')!;
   expect(other.spanContext().traceId).not.toBe(llm.spanContext().traceId);
   expect(other.endTime).toBeDefined();
+});
+
+it('waits for local persistence but not for remote telemetry at session checkpoints', async () => {
+  vi.useFakeTimers();
+  const ctx = new Context();
+  await apply(ctx, Config({ enabled: true, backend: 'phoenix' }));
+  const session = { id: 'checkpoint', header: { id: 'checkpoint' } } as never;
+  let finishLocalWrite = () => {};
+  const localWrite = new Promise<void>((resolve) => {
+    finishLocalWrite = resolve;
+  });
+  ctx.on('session/flush', () => localWrite);
+  const event = (type: string, data: unknown) =>
+    ctx.emit('session/event', session, { type, seq: 1, time: Date.now(), data } as never);
+  event('turn/start', { turn: 0 });
+  event('user/message', { role: 'user', content: [{ type: 'text', text: 'checkpoint' }] });
+  event('turn/end', { turn: 0, reason: { kind: 'completed' } });
+  state.hold = true;
+  try {
+    let checkpointCompleted = false;
+    const checkpoint = ctx.parallel('session/flush', session).then(() => {
+      checkpointCompleted = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(checkpointCompleted).toBe(false);
+    finishLocalWrite();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(checkpointCompleted).toBe(true);
+    await checkpoint;
+    expect(state.pending).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(state.pending).toHaveLength(1);
+    await ctx.parallel('session/flush', session);
+    expect(state.pending).toHaveLength(1);
+  } finally {
+    finishLocalWrite();
+    state.hold = false;
+    for (const callback of state.pending.splice(0)) callback({ code: 0 });
+    await ctx.fiber.dispose();
+  }
+});
+
+it('logs background export errors without exposing the response', async () => {
+  vi.useFakeTimers();
+  const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const reporter = new TelemetryReporter(
+    { backend: 'phoenix', captureContent: false },
+    adapters.phoenix,
+  );
+  try {
+    await reporter.ready;
+    state.fail = true;
+    reporter.endSpan(reporter.openTrace({ name: 'background failure' }));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(diagnostic).toHaveBeenCalledWith('[dsh-telemetry] export failed (HTTP 401)');
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('private-export-response');
+  } finally {
+    await reporter.shutdown();
+  }
 });
 
 it.each([256, 16_384])(
@@ -281,7 +340,6 @@ it.each([256, 16_384])(
         }
         expect(received).toBe(count + 1);
         event('turn/end');
-        await ctx.parallel('session/flush', session);
       }),
     );
     // Once capture fills, later chunks must not trigger serialization or masking.
@@ -290,6 +348,7 @@ it.each([256, 16_384])(
     );
     expect(mask.mock.calls.length).toBeLessThanOrEqual(1024);
     stringify.mockRestore();
+    await ctx.fiber.dispose();
     expect(state.spans).toHaveLength(24);
     for (const span of state.spans.filter((item) => item.name === 'llm-request')) {
       expect(JSON.parse(String(span.attributes.metadata))).toMatchObject({
@@ -772,7 +831,7 @@ it.each([
         : {}),
     });
     event('compaction/end', { compactionId: 'compact-1', turn: null });
-    await ctx.parallel('session/flush', session);
+    await ctx.fiber.dispose();
     const generations = state.spans.filter(
       (s) => s.attributes['openinference.span.kind'] === 'LLM',
     );
@@ -786,7 +845,6 @@ it.each([
       shadowedTokenCount: 100,
     });
     expect(generations[0].parentSpanContext?.spanId).toBe(compaction.spanContext().spanId);
-    await ctx.fiber.dispose();
   },
 );
 

@@ -442,46 +442,29 @@ export function collect(
   type Handle =
     | NonNullable<ObservationHandle>
     | NonNullable<ReturnType<InstrumentationReporter['startGeneration']>>;
-  const pendingMedia = new Map<Promise<void>, readonly string[]>();
-  const mediaFor = new WeakMap<Handle, { pending: Promise<void>; sessions: readonly string[] }>();
+  const pendingMedia = new Set<Promise<void>>();
+  const mediaFor = new WeakMap<Handle, Promise<void>>();
   const mediaOptions = {
     enabled: config.captureContent && !!config.captureMedia && config.mediaEnabled !== false,
     maxBytes: config.maxMediaBytes ?? 5 * 1024 * 1024,
     timeoutMs: config.mediaTimeoutMs ?? 5000,
   };
 
-  function mediaSessions(sessionId: string | undefined): string[] {
-    const owners: string[] = [];
-    while (sessionId && !owners.includes(sessionId)) {
-      owners.push(sessionId);
-      sessionId = children.get(sessionId)?.parentSessionId;
-    }
-    return owners;
-  }
-
-  function trackMedia(task: Promise<void>, owners: readonly string[]): Promise<void> {
+  function trackMedia(task: Promise<void>): Promise<void> {
     const pending = task.catch((error) => {
       console.error(`[${diagnostic}] media finalization failed:`, error);
     });
-    pendingMedia.set(pending, owners);
+    pendingMedia.add(pending);
     void pending.then(() => pendingMedia.delete(pending));
     return pending;
   }
 
-  function enrichInput(
-    handle: Handle | null,
-    input: Promise<unknown>,
-    sessionId: string | undefined,
-  ): void {
+  function enrichInput(handle: Handle | null, input: Promise<unknown>): void {
     if (!handle) return;
-    const owners = mediaSessions(sessionId);
-    mediaFor.set(handle, {
-      pending: trackMedia(
-        input.then((value) => reporter.updateSpan(handle, { input: value })),
-        owners,
-      ),
-      sessions: owners,
-    });
+    mediaFor.set(
+      handle,
+      trackMedia(input.then((value) => reporter.updateSpan(handle, { input: value }))),
+    );
   }
 
   function afterMedia(
@@ -490,33 +473,18 @@ export function collect(
     endedAt = new Date(),
   ): void {
     const task = handle ? mediaFor.get(handle) : undefined;
-    if (task)
-      trackMedia(
-        task.pending.then(() => close(endedAt)),
-        task.sessions,
-      );
+    if (task) trackMedia(task.then(() => close(endedAt)));
     else close(endedAt);
   }
 
-  function setMessageInput(
-    handle: ObservationHandle,
-    content: readonly ContentBlock[],
-    sessionId: string,
-  ): void {
+  function setMessageInput(handle: ObservationHandle, content: readonly ContentBlock[]): void {
     if (content.some((block) => block.type !== 'text')) {
-      enrichInput(handle, displayBlocks(content, ctx.get('attachments'), mediaOptions), sessionId);
+      enrichInput(handle, displayBlocks(content, ctx.get('attachments'), mediaOptions));
     } else reporter.updateSpan(handle, { input: messageText({ content }) });
   }
 
-  async function drainMedia(sessionId?: string): Promise<void> {
-    for (;;) {
-      // Session-less observations have no narrower durability checkpoint.
-      const pending = [...pendingMedia]
-        .filter(([, owners]) => !sessionId || !owners.length || owners.includes(sessionId))
-        .map(([task]) => task);
-      if (!pending.length) return;
-      await Promise.all(pending);
-    }
+  async function drainMedia(): Promise<void> {
+    while (pendingMedia.size) await Promise.all(pendingMedia);
   }
 
   ctx.on(contextEvent, (sessionId, context) => {
@@ -1096,7 +1064,7 @@ export function collect(
       // The delegated prompt (the child's first user/message) is the
       // subagent span's input; the descriptor enriches the span name.
       if (event.type === 'user/message' && !child.hasInput && config.captureContent) {
-        setMessageInput(child.span, event.data.content, sessionId);
+        setMessageInput(child.span, event.data.content);
         child.hasInput = true;
       } else if (event.type === 'subagent/descriptor') {
         // The label is the delegation's model-authored description — content.
@@ -1240,7 +1208,7 @@ export function collect(
         if (pendingTurns.has(sessionId)) traceFor(sessionId);
         const state = sessions.get(sessionId);
         if (state && !state.hasInput && config.captureContent) {
-          setMessageInput(state.trace, event.data.content, sessionId);
+          setMessageInput(state.trace, event.data.content);
           state.hasInput = true;
         }
         break;
@@ -1399,7 +1367,6 @@ export function collect(
           requestBudget.truncated ||= enrichmentBudget.truncated;
           return enriched;
         }),
-        options.sessionId,
       );
     }
 
@@ -1729,7 +1696,6 @@ export function collect(
               console.error(`[${diagnostic}] media projection failed:`, error);
               end();
             }),
-            mediaSessions(sessionId),
           );
         else end();
       }
@@ -1764,12 +1730,6 @@ export function collect(
 
   ctx.on('tools/result', (exec, result) => {
     toolResults.get(exec)?.(result);
-  });
-
-  // Durability checkpoint: the store awaits every session/flush listener.
-  ctx.on('session/flush', async (session) => {
-    await drainMedia(session.id);
-    await reporter.flush();
   });
 
   // Lifecycle: this cordis fork has no ready/dispose events — cleanup rides

@@ -87,7 +87,26 @@ export class TelemetryReporter implements InstrumentationReporter {
         import('@opentelemetry/exporter-trace-otlp-proto'),
         import('@opentelemetry/resources'),
       ]);
-      const transport = new exporter.OTLPTraceExporter({
+      const reporter = this;
+      const transport = new (class extends exporter.OTLPTraceExporter {
+        override export(
+          ...[spans, callback]: Parameters<typeof exporter.OTLPTraceExporter.prototype.export>
+        ) {
+          super.export(spans, (result) => {
+            if (result.code === 0) {
+              callback(result);
+              return;
+            }
+            reporter.failure('export', result.error);
+            const code = (result.error as (Error & { code?: number }) | undefined)?.code;
+            const error = new Error('OTLP trace export failed');
+            callback({
+              code: result.code,
+              error: typeof code === 'number' ? Object.assign(error, { code }) : error,
+            });
+          });
+        }
+      })({
         url: connection.endpoint,
         headers: connection.headers,
       });
