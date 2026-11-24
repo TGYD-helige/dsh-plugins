@@ -46,36 +46,43 @@ when available. Follow this workflow directly when skill loading is unavailable.
   Keep the minimum compatible peer floor, include each supported prerelease tuple for npm,
   and update affected compatibility docs. Declare heavy backend clients as peers, mark
   optional clients optional, and load them via dynamic import during backend initialization.
-- **Lifecycle.** Start work with `ctx.effect()` and return a disposer for fiber unload.
-  Tap settled events via `session/event(session, event)`, drain pending writes at the
-  awaited `session/flush(session)` checkpoint, and clean up on `session/disposed(session)`.
-  Use `agent/assistant-stream` for live deltas.
+- **Lifecycle.** Use `ctx.effect()` for startup and return a disposer for fiber unload.
+  Tap settled events via `session/event(session, event)` and live deltas via
+  `agent/assistant-stream`. Clean up on `session/disposed(session)`. At the awaited
+  `session/flush(session)` checkpoint, drain the work required for that session
+  by the plugin's contract.
 - **Boundaries.** Keep Cordis context and I/O at plugin edges and backend behavior in
   adapters. Pass helpers the fields or service they need. Share code across installable
   packages when callers need the same contract and can evolve together. Name values after
   their event, state, or protocol field and keep decision order visible.
 - **Failures.** Catch observer and mirror failures at event and waterfall boundaries
   and report them via `console.error` with a `[dsh-*]` prefix so they cannot break the
-  agent loop. Preserve stored data after read or parse failures and fail closed at policy gates.
+  agent loop. Preserve stored data after read or parse failures.
 - **Hot paths.** Count file, database, and network calls per turn. Reuse valid reads and
   batch independent writes only when ordering, error handling, and the awaited flush
   are preserved. Check for repeated parsing or copying of accumulated chunks and preserve
-  streaming and cancellation.
+  streaming and cancellation. Find the matching [performance checks](README.md#development).
 
 ## Package-specific checks
 
 - **A2A.** Keep [A2A task state](packages/dsh-a2a/README.md#task-stores) in `dsh-a2a` and
   the conversation mirror in `dsh-storage`. For listener or deployment changes, preserve and
   document the [loopback default and external authentication boundary](packages/dsh-a2a/README.md#security).
-- **Storage.** For database changes, follow the [Prisma client packaging contract](packages/dsh-storage/README.md#install)
-  and [SQL Server JSON serialization](packages/dsh-storage/README.md#data-model).
+- **Storage.** Preserve [pre-generated Prisma clients in the published package](packages/dsh-storage/README.md#install).
+  For database changes, follow [SQL Server JSON serialization](packages/dsh-storage/README.md#data-model).
+- **Policy.** Keep [unmatched calls delegated](packages/dsh-policy/README.md#matching-semantics)
+  to the remaining gate chain via `next()`. Fail closed on evaluation failure or when
+  a matched `ask` cannot obtain approval.
 - **Tracing.** For telemetry field changes, inspect serialized exports, test redaction
   with dummy credentials, and document what leaves the process. In `dsh-langfuse` and
-  `dsh-telemetry`, keep tracer providers isolated and end each turn's span at `turn/end`.
+  `dsh-telemetry`, keep tracer providers isolated. Start closing turn spans on `turn/end`.
+  If media is pending, retain the end time and close the span after media resolves.
   Preserve [legacy trace I/O attributes](packages/dsh-langfuse/README.md#trace-overview-compatibility)
-  on independently owned roots exported to Langfuse. Run `pnpm test:sdk` for Langfuse SDK
-  changes and `pnpm test:otlp` for native OTLP changes. Run both for changes to shared
-  tracing code or the `dsh-telemetry` Langfuse adapter.
+  on independently owned roots exported to Langfuse. Let session checkpoints complete
+  while [native OTLP exports](packages/dsh-telemetry/README.md#observations-and-request-context)
+  are pending. Run `pnpm test:sdk` for Langfuse SDK changes and
+  `pnpm test:otlp` for native OTLP changes. Run both for changes to shared tracing code
+  or the `dsh-telemetry` Langfuse adapter.
 
 ## Tests and CI
 
@@ -109,7 +116,8 @@ when available. Follow this workflow directly when skill loading is unavailable.
 
 - **Assets.** Use the accepted `preview.png` files as references. Export 1672 × 941 PNGs.
   Ship package previews at the package root via `package.json#files`. When a package name,
-  tagline, or scope changes, update its preview, README, and the root package table.
+  tagline, or scope changes, update its preview, package README, and affected entries
+  in the root package table and [preview gallery](README.md#plugin-previews).
 - **Package.** Put the exact name and tagline on the left, a beaver in the middle, and a
   sparse view of the plugin's data flow on the right. Connect the flow to a core showing
   only a white whale symbol. Use rounded matte 3D forms, short plush fur, diffuse fabric,
