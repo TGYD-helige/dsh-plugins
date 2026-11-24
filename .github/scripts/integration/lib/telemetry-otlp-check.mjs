@@ -30,6 +30,20 @@ const server = createServer(async (req, res) => {
       compression,
       bytes: wire.length,
     });
+    if (req.url.startsWith('/limited/') && wire.length > 512 * 1024) {
+      res.writeHead(413).end();
+      return;
+    }
+    if (req.url.startsWith('/mixed/')) {
+      const spans = payload.resourceSpans.flatMap(({ scopeSpans }) =>
+        scopeSpans.flatMap(({ spans }) => spans),
+      );
+      if (spans.some(({ name }) => name === 'queued failure')) {
+        res.writeHead(401).end();
+        return;
+      }
+      await delay(1250);
+    }
     if (req.url.startsWith('/slow/')) await delay(6000);
     responsesSent++;
     res.writeHead(200, { 'content-type': 'application/x-protobuf' }).end();
@@ -248,6 +262,44 @@ try {
     await ctx.fiber.dispose();
   }
   assert.equal(responsesSent, baseline + 2, 'graceful shutdown must drain both exports');
+  const reporterAt = (prefix) =>
+    new TelemetryReporter(
+      {
+        backend: 'phoenix',
+        endpoint: `http://127.0.0.1:${server.address().port}/${prefix}`,
+        captureContent: true,
+      },
+      adapters.phoenix,
+    );
+  const limited = reporterAt('limited');
+  try {
+    await limited.ready;
+    const responsesBefore = responsesSent;
+    for (const name of ['first turn', 'second turn'])
+      limited.endSpan(limited.openTrace({ name }), { input: 'x'.repeat(300 * 1024) });
+    await limited.flush();
+    const sizes = captured.slice(-3).map(({ bytes }) => bytes);
+    assert.ok(sizes[0] > 512 * 1024 && sizes.slice(1).every((size) => size <= 512 * 1024));
+    assert.equal(responsesSent, responsesBefore + 2, 'both split requests must be accepted');
+  } finally {
+    await limited.shutdown();
+  }
+  const mixed = reporterAt('mixed');
+  try {
+    await mixed.ready;
+    const responsesBefore = responsesSent;
+    const requestsBefore = captured.length;
+    mixed.endSpan(mixed.openTrace({ name: 'in flight' }));
+    for (let attempts = 0; captured.length === requestsBefore && attempts < 300; attempts++)
+      await delay(10);
+    assert.equal(captured.at(-1).path, '/mixed/v1/traces');
+    mixed.endSpan(mixed.openTrace({ name: 'queued failure' }));
+    await mixed.shutdown();
+    assert.equal(captured.length, requestsBefore + 2);
+    assert.equal(responsesSent, responsesBefore + 1, 'shutdown must await the earlier success');
+  } finally {
+    await mixed.shutdown();
+  }
   console.log(
     'OTLP_OK (both adapters: protobuf, auth, resource, IDs, parents, clocks, status, redaction)',
   );

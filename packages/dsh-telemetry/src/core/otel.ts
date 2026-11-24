@@ -1,5 +1,5 @@
 import type { Span, SpanContext, Tracer } from '@opentelemetry/api';
-import type { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
+import type { NodeTracerProvider, SpanExporter } from '@opentelemetry/sdk-trace-node';
 import type {
   Attributes,
   BackendAdapter,
@@ -34,11 +34,14 @@ interface Observation {
   contextMetadata?: Record<string, unknown>;
 }
 
+const exportTimeoutMillis = 30_000;
+
 /** One isolated OTel tree and one exporter, independent of the selected attribute adapter. */
 export class TelemetryReporter implements InstrumentationReporter {
   readonly ready: Promise<void>;
   private api?: typeof import('@opentelemetry/api');
   private provider?: NodeTracerProvider;
+  private transport?: SpanExporter;
   private tracer?: Tracer;
   private ids?: ReturnType<typeof createTraceIdGenerator>;
   private observations = new WeakMap<object, Observation>();
@@ -89,27 +92,59 @@ export class TelemetryReporter implements InstrumentationReporter {
       ]);
       const reporter = this;
       const transport = new (class extends exporter.OTLPTraceExporter {
-        override export(
-          ...[spans, callback]: Parameters<typeof exporter.OTLPTraceExporter.prototype.export>
-        ) {
-          super.export(spans, (result) => {
-            if (result.code === 0) {
-              callback(result);
-              return;
+        private pending = new Set<Promise<void>>();
+        private closing?: Promise<void>;
+
+        override export(...[spans, callback]: Parameters<SpanExporter['export']>) {
+          type Result = Parameters<typeof callback>[0];
+          let expired = false;
+          const send = async (batch: typeof spans): Promise<Result> => {
+            if (expired) return { code: 1, error: new Error('Timeout') };
+            const result = await new Promise<Result>((resolve) => super.export(batch, resolve));
+            if (result.code === 0) return result;
+            const code = (result.error as (Error & { code?: number }) | undefined)?.code;
+            if (code === 413 && batch.length > 1 && !expired) {
+              const midpoint = Math.floor(batch.length / 2);
+              const first = await send(batch.slice(0, midpoint));
+              const second = await send(batch.slice(midpoint));
+              return first.code === 0 ? second : first;
             }
             reporter.failure('export', result.error);
-            const code = (result.error as (Error & { code?: number }) | undefined)?.code;
             const error = new Error('OTLP trace export failed');
-            callback({
+            return {
               code: result.code,
               error: typeof code === 'number' ? Object.assign(error, { code }) : error,
-            });
+            };
+          };
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const deadline = new Promise<Result>((resolve) => {
+            timer = setTimeout(() => {
+              expired = true;
+              resolve({ code: 1, error: new Error('Timeout') });
+            }, exportTimeoutMillis);
           });
+          const finished = Promise.race([send(spans), deadline])
+            .catch((error) => {
+              reporter.failure('export', error);
+              return { code: 1, error: new Error('OTLP trace export failed') } as Result;
+            })
+            .then(callback)
+            .finally(() => {
+              clearTimeout(timer);
+              this.pending.delete(finished);
+            });
+          this.pending.add(finished);
+        }
+
+        override shutdown() {
+          this.closing ??= Promise.allSettled(this.pending).then(() => super.shutdown());
+          return this.closing;
         }
       })({
         url: connection.endpoint,
         headers: connection.headers,
       });
+      this.transport = transport;
       this.ids = createTraceIdGenerator(new sdk.RandomIdGenerator());
       this.provider = new sdk.NodeTracerProvider({
         idGenerator: this.ids,
@@ -127,6 +162,7 @@ export class TelemetryReporter implements InstrumentationReporter {
         spanProcessors: [
           new sdk.BatchSpanProcessor(transport, {
             scheduledDelayMillis: 1000,
+            exportTimeoutMillis,
           }),
         ],
       });
@@ -364,13 +400,20 @@ export class TelemetryReporter implements InstrumentationReporter {
   async shutdown() {
     await this.ready;
     const provider = this.provider;
+    const transport = this.transport;
     this.provider = undefined;
+    this.transport = undefined;
     this.tracer = undefined;
     this.api = undefined;
     try {
       await provider?.shutdown();
     } catch (error) {
       this.failure('shutdown', error);
+    }
+    try {
+      await transport?.shutdown();
+    } catch (error) {
+      this.failure('transport shutdown', error);
     }
   }
 }

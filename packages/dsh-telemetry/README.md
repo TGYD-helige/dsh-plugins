@@ -62,7 +62,9 @@ YAML `publicKey`, `secretKey` and `baseUrl` override the corresponding environme
 
 ## Observations and request context
 
-Coverage reuses the existing collector: turn roots, LLM generations plus nested `llm-request` spans, tools, hooks, subagents, and native A2A inbox tasks. OpenTelemetry exports completed spans in bounded batches in the background. Session checkpoints do not wait for trace exports or media enrichment; local session persistence is unchanged. The separate legacy `dsh-langfuse` plugin retains its checkpoint export behavior. Fiber unload finishes pending media, closes outstanding spans and drains the exporter. Trace delivery is best effort: a full queue, failed export or abrupt exit can lose spans without losing session history. Export failures log a `[dsh-telemetry]` diagnostic without the collector's response body.
+Coverage reuses the existing collector: turn roots, LLM generations plus nested `llm-request` spans, tools, hooks, subagents, and native A2A inbox tasks. OpenTelemetry exports completed spans in bounded batches in the background. Session checkpoints never wait for remote trace exports. When inline media capture is enabled, a checkpoint still finishes its session's pending media so that slow attachments do not consume the host's shutdown window. The separate legacy `dsh-langfuse` plugin retains its checkpoint export behavior.
+
+The exporter splits a batch rejected with HTTP 413 within the existing export deadline. An oversized single span is still rejected. Fiber unload closes outstanding spans and drains queued and in-flight exports, even if one batch fails. Trace delivery is best effort: a full queue, failed export or abrupt exit can lose spans without losing session history. Export failures log a `[dsh-telemetry]` diagnostic without the collector's response body.
 
 ```ts
 import type { TelemetryTraceContext } from '@amaster.ai/dsh-telemetry';

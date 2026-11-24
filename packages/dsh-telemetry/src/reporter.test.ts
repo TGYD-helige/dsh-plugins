@@ -10,6 +10,8 @@ const state = vi.hoisted(() => ({
   hold: false,
   pending: [] as Array<(result: { code: number; error?: Error }) => void>,
   batches: [] as number[],
+  rejectCombined: false,
+  shutdown: vi.fn(),
   spans: [] as Array<{
     name: string;
     attributes: Record<string, unknown>;
@@ -26,6 +28,10 @@ vi.mock('@opentelemetry/exporter-trace-otlp-proto', () => ({
     export(spans: typeof state.spans, callback: (result: { code: number; error?: Error }) => void) {
       state.spans.push(...spans);
       state.batches.push(spans.length);
+      if (state.rejectCombined && spans.length > 1) {
+        callback({ code: 1, error: Object.assign(new Error('too large'), { code: 413 }) });
+        return;
+      }
       if (state.hold) {
         state.pending.push(callback);
         return;
@@ -36,7 +42,9 @@ vi.mock('@opentelemetry/exporter-trace-otlp-proto', () => ({
           : { code: 0 },
       );
     }
-    async shutdown() {}
+    async shutdown() {
+      state.shutdown();
+    }
     async forceFlush() {}
   },
 }));
@@ -46,6 +54,8 @@ afterEach(() => {
   state.hold = false;
   for (const callback of state.pending.splice(0)) callback({ code: 0 });
   state.batches.length = 0;
+  state.rejectCombined = false;
+  state.shutdown.mockClear();
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -299,6 +309,95 @@ it('logs background export errors without exposing the response', async () => {
   } finally {
     await reporter.shutdown();
   }
+});
+
+it('keeps accepted spans when a combined payload receives HTTP 413', async () => {
+  vi.useFakeTimers();
+  const reporter = new TelemetryReporter(
+    { backend: 'phoenix', captureContent: true },
+    adapters.phoenix,
+  );
+  await reporter.ready;
+  state.rejectCombined = true;
+  try {
+    reporter.endSpan(reporter.openTrace({ name: 'first turn' }), { input: 'first' });
+    reporter.endSpan(reporter.openTrace({ name: 'second turn' }), { input: 'second' });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(state.batches).toEqual([2, 1, 1]);
+    expect(state.spans.slice(-2).map(({ name }) => name)).toEqual(['first turn', 'second turn']);
+  } finally {
+    await reporter.shutdown();
+  }
+});
+
+it('waits for in-flight export and closes the transport when a queued batch fails', async () => {
+  vi.useFakeTimers();
+  const reporter = new TelemetryReporter(
+    { backend: 'phoenix', captureContent: false },
+    adapters.phoenix,
+  );
+  await reporter.ready;
+  state.hold = true;
+  reporter.endSpan(reporter.openTrace({ name: 'in flight' }));
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(state.pending).toHaveLength(1);
+  state.hold = false;
+  state.fail = true;
+  reporter.endSpan(reporter.openTrace({ name: 'queued failure' }));
+  let stopped = false;
+  const shutdown = reporter.shutdown().then(() => {
+    stopped = true;
+  });
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stopped).toBe(false);
+    expect(state.shutdown).not.toHaveBeenCalled();
+  } finally {
+    for (const callback of state.pending.splice(0)) callback({ code: 0 });
+    await shutdown;
+  }
+  expect(state.shutdown).toHaveBeenCalledTimes(1);
+});
+
+it('finishes enabled media before the host starts its five-second shutdown window', async () => {
+  vi.useFakeTimers();
+  const ctx = new Context();
+  ctx.provide('attachments', {
+    readImage: () =>
+      new Promise((resolve) => {
+        setTimeout(() => resolve({ data: Uint8Array.of(1, 2, 3) }), 6000);
+      }),
+  } as never);
+  await apply(
+    ctx,
+    Config({ enabled: true, backend: 'phoenix', captureMedia: true, mediaTimeoutMs: 10_000 }),
+  );
+  const session = { id: 'media-checkpoint', header: { id: 'media-checkpoint' } } as never;
+  const event = (type: string, data: unknown) =>
+    ctx.emit('session/event', session, { type, seq: 1, time: Date.now(), data } as never);
+  event('turn/start', { turn: 0 });
+  event('user/message', {
+    role: 'user',
+    content: [{ type: 'image', attachment: { mediaType: 'image/png', bytes: 3 } }],
+  });
+  event('turn/end', { turn: 0, reason: { kind: 'completed' } });
+  let stopped = false;
+  const shutdown = ctx.parallel('session/flush', session).then(async () => {
+    const disposal = ctx.fiber.dispose();
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    stopped = await Promise.race([
+      disposal.then(() => true),
+      new Promise<false>((resolve) => {
+        deadline = setTimeout(() => resolve(false), 5000);
+      }),
+    ]);
+    clearTimeout(deadline);
+    await disposal;
+  });
+  await vi.advanceTimersByTimeAsync(12_000);
+  await shutdown;
+  expect(stopped).toBe(true);
+  expect(String(state.spans[0]?.attributes['input.value'])).toContain('data:image/png;base64,AQID');
 });
 
 it.each([256, 16_384])(

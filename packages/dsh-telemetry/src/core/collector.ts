@@ -1766,10 +1766,10 @@ export function collect(
     toolResults.get(exec)?.(result);
   });
 
-  if (contextEvent === 'langfuse/context') {
+  if (contextEvent === 'langfuse/context' || mediaOptions.enabled) {
     ctx.on('session/flush', async (session) => {
       await drainMedia(session.id);
-      await reporter.flush();
+      if (contextEvent === 'langfuse/context') await reporter.flush();
     });
   }
 
